@@ -60,17 +60,19 @@ function buildMonthGrid(
 export default function DailyPage() {
   const [allDates, setAllDates] = useState<DailyDate[]>([]);
   const [days, setDays] = useState(120);
-  const [loading, setLoading] = useState(false);
+  // Start as true so the first render shows loading, no cascade render needed.
+  const [loading, setLoading] = useState(true);
   const [selectedMonth, setSelectedMonth] = useState<string>(() => monthKey(new Date()));
   const { t, locale } = useI18n();
 
   useEffect(() => {
-    setLoading(true);
+    let cancelled = false;
     api
       .getDailyDates(days)
-      .then(setAllDates)
+      .then((d) => { if (!cancelled) setAllDates(d); })
       .catch(console.error)
-      .finally(() => setLoading(false));
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [days]);
 
   // Map: YYYY-MM-DD → {count, tools}

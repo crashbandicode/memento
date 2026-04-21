@@ -22,22 +22,35 @@ const PUBLIC_PATHS = ["/", "/auth/login", "/auth/register"];
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
-  const [token, setToken] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Lazy-init token from localStorage — avoids setState-in-effect rule and
+  // also means first render already has the token (no flash of logged-out UI).
+  const [token, setToken] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return localStorage.getItem("dr_token");
+  });
+  const [loading, setLoading] = useState<boolean>(() => {
+    // If we start with no token, no /me fetch needed → not loading.
+    if (typeof window === "undefined") return true;
+    return !!localStorage.getItem("dr_token");
+  });
   const pathname = usePathname();
   const router = useRouter();
 
   useEffect(() => {
-    const stored = localStorage.getItem("dr_token");
-    if (stored) {
-      setToken(stored);
-      api.getMe(stored).then(setUser).catch(() => {
+    // Only fetch /me if we have a token carried over from a previous session.
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    api.getMe(token)
+      .then(setUser)
+      .catch(() => {
         localStorage.removeItem("dr_token");
         setToken(null);
-      }).finally(() => setLoading(false));
-    } else {
-      setLoading(false);
-    }
+      })
+      .finally(() => setLoading(false));
+    // Intentionally run only on mount — token is a lazy-init snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Redirect to login if not authenticated and not on a public page

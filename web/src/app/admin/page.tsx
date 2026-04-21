@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
-import { Icon, ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
+import { ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
 import { TokenDisplay } from "@/components/TokenDisplay";
 

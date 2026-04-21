@@ -7,25 +7,52 @@ import { getApiBase, authFetch, ConversationMessage } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
-import { Icon, ToolGlyph } from "@/components/aurora/Icon";
+import { ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+
+type I18nT = ReturnType<typeof useI18n>["t"];
+
+interface DailySummary { title?: string; summary?: string }
+interface DailyConversation {
+  id: string; tool_id: string; content_type: string; title: string;
+  user_messages: number; assistant_messages: number;
+}
+interface DailyKeyChange { id: string; category: string; title: string }
+interface DailyOverview {
+  conversations?: DailyConversation[];
+  key_changes?: DailyKeyChange[];
+  tool_stats?: Record<string, number>;
+}
+interface DailyDetail {
+  total_messages?: number;
+  overview?: DailyOverview;
+  summaries?: DailySummary[];
+}
+
+interface RawDailyMessage {
+  role: string | null;
+  content: string;
+  timestamp: string | null;
+  conversation_title?: string;
+  tool_id?: string;
+}
 
 export default function DailyDetailPage() {
   const params = useParams();
   const dateStr = params.date as string;
-  const [data, setData] = useState<any>(null);
+  const [data, setData] = useState<DailyDetail | null>(null);
   const [generating, setGenerating] = useState(false);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
   const { t, locale } = useI18n();
 
   useEffect(() => {
     const tz = new Date().getTimezoneOffset();
-    authFetch(`${getApiBase()}/api/daily/${dateStr}?tz_offset=${tz}`).then((r) => r.json()).then((d) => {
+    authFetch(`${getApiBase()}/api/daily/${dateStr}?tz_offset=${tz}`).then((r) => r.json()).then((d: DailyDetail) => {
       setData(d);
       // summary title is produced server-side by the AI summary pipeline; match any title that
       // contains a known marker. The English pipeline emits "AI Daily Summary", Chinese "AI 日报".
-      const existing = d.summaries?.find((s: any) => s.title && /AI\s*(?:\u65e5\u62a5|Daily)/i.test(s.title));
-      if (existing) setAiSummary(existing.summary);
+      const existing = d.summaries?.find((s) => !!s.title && /AI\s*(?:\u65e5\u62a5|Daily)/i.test(s.title));
+      if (existing?.summary) setAiSummary(existing.summary);
     }).catch(console.error);
   }, [dateStr]);
 
@@ -166,8 +193,8 @@ export default function DailyDetailPage() {
   );
 }
 
-function DailyConversationFlow({ dateStr, t, locale }: { dateStr: string; t: any; locale: string }) {
-  const [messages, setMessages] = useState<any[]>([]);
+function DailyConversationFlow({ dateStr, t, locale }: { dateStr: string; t: I18nT; locale: string }) {
+  const [messages, setMessages] = useState<RawDailyMessage[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);

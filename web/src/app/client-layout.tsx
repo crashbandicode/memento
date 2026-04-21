@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { usePathname } from "next/navigation";
 import { AuthProvider, useAuth } from "@/lib/auth-context";
 import { DeviceProvider } from "@/lib/device-context";
@@ -11,12 +11,15 @@ import Header from "@/components/layout/Header";
 import { AuroraBackdrop } from "@/components/aurora/AuroraBackdrop";
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
-  const [locale, setLocale] = useState<Locale>("zh-CN");
-
-  useEffect(() => {
+  // Lazy init reads localStorage once, avoiding the "setState-in-effect" rule.
+  // On SSR, window is undefined → falls back to default. Hydration briefly uses
+  // the default before the first client render corrects it; acceptable because
+  // the only effect is which translation set renders.
+  const [locale, setLocale] = useState<Locale>(() => {
+    if (typeof window === "undefined") return "zh-CN";
     const saved = localStorage.getItem("dr_locale") as Locale | null;
-    if (saved && saved in locales) setLocale(saved);
-  }, []);
+    return saved && saved in locales ? saved : "zh-CN";
+  });
 
   const handleSetLocale = (l: Locale) => {
     setLocale(l);

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { useSSE } from "@/lib/use-sse";
+import { useNow } from "@/lib/use-now";
 import { timeAgo } from "@/lib/constants";
 import { Icon, ToolGlyph, PlatformGlyph, TOOL_HUE } from "@/components/aurora/Icon";
 import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora/primitives";
@@ -52,6 +53,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [lastEvent, setLastEvent] = useState("");
   const { t } = useI18n();
+  const now = useNow();
 
   const fetchData = useCallback(() => {
     const tz = new Date().getTimezoneOffset();
@@ -287,8 +289,8 @@ export default function Dashboard() {
               ) : (
                 devices.map((device) => {
                   const isOnline =
-                    device.last_heartbeat &&
-                    Date.now() - new Date(device.last_heartbeat).getTime() < 300000;
+                    !!device.last_heartbeat &&
+                    now - new Date(device.last_heartbeat).getTime() < 300000;
                   const shortName = device.name.replace(/ \(\w+\)$/, "");
                   return (
                     <div

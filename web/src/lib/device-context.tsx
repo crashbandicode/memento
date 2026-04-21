@@ -26,7 +26,12 @@ const DeviceContext = createContext<DeviceState>({
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
   const [devices, setDevices] = useState<Device[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  // Lazy init from localStorage — avoids setState-in-effect rule.
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    const saved = localStorage.getItem("dr_device_id");
+    return saved && saved !== "all" ? saved : null;
+  });
 
   useEffect(() => {
     // Only fetch if logged in
@@ -37,9 +42,6 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         .then(setDevices)
         .catch(() => {});
     }
-
-    const saved = localStorage.getItem("dr_device_id");
-    if (saved) setSelectedDeviceId(saved === "all" ? null : saved);
   }, []);
 
   const handleSelect = (id: string | null) => {

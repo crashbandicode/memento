@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { getApiBase } from "./api-client";
 
 export interface SSEEvent {
@@ -22,7 +22,12 @@ export interface SSEEvent {
  */
 export function useSSE(onEvent: (event: SSEEvent) => void) {
   const onEventRef = useRef(onEvent);
-  onEventRef.current = onEvent;
+  // Sync the latest onEvent handler into ref AFTER render, not during.
+  // This avoids the React 19 "refs during render" rule violation while
+  // preserving the "always-fresh-callback" semantics inside the effect below.
+  useLayoutEffect(() => {
+    onEventRef.current = onEvent;
+  });
 
   useEffect(() => {
     let es: EventSource | null = null;

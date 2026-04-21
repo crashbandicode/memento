@@ -51,6 +51,68 @@ const TYPE_COLORS: Record<string, string> = {
   file: "#6b7280",
 };
 
+interface SearchResult {
+  name: string;
+  entity_type?: string;
+  type?: string;
+  summary?: string | null;
+  content?: string;
+}
+
+// Pure — force-directed layout simulation, returns new positions.
+// Kept at module scope so it doesn't recreate each render and so it's available
+// before loadGraph is declared (no TDZ).
+function simulateForce(initialNodes: GraphNode[], edgeList: GraphEdge[]): GraphNode[] {
+  const ns = [...initialNodes];
+  const nodeMap = new Map(ns.map((n) => [n.id, n]));
+
+  for (let iter = 0; iter < 100; iter++) {
+    // Repulsion between all nodes
+    for (let i = 0; i < ns.length; i++) {
+      for (let j = i + 1; j < ns.length; j++) {
+        const dx = (ns[i].x || 0) - (ns[j].x || 0);
+        const dy = (ns[i].y || 0) - (ns[j].y || 0);
+        const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+        const force = 2000 / (dist * dist);
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        ns[i].vx = (ns[i].vx || 0) + fx;
+        ns[i].vy = (ns[i].vy || 0) + fy;
+        ns[j].vx = (ns[j].vx || 0) - fx;
+        ns[j].vy = (ns[j].vy || 0) - fy;
+      }
+    }
+    for (const e of edgeList) {
+      const s = nodeMap.get(e.source);
+      const t = nodeMap.get(e.target);
+      if (!s || !t) continue;
+      const dx = (t.x || 0) - (s.x || 0);
+      const dy = (t.y || 0) - (s.y || 0);
+      const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+      const force = (dist - 120) * 0.01;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      s.vx = (s.vx || 0) + fx;
+      s.vy = (s.vy || 0) + fy;
+      t.vx = (t.vx || 0) - fx;
+      t.vy = (t.vy || 0) - fy;
+    }
+    for (const n of ns) {
+      n.vx = (n.vx || 0) + (400 - (n.x || 400)) * 0.001;
+      n.vy = (n.vy || 0) + (300 - (n.y || 300)) * 0.001;
+    }
+    for (const n of ns) {
+      n.x = (n.x || 0) + (n.vx || 0) * 0.3;
+      n.y = (n.y || 0) + (n.vy || 0) * 0.3;
+      n.vx = (n.vx || 0) * 0.8;
+      n.vy = (n.vy || 0) * 0.8;
+      n.x = Math.max(30, Math.min(770, n.x || 0));
+      n.y = Math.max(30, Math.min(570, n.y || 0));
+    }
+  }
+  return ns;
+}
+
 export default function MemoryPage() {
   const { t } = useI18n();
   const [stats, setStats] = useState<MemoryStats | null>(null);
@@ -59,92 +121,34 @@ export default function MemoryPage() {
   const [selectedEntity, setSelectedEntity] = useState<EntityDetail | null>(null);
   const [filterType, setFilterType] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const svgRef = useRef<SVGSVGElement>(null);
-
-  // Load stats + graph
-  useEffect(() => {
-    authFetch(`${getApiBase()}/api/memory/stats`).then((r) => r.json()).then(setStats).catch(() => {});
-    loadGraph();
-  }, [filterType]); // eslint-disable-line
 
   const loadGraph = useCallback(() => {
     const params = filterType ? `?entity_type=${filterType}&limit=200` : "?limit=200";
     authFetch(`${getApiBase()}/api/memory/graph${params}`)
       .then((r) => r.json())
       .then((data) => {
-        // Initialize positions randomly
         const w = 800, h = 600;
-        const initialized = data.nodes.map((n: GraphNode, i: number) => ({
+        const initialized: GraphNode[] = data.nodes.map((n: GraphNode) => ({
           ...n,
           x: w / 2 + (Math.random() - 0.5) * w * 0.8,
           y: h / 2 + (Math.random() - 0.5) * h * 0.8,
           vx: 0,
           vy: 0,
         }));
-        setNodes(initialized);
         setEdges(data.edges || []);
-        // Run force simulation
-        simulateForce(initialized, data.edges || []);
+        // Run force simulation and commit the settled positions
+        setNodes(simulateForce(initialized, data.edges || []));
       })
       .catch(() => {});
   }, [filterType]);
 
-  // Simple force-directed layout simulation
-  const simulateForce = (initialNodes: GraphNode[], edgeList: GraphEdge[]) => {
-    const ns = [...initialNodes];
-    const nodeMap = new Map(ns.map((n) => [n.id, n]));
-
-    for (let iter = 0; iter < 100; iter++) {
-      // Repulsion between all nodes
-      for (let i = 0; i < ns.length; i++) {
-        for (let j = i + 1; j < ns.length; j++) {
-          const dx = (ns[i].x || 0) - (ns[j].x || 0);
-          const dy = (ns[i].y || 0) - (ns[j].y || 0);
-          const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-          const force = 2000 / (dist * dist);
-          const fx = (dx / dist) * force;
-          const fy = (dy / dist) * force;
-          ns[i].vx = (ns[i].vx || 0) + fx;
-          ns[i].vy = (ns[i].vy || 0) + fy;
-          ns[j].vx = (ns[j].vx || 0) - fx;
-          ns[j].vy = (ns[j].vy || 0) - fy;
-        }
-      }
-      // Attraction along edges
-      for (const e of edgeList) {
-        const s = nodeMap.get(e.source);
-        const t = nodeMap.get(e.target);
-        if (!s || !t) continue;
-        const dx = (t.x || 0) - (s.x || 0);
-        const dy = (t.y || 0) - (s.y || 0);
-        const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-        const force = (dist - 120) * 0.01;
-        const fx = (dx / dist) * force;
-        const fy = (dy / dist) * force;
-        s.vx = (s.vx || 0) + fx;
-        s.vy = (s.vy || 0) + fy;
-        t.vx = (t.vx || 0) - fx;
-        t.vy = (t.vy || 0) - fy;
-      }
-      // Center gravity
-      for (const n of ns) {
-        n.vx = (n.vx || 0) + (400 - (n.x || 400)) * 0.001;
-        n.vy = (n.vy || 0) + (300 - (n.y || 300)) * 0.001;
-      }
-      // Apply velocity with damping
-      for (const n of ns) {
-        n.x = (n.x || 0) + (n.vx || 0) * 0.3;
-        n.y = (n.y || 0) + (n.vy || 0) * 0.3;
-        n.vx = (n.vx || 0) * 0.8;
-        n.vy = (n.vy || 0) * 0.8;
-        // Bounds
-        n.x = Math.max(30, Math.min(770, n.x || 0));
-        n.y = Math.max(30, Math.min(570, n.y || 0));
-      }
-    }
-    setNodes([...ns]);
-  };
+  // Load stats + graph on mount and when filter changes
+  useEffect(() => {
+    authFetch(`${getApiBase()}/api/memory/stats`).then((r) => r.json()).then(setStats).catch(() => {});
+    loadGraph();
+  }, [loadGraph]);
 
   const handleNodeClick = async (nodeId: string) => {
     try {
@@ -214,14 +218,14 @@ export default function MemoryPage() {
                 <div
                   style={{
                     width: 18, height: 18, borderRadius: 9999,
-                    background: TYPE_COLORS[r.entity_type || r.type] || "#6b7280",
+                    background: TYPE_COLORS[r.entity_type || r.type || ""] || "#6b7280",
                     flexShrink: 0,
                     marginTop: 2,
                   }}
                 />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <span style={{ fontWeight: 500, color: "var(--aurora-fg1)" }}>{r.name}</span>
-                  <span style={{ fontSize: 11, color: "var(--aurora-fg4)", marginLeft: 8 }}>{r.entity_type || r.type}</span>
+                  <span style={{ fontSize: 11, color: "var(--aurora-fg4)", marginLeft: 8 }}>{r.entity_type || r.type || ""}</span>
                   {r.summary && <p style={{ fontSize: 12, color: "var(--aurora-fg3)", marginTop: 2 }}>{r.summary}</p>}
                   {r.content && <p style={{ fontSize: 12, color: "var(--aurora-fg3)", marginTop: 2 }}>{r.content.slice(0, 150)}</p>}
                 </div>

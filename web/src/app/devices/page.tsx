@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
+import { useNow } from "@/lib/use-now";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { ToolGlyph, PlatformGlyph, Icon } from "@/components/aurora/Icon";
 import { Glass, TopBar } from "@/components/aurora/primitives";
@@ -33,6 +34,7 @@ export default function DevicesPage() {
   const [discoveries, setDiscoveries] = useState<Record<string, Record<string, { root?: string }>>>({});
   const { t, locale } = useI18n();
   const timeAgo = useTimeAgo(t);
+  const now = useNow();
 
   useEffect(() => {
     authFetch(`${getApiBase()}/api/devices`)
@@ -96,7 +98,7 @@ memento-collector setup`}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {devices.map((d) => {
             const isOnline =
-              d.last_heartbeat && Date.now() - new Date(d.last_heartbeat).getTime() < 300000;
+              !!d.last_heartbeat && now - new Date(d.last_heartbeat).getTime() < 300000;
             const toolsShown = d.tools.filter((tool) => tool !== "system");
             return (
               <Glass key={d.id} padding={22} radius={20}>

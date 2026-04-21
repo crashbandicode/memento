@@ -129,17 +129,19 @@ export default function ProjectTimelinePage() {
   );
 }
 
+type SessionMessage = ConversationMessage & { subagent_name?: string };
+
 const SessionMessages = memo(function SessionMessages({
   session, dateFmt, locale, t,
 }: {
   session: Session;
   dateFmt: string;
   locale: string;
-  t: any;
+  t: ReturnType<typeof useI18n>["t"];
 }) {
   // Group consecutive subagent messages for collapsible rendering
-  type MsgItem = { msg: any; isSubagent: boolean; subagentName: string };
-  const items: MsgItem[] = session.messages.map((m: any) => ({
+  type MsgItem = { msg: SessionMessage; isSubagent: boolean; subagentName: string };
+  const items: MsgItem[] = session.messages.map((m) => ({
     msg: m,
     isSubagent: !!m.subagent_name,
     subagentName: m.subagent_name || "",

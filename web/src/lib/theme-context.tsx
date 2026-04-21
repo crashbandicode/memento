@@ -40,20 +40,27 @@ function applyAttrs(skin: Skin, theme: Theme) {
   if (link.href !== location.origin + href) link.href = href;
 }
 
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>("light");
-  const [skin, setSkinState] = useState<Skin>("aurora");
+function readInitialTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+  const saved = localStorage.getItem("dr_theme") as Theme | null;
+  if (saved === "light" || saved === "dark") return saved;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
+function readInitialSkin(): Skin {
+  if (typeof window === "undefined") return "aurora";
+  const saved = localStorage.getItem("dr_skin") as Skin | null;
+  return saved && SKINS.includes(saved) ? saved : "aurora";
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setThemeState] = useState<Theme>(readInitialTheme);
+  const [skin, setSkinState] = useState<Skin>(readInitialSkin);
+
+  // Sync <html data-*> attrs + favicon link on mount and whenever theme/skin change.
   useEffect(() => {
-    const savedTheme = (typeof window !== "undefined" && localStorage.getItem("dr_theme")) as Theme | null;
-    const savedSkin = (typeof window !== "undefined" && localStorage.getItem("dr_skin")) as Skin | null;
-    const prefersDark = typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches;
-    const initialTheme: Theme = savedTheme ?? (prefersDark ? "dark" : "light");
-    const initialSkin: Skin = savedSkin && SKINS.includes(savedSkin) ? savedSkin : "aurora";
-    setThemeState(initialTheme);
-    setSkinState(initialSkin);
-    applyAttrs(initialSkin, initialTheme);
-  }, []);
+    applyAttrs(skin, theme);
+  }, [skin, theme]);
 
   const setTheme = (t: Theme) => {
     setThemeState(t);
