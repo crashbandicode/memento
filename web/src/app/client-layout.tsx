@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import { AuthProvider, useAuth } from "@/lib/auth-context";
 import { DeviceProvider } from "@/lib/device-context";
@@ -31,15 +31,25 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   // Lazy init: first saved choice, else browser pref, else zh-CN. Avoids
   // setState-in-effect cascading render.
   const [locale, setLocale] = useState<Locale>(detectInitialLocale);
+  const t = locales[locale].translations;
 
   const handleSetLocale = (l: Locale) => {
     setLocale(l);
     localStorage.setItem("dr_locale", l);
   };
 
+  // Server metadata (layout.tsx) hard-codes English tab title since it can't
+  // read locale. Sync document.title + <html lang> on the client after
+  // hydration so they match the actual rendered language.
+  useEffect(() => {
+    document.title = `${t.app.title} — ${t.app.subtitle}`;
+    // lang attribute affects font rendering, hyphenation, screen readers.
+    document.documentElement.lang = locale === "zh-CN" ? "zh" : "en";
+  }, [locale, t.app.title, t.app.subtitle]);
+
   return (
     <ThemeProvider>
-      <I18nContext.Provider value={{ locale, t: locales[locale].translations, setLocale: handleSetLocale }}>
+      <I18nContext.Provider value={{ locale, t, setLocale: handleSetLocale }}>
         <AuthProvider>
           <AuroraBackdrop />
           <AppShell>{children}</AppShell>
