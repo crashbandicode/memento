@@ -32,6 +32,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   // setState-in-effect cascading render.
   const [locale, setLocale] = useState<Locale>(detectInitialLocale);
   const t = locales[locale].translations;
+  const pathname = usePathname();
 
   const handleSetLocale = (l: Locale) => {
     setLocale(l);
@@ -39,13 +40,13 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   };
 
   // Server metadata (layout.tsx) hard-codes English tab title since it can't
-  // read locale. Sync document.title + <html lang> on the client after
-  // hydration so they match the actual rendered language.
+  // read locale. On every route change, Next.js App Router re-applies the
+  // layout metadata — including the English title — which clobbers whatever
+  // we set on mount. Re-assert on every locale AND pathname change.
   useEffect(() => {
     document.title = `${t.app.title} — ${t.app.subtitle}`;
-    // lang attribute affects font rendering, hyphenation, screen readers.
     document.documentElement.lang = locale === "zh-CN" ? "zh" : "en";
-  }, [locale, t.app.title, t.app.subtitle]);
+  }, [locale, t.app.title, t.app.subtitle, pathname]);
 
   return (
     <ThemeProvider>
