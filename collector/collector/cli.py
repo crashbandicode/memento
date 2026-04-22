@@ -22,6 +22,31 @@ _LEGACY_SYSTEMD_UNIT = "daily-report-collector"
 # Windows task name *before* rebrand. Keep this as the old string so
 # install/uninstall flow tries to clean it up on upgrade.
 _LEGACY_WIN_TASK_NAME = "DailyReportCollector"
+_LEGACY_DATA_DIR = Path.home() / ".daily-report"
+
+
+def _migrate_legacy_data_dir() -> None:
+    """Pre-rebrand users had config + queue databases under ~/.daily-report.
+    Copy anything still there into ~/.memento on first setup, so upgrading
+    from the 0.0.1 PyPI wheel doesn't leave them with a silently-dead old
+    config path (the one in their screenshot) while the new binary writes
+    elsewhere.
+    """
+    if not _LEGACY_DATA_DIR.exists():
+        return
+    new_dir = _default_data_dir()
+    new_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for item in _LEGACY_DATA_DIR.iterdir():
+        target = new_dir / item.name
+        if target.exists():
+            continue  # don't clobber a freshly-written new-path file
+        shutil.move(str(item), str(target))
+        moved.append(item.name)
+    if moved:
+        print(f"Migrated {len(moved)} item(s) from {_LEGACY_DATA_DIR} → {new_dir}: {', '.join(moved)}")
+    # Leave the (now-empty) old dir rather than rmdir-ing, in case the user
+    # wants to check that nothing was lost.
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +63,7 @@ def setup() -> None:
       MEMENTO_OBSIDIAN_VAULT=...    skip vault discovery, use this path ('' to skip)
     """
     noninteractive = os.environ.get("MEMENTO_NONINTERACTIVE") == "1"
+    _migrate_legacy_data_dir()  # ~/.daily-report → ~/.memento for upgraders
     config = CollectorConfig()
     config.ensure_dirs()
     config_path = _default_data_dir() / "config.json"
