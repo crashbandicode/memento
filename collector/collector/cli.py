@@ -308,12 +308,37 @@ def _setup_mcp(server_url: str, token: str) -> None:
         print("  Codex: not installed")
 
     # --- OpenClaw (~/.openclaw/openclaw.json) ---
+    # OpenClaw uses its own schema under `mcp.servers.<name>` and rejects a
+    # top-level `mcpServers` key as "Unrecognized". Always use the official
+    # `openclaw mcp set` CLI — it validates + writes to the right path. Also
+    # strip any legacy top-level mcpServers we (or an even older version) may
+    # have written in the past, which would brick `openclaw gateway start`.
     openclaw_json = home / ".openclaw" / "openclaw.json"
     if openclaw_json.parent.exists():
-        if _inject_mcp_json(openclaw_json, mcp_entry):
-            print(f"  OpenClaw: ✅ configured")
+        # Defensive cleanup: prior versions of this setup wrote to the wrong key.
+        if openclaw_json.exists():
+            try:
+                d = json.loads(openclaw_json.read_text(encoding="utf-8"))
+                if "mcpServers" in d:
+                    del d["mcpServers"]
+                    openclaw_json.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+                    print("  OpenClaw: cleaned legacy mcpServers key")
+            except Exception:
+                pass
+
+        openclaw_cmd = shutil.which("openclaw")
+        if openclaw_cmd:
+            entry_json = json.dumps(mcp_entry)
+            r = subprocess.run(
+                [openclaw_cmd, "mcp", "set", "memento-memory", entry_json],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                print("  OpenClaw: ✅ configured (via openclaw mcp set)")
+            else:
+                print(f"  OpenClaw: skipped ({r.stderr.strip()[:120]})")
         else:
-            print(f"  OpenClaw: skipped")
+            print("  OpenClaw: CLI not in PATH — install with `npm i -g openclaw` then rerun setup")
     else:
         print("  OpenClaw: not installed")
 
