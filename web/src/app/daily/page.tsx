@@ -257,7 +257,7 @@ function DayCell({
       href={`/daily/${cell.date}`}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      className="min-h-[54px] sm:min-h-[88px] p-1.5 sm:p-2.5 flex flex-col"
+      className="min-h-[54px] sm:min-h-[88px] p-1 sm:p-2.5 flex flex-col"
       style={{
         position: "relative",
         borderRight: isEndOfRow ? "none" : "1px solid var(--aurora-border)",
@@ -272,9 +272,9 @@ function DayCell({
       title={cell.date ? `${cell.date}: ${cell.count}` : undefined}
     >
       {/* Top row: day + count side-by-side, always in flow */}
-      <div className="flex items-baseline justify-between gap-1 min-w-0">
+      <div className="flex items-baseline justify-between gap-0.5 sm:gap-1 min-w-0">
         <span
-          className="text-[10px] sm:text-[11px] flex-shrink-0"
+          className="text-[9px] sm:text-[11px] flex-shrink-0"
           style={{
             color: hot ? "rgba(255,255,255,0.85)" : "var(--aurora-fg3)",
             fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -283,10 +283,10 @@ function DayCell({
           {String(cell.day).padStart(2, "0")}
         </span>
         <span
-          className="text-[14px] sm:text-xl truncate"
+          className="text-[11px] sm:text-xl truncate"
           style={{
             fontWeight: 500,
-            letterSpacing: "-0.02em",
+            letterSpacing: "-0.03em",
             color: active ? textColor : "var(--aurora-fg5)",
             fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
           }}
