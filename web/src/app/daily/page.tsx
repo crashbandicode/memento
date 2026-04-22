@@ -141,7 +141,7 @@ export default function DailyPage() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(7, 1fr)",
+                gridTemplateColumns: "repeat(7, minmax(0, 1fr))",
                 borderBottom: "1px solid var(--aurora-border)",
                 background: "var(--aurora-chip)",
               }}
@@ -163,7 +163,7 @@ export default function DailyPage() {
               ))}
             </div>
             {/* Cells */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(0, 1fr))" }}>
               {cells.map((c, i) => (
                 <DayCell
                   key={i}
