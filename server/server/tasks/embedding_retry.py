@@ -54,11 +54,16 @@ async def _run() -> dict:
 
 @celery_app.task(
     name="server.tasks.embedding_retry.retry_failed_embeddings",
-    autoretry_for=(Exception,),
-    max_retries=3,
-    retry_backoff=True,
-    retry_backoff_max=600,
+    # No autoretry here: the beat schedule already re-fires every 15 min, and
+    # autoretry caused asyncio event-loop conflicts when the retry attempt
+    # queued before the previous run's engine/connection pool had finished
+    # teardown ("Future attached to a different loop" / "another operation
+    # is in progress"). The failed docs simply wait for the next beat tick.
     acks_late=True,
 )
 def retry_failed_embeddings() -> dict:
-    return asyncio.run(_run())
+    try:
+        return asyncio.run(_run())
+    except Exception as e:
+        logger.warning("retry_failed_embeddings errored: %s", e)
+        return {"scanned": 0, "retried": 0, "recovered": 0, "error": str(e)[:200]}
