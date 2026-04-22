@@ -153,11 +153,16 @@ async def extract_knowledge_from_document(
         if not name:
             continue
 
-        # Upsert entity
+        # Upsert entity — scoped to the document's owner so user B's ingest
+        # can't attach observations to user A's entity just because the LLM
+        # pulled out the same name. Schema already has
+        # UniqueConstraint(user_id, name, entity_type); this query was missing
+        # the user_id predicate, silently cross-pollinating knowledge graphs.
         existing = (await db.execute(
             select(KnowledgeEntity).where(
                 KnowledgeEntity.name == name,
                 KnowledgeEntity.entity_type == etype,
+                KnowledgeEntity.user_id == user_id,
             ).limit(1)
         )).scalar_one_or_none()
 
