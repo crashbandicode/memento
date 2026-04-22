@@ -84,12 +84,13 @@ export function LandingNav() {
         </div>
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          {/* Language pill */}
-          <div className="hidden sm:flex" style={{ gap: 2 }}>
+          {/* Language pill — 所有断点都显示 (slogan 是主要信息,非英语访客也要能切) */}
+          <div style={{ display: "flex", gap: 2 }}>
             {(Object.keys(locales) as Locale[]).map((l) => (
               <button
                 key={l}
                 onClick={() => setLocale(l)}
+                aria-label={`Switch to ${locales[l].label}`}
                 style={{
                   padding: "4px 10px",
                   borderRadius: 8,

@@ -10,16 +10,27 @@ import Sidebar from "@/components/layout/Sidebar";
 import Header from "@/components/layout/Header";
 import { AuroraBackdrop } from "@/components/aurora/AuroraBackdrop";
 
+/** Detect the best initial locale: user's saved choice → browser preference → zh-CN default. */
+function detectInitialLocale(): Locale {
+  if (typeof window === "undefined") return "zh-CN";
+  const saved = localStorage.getItem("dr_locale") as Locale | null;
+  if (saved && saved in locales) return saved;
+  // Browser preference. navigator.languages is ordered by priority.
+  const prefs = (navigator.languages && navigator.languages.length
+    ? navigator.languages
+    : [navigator.language || ""]);
+  for (const p of prefs) {
+    const lower = p.toLowerCase();
+    if (lower.startsWith("zh")) return "zh-CN";
+    if (lower.startsWith("en")) return "en-US";
+  }
+  return "zh-CN";
+}
+
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
-  // Lazy init reads localStorage once, avoiding the "setState-in-effect" rule.
-  // On SSR, window is undefined → falls back to default. Hydration briefly uses
-  // the default before the first client render corrects it; acceptable because
-  // the only effect is which translation set renders.
-  const [locale, setLocale] = useState<Locale>(() => {
-    if (typeof window === "undefined") return "zh-CN";
-    const saved = localStorage.getItem("dr_locale") as Locale | null;
-    return saved && saved in locales ? saved : "zh-CN";
-  });
+  // Lazy init: first saved choice, else browser pref, else zh-CN. Avoids
+  // setState-in-effect cascading render.
+  const [locale, setLocale] = useState<Locale>(detectInitialLocale);
 
   const handleSetLocale = (l: Locale) => {
     setLocale(l);
