@@ -3,7 +3,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { getApiBase } from "@/lib/api-client";
+import { authFetch, getApiBase } from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
@@ -62,7 +62,7 @@ export default function ProjectConversationsPage() {
     setLoading(true);
     try {
       const off = reset ? 0 : offsetRef.current;
-      const res = await fetch(
+      const res = await authFetch(
         `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`
       ).then((r) => r.json()) as ProjectConversationsResponse;
 
