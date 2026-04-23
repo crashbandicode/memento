@@ -121,19 +121,26 @@ async def list_device_tool_projects(
         return []
 
     # Get documents for this device+tool
-    docs_with_project = await db.execute(
+    rows = list((await db.execute(
         select(Document.project_id, func.count().label("cnt"), func.max(Document.synced_at).label("last"))
         .where(Document.machine_id == m.id, Document.tool_id == tool_id)
         .group_by(Document.project_id)
-    )
+    )).all())
+
+    # Batch-fetch every referenced project in a single query instead of
+    # looping N SELECT-by-id's (one per project).
+    project_ids = [pid for pid, _c, _l in rows if pid]
+    project_map: dict = {}
+    if project_ids:
+        proj_rows = await db.execute(
+            select(Project.id, Project.title, Project.slug).where(Project.id.in_(project_ids))
+        )
+        project_map = {pid: (title, slug) for pid, title, slug in proj_rows.all()}
 
     items = []
-    for project_id, count, last_sync in docs_with_project.all():
+    for project_id, count, last_sync in rows:
         if project_id:
-            proj = await db.execute(select(Project).where(Project.id == project_id))
-            p = proj.scalar_one_or_none()
-            title = p.title if p else "Unknown"
-            slug = p.slug if p else ""
+            title, slug = project_map.get(project_id, ("Unknown", ""))
         else:
             title = "(No Project)"
             slug = ""

@@ -45,21 +45,26 @@ async def list_devices(
     machines_q = select(Machine).order_by(Machine.name)
     if _user.role not in ("admin", "owner"):
         machines_q = machines_q.where(Machine.user_id == _user.id)
-    result = await db.execute(machines_q)
-    machines = result.scalars().all()
+    machines = list((await db.execute(machines_q)).scalars().all())
+    if not machines:
+        return []
+
+    machine_ids = [m.id for m in machines]
+
+    # One GROUP BY replaces the per-machine COUNT + DISTINCT round-trips.
+    stats_q = (
+        select(Document.machine_id, Document.tool_id, func.count())
+        .where(Document.machine_id.in_(machine_ids), Document.tool_id != "system")
+        .group_by(Document.machine_id, Document.tool_id)
+    )
+    totals_by_machine: dict = {}
+    tools_by_machine: dict = {}
+    for mid, tid, n in (await db.execute(stats_q)).all():
+        totals_by_machine[mid] = totals_by_machine.get(mid, 0) + n
+        tools_by_machine.setdefault(mid, []).append(tid)
 
     items = []
     for m in machines:
-        doc_count = await db.execute(
-            select(func.count()).where(Document.machine_id == m.id, Document.tool_id != "system")
-        )
-        count = doc_count.scalar() or 0
-
-        tools_result = await db.execute(
-            select(Document.tool_id).where(Document.machine_id == m.id, Document.tool_id != "system").distinct()
-        )
-        tool_ids = [r[0] for r in tools_result.all()]
-
         items.append({
             "id": str(m.id),
             "name": m.name,
@@ -67,8 +72,8 @@ async def list_devices(
             "collector_version": m.collector_version,
             "last_heartbeat": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
             "created_at": m.created_at.isoformat(),
-            "document_count": count,
-            "tools": tool_ids,
+            "document_count": totals_by_machine.get(m.id, 0),
+            "tools": tools_by_machine.get(m.id, []),
         })
 
     return items

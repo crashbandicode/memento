@@ -39,39 +39,42 @@ async def get_dashboard(
     now = datetime.now(tz)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Tools with stats
+    # Tools with stats — one-shot aggregation instead of 3 COUNT queries per
+    # tool. With N tools, this was 3N+1 round-trips; now it's 2 (tool list +
+    # single GROUP BY).
     tools_result = await db.execute(select(Tool).order_by(Tool.display_name))
+    tool_records = list(tools_result.scalars().all())
+
+    cat_agg_q = select(Document.tool_id, Document.category, func.count().label("n"))
+    cat_agg_q = _apply_device_filter(cat_agg_q, device_id)
+    cat_agg_q = apply_user_filter(cat_agg_q, mids, Document.machine_id)
+    cat_agg_q = cat_agg_q.group_by(Document.tool_id, Document.category)
+    categories_by_tool: dict[str, dict[str, int]] = {}
+    for tid, cat, n in (await db.execute(cat_agg_q)).all():
+        categories_by_tool.setdefault(tid, {})[cat] = n
+
+    today_q = (
+        select(Document.tool_id, func.count().label("n"))
+        .where(Document.synced_at >= today_start)
+    )
+    today_q = _apply_device_filter(today_q, device_id)
+    today_q = apply_user_filter(today_q, mids, Document.machine_id)
+    today_q = today_q.group_by(Document.tool_id)
+    today_by_tool: dict[str, int] = {tid: n for tid, n in (await db.execute(today_q)).all()}
+
     tools = []
-    for t in tools_result.scalars().all():
-        cat_query = select(Document.category, func.count()).where(Document.tool_id == t.id)
-        cat_query = _apply_device_filter(cat_query, device_id)
-        cat_query = apply_user_filter(cat_query, mids, Document.machine_id)
-        cat_result = await db.execute(cat_query.group_by(Document.category))
-        categories = {r[0]: r[1] for r in cat_result.all()}
+    for t in tool_records:
+        categories = categories_by_tool.get(t.id, {})
         if (device_id or mids is not None) and not categories:
             continue
-        # Today's sync count for this tool
-        today_q = select(func.count()).where(
-            Document.tool_id == t.id, Document.synced_at >= today_start,
-        )
-        today_q = _apply_device_filter(today_q, device_id)
-        today_q = apply_user_filter(today_q, mids, Document.machine_id)
-        today_count = (await db.execute(today_q)).scalar() or 0
-        # Conversation count for this tool
-        conv_q = select(func.count()).where(
-            Document.tool_id == t.id, Document.category == "conversation",
-        )
-        conv_q = _apply_device_filter(conv_q, device_id)
-        conv_q = apply_user_filter(conv_q, mids, Document.machine_id)
-        conv_count = (await db.execute(conv_q)).scalar() or 0
         tools.append({
             "id": t.id,
             "display_name": t.display_name,
             "total_files": sum(categories.values()) if (device_id or mids is not None) else t.total_files,
             "last_sync_at": t.last_sync_at.isoformat() if t.last_sync_at else None,
             "categories": categories,
-            "today_count": today_count,
-            "conversation_count": conv_count,
+            "today_count": today_by_tool.get(t.id, 0),
+            "conversation_count": categories.get("conversation", 0),
         })
 
     # Recent conversations (last 10 across all tools)
@@ -86,20 +89,28 @@ async def get_dashboard(
     )
     recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
-    convos_result = await db.execute(recent_convos_q)
+    convos_rows = list((await db.execute(recent_convos_q)).all())
+
+    # Batch message counts for these 10 docs in one GROUP BY instead of one
+    # COUNT per iteration (N+1 → 1 round-trip).
+    msg_counts: dict = {}
+    if convos_rows:
+        msg_count_q = (
+            select(ConversationMessage.document_id, func.count())
+            .where(ConversationMessage.document_id.in_([r.id for r in convos_rows]))
+            .group_by(ConversationMessage.document_id)
+        )
+        msg_counts = {did: n for did, n in (await db.execute(msg_count_q)).all()}
+
     recent_conversations = []
-    for r in convos_result.all():
-        # Get message count
-        msg_count = (await db.execute(
-            select(func.count()).where(ConversationMessage.document_id == r.id)
-        )).scalar() or 0
+    for r in convos_rows:
         recent_conversations.append({
             "id": str(r.id),
             "tool_id": r.tool_id,
             "title": r.title,
             "synced_at": r.synced_at.isoformat(),
             "project_title": r.project_title,
-            "message_count": msg_count,
+            "message_count": msg_counts.get(r.id, 0),
         })
 
     # Recent activity (last 7 days by date, timezone-adjusted)
@@ -130,24 +141,31 @@ async def get_dashboard(
     for r in tool_daily_result.all():
         tool_daily.setdefault(r.tool_id, []).append({"date": str(r.day), "count": r.count})
 
-    # Active devices
+    # Active devices — batch per-device document counts in a single GROUP BY
+    # instead of N+1.
     devices_q = select(Machine).order_by(Machine.name).limit(10)
     if mids is not None:
         devices_q = devices_q.where(Machine.id.in_(mids))
-    devices_result = await db.execute(devices_q)
+    machine_rows = list((await db.execute(devices_q)).scalars().all())
+
+    dev_counts: dict = {}
+    if machine_rows:
+        dev_count_q = (
+            select(Document.machine_id, func.count())
+            .where(Document.machine_id.in_([m.id for m in machine_rows]))
+            .group_by(Document.machine_id)
+        )
+        dev_counts = {mid: n for mid, n in (await db.execute(dev_count_q)).all()}
+
     devices = []
-    for m in devices_result.scalars().all():
-        # Count files per device
-        dev_count = (await db.execute(
-            select(func.count()).where(Document.machine_id == m.id)
-        )).scalar() or 0
+    for m in machine_rows:
         devices.append({
             "id": str(m.id),
             "device_id": m.collector_token_hash,
             "name": m.name,
             "last_heartbeat": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
             "collector_version": m.collector_version,
-            "total_files": dev_count,
+            "total_files": dev_counts.get(m.id, 0),
         })
 
     # Today's stats
