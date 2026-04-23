@@ -19,6 +19,7 @@ celery_app = Celery(
         "server.tasks.daily_digest",
         "server.tasks.summary_tasks",
         "server.tasks.embedding_retry",
+        "server.tasks.tsvector_backfill",
     ],
 )
 

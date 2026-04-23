@@ -323,6 +323,19 @@ async def ingest_file(
         )
         db.add(version)
 
+    # Refresh the content_tsv full-text index from the current (possibly
+    # delta-appended) content + title. Runs inside the ingest transaction
+    # via a bound SQL expression so the tokenized string is passed as a
+    # parameter, not compiled into SQL.
+    from sqlalchemy import func as _func, update as _update
+    from .tokenize import tokenize_for_index as _tok
+    tsv_input = _tok(f"{doc.title or ''} {doc.content or ''}")
+    await db.execute(
+        _update(Document)
+        .where(Document.id == doc.id)
+        .values(content_tsv=_func.to_tsvector("simple", tsv_input))
+    )
+
     await db.flush()
 
     # Update tool stats

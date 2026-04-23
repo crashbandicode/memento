@@ -9,7 +9,7 @@ from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String,
     Text, UniqueConstraint, func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 try:
@@ -100,6 +100,9 @@ class Document(Base):
     content_s3_key: Mapped[str | None] = mapped_column(String(500))  # for files > 1MB
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Full-text search index: space-joined jieba tokens of title + content,
+    # fed through to_tsvector('simple', ...). Populated in ingest_service.
+    content_tsv: Mapped[object | None] = mapped_column(TSVECTOR, nullable=True)
 
     # Parsed metadata (tool-specific)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)

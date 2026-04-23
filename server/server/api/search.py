@@ -25,19 +25,34 @@ async def search(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
-    """Search documents by title and path (fast, trgm-indexed).
+    """Full-text search across title, path, and content.
 
-    Content search goes through embedding/semantic search (/api/memory/search).
+    Three index-backed branches in one OR:
+    1. ``title.ilike`` + ``relative_path.ilike`` — trigram GIN, fast for
+       path / filename lookups.
+    2. ``content_tsv @@ to_tsquery('simple', ...)`` — jieba-tokenized
+       full-text, fast for keyword-in-body matches (even Chinese) and
+       avoids the TOAST-heap scan that raw ``content.ilike`` triggers.
+
+    The content_tsv path is the keyword fallback when the BGE-M3 semantic
+    endpoint is slow or unavailable — earlier revisions fell through to
+    an ilike on ``content`` which pulled every matching doc's full body
+    out of TOAST and blew past the MCP client's 30s ceiling.
     """
+    from ..services.tokenize import tokenize_for_query
+
     mids = await user_machine_ids(db, _user)
     search_term = f"%{q}%"
+    tsquery = tokenize_for_query(q)
 
-    query = select(Document).where(
-        or_(
-            Document.title.ilike(search_term),
-            Document.relative_path.ilike(search_term),
-        )
-    )
+    conds = [
+        Document.title.ilike(search_term),
+        Document.relative_path.ilike(search_term),
+    ]
+    if tsquery:
+        conds.append(Document.content_tsv.op("@@")(func.to_tsquery("simple", tsquery)))
+
+    query = select(Document).where(or_(*conds))
 
     if tool:
         query = query.where(Document.tool_id == tool)

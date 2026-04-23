@@ -73,6 +73,23 @@ def _run_migrations(conn) -> None:
             "NOT NULL DEFAULT 0"
         ))
 
+    # Document.content_tsv: tsvector of jieba-tokenized content+title for
+    # full-text search fallback when the embedding server is slow/down. We
+    # populate it from Python (jieba) on ingest; Postgres just stores +
+    # indexes. Backfill is done by a one-shot script, not here, to avoid
+    # blocking startup on large tables.
+    if "content_tsv" not in doc_cols:
+        conn.execute(text("ALTER TABLE documents ADD COLUMN content_tsv tsvector"))
+    sp3 = conn.begin_nested()
+    try:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_documents_content_tsv "
+            "ON documents USING gin (content_tsv)"
+        ))
+        sp3.commit()
+    except Exception:
+        sp3.rollback()
+
     # DailySummary.user_id + swap unique index so each user has their own digest
     # per date+tool. Before this, the table was globally scoped and any user's
     # call to /generate-summary wrote a summary visible to every other user.
