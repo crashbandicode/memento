@@ -155,7 +155,13 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                         content = parts[-1].strip()
                 # Strip [[reply_to_current]] prefix
                 content = content.replace("[[reply_to_current]] ", "")
-                if role in ("user", "assistant"):
+                # Map OpenClaw's toolResult role (~27% of messages in a real
+                # session) to our "tool" role so it participates in the
+                # timeline. Without this, every tool step dropped and chat
+                # looked like a disjointed user/assistant transcript.
+                if role == "toolResult":
+                    role = "tool"
+                if role in ("user", "assistant", "tool"):
                     if not content.strip() and thinking.strip():
                         # Only thinking — use it as content
                         content = thinking
@@ -165,6 +171,18 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                             role=role, content=content.strip(), thinking=thinking,
                             timestamp=timestamp, raw_type=msg_type,
                         )
+            return None
+
+        if msg_type == "compaction":
+            # Summary line auto-generated when OpenClaw compacts context.
+            # Surface as a system message so it's searchable + visible in the
+            # transcript instead of being silently dropped.
+            summary = obj.get("summary") or ""
+            if summary.strip():
+                return NormalizedMessage(
+                    role="system", content=summary.strip(),
+                    timestamp=timestamp, raw_type=msg_type,
+                )
             return None
 
         if msg_type in ("session", "model_change", "thinking_level_change", "custom"):
@@ -330,14 +348,17 @@ def _extract_content(content) -> str:
         parts = []
         for item in content:
             if isinstance(item, dict):
-                if item.get("type") == "text":
+                t = item.get("type")
+                if t == "text":
                     parts.append(item.get("text", ""))
-                elif item.get("type") == "tool_use":
+                elif t in ("tool_use", "toolCall"):
+                    # Claude uses tool_use + input; OpenClaw uses toolCall + arguments.
                     name = item.get("name", "tool")
-                    inp = json.dumps(item.get("input", {}), ensure_ascii=False)
-                    parts.append(f"[Tool: {name}]\n{inp}")
-                elif item.get("type") == "tool_result":
-                    result = item.get("content", "")
+                    inp = item.get("input") if "input" in item else item.get("arguments", {})
+                    inp_str = json.dumps(inp, ensure_ascii=False) if not isinstance(inp, str) else inp
+                    parts.append(f"[Tool: {name}]\n{inp_str}")
+                elif t in ("tool_result", "toolResult"):
+                    result = item.get("content", item.get("output", ""))
                     if isinstance(result, list):
                         result = " ".join(r.get("text", "") for r in result if isinstance(r, dict))
                     parts.append(f"[Result]\n{str(result)}")

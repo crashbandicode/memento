@@ -468,9 +468,13 @@ async def _extract_messages(
         if not line:
             continue
 
-        # Use conversation_parser for normalized output — only store user/assistant
+        # Use conversation_parser for normalized output. We store user / assistant
+        # plus OpenClaw-style tool / system (compaction summaries) so the
+        # conversation viewer + /api/search can see the full transcript —
+        # downstream "daily activity" queries already filter to user+assistant
+        # on their side, so this doesn't inflate message counts.
         normalized = parse_conversation_line(line, tool_id)
-        if normalized and normalized.role in ("user", "assistant"):
+        if normalized and normalized.role in ("user", "assistant", "tool", "system"):
             # Deduplicate: same role + content + timestamp (within same second).
             # This prevents event_msg/user_message and response_item/user duplicates
             # while keeping genuinely repeated inputs across different turns.
