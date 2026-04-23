@@ -139,8 +139,76 @@ export const ChatBubble = memo(function ChatBubble({
   const [expanded, setExpanded] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
 
-  // User — right aligned, violet gradient
+  // User — right aligned, violet gradient.
+  // OpenClaw subagent sessions inject a synthetic "user" message at the top
+  // that starts with `[Subagent Context]` — it's the parent agent's task
+  // dispatch, not a human chat. Render these as a gray "子任务派发" card
+  // (centered, muted) so users don't mistake them for their own chat input.
   if (role === "user") {
+    const isSubagentDispatch = msg.content.startsWith("[Subagent Context]")
+      || msg.content.includes("\n[Subagent Context]");
+    if (isSubagentDispatch) {
+      const isLong = msg.content.length > 300;
+      const displayContent = isLong && !expanded ? msg.content.slice(0, 300) + "..." : msg.content;
+      return (
+        <div style={{ display: "flex", justifyContent: "center", margin: "6px 0" }}>
+          <div
+            style={{
+              maxWidth: "92%",
+              minWidth: 0,
+              padding: "10px 14px",
+              borderRadius: 12,
+              background: "var(--aurora-chip)",
+              border: "1px dashed var(--aurora-border)",
+              fontSize: 12,
+              lineHeight: 1.5,
+              color: "var(--aurora-fg3)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              overflowWrap: "anywhere",
+            }}
+          >
+            <div style={{
+              fontSize: 10,
+              fontWeight: 600,
+              color: "var(--aurora-fg4)",
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+              marginBottom: 6,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+            }}>
+              <span>{t.conversation.subagentDispatch}</span>
+              {msg.timestamp && (
+                <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0, color: "var(--aurora-fg4)" }}>
+                  · {new Date(msg.timestamp).toLocaleString(locale)}
+                </span>
+              )}
+            </div>
+            {displayContent}
+            {isLong && (
+              <button
+                onClick={() => setExpanded(!expanded)}
+                style={{
+                  display: "block",
+                  marginTop: 6,
+                  fontSize: 11,
+                  color: "var(--aurora-accent)",
+                  background: "transparent",
+                  border: 0,
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              >
+                {expanded ? t.conversation.collapse : t.conversation.expandAll}
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     const isLong = msg.content.length > 500;
     const displayContent = isLong && !expanded ? msg.content.slice(0, 500) + "..." : msg.content;
     return (

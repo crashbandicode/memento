@@ -101,6 +101,7 @@ const zhCN = {
     offlinePbFallback: "已从本地 protobuf 缓存补回内容",
     collapse: "收起",
     expandAll: "展开全部",
+    subagentDispatch: "子任务派发",
     diagnostics: "导出诊断",
     diagnosticsHelp: "用于判断会话缺失发生在 LS、元数据还是本地缓存层。",
     stepFetchFailed: "步骤抓取失败",

@@ -96,6 +96,7 @@ const enUS: Translations = {
     offlinePbFallback: "Recovered from local protobuf cache",
     collapse: "Collapse",
     expandAll: "Expand All",
+    subagentDispatch: "Subagent dispatch",
     diagnostics: "Export Diagnostics",
     diagnosticsHelp: "Helps locate whether data loss happened in LS, metadata, or local cache recovery.",
     stepFetchFailed: "Step fetch failed",
