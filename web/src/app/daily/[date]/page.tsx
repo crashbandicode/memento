@@ -89,14 +89,14 @@ export default function DailyDetailPage() {
           messages: data.total_messages || 0,
         })}
         right={
-          <>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Btn variant="glass" size="sm" icon="link" onClick={() => setShareOpen(true)}>
               {t.share.shared}
             </Btn>
             <Btn onClick={handleGenerate} disabled={generating} icon="sparkles">
               {generating ? t.daily.generating : aiSummary ? t.daily.regenerate : t.daily.generate}
             </Btn>
-          </>
+          </div>
         }
       />
       <ShareModal

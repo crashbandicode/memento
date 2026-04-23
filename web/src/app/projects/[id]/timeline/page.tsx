@@ -103,7 +103,7 @@ export default function ProjectTimelinePage() {
         title={data?.project?.title || ""}
         subtitle={`${data?.project?.source_path || ""} · ${data?.total_sessions || 0}`}
         right={
-          <>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Btn variant="glass" size="sm" icon="link" onClick={() => setShareOpen(true)}>
               {t.share.shared}
             </Btn>
@@ -111,7 +111,7 @@ export default function ProjectTimelinePage() {
                  onClick={() => setOrder(order === "asc" ? "desc" : "asc")}>
               {order === "asc" ? t.timeline?.oldToNew || "Oldest first" : t.timeline?.newToOld || "Newest first"}
             </Btn>
-          </>
+          </div>
         }
       />
 
