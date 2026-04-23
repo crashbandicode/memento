@@ -145,6 +145,13 @@ def _run_migrations(conn) -> None:
     for stmt in (
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_timestamp ON conversation_messages (timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_doc_ts ON conversation_messages (document_id, timestamp)",
+        # Partial index for the daily / dashboard hot path: filter user+assistant
+        # messages by recent timestamp. Without it the planner seq-scans the
+        # whole 117K+ row conversation_messages table and cold-cache first hits
+        # take ~6s; with it, the same query is <200ms cold.
+        "CREATE INDEX IF NOT EXISTS idx_conv_msg_role_ts "
+        "ON conversation_messages (role, timestamp DESC) "
+        "WHERE role IN ('user', 'assistant')",
         "CREATE INDEX IF NOT EXISTS idx_documents_tool_synced ON documents (tool_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_synced ON documents (project_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_category ON documents (project_id, category)",
