@@ -70,6 +70,12 @@ services:
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
       MEMENTO_EMBEDDING_SERVER_URL: http://host.docker.internal:8002
+      MEMENTO_GEOIP_DB: /data/geoip/GeoLite2-City.mmdb
+    volumes:
+      # GeoIP database for share-link visitor location. Host dir is created
+      # on-demand by scripts/download_geoip.sh; mount is optional — service
+      # gracefully degrades to "country/city unknown" if missing.
+      - ./server/data/geoip:/data/geoip:ro
     depends_on:
       postgres:
         condition: service_healthy

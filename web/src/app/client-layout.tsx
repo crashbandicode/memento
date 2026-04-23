@@ -70,8 +70,11 @@ function AppShell({ children }: { children: React.ReactNode }) {
   // Always plain layout for the marketing landing page — its own nav is
   // rendered by the landing component itself.
   const isLanding = pathname === "/";
+  // Public share pages are read-only and shouldn't show the app sidebar
+  // (visitors have no account; the sidebar wouldn't work anyway).
+  const isSharePage = pathname.startsWith("/s/") || pathname === "/s";
 
-  if (isLanding || loading || !token) {
+  if (isLanding || isSharePage || loading || !token) {
     return <main className="min-h-screen">{children}</main>;
   }
 

@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import admin, auth, conversations, daily, dashboard, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, tools
+from .api import admin, auth, conversations, daily, dashboard, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -236,6 +236,7 @@ app.include_router(hierarchy.router)
 app.include_router(memory.router)
 app.include_router(install_bootstrap.router)
 app.include_router(public.router)
+app.include_router(share.router)
 
 # Mount MCP Memory Server (best-effort, skip if deps not available)
 try:

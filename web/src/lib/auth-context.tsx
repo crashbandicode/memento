@@ -53,9 +53,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Redirect to login if not authenticated and not on a public page
+  // Redirect to login if not authenticated and not on a public page.
+  // /s/<token> is a share URL — recipient has no account, must stay public.
   useEffect(() => {
-    if (!loading && !token && !PUBLIC_PATHS.includes(pathname)) {
+    const isSharePrefix = pathname.startsWith("/s/") || pathname === "/s";
+    if (!loading && !token && !PUBLIC_PATHS.includes(pathname) && !isSharePrefix) {
       router.replace("/auth/login");
     }
   }, [loading, token, pathname, router]);

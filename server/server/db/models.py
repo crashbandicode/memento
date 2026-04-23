@@ -9,7 +9,7 @@ from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String,
     Text, UniqueConstraint, func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 try:
@@ -398,4 +398,50 @@ class KnowledgeObservation(Base):
 
     __table_args__ = (
         Index("idx_observation_entity", "entity_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public share links (timeline / daily report)
+# ---------------------------------------------------------------------------
+class ShareLink(Base):
+    __tablename__ = "share_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Opaque token exposed in the URL. 24 bytes base32 ≈ 40 chars — plenty of
+    # entropy so enumeration attacks aren't useful, short enough to be
+    # copy-pasteable.
+    token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # "timeline" → target_id is a project uuid; "daily" → target_id is a date
+    # string YYYY-MM-DD. Keeps the table a single type; discriminator logic
+    # lives in the API.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_share_owner", "owner_user_id"),
+        Index("idx_share_kind_target", "kind", "target_id"),
+    )
+
+
+class ShareView(Base):
+    __tablename__ = "share_views"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    share_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("share_links.id", ondelete="CASCADE"), nullable=False)
+    ip: Mapped[str | None] = mapped_column(INET)
+    country: Mapped[str | None] = mapped_column(String(80))
+    region: Mapped[str | None] = mapped_column(String(120))
+    city: Mapped[str | None] = mapped_column(String(120))
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    referer: Mapped[str | None] = mapped_column(Text)
+    viewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_share_view_share", "share_id", "viewed_at"),
     )

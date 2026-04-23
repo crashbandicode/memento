@@ -9,6 +9,7 @@ import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, TopBar } from "@/components/aurora/primitives";
+import { ShareModal } from "@/components/ShareModal";
 
 interface Artifact {
   id: string;
@@ -45,6 +46,7 @@ export default function ProjectTimelinePage() {
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [order, setOrder] = useState<"asc" | "desc">("asc");
+  const [shareOpen, setShareOpen] = useState(false);
   const offsetRef = useRef(0);
 
   const loadMore = async (reset = false) => {
@@ -101,10 +103,15 @@ export default function ProjectTimelinePage() {
         title={data?.project?.title || ""}
         subtitle={`${data?.project?.source_path || ""} · ${data?.total_sessions || 0}`}
         right={
-          <Btn variant="glass" size="sm" icon={order === "asc" ? "arrow_up" : "arrow_down"}
-               onClick={() => setOrder(order === "asc" ? "desc" : "asc")}>
-            {order === "asc" ? t.timeline?.oldToNew || "Oldest first" : t.timeline?.newToOld || "Newest first"}
-          </Btn>
+          <>
+            <Btn variant="glass" size="sm" icon="link" onClick={() => setShareOpen(true)}>
+              {t.share.shared}
+            </Btn>
+            <Btn variant="glass" size="sm" icon={order === "asc" ? "arrow_up" : "arrow_down"}
+                 onClick={() => setOrder(order === "asc" ? "desc" : "asc")}>
+              {order === "asc" ? t.timeline?.oldToNew || "Oldest first" : t.timeline?.newToOld || "Newest first"}
+            </Btn>
+          </>
         }
       />
 
@@ -128,6 +135,13 @@ export default function ProjectTimelinePage() {
       {!loading && sessions.length === 0 && (
         <div className="aurora-card" style={{ textAlign: "center", padding: 40, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.timeline.noEvents}</div>
       )}
+      <ShareModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        kind="timeline"
+        targetId={projectId}
+        title={data?.project?.title || ""}
+      />
     </div>
   );
 }

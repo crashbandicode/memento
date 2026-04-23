@@ -9,6 +9,7 @@ import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 import { ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+import { ShareModal } from "@/components/ShareModal";
 
 type I18nT = ReturnType<typeof useI18n>["t"];
 
@@ -43,6 +44,7 @@ export default function DailyDetailPage() {
   const [data, setData] = useState<DailyDetail | null>(null);
   const [generating, setGenerating] = useState(false);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
   const { t, locale } = useI18n();
 
   useEffect(() => {
@@ -87,10 +89,22 @@ export default function DailyDetailPage() {
           messages: data.total_messages || 0,
         })}
         right={
-          <Btn onClick={handleGenerate} disabled={generating} icon="sparkles">
-            {generating ? t.daily.generating : aiSummary ? t.daily.regenerate : t.daily.generate}
-          </Btn>
+          <>
+            <Btn variant="glass" size="sm" icon="link" onClick={() => setShareOpen(true)}>
+              {t.share.shared}
+            </Btn>
+            <Btn onClick={handleGenerate} disabled={generating} icon="sparkles">
+              {generating ? t.daily.generating : aiSummary ? t.daily.regenerate : t.daily.generate}
+            </Btn>
+          </>
         }
+      />
+      <ShareModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        kind="daily"
+        targetId={dateStr}
+        title={dateStr}
       />
 
       {aiSummary && (
