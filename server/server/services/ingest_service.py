@@ -439,7 +439,7 @@ async def _extract_messages(
     db: AsyncSession, doc: Document, content: str, mode: str,
 ) -> None:
     """Parse conversation content and store normalized messages."""
-    from .conversation_parser import parse_conversation_line
+    from .conversation_parser import _iter_json_objects, parse_conversation_line
 
     # Get current max line number for delta mode
     if mode == "delta":
@@ -463,7 +463,10 @@ async def _extract_messages(
     line_num = start_line
     batch = []
     seen_contents: set[str] = set()  # Deduplicate identical messages
-    for line in content.strip().split("\n"):
+    # Walk the content with the tolerant JSON iterator so pretty-printed
+    # multi-line entries from Claude Code (Windows 2.1.x) don't get
+    # shattered into unparseable single-character fragments by split("\n").
+    for line in _iter_json_objects(content):
         line = line.strip()
         if not line:
             continue

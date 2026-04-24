@@ -385,13 +385,48 @@ def _extract_codex_content(content_list) -> str:
     return "\n".join(parts)
 
 
+def _iter_json_objects(raw_content: str):
+    """Yield JSON object source strings from mixed compact JSONL / pretty-
+    printed content. Claude Code's VS Code extension on Windows sometimes
+    writes entries as indented multi-line JSON in the same ``.jsonl`` file
+    as compact ones; splitting on newlines loses those multi-line objects
+    entirely. Using json.JSONDecoder.raw_decode walks the stream and
+    tolerates arbitrary whitespace between objects.
+    """
+    if not raw_content:
+        return
+    decoder = json.JSONDecoder()
+    i = 0
+    n = len(raw_content)
+    while i < n:
+        # skip any whitespace (incl newlines, CR, tabs) between objects
+        while i < n and raw_content[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw_content, i)
+            # Re-serialize as a single compact line so downstream
+            # parse_conversation_line (which expects one JSON per string)
+            # works unchanged.
+            yield json.dumps(obj, ensure_ascii=False)
+            i = end
+        except json.JSONDecodeError:
+            # Couldn't parse starting here — advance to next newline and
+            # retry. This handles truncated fragments / concatenation noise.
+            next_nl = raw_content.find("\n", i)
+            if next_nl < 0:
+                break
+            i = next_nl + 1
+
+
 def parse_conversation(raw_content: str, tool_id: str, offset: int = 0, limit: int | None = None) -> list[NormalizedMessage]:
     """Parse JSONL conversation into normalized messages. Supports pagination."""
     import hashlib
     messages = []
     seen: set[str] = set()
     skipped = 0
-    for line in raw_content.splitlines():
+    for line in _iter_json_objects(raw_content):
         if not line.strip():
             continue
         msg = parse_conversation_line(line.strip(), tool_id)
@@ -424,7 +459,7 @@ def count_conversation_messages(raw_content: str, tool_id: str) -> int:
     import hashlib
     count = 0
     seen: set[str] = set()
-    for line in raw_content.splitlines():
+    for line in _iter_json_objects(raw_content):
         if not line.strip():
             continue
         msg = parse_conversation_line(line.strip(), tool_id)
