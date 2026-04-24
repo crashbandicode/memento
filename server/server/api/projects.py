@@ -161,7 +161,10 @@ async def get_project_timeline(
         d_id, d_tool_id, d_category, d_ctype, d_path, d_title, d_size, \
             d_ai_summary, d_meta, d_src_mod, d_synced, _d_mid = r
         # Skip noise files
-        if ".resolved" in d_path or ".metadata.json" in d_path:
+        # `.meta.json` is the Claude Code subagent sidecar (just type +
+        # description, no conversation content). `.metadata.json` and
+        # `.resolved` are transient versions. All are noise on a timeline.
+        if ".resolved" in d_path or ".meta.json" in d_path or ".metadata.json" in d_path:
             continue
 
         session_id = (d_meta or {}).get("session_id") or (d_meta or {}).get("cascade_id")
@@ -380,6 +383,9 @@ async def get_project_conversations(
 
     for d in all_convs:
         rp = d.relative_path or ""
+        # Skip the sidecar noise that isn't real conversation content.
+        if ".meta.json" in rp or ".metadata.json" in rp or ".resolved" in rp:
+            continue
         if "/subagents/" in rp:
             # Extract parent path: everything before /subagents/
             parent_base = rp.split("/subagents/")[0] + ".jsonl"
@@ -419,7 +425,8 @@ async def get_project_conversations(
     # Index plans by session_id
     plans_by_session: dict[str, list] = {}
     for p in all_plans:
-        if ".resolved" in p.relative_path or ".metadata.json" in p.relative_path:
+        rp = p.relative_path or ""
+        if ".resolved" in rp or ".meta.json" in rp or ".metadata.json" in rp:
             continue
         sid = (p.metadata_ or {}).get("session_id", "")
         if sid:
