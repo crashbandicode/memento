@@ -485,13 +485,19 @@ async def get_project_conversations(
         if messages and messages[0].get("timestamp"):
             messages.sort(key=lambda x: x.get("timestamp") or "")
 
-        # Preview mode: clip to first N messages per session (0 = no limit).
-        # The /timeline page uses this to keep initial payload under a few
-        # hundred KB even for sessions with thousands of tool-heavy turns;
-        # the actual conversation reader passes 0 to get everything.
+        # Preview mode: clip to N messages per session (0 = no limit).
+        # When the user is reading oldest-first (order=asc, default on /timeline),
+        # show the *first* N so they see how the session started. When reading
+        # newest-first (desc), show the *last* N — the latest state matters
+        # more. Picking the wrong end is what made a user see a session
+        # "start at 19:50" when the first real prompt was at 19:24 and
+        # there were simply more than N messages in between.
         total_msgs = len(messages)
         if max_messages_per_session and total_msgs > max_messages_per_session:
-            messages = messages[-max_messages_per_session:]
+            if order == "asc":
+                messages = messages[:max_messages_per_session]
+            else:
+                messages = messages[-max_messages_per_session:]
 
         # Get artifacts for this session
         artifacts = []
