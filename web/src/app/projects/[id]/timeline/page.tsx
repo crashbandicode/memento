@@ -53,11 +53,10 @@ export default function ProjectTimelinePage() {
     setLoading(true);
     try {
       const off = reset ? 0 : offsetRef.current;
-      // /timeline 是略览页，每 session 只要最后 40 条消息就够看——完整对话走
-      // /conversations/<doc_id>。backend 把 message_count 单独返回，所以卡片
-      // 仍能显示真实总条数 + "truncated" 旗标提醒"本 session 还有更多"。
+      // 每个 session 卡展示完整消息——用户优先看全貌，不做截断。
+      // 大 session（几千条）首屏会慢一点但不丢内容。
       const res: ProjectConversationsResponse = await authFetch(
-        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&max_messages_per_session=40&order=${order}`
+        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`
       ).then((r) => r.json());
 
       if (reset) {
