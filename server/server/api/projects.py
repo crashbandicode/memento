@@ -355,6 +355,18 @@ async def get_project_conversations(
     - brain artifacts (task.md, implementation_plan.md, walkthrough.md)
     Paginated by session (not by message).
     """
+    from ..services.cache import cache_get, cache_set
+    # Cache by full query shape — different pages / orderings / preview caps
+    # all need separate entries. 30s TTL: short enough that fresh ingest
+    # shows up quickly, long enough to hide back/forward navigation hits.
+    cache_key = (
+        f"project:conv:{_user.id}:{project_id}:"
+        f"{session_offset}:{session_limit}:{max_messages_per_session}:{order}"
+    )
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     mids = await user_machine_ids(db, _user)
 
     proj_result = await db.execute(select(Project).where(Project.id == project_id))
@@ -362,9 +374,20 @@ async def get_project_conversations(
     if not project:
         raise HTTPException(status_code=404)
 
-    # Get all conversation docs for this project
+    # Phase 1: scan only metadata columns to figure out pagination + subagent
+    # grouping. Pulling Document.content (TOAST'd, can be 500 KB+ per doc)
+    # for every doc in the project just to discard 90% of them blew up
+    # cold-start time on chunky projects (favorite_chat hit 24 s with 152
+    # conversations). load_only here ~halves wall time on big projects and
+    # dramatically reduces TOAST reads.
+    from sqlalchemy.orm import load_only
     conv_q = (
         select(Document)
+        .options(load_only(
+            Document.id, Document.relative_path, Document.machine_id,
+            Document.tool_id, Document.title, Document.metadata_,
+            Document.source_modified_at, Document.synced_at,
+        ))
         .where(
             Document.project_id == project_id,
             Document.category == "conversation",
@@ -432,36 +455,56 @@ async def get_project_conversations(
         if sid:
             plans_by_session.setdefault(sid, []).append(p)
 
-    def _parse_doc_messages(d: Document) -> list[dict]:
-        """Parse a document's messages, filtering out tool noise."""
-        if not d.content:
-            return []
-        parsed = parse_conversation(d.content, d.tool_id)
-        msgs = []
-        for m in parsed:
-            if m.role not in ("user", "assistant"):
+    # Phase 2: read pre-parsed messages from conversation_messages instead of
+    # re-walking the JSONL content per request. The original implementation
+    # called parse_conversation(d.content, ...) per doc — for a project with
+    # 5 sessions × 1 MB of JSONL each (favorite_chat), that is 5+ MB of
+    # JSON.loads() + dataclass building per request, which dominated cold
+    # latency (30 s observed).
+    needed_ids: list = [d.id for d in page_convs]
+    for d in page_convs:
+        for child in subagent_map.get(d.relative_path or "", []):
+            needed_ids.append(child.id)
+    msgs_by_doc: dict = {}
+    if needed_ids:
+        rows = await db.execute(
+            select(
+                ConversationMessage.document_id,
+                ConversationMessage.role,
+                ConversationMessage.content,
+                ConversationMessage.message_type,
+                ConversationMessage.timestamp,
+                ConversationMessage.line_number,
+            )
+            .where(ConversationMessage.document_id.in_(needed_ids))
+            .order_by(ConversationMessage.document_id, ConversationMessage.line_number)
+        )
+        for did, role, content, mtype, ts, _ln in rows.all():
+            if role not in ("user", "assistant"):
                 continue
-            if m.role == "user" and (
-                m.content.startswith("[Result]")
-                or m.content.startswith("[Tool:")
-                or m.content.startswith('{"tool_use_id"')
+            if role == "user" and (
+                content.startswith("[Result]")
+                or content.startswith("[Tool:")
+                or content.startswith('{"tool_use_id"')
             ):
                 continue
-            if m.role == "assistant" and (
-                m.content.startswith("[Tool:")
-                and "\n" not in m.content.split("[Tool:")[0]
+            if role == "assistant" and (
+                content.startswith("[Tool:")
+                and "\n" not in content.split("[Tool:")[0]
             ):
                 continue
-            msgs.append({
-                "role": m.role,
-                "content": m.content,
-                "thinking": m.thinking or None,
-                "tool_name": m.tool_name or "",
-                "tool_input": m.tool_input or "",
-                "raw_type": m.raw_type or "",
-                "timestamp": m.timestamp or None,
+            msgs_by_doc.setdefault(did, []).append({
+                "role": role,
+                "content": content,
+                "thinking": None,
+                "tool_name": "",
+                "tool_input": "",
+                "raw_type": mtype or "",
+                "timestamp": ts.isoformat() if ts else None,
             })
-        return msgs
+
+    def _parse_doc_messages(d: Document) -> list[dict]:
+        return msgs_by_doc.get(d.id, [])
 
     # Build session list — merge subagent messages into parent by timestamp
     sessions = []
@@ -522,7 +565,7 @@ async def get_project_conversations(
             "artifacts": artifacts,
         })
 
-    return {
+    payload = {
         "project": {
             "id": str(project.id),
             "slug": project.slug,
@@ -535,3 +578,5 @@ async def get_project_conversations(
         "order": order,
         "sessions": sessions,
     }
+    await cache_set(cache_key, payload, ttl_seconds=30)
+    return payload
