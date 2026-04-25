@@ -266,38 +266,46 @@ const SessionMessages = memo(function SessionMessages({
       </button>
 
       {!expanded && (firstUserMsg || lastAssistantMsg) && (
-        <div
-          onClick={() => setExpanded(true)}
-          style={{
-            maxWidth: 720, margin: "0 auto 8px",
-            padding: "12px 16px",
-            border: "1px dashed var(--aurora-border)",
-            borderRadius: 12,
-            background: "var(--aurora-surface)",
-            cursor: "pointer",
-            fontSize: 12,
-            color: "var(--aurora-fg3)",
-            lineHeight: 1.55,
-          }}
-        >
+        <div className="space-y-4 max-w-3xl mx-auto" style={{ marginBottom: 12 }}>
           {firstUserMsg && (
-            <div style={{ display: "flex", gap: 8, marginBottom: lastAssistantMsg ? 8 : 0 }}>
-              <span style={{ flexShrink: 0, fontWeight: 600, color: "var(--aurora-accent)" }}>U</span>
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-                {stripMd(firstUserMsg.content).slice(0, 240)}
-              </span>
-            </div>
+            <ChatBubble
+              msg={{
+                id: -1, line_number: -1, role: "user",
+                // Truncate first so MarkdownViewer doesn't have to render
+                // huge blocks for a preview. ChatBubble's own ">500 chars =
+                // collapsed" rule will further trim if needed.
+                content: stripMd(firstUserMsg.content).slice(0, 280),
+                tool_name: "", tool_input: "", raw_type: "",
+                timestamp: firstUserMsg.timestamp ?? null,
+              }}
+              locale={locale}
+              t={t}
+            />
           )}
           {lastAssistantMsg && (
-            <div style={{ display: "flex", gap: 8 }}>
-              <span style={{ flexShrink: 0, fontWeight: 600, color: "var(--aurora-fg2)" }}>A</span>
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-                {stripMd(lastAssistantMsg.content).slice(0, 240)}
-              </span>
-            </div>
+            <ChatBubble
+              msg={{
+                id: -2, line_number: -2, role: "assistant",
+                content: stripMd(lastAssistantMsg.content).slice(0, 280),
+                tool_name: "", tool_input: "", raw_type: "",
+                timestamp: lastAssistantMsg.timestamp ?? null,
+              }}
+              locale={locale}
+              t={t}
+            />
           )}
-          <div style={{ marginTop: 8, fontSize: 11, color: "var(--aurora-accent)", textAlign: "center" }}>
-            {t.timeline.expandSession || "展开"}
+          <div style={{ textAlign: "center", marginTop: 12 }}>
+            <button
+              onClick={() => setExpanded(true)}
+              style={{
+                fontSize: 12, color: "var(--aurora-accent)",
+                background: "var(--aurora-accent-soft)",
+                border: 0, borderRadius: 9999,
+                padding: "6px 14px", cursor: "pointer",
+              }}
+            >
+              {t.timeline.expandSession || "展开"} · {session.message_count - 2}
+            </button>
           </div>
         </div>
       )}
