@@ -315,6 +315,7 @@ const enUS: Translations = {
     title: "Project Timeline",
     subtitle: "AI Thinking Process Reconstruction",
     noEvents: "No timeline events yet",
+    expandSession: "Expand session",
     messagesCount: "{count} messages",
     viewConversation: "View Full Conversation",
     viewDocument: "View Document",

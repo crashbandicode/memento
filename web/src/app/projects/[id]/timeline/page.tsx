@@ -155,6 +155,17 @@ const SessionMessages = memo(function SessionMessages({
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
 }) {
+  // Default-collapsed: bigger sessions (>30 messages) hide their bodies until
+  // the user clicks the header. Saves React from mounting hundreds of
+  // ChatBubble + Markdown components on first paint, especially on phones.
+  const [expanded, setExpanded] = useState(session.messages.length <= 30);
+
+  // Pull the first human-typed prompt and the last assistant reply for the
+  // collapsed preview — gives the user enough context to decide whether to
+  // open the session without rendering everything.
+  const firstUserMsg = session.messages.find((m) => m.role === "user" && m.content && !m.content.startsWith("[Result]") && !m.content.startsWith("[Tool:"));
+  const lastAssistantMsg = [...session.messages].reverse().find((m) => m.role === "assistant" && m.content && !m.content.startsWith("[Tool:"));
+
   // Group consecutive subagent messages for collapsible rendering
   type MsgItem = { msg: SessionMessage; isSubagent: boolean; subagentName: string };
   const items: MsgItem[] = session.messages.map((m) => ({
@@ -181,7 +192,14 @@ const SessionMessages = memo(function SessionMessages({
 
   return (
     <>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "24px 0" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10, margin: "24px 0",
+          width: "100%", background: "transparent", border: 0, cursor: "pointer",
+          padding: 0,
+        }}
+      >
         <div style={{ flex: 1, borderTop: "1px solid var(--aurora-border)", minWidth: 20 }} />
         <div
           style={{
@@ -198,6 +216,10 @@ const SessionMessages = memo(function SessionMessages({
             justifyContent: "center",
           }}
         >
+          <Icon
+            name="chevron_down" size={11}
+            style={{ color: "var(--aurora-fg4)", transform: expanded ? "none" : "rotate(-90deg)", transition: "transform .15s" }}
+          />
           <span
             style={{
               fontWeight: 600,
@@ -215,9 +237,47 @@ const SessionMessages = memo(function SessionMessages({
           {session.message_count > 0 && (<><span>·</span><span>{session.message_count}</span></>)}
         </div>
         <div style={{ flex: 1, borderTop: "1px solid var(--aurora-border)", minWidth: 20 }} />
-      </div>
+      </button>
 
-      {/* Messages with subagent groups collapsed inline */}
+      {!expanded && (firstUserMsg || lastAssistantMsg) && (
+        <div
+          onClick={() => setExpanded(true)}
+          style={{
+            maxWidth: 720, margin: "0 auto 8px",
+            padding: "12px 16px",
+            border: "1px dashed var(--aurora-border)",
+            borderRadius: 12,
+            background: "var(--aurora-surface)",
+            cursor: "pointer",
+            fontSize: 12,
+            color: "var(--aurora-fg3)",
+            lineHeight: 1.55,
+          }}
+        >
+          {firstUserMsg && (
+            <div style={{ display: "flex", gap: 8, marginBottom: lastAssistantMsg ? 8 : 0 }}>
+              <span style={{ flexShrink: 0, fontWeight: 600, color: "var(--aurora-accent)" }}>U</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
+                {firstUserMsg.content.slice(0, 240)}
+              </span>
+            </div>
+          )}
+          {lastAssistantMsg && (
+            <div style={{ display: "flex", gap: 8 }}>
+              <span style={{ flexShrink: 0, fontWeight: 600, color: "var(--aurora-fg2)" }}>A</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
+                {lastAssistantMsg.content.slice(0, 240)}
+              </span>
+            </div>
+          )}
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--aurora-accent)", textAlign: "center" }}>
+            {t.timeline.expandSession || "展开"}
+          </div>
+        </div>
+      )}
+
+      {expanded && (
+      /* Messages with subagent groups collapsed inline */
       <div className="space-y-4 max-w-3xl mx-auto">
         {groups.map((g, gIdx) => {
           if (g.type === "msg") {
@@ -273,9 +333,10 @@ const SessionMessages = memo(function SessionMessages({
           );
         })}
       </div>
+      )}
 
-      {/* Artifacts inline */}
-      {session.artifacts.length > 0 && (
+      {/* Artifacts inline — only when session expanded */}
+      {expanded && session.artifacts.length > 0 && (
         <div className="space-y-2 my-4 max-w-3xl mx-auto">
           {session.artifacts.map((art) => (
             <InlineArtifact key={art.id} artifact={art} />

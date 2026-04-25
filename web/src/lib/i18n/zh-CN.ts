@@ -327,6 +327,7 @@ const zhCN = {
     title: "项目时间线",
     subtitle: "AI 思考过程还原",
     noEvents: "暂无时间线事件",
+    expandSession: "展开对话",
     messagesCount: "{count} 条消息",
     viewConversation: "查看完整对话",
     viewDocument: "查看文档",
