@@ -7,6 +7,7 @@ import { useI18n } from "@/lib/i18n";
 import { Glass, Chip } from "@/components/aurora/primitives";
 import { Icon } from "@/components/aurora/Icon";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
+import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 
 interface ShareMeta {
   kind: "timeline" | "daily";
@@ -212,9 +213,7 @@ function DailyView({ data }: { data: DailyData }) {
               <div style={{ fontSize: 14, fontWeight: 600, color: "var(--aurora-fg1)", marginBottom: 8 }}>
                 {s.title}
               </div>
-              <div style={{ fontSize: 13, lineHeight: 1.65, color: "var(--aurora-fg2)", whiteSpace: "pre-wrap" }}>
-                {s.summary}
-              </div>
+              <MarkdownViewer content={s.summary} />
             </div>
           ))}
         </Glass>
