@@ -1,0 +1,164 @@
+name: Release to PyPI
+
+# Triggered by a git tag like v0.0.2. All 3 packages are bumped to the same
+# version and released together. Example:
+#
+#   # 1. bump version in all 3 pyproject.toml
+#   sed -i '' 's/version = "0\.0\.1"/version = "0.0.2"/' \
+#     collector/pyproject.toml mcp_server/pyproject.toml memento_brain/pyproject.toml
+#   # 2. also bump the dep pins
+#   sed -i '' 's/memento-brain-memory>=0\.0\.1/memento-brain-memory>=0.0.2/' \
+#     collector/pyproject.toml memento_brain/pyproject.toml
+#   sed -i '' 's/memento-brain-collector>=0\.0\.1/memento-brain-collector>=0.0.2/' \
+#     memento_brain/pyproject.toml
+#   # 3. commit + tag + push
+#   git commit -am "release: 0.0.2"
+#   git tag v0.0.2 && git push && git push --tags
+#
+# Trusted publishing setup (one-time, per PyPI project):
+#   https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+#   For each of memento-brain / memento-brain-collector / memento-brain-memory,
+#   add a "GitHub" trusted publisher:
+#     Repository owner: ddong8
+#     Repository name:  memento
+#     Workflow name:    release.yml
+#     Environment:      pypi
+#
+# If trusted publishing isn't set up, fall back to API token: uncomment the
+# `password:` line in each publish step and add PYPI_API_TOKEN to repo secrets.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Sanity: verify git tag matches the version in each pyproject.toml ──
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: extract
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag version: $TAG"
+      - name: Check pyproject versions all match tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          fail=0
+          for pkg in collector mcp_server memento_brain; do
+            ver=$(grep -E '^version = ' "$pkg/pyproject.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "$ver" != "$TAG" ]; then
+              echo "::error::$pkg/pyproject.toml has version=$ver but tag is v$TAG"
+              fail=1
+            else
+              echo "✓ $pkg → $ver"
+            fi
+          done
+          exit $fail
+
+  build:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        # Order matters at publish time (memory before collector before meta),
+        # but build can run in parallel.
+        package: [mcp_server, collector, memento_brain]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build
+        working-directory: ${{ matrix.package }}
+        run: python -m build
+      - name: twine check
+        working-directory: ${{ matrix.package }}
+        run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.package }}
+          path: ${{ matrix.package }}/dist/
+          retention-days: 7
+
+  # ── Publish in dependency order: memory → collector → meta ──
+  publish-memory:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/memento-brain-memory/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-mcp_server
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        # Trusted publishing (no password needed) — see workflow header for setup.
+        # For API-token fallback, uncomment and add PYPI_API_TOKEN secret:
+        # with:
+        #   password: ${{ secrets.PYPI_API_TOKEN }}
+
+  publish-collector:
+    needs: publish-memory
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/memento-brain-collector/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-collector
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-meta:
+    needs: publish-collector
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/memento-brain/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-memento_brain
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish-meta
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-all/
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-assets
+          find dist-all -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} release-assets/ \;
+          ls -la release-assets/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-assets/*

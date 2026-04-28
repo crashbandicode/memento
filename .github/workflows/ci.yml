@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: ${{ matrix.package }} · py${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: collector
+            python: "3.10"
+          - package: collector
+            python: "3.12"
+          - package: server
+            python: "3.12"
+          - package: mcp_server
+            python: "3.10"
+          - package: mcp_server
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: ${{ matrix.package }}/pyproject.toml
+
+      - name: Install package + dev deps
+        working-directory: ${{ matrix.package }}
+        run: |
+          python -m pip install --upgrade pip
+          # collector and server declare [dev] extras; mcp_server does not — fall back cleanly.
+          pip install -e ".[dev]" || pip install -e .
+          pip install pytest pytest-asyncio
+
+      - name: AST syntax check
+        working-directory: ${{ matrix.package }}
+        run: python -m compileall -q .
+
+      - name: pytest
+        working-directory: ${{ matrix.package }}
+        run: |
+          if [ -d tests ] && [ "$(find tests -name 'test_*.py' | wc -l)" -gt 0 ]; then
+            pytest -v
+          else
+            echo "No tests in ${{ matrix.package }}/tests — skipping."
+          fi
+
+  build-check:
+    name: build · ${{ matrix.package }} (wheel + sdist + twine check)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [collector, mcp_server, memento_brain]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build
+        working-directory: ${{ matrix.package }}
+        run: python -m build
+      - name: twine check
+        working-directory: ${{ matrix.package }}
+        run: twine check dist/*
+
+  web:
+    name: web · Next.js build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+      # Note: separate `npm run lint` 被 next.config 的 eslint.ignoreDuringBuilds
+      # 一并绕过; React 19 hook 新规则产生的 18 个报错需单独整治后再恢复 lint gate。
