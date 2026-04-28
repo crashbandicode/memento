@@ -3,7 +3,7 @@ name = "memento-brain-collector"
 version = "0.0.5"
 description = "Cross-platform agent that collects AI coding tool memory files and syncs to a central server"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-only"}
 requires-python = ">=3.10"
 authors = [
     {name = "ddong8"},
@@ -12,7 +12,7 @@ keywords = ["ai", "memento", "memento-brain", "collector", "claude", "codex", "o
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

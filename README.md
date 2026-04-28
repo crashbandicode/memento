@@ -6,7 +6,7 @@
 
 跨设备、跨工具自动采集 AI 编程对话与记忆,自建后端汇总,Web + MCP 统一查看、搜索、召回。
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Python ≥3.10](https://img.shields.io/badge/python-≥3.10-blue.svg)](#技术栈)
 [![Next.js 16](https://img.shields.io/badge/next.js-16-black.svg)](#技术栈)
 [![PyPI - memento-brain](https://img.shields.io/pypi/v/memento-brain?label=memento-brain)](https://pypi.org/project/memento-brain/)
@@ -430,4 +430,8 @@ rm -rf ~/.local/share/memento/logs                           # Linux
 
 ## 📄 License
 
-[MIT](LICENSE)
+本项目采用 [AGPL-3.0](LICENSE) 许可证。
+
+简单说:个人使用、自托管、内部用、研究学习都免费。但如果你拿这份代码(或任何改动)对外提供网络服务(SaaS / 公开 host),按 AGPL 第 13 条,你**必须**把你修改后的完整源码也按 AGPL 公开。
+
+商业授权(免除 AGPL 限制、闭源使用、SaaS 化等场景)请联系作者。

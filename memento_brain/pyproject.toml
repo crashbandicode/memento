@@ -3,13 +3,13 @@ name = "memento-brain"
 version = "0.0.5"
 description = "Memento — a shared brain for your AI coding tools (umbrella/meta package)"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-only"}
 requires-python = ">=3.10"
 authors = [{name = "ddong8"}]
 keywords = ["memento", "memento-brain", "ai", "mcp", "claude", "developer-tools"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries",
 ]
