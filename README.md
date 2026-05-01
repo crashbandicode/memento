@@ -25,11 +25,13 @@
 
 - 🧠 **跨设备同步对话** — Mac / Linux / Windows 上的 Claude Code / Codex / Cursor / Antigravity 等工具,聊过的内容统一汇总
 - 🔍 **混合检索** — BGE-M3 向量 + jieba 分词的全文索引,中英文都能搜
+- 🕸️ **知识图谱** — LLM 自动从对话抽实体(项目 / 工具 / 技术 / 人物 / 概念)、关系、观察;超过 7 天的老观察自动压缩成 summary
 - 🔗 **MCP 接入** — 在任何 AI IDE 里通过 MCP 直接调 `memory_search` / `memory_recall` / `daily_summary`,Claude 自己就能查你过去做的事
-- 📅 **AI 日报** — 每日自动汇总跨工具的活动 + LLM 摘要,记得自己今天干了什么
-- 🌐 **公开分享** — 项目时间线 / 日报一键生成 share 链接,带 GeoIP 访客统计
+- 📅 **AI 日报** — Celery 每天 23:30 跑两阶段:先为每篇文档生成摘要,再聚合成跨工具每日 digest
+- 🔒 **入队前脱敏** — Collector 本地就过 14 类密钥正则(OpenAI / Anthropic / GitHub / Slack / Telegram / AWS / Bearer / 私钥 / URL 内嵌凭证 …),磁盘上 SQLite 队列也安全
+- 🌐 **公开分享** — 项目时间线 / 日报一键生成 share 链接,带 GeoIP 访客统计、有效期、随时撤销
 - 🛡️ **完全自托管** — Docker Compose 一键起,Postgres + Redis + MinIO 全在你机器上,数据不出门
-- 🔐 **多租户隔离** — 多用户独立空间,owner / admin / viewer 三级角色 + 细粒度授权
+- 🔐 **多租户隔离** — 多用户独立空间,owner / admin / viewer 三级角色 + 细粒度授权 + 审计日志
 - ⚡ **守护进程级** — 设备上跑成 launchd / systemd / Task Scheduler,断网离线队列、自愈重试
 
 ## 🏗️ 架构
@@ -144,6 +146,8 @@ sequenceDiagram
     P-->>M: 返回相关 chunk
 ```
 
+> Embedding 失败时 `embedding_status` 写为 `failed`,Celery beat **每 15 分钟**扫 `pending/failed` 自动重试,不会因为单次抖动丢向量。
+
 ## 🧰 支持的 AI 工具
 
 | 工具 | 采集内容 | 格式 |
@@ -235,6 +239,18 @@ memento-collector run       # 前台运行(调试)
 
 按平台自动适配:**macOS** launchd / **Linux** systemd user / **Windows** Task Scheduler。
 
+## 🕸️ 知识图谱
+
+LLM 自动从同步进来的对话和文档里抽:
+
+- **实体** (`knowledge_entities`) — 项目 / 工具 / 技术 / 人物 / 概念,跨对话去重合并
+- **关系** (`knowledge_relations`) — 实体之间的 `uses` / `creates` / `depends_on` / `discussed`
+- **观察** (`observations`) — 关于某个实体的具体事实陈述,带时间戳和来源 doc
+
+**自动压缩**:同一实体超过 7 天的累积观察会被 LLM 合并成一段更短的 summary,保语义、省空间。压缩窗口可通过 `MEMENTO_COMPACTION_AGE_DAYS` 调整。
+
+通过 MCP 工具 `memory_recall` / `memory_context` / `memory_store` 可读写;Web `/memory` 页可视化查看。
+
 ## 🧠 MCP 记忆服务
 
 装齐 `memento-brain` 后,所有 AI IDE 会自动配置 MCP 接入(由 `memento-collector setup` 完成):
@@ -258,6 +274,15 @@ memento-collector run       # 前台运行(调试)
 | `daily_summary(date)` | 看某天的活动汇总 |
 | `memory_store(content, entity_name)` | 主动保存观察 |
 
+外加 4 个 MCP **resources**(以 URI 形式暴露,IDE 可订阅):
+
+| URI | 内容 |
+|---|---|
+| `memory://projects` | 所有项目列表 |
+| `memory://projects/{name}` | 单个项目详情(对话 / 实体 / 观察) |
+| `memory://identity/{tool}` | 指定工具的"身份卡"(用户偏好 / 长期记忆) |
+| `memory://daily/{date}` | 某天的活动汇总 |
+
 ## 👥 用户与权限
 
 | 角色 | 说明 |
@@ -273,6 +298,7 @@ memento-collector run       # 前台运行(调试)
 - **token 自助管理**:右上角头像 → 个人资料,查看/复制/重新生成 collector token
 - **批准用户**:owner/admin 进 `/admin`,pending 用户旁有按钮,批准后 token 立即出现可复制
 - **细粒度授权**:`/admin/permissions` 按 project / tool 给 viewer 发 read/write 权限
+- **审计日志**:`access_logs` 表落库每次敏感操作(user_id / action / IP / metadata),便于事后追溯
 
 ## 🌐 公开分享
 
@@ -297,6 +323,17 @@ memento-collector run       # 前台运行(调试)
 | Embedding | BGE-M3 宿主运行(macOS MPS / Linux CUDA / CPU 回退) |
 | GeoIP | MaxMind GeoLite2 / db-ip city-lite(离线 mmdb) |
 | 部署 | Docker Compose(7 服务) |
+
+## ⚙️ 后台任务
+
+Celery beat 调度的定时任务:
+
+| 任务 | 触发 | 作用 |
+|---|---|---|
+| `daily_digest` | 每天 23:30 | 生成跨工具的每日 AI 活动汇总(逐 doc 摘要 → 聚合) |
+| `embedding_retry` | 每 15 分钟 | 扫 `embedding_status=pending/failed` 的 doc 重新算向量 |
+| `tsvector_backfill` | 启动时 | 给历史数据补全 jieba 分词的全文索引 |
+| `memory_compaction` | 手动 / 周期 | 合并 7 天以上累积过多的实体观察为 summary |
 
 ## 📁 目录结构
 

@@ -25,11 +25,13 @@ Auto-collect AI coding conversations and memory across devices and tools, aggreg
 
 - 🧠 **Cross-device conversation sync** — Claude Code / Codex / Cursor / Antigravity etc. on Mac / Linux / Windows, all aggregated in one place
 - 🔍 **Hybrid retrieval** — BGE-M3 vectors + jieba-tokenized full-text index; works for both English and Chinese
+- 🕸️ **Knowledge graph** — LLM extracts entities (projects / tools / technologies / people / concepts), relations and observations from conversations; observations older than 7 days are auto-compacted into summaries
 - 🔗 **MCP integration** — Call `memory_search` / `memory_recall` / `daily_summary` directly inside any AI IDE; Claude can look up what you've done
-- 📅 **AI daily digest** — Daily auto-summary of cross-tool activity with LLM-generated highlights
-- 🌐 **Public sharing** — One-click share links for project timelines / daily digests, with GeoIP visitor stats
+- 📅 **AI daily digest** — Celery runs a two-stage job at 23:30 every day: per-document summaries first, then aggregated into a cross-tool digest
+- 🔒 **Sanitize-before-enqueue** — The collector strips 14 classes of secrets locally (OpenAI / Anthropic / GitHub / Slack / Telegram / AWS / Bearer tokens / private keys / URL-embedded credentials …) so even the on-disk SQLite queue is safe
+- 🌐 **Public sharing** — One-click share links for project timelines / daily digests, with GeoIP visitor stats, expiry, revoke any time
 - 🛡️ **Fully self-hosted** — One-shot Docker Compose; Postgres + Redis + MinIO all on your own machine — data never leaves
-- 🔐 **Multi-tenant isolation** — Per-user namespaces with owner / admin / viewer roles + fine-grained per-resource grants
+- 🔐 **Multi-tenant isolation** — Per-user namespaces with owner / admin / viewer roles + fine-grained per-resource grants + audit log
 - ⚡ **Daemon-grade** — Runs as launchd / systemd / Task Scheduler; offline queue and self-healing retry when network drops
 
 ## 🏗️ Architecture
@@ -144,6 +146,8 @@ sequenceDiagram
     P-->>M: return relevant chunks
 ```
 
+> When embedding fails, `embedding_status` is set to `failed`; Celery beat scans `pending/failed` rows **every 15 minutes** and retries — no vectors are lost to transient hiccups.
+
 ## 🧰 Supported AI tools
 
 | Tool | What's collected | Format |
@@ -235,6 +239,18 @@ memento-collector run       # run in foreground (debug)
 
 Auto-detects platform: **macOS** launchd / **Linux** systemd user / **Windows** Task Scheduler.
 
+## 🕸️ Knowledge graph
+
+The system extracts the following from every synced conversation / document via LLM:
+
+- **Entities** (`knowledge_entities`) — projects / tools / technologies / people / concepts; deduplicated across conversations
+- **Relations** (`knowledge_relations`) — `uses` / `creates` / `depends_on` / `discussed` between entities
+- **Observations** (`observations`) — concrete factual statements about an entity, with timestamp and source document
+
+**Auto-compaction**: observations on the same entity older than 7 days get merged by an LLM into a shorter summary — preserves semantics, saves space. The window is tunable via `MEMENTO_COMPACTION_AGE_DAYS`.
+
+Read / write through MCP tools `memory_recall` / `memory_context` / `memory_store`; visualize at the Web `/memory` page.
+
 ## 🧠 MCP memory service
 
 After installing `memento-brain`, `memento-collector setup` automatically wires MCP into every AI IDE it finds:
@@ -258,6 +274,15 @@ Tools available inside any AI IDE:
 | `daily_summary(date)` | get the activity digest for a given day |
 | `memory_store(content, entity_name)` | save an observation explicitly |
 
+Plus 4 MCP **resources** exposed as URIs (subscribable from any IDE):
+
+| URI | Content |
+|---|---|
+| `memory://projects` | list of all projects |
+| `memory://projects/{name}` | single project detail (conversations / entities / observations) |
+| `memory://identity/{tool}` | "identity card" for a tool (user preferences / long-term memory) |
+| `memory://daily/{date}` | activity digest for a given day |
+
 ## 👥 Users and permissions
 
 | Role | Description |
@@ -273,6 +298,7 @@ Key flows:
 - **Self-service token** — Avatar menu → Profile to view / copy / regenerate the collector token.
 - **Approve users** — owner/admin go to `/admin`; pending users have an Approve button. The token is revealed immediately after approval.
 - **Fine-grained grants** — `/admin/permissions` issues per-project / per-tool read/write grants to viewers.
+- **Audit log** — every sensitive action is recorded in `access_logs` (user_id / action / IP / metadata) for after-the-fact review.
 
 ## 🌐 Public sharing
 
@@ -297,6 +323,17 @@ Project timelines and daily digests can be shared publicly with one click:
 | Embedding | BGE-M3 host process (macOS MPS / Linux CUDA / CPU fallback) |
 | GeoIP | MaxMind GeoLite2 / db-ip city-lite (offline mmdb) |
 | Deployment | Docker Compose (7 services) |
+
+## ⚙️ Background tasks
+
+Scheduled by Celery beat:
+
+| Task | Trigger | Purpose |
+|---|---|---|
+| `daily_digest` | every day at 23:30 | Cross-tool daily activity digest (per-doc summaries → aggregation) |
+| `embedding_retry` | every 15 minutes | Scan `embedding_status=pending/failed` and re-embed |
+| `tsvector_backfill` | on startup | Backfill jieba-tokenized full-text index for legacy data |
+| `memory_compaction` | manual / periodic | Merge accumulated observations older than 7 days into summaries |
 
 ## 📁 Directory layout
 
