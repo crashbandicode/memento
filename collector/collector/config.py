@@ -91,6 +91,7 @@ def _tool_root_paths() -> dict[str, Path]:
             "cursor": HOME / ".cursor",
             "windsurf": HOME / ".windsurf",
             "vscode": HOME / ".vscode",
+            "hermes": HOME / ".hermes",
         }
     else:
         return {
@@ -101,6 +102,7 @@ def _tool_root_paths() -> dict[str, Path]:
             "cursor": HOME / ".cursor",
             "windsurf": HOME / ".windsurf",
             "vscode": HOME / ".vscode",
+            "hermes": HOME / ".hermes",
         }
 
 

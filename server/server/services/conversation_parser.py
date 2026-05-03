@@ -420,8 +420,73 @@ def _iter_json_objects(raw_content: str):
             i = next_nl + 1
 
 
+def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> list[NormalizedMessage]:
+    """Hermes stores a whole session as a single top-level JSON, not JSONL."""
+    try:
+        d = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(d, dict):
+        return []
+    msgs = d.get("messages") or []
+    timestamp = d.get("last_updated") or d.get("session_start") or ""
+    out: list[NormalizedMessage] = []
+    skipped = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content", "")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        text = content.strip()
+
+        if role == "system" or not text:
+            continue
+        if role == "user":
+            norm = NormalizedMessage(role="user", content=text, timestamp=timestamp)
+        elif role == "assistant":
+            norm = NormalizedMessage(role="assistant", content=text, timestamp=timestamp)
+        elif role == "tool":
+            display = text if len(text) <= 2000 else text[:2000] + " …(truncated)"
+            norm = NormalizedMessage(role="tool", content=display, tool_name="tool", timestamp=timestamp)
+        else:
+            continue
+
+        if skipped < offset:
+            skipped += 1
+            continue
+        out.append(norm)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _count_hermes_messages(raw_content: str) -> int:
+    try:
+        d = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(d, dict):
+        return 0
+    n = 0
+    for m in d.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content", "")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        if role == "system" or not content.strip() or role not in ("user", "assistant", "tool"):
+            continue
+        n += 1
+    return n
+
+
 def parse_conversation(raw_content: str, tool_id: str, offset: int = 0, limit: int | None = None) -> list[NormalizedMessage]:
     """Parse JSONL conversation into normalized messages. Supports pagination."""
+    if tool_id == "hermes":
+        return _parse_hermes_session(raw_content, offset, limit)
     import hashlib
     messages = []
     seen: set[str] = set()
@@ -456,6 +521,8 @@ def parse_conversation(raw_content: str, tool_id: str, offset: int = 0, limit: i
 
 def count_conversation_messages(raw_content: str, tool_id: str) -> int:
     """Count messages without building full list — memory efficient."""
+    if tool_id == "hermes":
+        return _count_hermes_messages(raw_content)
     import hashlib
     count = 0
     seen: set[str] = set()

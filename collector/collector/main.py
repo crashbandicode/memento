@@ -17,6 +17,7 @@ from .tools.antigravity import AntigravityTool
 from .tools.claude_code import ClaudeCodeTool
 from .tools.codex import CodexTool
 from .tools.cursor import CursorTool
+from .tools.hermes import HermesTool
 from .tools.obsidian import ObsidianTool
 from .tools.openclaw import OpenClawTool
 from .watcher import FileWatcher
@@ -298,6 +299,7 @@ def main() -> None:
     tools = [
         ClaudeCodeTool(), OpenClawTool(), CodexTool(),
         AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path), CursorTool(),
+        HermesTool(),
     ]
     available = [t for t in tools if t.is_available()]
     logger.info("Available tools (%d): %s", len(available),

@@ -201,6 +201,31 @@ def discover_openclaw() -> dict | None:
     return info
 
 
+def discover_hermes() -> dict | None:
+    """Discover Hermes Agent installation."""
+    root = HOME / ".hermes"
+    if not root.exists():
+        return None
+
+    info: dict = {"root": str(root), "projects": []}
+
+    state_db = root / "state.db"
+    if state_db.exists():
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=2)
+            row = conn.execute(
+                "SELECT model FROM sessions ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if row and row[0]:
+                info["model"] = row[0]
+            conn.close()
+        except Exception:
+            pass
+
+    return info
+
+
 def discover_obsidian() -> dict | None:
     """Discover Obsidian vaults from obsidian.json."""
     from .config import _discover_obsidian_vault_from_config
@@ -249,6 +274,7 @@ def discover_all_tools() -> dict[str, dict]:
         "cursor": discover_cursor,
         "antigravity": discover_antigravity,
         "openclaw": discover_openclaw,
+        "hermes": discover_hermes,
         "obsidian": discover_obsidian,
     }
 
