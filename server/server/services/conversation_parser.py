@@ -420,6 +420,47 @@ def _iter_json_objects(raw_content: str):
             i = next_nl + 1
 
 
+def _format_hermes_tool_content(content_str: str) -> str:
+    """Hermes tool result is `{"output": ..., "exit_code": 0, "error": null}`.
+    Extract output (parse inner JSON if applicable), prepend error/exit_code notes.
+    """
+    try:
+        outer = json.loads(content_str)
+    except (json.JSONDecodeError, TypeError):
+        return content_str
+    if not isinstance(outer, dict):
+        return content_str
+
+    output = outer.get("output", "")
+    error = outer.get("error")
+    exit_code = outer.get("exit_code")
+
+    # output may itself be a JSON-encoded string — pretty-print if so
+    pretty: str
+    if isinstance(output, str):
+        s = output.strip()
+        if s and s[0] in "{[":
+            try:
+                pretty = json.dumps(json.loads(s), ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                pretty = output
+        else:
+            pretty = output
+    elif isinstance(output, (dict, list)):
+        pretty = json.dumps(output, ensure_ascii=False, indent=2)
+    else:
+        pretty = str(output) if output is not None else ""
+
+    parts = []
+    if error:
+        parts.append(f"⚠️  {error}")
+    if pretty:
+        parts.append(pretty)
+    if exit_code not in (None, 0):
+        parts.append(f"(exit_code={exit_code})")
+    return "\n\n".join(parts) if parts else content_str
+
+
 def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> list[NormalizedMessage]:
     """Hermes stores a whole session as a single top-level JSON, not JSONL."""
     try:
@@ -430,6 +471,21 @@ def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> l
         return []
     msgs = d.get("messages") or []
     timestamp = d.get("last_updated") or d.get("session_start") or ""
+
+    # Pre-scan: build call_id → tool_name from assistant.tool_calls
+    tool_name_by_id: dict[str, str] = {}
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else None
+            cid = tc.get("id") or tc.get("call_id")
+            if cid and name:
+                tool_name_by_id[str(cid)] = str(name)
+
     out: list[NormalizedMessage] = []
     skipped = 0
     for m in msgs:
@@ -448,8 +504,11 @@ def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> l
         elif role == "assistant":
             norm = NormalizedMessage(role="assistant", content=text, timestamp=timestamp)
         elif role == "tool":
-            display = text if len(text) <= 2000 else text[:2000] + " …(truncated)"
-            norm = NormalizedMessage(role="tool", content=display, tool_name="tool", timestamp=timestamp)
+            tcid = str(m.get("tool_call_id") or "")
+            tool_name = tool_name_by_id.get(tcid, "tool")
+            formatted = _format_hermes_tool_content(text)
+            display = formatted if len(formatted) <= 4000 else formatted[:4000] + "\n…(truncated)"
+            norm = NormalizedMessage(role="tool", content=display, tool_name=tool_name, timestamp=timestamp)
         else:
             continue
 
