@@ -144,6 +144,12 @@ class HermesTool(BaseTool):
             if name.startswith("session_") and name.endswith(".json"):
                 meta = self._enrich_session_meta(abs_path)
                 meta["session_name"] = abs_path.stem
+                # Hermes has no per-directory project concept (it's a general
+                # cross-task agent). Group all sessions under a single virtual
+                # 'hermes' project so the Web Projects page surfaces them
+                # rather than leaving them orphaned.
+                meta["project_hash"] = "hermes"
+                meta["project_path"] = str(self.root_path)
                 return FileClassification(
                     tool_name=self.name,
                     category=Category.CONVERSATION,

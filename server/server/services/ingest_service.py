@@ -314,6 +314,10 @@ async def ingest_file(
         if machine_id and not doc.machine_id:
             doc.machine_id = machine_id
         doc.title = title
+        # Backfill project_id when newly resolved (was NULL, or changed).
+        # Don't overwrite an existing link with NULL — keep last good value.
+        if project_id and doc.project_id != project_id:
+            doc.project_id = project_id
 
         # Save version history
         version = DocumentVersion(
