@@ -1,6 +1,15 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import ClientLayout from "./client-layout";
+
+// Without this, Next.js 16 omits <meta name="viewport">, so iOS Safari and
+// Android Chrome render at ~980px desktop width and then scale to fit —
+// every page looks oversized and text tiny on phones.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
 
 // SSR default is zh-CN because Next.js App Router re-asserts this static
 // metadata on every client-side navigation, overriding any document.title we
