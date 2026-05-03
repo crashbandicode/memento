@@ -391,7 +391,7 @@ async def get_project_conversations(
         .where(
             Document.project_id == project_id,
             Document.category == "conversation",
-            Document.content_type == "jsonl",
+            Document.content_type.in_(("jsonl", "json")),
         )
     )
     conv_q = apply_user_filter(conv_q, mids, Document.machine_id)

@@ -196,7 +196,7 @@ async def generate_daily_summary(
         content_type = conv.get("content_type", "")
         if not content:
             continue
-        if content_type == "jsonl":
+        if content_type == "jsonl" or (content_type == "json" and tool_id == "hermes"):
             digest = _extract_conversation_digest(
                 content, tool_id, target_date=summary_date.isoformat(), max_chars=2000,
             )
