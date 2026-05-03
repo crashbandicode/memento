@@ -420,6 +420,21 @@ def _iter_json_objects(raw_content: str):
             i = next_nl + 1
 
 
+def _pretty_leading_json(text: str) -> str:
+    """If text starts with a JSON object/array, pretty-print just that prefix
+    and append any trailing non-JSON text unchanged. Otherwise return as-is."""
+    s = text.lstrip()
+    if not s or s[0] not in "{[":
+        return text
+    try:
+        obj, end = json.JSONDecoder().raw_decode(s)
+    except json.JSONDecodeError:
+        return text
+    pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+    rest = s[end:].strip()
+    return pretty + "\n\n" + rest if rest else pretty
+
+
 def _format_hermes_tool_content(content_str: str) -> str:
     """Hermes tool result is `{"output": ..., "exit_code": 0, "error": null}`.
     Extract output (parse inner JSON if applicable), prepend error/exit_code notes.
@@ -435,17 +450,13 @@ def _format_hermes_tool_content(content_str: str) -> str:
     error = outer.get("error")
     exit_code = outer.get("exit_code")
 
-    # output may itself be a JSON-encoded string — pretty-print if so
+    # output may be a JSON-encoded string, optionally followed by non-JSON
+    # trailing text (e.g. terminal output prints a JSON line then a stack
+    # trace). Pretty-print just the leading JSON value with raw_decode and
+    # preserve whatever comes after.
     pretty: str
     if isinstance(output, str):
-        s = output.strip()
-        if s and s[0] in "{[":
-            try:
-                pretty = json.dumps(json.loads(s), ensure_ascii=False, indent=2)
-            except json.JSONDecodeError:
-                pretty = output
-        else:
-            pretty = output
+        pretty = _pretty_leading_json(output)
     elif isinstance(output, (dict, list)):
         pretty = json.dumps(output, ensure_ascii=False, indent=2)
     else:
