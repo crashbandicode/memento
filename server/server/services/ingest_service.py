@@ -427,8 +427,8 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
     logger = logging.getLogger("post_ingest")
     logger.info("Post-ingest starting for %s/%s (category=%s)", tool_id, doc_id, category)
     try:
-        from ..db.session import async_session_factory
-        async with async_session_factory() as db:
+        from ..db.session import post_ingest_session_factory
+        async with post_ingest_session_factory() as db:
             doc = (await db.execute(
                 select(Document).where(Document.id == doc_id)
             )).scalar_one_or_none()

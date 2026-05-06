@@ -21,8 +21,26 @@ engine = create_async_engine(
     pool_timeout=10,  # fail fast instead of stalling user requests 30s
 )
 
+# Separate engine for post-ingest (embedding + knowledge graph) so a re-sync
+# storm can't starve the user-facing request pool. Smaller pool because
+# post-ingest is already capped at 8 concurrent tasks via Semaphore.
+post_ingest_engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_size=8,
+    max_overflow=4,
+    pool_recycle=3600,
+    pool_timeout=15,
+)
+
 async_session_factory = async_sessionmaker(
     engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+post_ingest_session_factory = async_sessionmaker(
+    post_ingest_engine,
     class_=AsyncSession,
     expire_on_commit=False,
 )
