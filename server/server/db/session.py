@@ -11,8 +11,12 @@ from ..config import settings
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
-    pool_size=50,
-    max_overflow=50,
+    # Postgres default max_connections=100. With api + celery_worker +
+    # celery_beat each owning a pool, total has to leave room. 25+25 per
+    # service * 3 services = 150 max < 100 would breach. Keep total per
+    # service ≤ 32 so 3 services + admin/migration < 100.
+    pool_size=20,
+    max_overflow=12,
     pool_recycle=3600,
     pool_timeout=10,  # fail fast instead of stalling user requests 30s
 )
