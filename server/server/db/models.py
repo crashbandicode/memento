@@ -418,6 +418,10 @@ class ShareLink(Base):
     kind: Mapped[str] = mapped_column(String(20), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
     owner_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # When set, only this user (after login) may view the share; the public
+    # /s/<token> page still works as the URL but the API requires auth and
+    # checks the user matches. NULL = anonymous public link (legacy default).
+    target_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     title: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -426,6 +430,7 @@ class ShareLink(Base):
     __table_args__ = (
         Index("idx_share_owner", "owner_user_id"),
         Index("idx_share_kind_target", "kind", "target_id"),
+        Index("idx_share_target_user", "target_user_id"),
     )
 
 

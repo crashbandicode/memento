@@ -19,8 +19,19 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-    try { await login(email, password); router.push("/app"); }
-    catch { setError(t.auth.invalidCredentials); }
+    try {
+      await login(email, password);
+      // Honor ?next= so visitors landing on a directed share land back on it
+      // after authenticating, instead of dropping into the dashboard. Read
+      // from window.location instead of useSearchParams() because the latter
+      // forces the page out of Next 16's static prerender.
+      let next: string | null = null;
+      if (typeof window !== "undefined") {
+        const params = new URLSearchParams(window.location.search);
+        next = params.get("next");
+      }
+      router.push(next && next.startsWith("/") ? next : "/app");
+    } catch { setError(t.auth.invalidCredentials); }
   };
 
   return (

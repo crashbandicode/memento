@@ -117,6 +117,22 @@ def _run_migrations(conn) -> None:
             except Exception:
                 sp2.rollback()
 
+    # ShareLink.target_user_id: when set, the share is only viewable by that
+    # logged-in user (vs the legacy "anyone with the link" public default).
+    # Lets owners forward project timelines / dailies / memory to specific
+    # viewer accounts without exposing them anonymously.
+    if "share_links" in tables:
+        sl_cols = {c["name"] for c in insp.get_columns("share_links")}
+        if "target_user_id" not in sl_cols:
+            conn.execute(text(
+                "ALTER TABLE share_links ADD COLUMN target_user_id UUID "
+                "REFERENCES users(id) ON DELETE CASCADE"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_share_target_user "
+                "ON share_links (target_user_id)"
+            ))
+
     # Data migration: assign owner token + bind existing machines to owner
     result = conn.execute(text(
         "SELECT id, collector_token FROM users WHERE role = 'owner' AND status = 'active' LIMIT 1"

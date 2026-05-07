@@ -2,26 +2,29 @@
 
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import { getApiBase } from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
-import { Glass, Chip } from "@/components/aurora/primitives";
+import { Btn, Glass, Chip } from "@/components/aurora/primitives";
 import { Icon } from "@/components/aurora/Icon";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 
 interface ShareMeta {
-  kind: "timeline" | "daily";
+  kind: "timeline" | "daily" | "memory";
   target_id: string;
   title: string | null;
   owner_name: string;
   expires_at: string | null;
   created_at: string;
   view_count: number;
+  directed: boolean;
 }
 
 type ShareData =
   | { kind: "timeline"; data: TimelineData }
-  | { kind: "daily"; data: DailyData };
+  | { kind: "daily"; data: DailyData }
+  | { kind: "memory"; data: MemoryData };
 
 interface SessionMessage {
   role: string;
@@ -73,6 +76,38 @@ interface DailyData {
     summary: string;
   }>;
 }
+interface MemoryNode {
+  id: string;
+  name: string;
+  type: string;
+  summary: string | null;
+}
+interface MemoryEdge {
+  source: string;
+  target: string;
+  type: string;
+  strength: number;
+}
+interface MemoryData {
+  nodes: MemoryNode[];
+  edges: MemoryEdge[];
+  total_entities: number;
+  total_relations: number;
+}
+
+type ErrState = "not_found" | "expired" | "revoked" | "load_failed" | "login_required" | "forbidden" | null;
+
+function shareFetch(url: string): Promise<Response> {
+  // Plain fetch + bearer if available. Bypasses authFetch's auto-redirect on
+  // 401, since on /s/<token> we want to show our own "login required" UI
+  // (which preserves the share URL so the visitor returns here after login).
+  const headers: Record<string, string> = {};
+  if (typeof window !== "undefined") {
+    const token = localStorage.getItem("dr_token");
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  }
+  return fetch(url, { headers });
+}
 
 export default function PublicSharePage() {
   const params = useParams();
@@ -80,13 +115,15 @@ export default function PublicSharePage() {
   const { t, locale } = useI18n();
   const [meta, setMeta] = useState<ShareMeta | null>(null);
   const [payload, setPayload] = useState<ShareData | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrState>(null);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const r = await fetch(`${getApiBase()}/api/share/public/${token}`);
+        const r = await shareFetch(`${getApiBase()}/api/share/public/${token}`);
+        if (r.status === 401) { if (alive) setError("login_required"); return; }
+        if (r.status === 403) { if (alive) setError("forbidden"); return; }
         if (r.status === 404) { if (alive) setError("not_found"); return; }
         if (r.status === 410) {
           const d = await r.json().catch(() => ({}));
@@ -97,7 +134,7 @@ export default function PublicSharePage() {
         if (!alive) return;
         setMeta(m);
 
-        const r2 = await fetch(`${getApiBase()}/api/share/public/${token}/data`);
+        const r2 = await shareFetch(`${getApiBase()}/api/share/public/${token}/data`);
         if (!r2.ok) { if (alive) setError("load_failed"); return; }
         const d2: ShareData = await r2.json();
         if (alive) setPayload(d2);
@@ -112,21 +149,45 @@ export default function PublicSharePage() {
   if (error === "revoked") return <Centered msg={t.share.revokedNotice} />;
   if (error === "expired") return <Centered msg={t.share.expiredNotice} />;
   if (error === "load_failed") return <Centered msg={t.loading} />;
+  if (error === "forbidden") return <Centered msg={t.share.revokedNotice} />;
+  if (error === "login_required") {
+    const next = typeof window !== "undefined"
+      ? `${window.location.pathname}${window.location.search}`
+      : `/s/${token}`;
+    return (
+      <div style={{ minHeight: "80vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+        <Glass padding={28} radius={20} style={{ maxWidth: 380, textAlign: "center" }}>
+          <Icon name="lock" size={28} style={{ color: "var(--aurora-fg3)", marginBottom: 12 }} />
+          <div style={{ fontSize: 14, color: "var(--aurora-fg2)", marginBottom: 16 }}>
+            {t.share.directedHint}
+          </div>
+          <Link href={`/auth/login?next=${encodeURIComponent(next)}`} style={{ textDecoration: "none" }}>
+            <Btn size="sm" icon="arrow_right">{t.login}</Btn>
+          </Link>
+        </Glass>
+      </div>
+    );
+  }
 
   if (!meta || !payload) return <Centered msg={t.loading} />;
 
+  const kindLabel =
+    meta.kind === "timeline" ? t.share.targetTimeline :
+    meta.kind === "daily" ? t.share.targetDaily :
+    t.share.targetMemory;
+
   return (
     <div className="max-w-4xl mx-auto px-4 py-6 pb-16">
-      {/* Header strip */}
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 11, color: "var(--aurora-fg4)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-          {meta.kind === "timeline" ? t.share.targetTimeline : t.share.targetDaily}
+          {kindLabel}
         </div>
         <h1 style={{ margin: "6px 0 8px", fontSize: 22, fontWeight: 600, color: "var(--aurora-fg1)" }}>
           {meta.title || meta.target_id}
         </h1>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--aurora-fg3)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--aurora-fg3)", flexWrap: "wrap" }}>
           <span>{t.share.sharedBy} {meta.owner_name}</span>
+          {meta.directed && <Chip>{t.share.audienceUser}</Chip>}
           <Chip tone="accent">
             <Icon name="eye" size={11} style={{ marginRight: 4, verticalAlign: -1 }} />
             {meta.view_count}
@@ -141,6 +202,7 @@ export default function PublicSharePage() {
 
       {payload.kind === "timeline" && <TimelineView data={payload.data} locale={locale} t={t} />}
       {payload.kind === "daily" && <DailyView data={payload.data} />}
+      {payload.kind === "memory" && <MemoryView data={payload.data} />}
 
       <div style={{ marginTop: 40, textAlign: "center", fontSize: 11, color: "var(--aurora-fg4)" }}>
         Powered by Memento · <a href="/" style={{ color: "var(--aurora-accent)" }}>memento</a>
@@ -237,6 +299,45 @@ function DailyView({ data }: { data: DailyData }) {
           </div>
         ))}
       </Glass>
+    </>
+  );
+}
+
+function MemoryView({ data }: { data: MemoryData }) {
+  // Simple list view of entities + relation count summary. The real graph
+  // viz on /memory uses canvas + force layout — too heavy to bundle into the
+  // share page just for a read-only snapshot.
+  const byType = data.nodes.reduce<Record<string, MemoryNode[]>>((acc, n) => {
+    (acc[n.type] = acc[n.type] || []).push(n);
+    return acc;
+  }, {});
+  return (
+    <>
+      <Glass padding={18} radius={16} style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 16, fontSize: 13, color: "var(--aurora-fg3)" }}>
+          <span>{data.total_entities} entities</span>
+          <span>·</span>
+          <span>{data.total_relations} relations</span>
+        </div>
+      </Glass>
+      {Object.keys(byType).sort().map((type) => (
+        <Glass key={type} padding={18} radius={16} style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: "var(--aurora-fg4)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
+            {type} · {byType[type].length}
+          </div>
+          {byType[type].map((n) => (
+            <div key={n.id} style={{
+              padding: "8px 0", borderBottom: "1px solid var(--aurora-border)",
+              fontSize: 13,
+            }}>
+              <div style={{ fontWeight: 500, color: "var(--aurora-fg1)" }}>{n.name}</div>
+              {n.summary && (
+                <div style={{ fontSize: 12, color: "var(--aurora-fg3)", marginTop: 2 }}>{n.summary}</div>
+              )}
+            </div>
+          ))}
+        </Glass>
+      ))}
     </>
   );
 }

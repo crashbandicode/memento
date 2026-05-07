@@ -10,6 +10,8 @@ interface CreatedShare {
   token: string;
   expires_at: string | null;
   created_at: string;
+  target_user_id: string | null;
+  target_user_label: string | null;
 }
 
 interface ViewRow {
@@ -22,18 +24,33 @@ interface ViewRow {
   viewed_at: string;
 }
 
+interface Recipient {
+  id: string;
+  email: string;
+  name: string | null;
+  role: string;
+  label: string;
+}
+
 export interface ShareModalProps {
   open: boolean;
   onClose: () => void;
-  kind: "timeline" | "daily";
-  targetId: string;   // project UUID for timeline; YYYY-MM-DD for daily
+  kind: "timeline" | "daily" | "memory";
+  targetId: string;   // project UUID for timeline; YYYY-MM-DD for daily; "all" for memory
   title?: string;     // human-readable label shown in modal header
 }
+
+type Audience = "public" | "user";
 
 export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalProps) {
   const { t } = useI18n();
   const [existing, setExisting] = useState<CreatedShare | null>(null);
   const [expiresDays, setExpiresDays] = useState<number | "">(7);
+  const [audience, setAudience] = useState<Audience>("public");
+  const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [recipientsTried, setRecipientsTried] = useState(false);
+  const [recipientsAvailable, setRecipientsAvailable] = useState(true);
+  const [targetUserId, setTargetUserId] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [viewCount, setViewCount] = useState(0);
   const [views, setViews] = useState<ViewRow[]>([]);
@@ -50,7 +67,13 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
         if (!alive) return;
         const hit = rows.find((r) => r.kind === kind && r.target_id === targetId && !r.revoked_at);
         if (hit) {
-          setExisting({ token: hit.token, expires_at: hit.expires_at, created_at: hit.created_at });
+          setExisting({
+            token: hit.token,
+            expires_at: hit.expires_at,
+            created_at: hit.created_at,
+            target_user_id: hit.target_user_id,
+            target_user_label: hit.target_user_label,
+          });
           setViewCount(hit.view_count || 0);
         }
       })
@@ -58,9 +81,37 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
     return () => { alive = false; };
   }, [open, kind, targetId]);
 
+  // Lazy-load recipients the first time the user picks "user" audience.
+  // /api/share/recipients is admin/owner-only — for other roles we silently
+  // hide the user-mode option.
+  useEffect(() => {
+    if (!open || audience !== "user" || recipientsTried) return;
+    let alive = true;
+    setRecipientsTried(true);
+    authFetch(`${getApiBase()}/api/share/recipients`)
+      .then(async (r) => {
+        if (!alive) return;
+        if (!r.ok) {
+          setRecipientsAvailable(false);
+          setAudience("public");
+          return;
+        }
+        const data: Recipient[] = await r.json();
+        setRecipients(data);
+        if (data.length > 0 && !targetUserId) setTargetUserId(data[0].id);
+      })
+      .catch(() => { setRecipientsAvailable(false); setAudience("public"); });
+    return () => { alive = false; };
+  }, [open, audience, recipientsTried, targetUserId]);
+
   const publicUrl = existing ? `${typeof window !== "undefined" ? window.location.origin : ""}/s/${existing.token}` : "";
+  const isDirected = !!existing?.target_user_id;
 
   const handleCreate = async () => {
+    if (audience === "user" && !targetUserId) {
+      setNotice(t.share.pickRecipient);
+      return;
+    }
     setLoading(true);
     setNotice("");
     try {
@@ -70,10 +121,18 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
         body: JSON.stringify({
           kind, target_id: targetId, title,
           expires_in_days: expiresDays === "" ? null : Number(expiresDays),
+          target_user_id: audience === "user" ? targetUserId : null,
         }),
       });
+      if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
-      setExisting({ token: data.token, expires_at: data.expires_at, created_at: data.created_at });
+      setExisting({
+        token: data.token,
+        expires_at: data.expires_at,
+        created_at: data.created_at,
+        target_user_id: data.target_user_id,
+        target_user_label: data.target_user_label,
+      });
       setViewCount(0);
     } catch (e) {
       setNotice(e instanceof Error ? e.message : "create failed");
@@ -122,6 +181,11 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
 
   if (!open) return null;
 
+  const targetDescription =
+    kind === "timeline" ? t.share.targetTimeline :
+    kind === "daily" ? t.share.targetDaily :
+    t.share.targetMemory;
+
   return (
     <div
       onClick={onClose}
@@ -145,13 +209,53 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
           </div>
 
           <div style={{ fontSize: 12, color: "var(--aurora-fg3)", marginBottom: 18 }}>
-            {kind === "timeline" ? t.share.targetTimeline : t.share.targetDaily}
+            {targetDescription}
             {title ? " · " : ""}
             <span style={{ color: "var(--aurora-fg1)", fontWeight: 500 }}>{title || targetId}</span>
           </div>
 
           {!existing ? (
             <div>
+              {/* Audience picker — only shown if recipients endpoint is reachable */}
+              {recipientsAvailable && (
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  <AudienceTab active={audience === "public"} onClick={() => setAudience("public")}>
+                    {t.share.audiencePublic}
+                  </AudienceTab>
+                  <AudienceTab active={audience === "user"} onClick={() => setAudience("user")}>
+                    {t.share.audienceUser}
+                  </AudienceTab>
+                </div>
+              )}
+
+              {audience === "user" && (
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ fontSize: 12, color: "var(--aurora-fg3)", display: "block", marginBottom: 6 }}>
+                    {t.share.recipient}
+                  </label>
+                  <select
+                    value={targetUserId}
+                    onChange={(e) => setTargetUserId(e.target.value)}
+                    style={{
+                      width: "100%", padding: "8px 10px", fontSize: 13,
+                      background: "var(--aurora-surface)",
+                      border: "1px solid var(--aurora-border)",
+                      borderRadius: 8, color: "var(--aurora-fg1)",
+                    }}
+                  >
+                    {recipients.length === 0 && <option value="">{t.share.noRecipients}</option>}
+                    {recipients.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.label} ({u.email}) · {u.role}
+                      </option>
+                    ))}
+                  </select>
+                  <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginTop: 6 }}>
+                    {t.share.recipientHint}
+                  </div>
+                </div>
+              )}
+
               <label style={{ fontSize: 12, color: "var(--aurora-fg3)", display: "block", marginBottom: 6 }}>
                 {t.share.expiresLabel}
               </label>
@@ -180,6 +284,16 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
             </div>
           ) : (
             <div>
+              {isDirected && (
+                <div style={{
+                  marginBottom: 10, padding: "8px 10px", borderRadius: 8,
+                  fontSize: 12, color: "var(--aurora-fg2)",
+                  background: "rgba(59,130,246,0.10)",
+                  border: "1px solid rgba(59,130,246,0.25)",
+                }}>
+                  {t.share.directedTo} <strong>{existing.target_user_label}</strong> · {t.share.directedHint}
+                </div>
+              )}
               <div style={{
                 display: "flex", gap: 6, alignItems: "center",
                 padding: "8px 10px", border: "1px solid var(--aurora-border)",
@@ -266,5 +380,27 @@ export function ShareModal({ open, onClose, kind, targetId, title }: ShareModalP
         </Glass>
       </div>
     </div>
+  );
+}
+
+function AudienceTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        flex: 1,
+        padding: "8px 12px",
+        fontSize: 12,
+        fontWeight: 500,
+        background: active ? "var(--aurora-chip)" : "transparent",
+        color: active ? "var(--aurora-fg1)" : "var(--aurora-fg3)",
+        border: "1px solid",
+        borderColor: active ? "var(--aurora-accent)" : "var(--aurora-border)",
+        borderRadius: 8,
+        cursor: "pointer",
+      }}
+    >
+      {children}
+    </button>
   );
 }

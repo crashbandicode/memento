@@ -5,6 +5,15 @@ const enUS: Translations = {
     title: "Share link",
     targetTimeline: "Project timeline",
     targetDaily: "Daily report",
+    targetMemory: "Memory",
+    audiencePublic: "Public link",
+    audienceUser: "Specific user",
+    recipient: "Recipient",
+    recipientHint: "Only this user (after login) can view; the URL won't work for anyone else.",
+    noRecipients: "No users available",
+    pickRecipient: "Pick a recipient",
+    directedTo: "Shared with",
+    directedHint: "this user must be logged in",
     expiresLabel: "Expires",
     days: "days",
     expiresHint: "0 or blank = never",
@@ -62,6 +71,23 @@ const enUS: Translations = {
     admin: "Admin",
     projects: "Projects",
     memory: "Memory",
+    inbox: "Shared with me",
+  },
+
+  inbox: {
+    title: "Shared with me",
+    subtitle: "Project timelines, dailies, and memory shared by other users.",
+    empty: "Nothing shared with you yet.",
+    open: "Open",
+    sharedBy: "Shared by",
+    expiresAt: "Expires",
+    kindTimeline: "Timeline",
+    kindDaily: "Daily",
+    kindMemory: "Memory",
+  },
+
+  memoryShare: {
+    button: "Share memory",
   },
 
   dashboard: {

@@ -4,6 +4,15 @@ const zhCN = {
     title: "分享链接",
     targetTimeline: "项目时间线",
     targetDaily: "日报",
+    targetMemory: "记忆",
+    audiencePublic: "公开链接",
+    audienceUser: "指定用户",
+    recipient: "接收人",
+    recipientHint: "只有该用户登录后才能查看,公开链接对所有人无效。",
+    noRecipients: "没有可选用户",
+    pickRecipient: "请选择接收人",
+    directedTo: "已分享给",
+    directedHint: "需该用户登录访问",
     expiresLabel: "有效期",
     days: "天",
     expiresHint: "0 或留空 = 永久",
@@ -63,6 +72,23 @@ const zhCN = {
     admin: "管理",
     projects: "项目",
     memory: "记忆",
+    inbox: "收到的分享",
+  },
+
+  inbox: {
+    title: "收到的分享",
+    subtitle: "其他用户分享给我的项目时间线、日报、记忆。",
+    empty: "还没有收到任何分享。",
+    open: "打开",
+    sharedBy: "分享自",
+    expiresAt: "过期",
+    kindTimeline: "时间线",
+    kindDaily: "日报",
+    kindMemory: "记忆",
+  },
+
+  memoryShare: {
+    button: "分享记忆",
   },
 
   // Dashboard

@@ -5,6 +5,7 @@ import { getApiBase, authFetch } from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, Glass, GhostInput, StatCard, TopBar } from "@/components/aurora/primitives";
+import { ShareModal } from "@/components/ShareModal";
 
 interface GraphNode {
   id: string;
@@ -122,6 +123,7 @@ export default function MemoryPage() {
   const [filterType, setFilterType] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [shareOpen, setShareOpen] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
 
   const loadGraph = useCallback(() => {
@@ -205,7 +207,19 @@ export default function MemoryPage() {
           wrapStyle={{ flex: 1, minWidth: 260 }}
         />
         <Btn onClick={handleSearch} icon="search">Search</Btn>
+        <Btn variant="glass" icon="link" onClick={() => setShareOpen(true)}>
+          {t.memoryShare.button}
+        </Btn>
       </div>
+
+      <ShareModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        kind="memory"
+        targetId="all"
+        title={t.nav.memory}
+      />
+
 
       {searchResults.length > 0 && (
         <Glass padding={16} radius={18}>
