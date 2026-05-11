@@ -116,7 +116,16 @@ def docker_start_hint() -> str:
 
 
 def find_python() -> str:
-    """Locate a usable Python 3.11+ for the embedding venv."""
+    """Locate a usable Python 3.11+ for the embedding venv.
+
+    Beyond version, also verify the interpreter has `ctypes` + `venv`
+    importable — a Python built without libffi-dev (very common with
+    pyenv on minimal Linux images) loads fine but explodes the moment
+    torch tries to `import ctypes`, which is the kind of failure that
+    only surfaces 1.3GB into the model download. Cheaper to catch it
+    here and move on to the next candidate (or fail loudly with a clear
+    libffi-dev hint).
+    """
     candidates = [
         os.environ.get("MEMENTO_EMBEDDING_PYTHON"),
         "python3.13", "python3.12", "python3.11",
@@ -124,6 +133,7 @@ def find_python() -> str:
         "/usr/local/opt/python@3.11/bin/python3.11",
         "python3", "python",
     ]
+    saw_broken_ctypes = False  # tracks the libffi-dev case for the error msg
     for c in candidates:
         if not c:
             continue
@@ -132,14 +142,34 @@ def find_python() -> str:
             continue
         try:
             out = subprocess.check_output(
-                [exe, "-c", "import sys; print(sys.version_info[:2])"],
-                text=True, timeout=5,
+                [exe, "-c",
+                 "import sys, ctypes, venv; "
+                 "print(sys.version_info[:2])"],
+                text=True, timeout=5, stderr=subprocess.STDOUT,
             )
             ver = eval(out.strip())
             if ver >= (3, 11):
                 return exe
+        except subprocess.CalledProcessError as e:
+            # Distinguish "no _ctypes" from "no such version" so we can
+            # give a precise hint when every candidate is broken the same way.
+            if "_ctypes" in (e.output or ""):
+                saw_broken_ctypes = True
+            continue
         except Exception:
             continue
+    if saw_broken_ctypes:
+        raise RuntimeError(
+            "Found Python 3.11+ but it was built without _ctypes — torch/numpy "
+            "won't work. This typically means the pyenv build skipped libffi-dev.\n"
+            "Fix on Ubuntu/Debian:\n"
+            "  sudo apt install -y libffi-dev libssl-dev libbz2-dev \\\n"
+            "                       libreadline-dev libsqlite3-dev zlib1g-dev\n"
+            "  pyenv install --force 3.11.15   # rebuild against new libs\n"
+            "Or use the system Python instead:\n"
+            "  sudo apt install -y python3.12 python3.12-venv\n"
+            "  MEMENTO_EMBEDDING_PYTHON=$(which python3.12) ./install.sh embedding"
+        )
     raise RuntimeError(
         "Python 3.11+ not found. Install it first:\n"
         "  macOS:   brew install python@3.11\n"
