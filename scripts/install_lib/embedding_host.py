@@ -66,10 +66,13 @@ def install_torch_and_transformers() -> None:
     torch_spec = "torch>=2.6"
 
     if accel == "cuda":
-        info("Installing torch with CUDA 12.1 wheels…")
+        # Default PyPI ships CUDA-enabled torch wheels from 2.6 onwards
+        # (CUDA libs come via nvidia-cuda-* sub-packages auto-resolved
+        # as deps). The old cu121 download.pytorch.org index caps at
+        # torch 2.5.1, which trips CVE-2025-32434's torch.load guard.
+        info("Installing torch with CUDA support (default PyPI)…")
         subprocess.run(
-            [str(py), "-m", "pip", "install", torch_spec,
-             "--index-url", "https://download.pytorch.org/whl/cu121"],
+            [str(py), "-m", "pip", "install", torch_spec],
             check=True,
         )
     elif accel == "mps":
