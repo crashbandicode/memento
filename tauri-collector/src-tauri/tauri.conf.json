@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "productName": "Memento",
+  "version": "0.1.0",
+  "identifier": "com.memento.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": null,
+    "beforeDevCommand": null,
+    "beforeBuildCommand": null
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Memento",
+        "width": 820,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "visible": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    },
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis", "app", "dmg", "appimage", "deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "externalBin": [
+      "binaries/memento-collector-sidecar"
+    ],
+    "copyright": "© ddong8 — AGPL-3.0",
+    "category": "DeveloperTool",
+    "shortDescription": "Memento collector — desktop manager",
+    "longDescription": "Watches your AI coding tools (Claude Code, Codex, Cursor, Obsidian, Hermes, ...) and syncs conversations + memory files to a self-hosted Memento server.",
+    "windows": {
+      "wix": {
+        "language": ["en-US"]
+      }
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

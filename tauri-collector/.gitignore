@@ -1,0 +1,15 @@
+# Rust build artifacts
+src-tauri/target/
+
+# PyInstaller workspace + bundled sidecar binaries
+sidecar/build/
+sidecar/dist/
+sidecar/__pycache__/
+src-tauri/binaries/
+
+# Tauri 2.x sometimes writes a capabilities cache here
+src-tauri/gen/
+
+# IDE noise
+.DS_Store
+*.swp
