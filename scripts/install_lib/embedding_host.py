@@ -58,19 +58,26 @@ def install_torch_and_transformers() -> None:
     accel = detect_accelerator()
     info(f"Detected accelerator: {accel}")
 
+    # torch>=2.6 — transformers 5.x refuses to call torch.load on anything
+    # older after CVE-2025-32434 (a deserialization gadget that bypasses
+    # weights_only=True). BGE-M3's pytorch_model.bin only loads through
+    # torch.load, so without this pin you can download 2.27 GB and then
+    # eat a ValueError on the very last step.
+    torch_spec = "torch>=2.6"
+
     if accel == "cuda":
         info("Installing torch with CUDA 12.1 wheels…")
         subprocess.run(
-            [str(py), "-m", "pip", "install", "torch",
+            [str(py), "-m", "pip", "install", torch_spec,
              "--index-url", "https://download.pytorch.org/whl/cu121"],
             check=True,
         )
     elif accel == "mps":
         info("Installing torch (MPS is built into the standard wheel on arm64 macOS)…")
-        subprocess.run([str(py), "-m", "pip", "install", "torch"], check=True)
+        subprocess.run([str(py), "-m", "pip", "install", torch_spec], check=True)
     else:
         warn("No GPU detected — embedding will run on CPU and will be slow.")
-        subprocess.run([str(py), "-m", "pip", "install", "torch"], check=True)
+        subprocess.run([str(py), "-m", "pip", "install", torch_spec], check=True)
 
     info("Installing sentence-transformers + fastapi/uvicorn + modelscope…")
     subprocess.run(
