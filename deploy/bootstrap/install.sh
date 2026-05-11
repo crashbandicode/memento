@@ -2,12 +2,27 @@
 # Memento — remote bootstrap installer.
 #
 # Usage:  curl -fsSL https://mem.ihasy.com/install.sh | sh
+#         curl -fsSL https://mem.ihasy.com/install.sh | bash
 #
 # Overrides:
 #   MEMENTO_INSTALL_DIR   target dir (default: $HOME/memento)
 #   MEMENTO_VERSION       git ref to download (default: main)
 #   MEMENTO_REPO_URL      repo base URL (default: https://github.com/ddong8/memento)
 #   MEMENTO_MIRROR_URL    fast mirror for tarball (default: https://mem.ihasy.com/install/latest.tar.gz)
+
+# `| sh` on Debian/Ubuntu hands the script to dash, which doesn't support
+# `set -o pipefail`, ANSI-C quoting, or several other bashisms below. Re-fetch
+# under bash if we aren't already there. The check + re-exec uses only POSIX
+# constructs so dash, ash, busybox sh all reach the relaunch path cleanly.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        URL="${MEMENTO_INSTALLER_URL:-https://mem.ihasy.com/install.sh}"
+        exec bash -c "$(curl -fsSL "$URL")"
+    else
+        printf '%s\n' "Memento installer requires bash. Install bash (apt install bash) and retry." >&2
+        exit 1
+    fi
+fi
 
 set -euo pipefail
 
