@@ -22,27 +22,44 @@ use crate::sidecar::Sidecar;
 /// Pick zh / en for the tray menu by reading the OS user locale.
 /// sys_locale::get_locale returns BCP-47 like "zh-CN" or "en-US".
 /// Anything starting with "zh" → Chinese; everything else falls back to English.
-fn tray_strings() -> [&'static str; 5] {
+fn tray_strings(version: &str) -> [String; 4] {
     let is_zh = sys_locale::get_locale()
         .map(|l| l.to_lowercase().starts_with("zh"))
         .unwrap_or(false);
     if is_zh {
-        ["打开 Memento", "暂停采集", "恢复采集", "检查更新", "退出"]
+        [
+            "打开 Memento".into(),
+            "检查更新".into(),
+            format!("关于 (v{version})"),
+            "退出".into(),
+        ]
     } else {
-        ["Open Memento", "Pause collector", "Resume collector", "Check for updates", "Quit"]
+        [
+            "Open Memento".into(),
+            "Check for updates".into(),
+            format!("About (v{version})"),
+            "Quit".into(),
+        ]
     }
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    let [s_open, s_pause, s_resume, s_check, s_quit] = tray_strings();
-    let open_item = MenuItem::with_id(app, "open", s_open, true, None::<&str>)?;
-    let pause_item = MenuItem::with_id(app, "pause", s_pause, true, None::<&str>)?;
-    let resume_item = MenuItem::with_id(app, "resume", s_resume, true, None::<&str>)?;
-    let check_item = MenuItem::with_id(app, "check_update", s_check, true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
+    // Inline the bundle version into the About menu entry so users see
+    // what they're running without having to open the app first. Pulled
+    // from Cargo.toml at compile time via `env!`, same source as the
+    // app's window title and the auto-updater's "current version" check.
+    let version = env!("CARGO_PKG_VERSION");
+    let [s_open, s_check, s_about, s_quit] = tray_strings(version);
+    let open_item = MenuItem::with_id(app, "open", &s_open, true, None::<&str>)?;
+    let check_item = MenuItem::with_id(app, "check_update", &s_check, true, None::<&str>)?;
+    // "About" is informational only — version is in the label. Disabled
+    // so clicks don't do anything (no menu item handler for it). Tauri
+    // renders disabled items as grayed-out, signalling they're labels.
+    let about_item = MenuItem::with_id(app, "about", &s_about, false, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", &s_quit, true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&open_item, &pause_item, &resume_item, &check_item, &quit_item],
+        &[&open_item, &check_item, &about_item, &quit_item],
     )?;
 
     // Reuse the bundled app icon (declared in tauri.conf.json bundle.icon[])
@@ -71,16 +88,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
-                }
-            }
-            "pause" => {
-                if let Some(state) = app.try_state::<AppState>() {
-                    let _ = state.sidecar.stop();
-                }
-            }
-            "resume" => {
-                if let Some(state) = app.try_state::<AppState>() {
-                    let _ = state.sidecar.start(app.clone());
                 }
             }
             "check_update" => {
