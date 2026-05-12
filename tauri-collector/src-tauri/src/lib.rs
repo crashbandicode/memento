@@ -75,7 +75,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let _tray = TrayIconBuilder::with_id("main")
         .icon(icon)
-        .icon_as_template(true)
+        // Tell macOS to render the icon as-is rather than treating it as a
+        // monochrome template image. Our Aurora-gradient icon has a fully
+        // opaque alpha channel, so template rendering blanks it into a
+        // solid white square in the menu bar. Setting this false keeps the
+        // full color; Windows/Linux ignore the flag anyway.
+        .icon_as_template(false)
         .menu(&menu)
         .tooltip("Memento")
         // Default Tauri behavior shows the menu on left-click too, which
