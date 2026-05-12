@@ -185,6 +185,24 @@ async function boot() {
   // Fire-and-forget update check. Failures (no network, rate-limited
   // GitHub API) are silent — banner just won't appear.
   checkForUpdate().catch(() => {});
+
+  // Tray menu "Check for updates" → Rust emits this. Clear the session
+  // dismissal and force a fresh check; if no update, show a brief notice
+  // so the user gets feedback instead of silence.
+  await listen("menu:check-update", async () => {
+    sessionStorage.removeItem("update_dismissed");
+    try {
+      const update = await tauriUpdater.check();
+      if (update?.available) {
+        await checkForUpdate();
+      } else {
+        const v = await tauriApp.getVersion();
+        flash("ok", `Memento v${v} · ${t("update.upToDate")}`);
+      }
+    } catch (e) {
+      flash("err", String(e?.message || e));
+    }
+  });
 }
 
 // ─── Update check (Tauri auto-updater) ────────────────────────────

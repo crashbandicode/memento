@@ -1,6 +1,6 @@
 [package]
 name = "memento-app"
-version = "0.1.11"
+version = "0.1.12"
 description = "Memento desktop — manages the local collector daemon"
 authors = ["ddong8"]
 license = "AGPL-3.0-only"
@@ -36,6 +36,7 @@ thiserror = "1"
 anyhow = "1"
 dirs = "5"
 tracing = "0.1"
+sys-locale = "0.3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

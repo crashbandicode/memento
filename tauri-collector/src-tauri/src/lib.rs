@@ -13,18 +13,37 @@ use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 use crate::ipc::AppState;
 use crate::sidecar::Sidecar;
 
+/// Pick zh / en for the tray menu by reading the OS user locale.
+/// sys_locale::get_locale returns BCP-47 like "zh-CN" or "en-US".
+/// Anything starting with "zh" → Chinese; everything else falls back to English.
+fn tray_strings() -> [&'static str; 5] {
+    let is_zh = sys_locale::get_locale()
+        .map(|l| l.to_lowercase().starts_with("zh"))
+        .unwrap_or(false);
+    if is_zh {
+        ["打开 Memento", "暂停采集", "恢复采集", "检查更新", "退出"]
+    } else {
+        ["Open Memento", "Pause collector", "Resume collector", "Check for updates", "Quit"]
+    }
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open_item = MenuItem::with_id(app, "open", "Open Memento", true, None::<&str>)?;
-    let pause_item = MenuItem::with_id(app, "pause", "Pause collector", true, None::<&str>)?;
-    let resume_item = MenuItem::with_id(app, "resume", "Resume collector", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open_item, &pause_item, &resume_item, &quit_item])?;
+    let [s_open, s_pause, s_resume, s_check, s_quit] = tray_strings();
+    let open_item = MenuItem::with_id(app, "open", s_open, true, None::<&str>)?;
+    let pause_item = MenuItem::with_id(app, "pause", s_pause, true, None::<&str>)?;
+    let resume_item = MenuItem::with_id(app, "resume", s_resume, true, None::<&str>)?;
+    let check_item = MenuItem::with_id(app, "check_update", s_check, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", s_quit, true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&open_item, &pause_item, &resume_item, &check_item, &quit_item],
+    )?;
 
     // Reuse the bundled app icon (declared in tauri.conf.json bundle.icon[])
     // for the tray. Without an explicit .icon() call here, Tauri creates a
@@ -63,6 +82,16 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(state) = app.try_state::<AppState>() {
                     let _ = state.sidecar.start(app.clone());
                 }
+            }
+            "check_update" => {
+                // Bring the window forward so the user sees the prompt /
+                // banner, then ping JS to clear the per-session dismissal
+                // and re-run the updater check.
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+                let _ = app.emit("menu:check-update", ());
             }
             "quit" => {
                 if let Some(state) = app.try_state::<AppState>() {

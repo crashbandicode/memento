@@ -7,6 +7,10 @@ import { useI18n } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth-context";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
+// Read version from package.json so the sidebar footer tracks releases
+// automatically — no more "v0.1.0 forever" when actual builds are 0.2.x.
+import pkg from "../../../package.json";
+const WEB_VERSION = `v${(pkg as { version: string }).version}`;
 
 interface SidebarDevice {
   device_id: string;
@@ -241,7 +245,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
               padding: "6px 0",
             }}
           >
-            {t.app.version}
+            {WEB_VERSION}
           </div>
         </div>
       </aside>
