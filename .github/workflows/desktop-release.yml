@@ -44,14 +44,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows first per project priority. macOS / Linux runners can
-          # be enabled here once the Windows pipeline is green:
-          #   - { os: macos-latest,   target: aarch64-apple-darwin,         bundle: dmg }
-          #   - { os: macos-13,       target: x86_64-apple-darwin,          bundle: dmg }
-          #   - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,     bundle: appimage }
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: "msi nsis"
+          # macOS — both architectures. Apple Silicon is the modern default;
+          # x86_64 Intel covers the older fleet. Both produce .dmg + .app.
+          # NOT code-signed/notarized — users see Gatekeeper "Apple cannot
+          # check for malicious software" warning, bypassed via
+          # right-click → Open. Real signing needs APPLE_CERTIFICATE +
+          # APPLE_NOTARIZATION env + $99/yr Apple Developer account.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: "app dmg"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bundles: "app dmg"
 
     runs-on: ${{ matrix.os }}
 
@@ -124,7 +131,11 @@ jobs:
         run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Generate latest.json (auto-update manifest)
-        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        # Windows runner only for now: latest.json points at the NSIS .exe
+        # and the embedded auto-updater on that binary picks it up. Adding
+        # macOS .app.tar.gz signed update artifacts to the same manifest
+        # is a follow-up — macOS users install manually for v1.
+        if: startsWith(github.ref, 'refs/tags/desktop-v') && matrix.os == 'windows-latest'
         working-directory: tauri-collector/src-tauri/target/${{ matrix.target }}/release/bundle
         run: |
           set -eu
