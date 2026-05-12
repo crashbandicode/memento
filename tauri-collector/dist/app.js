@@ -4,6 +4,7 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open: openDialog } = window.__TAURI__.dialog;
+const tauriShell = window.__TAURI__.shell;  // tauri-plugin-shell .open(url)
 
 // Same set the Python collector knows about. Keep names in sync with
 // collector/collector/tools/*.py — these are the values used to index
@@ -33,7 +34,54 @@ document.querySelectorAll(".tab").forEach((tab) => {
     tab.classList.add("active");
     const target = document.querySelector(`.panel[data-panel="${tab.dataset.tab}"]`);
     if (target) target.classList.add("active");
+    if (tab.dataset.tab === "dashboard") openDashboard();
   });
+});
+
+// ─── Dashboard tab (embedded webview) ─────────────────────────────
+function openDashboard() {
+  const url = (state.config?.server_url || "").trim().replace(/\/$/, "");
+  const empty = document.getElementById("dashboardEmpty");
+  const frame = document.getElementById("dashboardFrame");
+  const iframe = document.getElementById("dashboardIframe");
+  const urlEl = document.getElementById("dashboardUrl");
+  if (!url) {
+    empty.style.display = "block";
+    frame.classList.add("hidden");
+    return;
+  }
+  empty.style.display = "none";
+  frame.classList.remove("hidden");
+  const target = `${url}/app`;
+  // Only navigate when the URL actually changes — preserves the user's
+  // current page (e.g. they were deep in a project) on every tab switch.
+  if (iframe.src !== target) {
+    iframe.src = target;
+  }
+  urlEl.textContent = target;
+}
+
+document.getElementById("dashboardReload")?.addEventListener("click", () => {
+  const iframe = document.getElementById("dashboardIframe");
+  // Re-assigning src forces a fresh load even if it's the same URL.
+  const current = iframe.src;
+  iframe.src = "about:blank";
+  setTimeout(() => { iframe.src = current; }, 50);
+});
+
+document.getElementById("dashboardOpenExternal")?.addEventListener("click", async () => {
+  const url = document.getElementById("dashboardUrl").textContent;
+  if (!url) return;
+  try {
+    // tauri-plugin-shell's `open` opens with the OS default browser.
+    if (tauriShell?.open) {
+      await tauriShell.open(url);
+    } else {
+      window.open(url, "_blank");
+    }
+  } catch (e) {
+    console.warn("openExternal failed", e);
+  }
 });
 
 // ─── Initial load ─────────────────────────────────────────────────

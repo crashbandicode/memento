@@ -20,6 +20,7 @@
 
   <nav class="tabs" role="tablist">
     <button class="tab active" data-tab="server" role="tab">Server</button>
+    <button class="tab" data-tab="dashboard" role="tab">Dashboard</button>
     <button class="tab" data-tab="tools" role="tab">Tools</button>
     <button class="tab" data-tab="logs" role="tab">Logs</button>
     <button class="tab" data-tab="about" role="tab">About</button>
@@ -80,6 +81,22 @@
         <button class="btn ghost" id="stopBtn">Stop</button>
       </div>
       <p class="notice" id="serverNotice"></p>
+    </section>
+
+    <!-- Dashboard tab -->
+    <section class="panel" data-panel="dashboard">
+      <div id="dashboardEmpty" class="dashboard-empty">
+        <p>Configure the server URL on the Server tab, then come back here to see the dashboard.</p>
+      </div>
+      <div id="dashboardFrame" class="dashboard-frame hidden">
+        <div class="dashboard-toolbar">
+          <span class="dashboard-url" id="dashboardUrl"></span>
+          <button class="btn ghost" id="dashboardReload" title="Reload">↻</button>
+          <button class="btn ghost" id="dashboardOpenExternal" title="Open in browser">↗</button>
+        </div>
+        <iframe id="dashboardIframe" class="dashboard-iframe"
+                title="Memento dashboard" sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-downloads"></iframe>
+      </div>
     </section>
 
     <!-- Tools tab -->
