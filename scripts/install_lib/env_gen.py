@@ -52,6 +52,19 @@ def _write_env_atomic(path: Path, values: dict[str, str]) -> None:
             lines.append(f"{key}={values[key]}")
         else:
             lines.append(f"# {key}=")
+
+    lines += [
+        "",
+        "# ── optional: embedding server URL ──",
+        "# Default host.docker.internal:8002 works for Docker Desktop AND",
+        "# Linux Docker (compose.yml maps it to host-gateway). Only set",
+        "# this if the embedding server runs on a different machine.",
+    ]
+    embedding_key = "MEMENTO_EMBEDDING_SERVER_URL"
+    if values.get(embedding_key):
+        lines.append(f"{embedding_key}={values[embedding_key]}")
+    else:
+        lines.append(f"# {embedding_key}=http://host.docker.internal:8002")
     lines.append("")
 
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env.", text=True)
