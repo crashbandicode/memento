@@ -282,15 +282,29 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
           GH_TAG: ${{ github.ref_name }}
+          # Optional download proxy (set via RELEASE_PROXY_BASE secret) —
+          # if set, the per-platform URLs get this URL prefixed. Used so
+          # Chinese users hit a fast Cloudflare Worker mirror instead of
+          # objects.githubusercontent.com (which is slow / rate-limited
+          # from mainland CN). Signature verification still runs against
+          # the downloaded bytes, so a malicious proxy can't push a fake
+          # update — it would just fail signing.
+          RELEASE_PROXY_BASE: ${{ secrets.RELEASE_PROXY_BASE }}
         run: |
           set -eu
           version="${GH_TAG#desktop-v}"
           python3 - "$version" "$GH_REPO" "$GH_TAG" <<'PY'
-          import datetime, glob, json, sys
+          import datetime, glob, json, os, sys
           version, repo, tag = sys.argv[1:4]
+          proxy = os.environ.get("RELEASE_PROXY_BASE", "").rstrip("/")
           platforms = {}
           for f in sorted(glob.glob("_fragments/*.json")):
               platforms.update(json.load(open(f)))
+          # Apply proxy prefix to each platform's download URL (kept on
+          # github.com as the canonical source — the proxy just streams it).
+          if proxy:
+              for entry in platforms.values():
+                  entry["url"] = f"{proxy}/{entry['url']}"
           manifest = {
               "version": version,
               "notes": f"See release notes at https://github.com/{repo}/releases/tag/{tag}",
