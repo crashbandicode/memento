@@ -39,22 +39,40 @@ document.querySelectorAll(".tab").forEach((tab) => {
 });
 
 // ─── Dashboard tab (embedded webview) ─────────────────────────────
+// The user only configures ONE URL on the Server tab — the API base, since
+// that's what gets paired with the collector token. The Dashboard tab needs
+// the WEB UI URL though, which may or may not be the same depending on the
+// deployment topology. Heuristics, in order:
+//
+//   1. API on :8001  → web on :3001         (docker-compose default ports)
+//   2. API ends /api → web at the parent    (nginx subpath proxy)
+//   3. otherwise     → same base            (nginx unified domain, e.g.
+//                                            mem.ihasy.com serves both /app
+//                                            and /api/* from one origin)
+//
+// Two-URL config would let the user override this, but for the common cases
+// the derivation gets it right and keeps the Server tab to just one field.
+function deriveWebUrl(apiUrl) {
+  const base = apiUrl.trim().replace(/\/$/, "");
+  if (/:8001(\/|$)/.test(base)) return base.replace(/:8001/, ":3001");
+  if (/\/api(\/|$)/.test(base)) return base.replace(/\/api\/?$/, "");
+  return base;
+}
+
 function openDashboard() {
-  const url = (state.config?.server_url || "").trim().replace(/\/$/, "");
+  const apiUrl = (state.config?.server_url || "").trim();
   const empty = document.getElementById("dashboardEmpty");
   const frame = document.getElementById("dashboardFrame");
   const iframe = document.getElementById("dashboardIframe");
   const urlEl = document.getElementById("dashboardUrl");
-  if (!url) {
+  if (!apiUrl) {
     empty.style.display = "block";
     frame.classList.add("hidden");
     return;
   }
   empty.style.display = "none";
   frame.classList.remove("hidden");
-  const target = `${url}/app`;
-  // Only navigate when the URL actually changes — preserves the user's
-  // current page (e.g. they were deep in a project) on every tab switch.
+  const target = `${deriveWebUrl(apiUrl)}/app`;
   if (iframe.src !== target) {
     iframe.src = target;
   }
