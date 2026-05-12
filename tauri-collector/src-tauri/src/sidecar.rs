@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
