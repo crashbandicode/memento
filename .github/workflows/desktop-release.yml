@@ -91,7 +91,7 @@ jobs:
         working-directory: tauri-collector/src-tauri
         run: cargo tauri icon ../../web/public/favicon.png
 
-      - name: Build sidecar (PyInstaller frozen collector)
+      - name: Build sidecars (PyInstaller frozen collector + MCP)
         working-directory: tauri-collector/sidecar
         # Force utf-8 on Windows stdout — the helper script prints `→` /
         # `✓` etc. which trip the default cp1252 codec on the Windows
@@ -102,10 +102,11 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip
-          # The collector pulls in memento-brain-memory as a hard dep at
-          # install time but the entry.py + collector.spec exclude it
-          # from the frozen binary so we keep the .msi tight.
-          python -m pip install -e ../../collector pyinstaller
+          # Two frozen binaries get built:
+          #   - memento-collector-sidecar : file-watcher daemon
+          #   - memento-mcp-sidecar       : MCP server for AI IDEs
+          # Each has its own .spec; build_sidecar.py runs PyInstaller twice.
+          python -m pip install -e ../../mcp_server -e ../../collector pyinstaller
           python build_sidecar.py
 
       - name: Tauri build (signed)
@@ -119,7 +120,7 @@ jobs:
         # installed even over compromised HTTP.
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Generate latest.json (auto-update manifest)

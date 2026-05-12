@@ -64,36 +64,12 @@ def host_triple() -> str:
     return f"{arch_t}-unknown-linux-gnu"
 
 
-def main() -> int:
-    triple = host_triple()
-    print(f"Building sidecar for triple: {triple}")
-
-    # Sanity: PyInstaller installed?
-    try:
-        import PyInstaller  # noqa: F401
-    except ImportError:
-        print(
-            "PyInstaller not installed. Run: pip install pyinstaller",
-            file=sys.stderr,
-        )
-        return 1
-    # Sanity: collector importable?
-    try:
-        import collector  # noqa: F401
-    except ImportError:
-        print(
-            "collector package not importable. Run: pip install -e ../../collector",
-            file=sys.stderr,
-        )
-        return 1
-
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-
-    spec = HERE / "collector.spec"
+def _build_one(spec_name: str, exe_name: str, triple: str, exe_suffix: str) -> Path:
+    """Run PyInstaller for a single .spec, move the binary into BIN_DIR
+    under Tauri's per-triple naming convention. Returns the final path."""
+    spec = HERE / spec_name
     work = HERE / "build"
     dist = HERE / "dist"
-
-    # Clean previous output — PyInstaller will refuse otherwise.
     for d in (work, dist):
         if d.exists():
             shutil.rmtree(d)
@@ -105,30 +81,62 @@ def main() -> int:
         "--distpath", str(dist),
         str(spec),
     ]
-    print("→", " ".join(cmd))
+    print("->", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
-    # PyInstaller writes to dist/<exe-name>{.exe}; rename + move into
-    # the binaries/ folder under Tauri's required name.
-    exe_suffix = ".exe" if platform.system() == "Windows" else ""
-    src = dist / f"memento-collector-sidecar{exe_suffix}"
+    src = dist / f"{exe_name}{exe_suffix}"
     if not src.exists():
-        print(f"PyInstaller did not produce expected output at {src}", file=sys.stderr)
-        return 1
-    target = BIN_DIR / f"memento-collector-sidecar-{triple}{exe_suffix}"
+        raise RuntimeError(f"PyInstaller did not produce {src}")
+    target = BIN_DIR / f"{exe_name}-{triple}{exe_suffix}"
+    if target.exists():
+        target.unlink()
     shutil.move(str(src), str(target))
-    # Match Unix executable bit explicitly — shutil.move preserves it
-    # on POSIX, but be defensive for archives that strip it.
     if exe_suffix == "":
         target.chmod(0o755)
 
-    # Tidy up the spec working dirs once we've extracted the binary —
-    # the .msi / .dmg shouldn't include them.
     shutil.rmtree(work, ignore_errors=True)
     shutil.rmtree(dist, ignore_errors=True)
+    return target
 
-    print(f"\n✓ Sidecar written to {target}")
-    print("Now run `cargo tauri build` from tauri-collector/.")
+
+def main() -> int:
+    triple = host_triple()
+    print(f"Building sidecars for triple: {triple}")
+
+    # Sanity: PyInstaller installed?
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        print("PyInstaller not installed. Run: pip install pyinstaller", file=sys.stderr)
+        return 1
+    # Sanity: both packages importable?
+    try:
+        import collector  # noqa: F401
+    except ImportError:
+        print("collector not importable. Run: pip install -e ../../collector", file=sys.stderr)
+        return 1
+    try:
+        import mcp_server  # noqa: F401
+    except ImportError:
+        print("mcp_server not importable. Run: pip install -e ../../mcp_server", file=sys.stderr)
+        return 1
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    exe_suffix = ".exe" if platform.system() == "Windows" else ""
+
+    # Build collector first (faster, easier to debug if anything fails).
+    collector_path = _build_one(
+        "collector.spec", "memento-collector-sidecar", triple, exe_suffix
+    )
+    print(f"\nv Collector sidecar -> {collector_path}")
+
+    # Then MCP server — larger dep tree (mcp SDK + openai + asyncpg + ...).
+    mcp_path = _build_one(
+        "mcp.spec", "memento-mcp-sidecar", triple, exe_suffix
+    )
+    print(f"v MCP sidecar       -> {mcp_path}")
+
+    print("\nNow run `cargo tauri build` from tauri-collector/.")
     return 0
 
 

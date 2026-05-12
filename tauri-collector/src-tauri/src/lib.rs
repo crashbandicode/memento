@@ -6,6 +6,7 @@
 
 mod config;
 mod ipc;
+mod mcp_configs;
 mod sidecar;
 
 use std::sync::Arc;
@@ -119,6 +120,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::load_config,
             ipc::save_config,
+            ipc::configure_mcp,
             ipc::sidecar_status,
             ipc::sidecar_available,
             ipc::sidecar_log_snapshot,

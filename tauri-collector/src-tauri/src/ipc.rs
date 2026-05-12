@@ -39,6 +39,16 @@ pub fn save_config(cfg: Config) -> CmdResult<()> {
     Ok(())
 }
 
+/// Write MCP server entries into AI tool config files (Claude Code,
+/// Cursor, Codex, Windsurf, Antigravity). Best-effort: missing tool
+/// configs are silently skipped. Returns which tools were configured
+/// so the UI can show "configured for: claude_code, cursor".
+#[tauri::command]
+pub fn configure_mcp(server_url: String, server_token: String) -> CmdResult<crate::mcp_configs::McpWriteReport> {
+    let report = crate::mcp_configs::write_all(&server_url, &server_token)?;
+    Ok(report)
+}
+
 #[tauri::command]
 pub fn sidecar_status(state: State<'_, AppState>) -> Status {
     state.sidecar.status()

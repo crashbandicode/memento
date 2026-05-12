@@ -283,7 +283,24 @@ $("#saveBtn").addEventListener("click", async () => {
   try {
     await invoke("save_config", { cfg });
     state.config = cfg;
-    flash("ok", "Saved.");
+    // Also configure MCP server entries in every AI tool's config that
+    // exists on disk. Best-effort — missing tool configs are silently
+    // skipped; existing entries for other MCP servers are preserved.
+    let mcpMsg = "";
+    if (cfg.server_url && cfg.server_token) {
+      try {
+        const report = await invoke("configure_mcp", {
+          serverUrl: cfg.server_url,
+          serverToken: cfg.server_token,
+        });
+        if (report.configured?.length) {
+          mcpMsg = ` · MCP configured for: ${report.configured.join(", ")}`;
+        }
+      } catch (e) {
+        console.warn("configure_mcp failed:", e);
+      }
+    }
+    flash("ok", `Saved.${mcpMsg}`);
     // Once they have a server URL configured, jump them straight to the
     // dashboard — they're done configuring, they want to see their data.
     if (cfg.server_url && cfg.server_token) {
