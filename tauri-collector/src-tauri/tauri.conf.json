@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2.0.0",
   "productName": "Memento",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.memento.app",
   "build": {
     "frontendDist": "../dist",
@@ -10,6 +10,7 @@
     "beforeBuildCommand": null
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Memento",

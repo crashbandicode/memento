@@ -1,5 +1,18 @@
 // Memento desktop — vanilla JS, no framework.
 // Uses Tauri 2.x's window.__TAURI__ globals to call Rust commands.
+// `withGlobalTauri: true` in tauri.conf.json enables this; without it
+// every line below would throw at module load and silently break every
+// button on the page (no event listeners ever get registered).
+
+if (!window.__TAURI__) {
+  document.body.innerHTML =
+    '<div style="padding:40px;font:14px/1.5 system-ui">' +
+    '<h2>Tauri runtime not detected.</h2>' +
+    '<p>Open this app via the Memento installer, not by opening dist/index.html ' +
+    'directly. If you built from source, ensure tauri.conf.json has ' +
+    '<code>app.withGlobalTauri = true</code>.</p></div>';
+  throw new Error("window.__TAURI__ undefined — was the page opened outside Tauri?");
+}
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
