@@ -201,19 +201,50 @@ def install_macos(model: str = "BAAI/bge-m3") -> None:
 
 
 def install_linux(model: str = "BAAI/bge-m3") -> None:
-    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    # Two install modes — picked by effective uid:
+    #   - non-root → user-scope unit in ~/.config/systemd/user/.
+    #     Standard for desktops / multi-user boxes.
+    #   - root    → system-scope unit in /etc/systemd/system/.
+    #     Standard for headless servers, where root typically has no user
+    #     dbus session and `systemctl --user daemon-reload` fails with
+    #     "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS … not defined".
+    is_system = os.geteuid() == 0
+
+    if is_system:
+        unit_dir = Path("/etc/systemd/system")
+        ctl = ["systemctl"]
+        wanted_by = "multi-user.target"
+        logdir = Path("/var/log/memento")
+        scope_label = "system"
+    else:
+        unit_dir = Path.home() / ".config" / "systemd" / "user"
+        ctl = ["systemctl", "--user"]
+        wanted_by = "default.target"
+        logdir = Path.home() / ".local" / "share" / "memento" / "logs"
+        scope_label = "user"
+
     unit_dir.mkdir(parents=True, exist_ok=True)
-    # Migrate: disable + remove legacy dr-embedding.service.
-    legacy = unit_dir / "dr-embedding.service"
-    if legacy.exists():
-        subprocess.run(["systemctl", "--user", "disable", "--now", "dr-embedding"],
-                       capture_output=True)
-        legacy.unlink()
-        info(f"Migrated: removed legacy {legacy.name}")
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    # Migrate: disable + remove legacy dr-embedding.service from BOTH
+    # locations — installs may have switched scope across upgrades.
+    for legacy_dir, legacy_ctl in (
+        (Path.home() / ".config" / "systemd" / "user", ["systemctl", "--user"]),
+        (Path("/etc/systemd/system"), ["systemctl"]),
+    ):
+        legacy = legacy_dir / "dr-embedding.service"
+        if legacy.exists():
+            subprocess.run(
+                [*legacy_ctl, "disable", "--now", "dr-embedding"],
+                capture_output=True,
+            )
+            try:
+                legacy.unlink()
+                info(f"Migrated: removed legacy {legacy}")
+            except (PermissionError, OSError):
+                pass
 
     unit_path = unit_dir / "memento-embedding.service"
-    logdir = Path.home() / ".local" / "share" / "memento" / "logs"
-    logdir.mkdir(parents=True, exist_ok=True)
 
     body = _render(
         (TEMPLATE_DIR / "memento-embedding.service.tmpl").read_text(),
@@ -222,24 +253,26 @@ def install_linux(model: str = "BAAI/bge-m3") -> None:
         logdir=str(logdir),
         path=os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         model=model,
+        wanted_by=wanted_by,
     )
     unit_path.write_text(body)
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "memento-embedding"],
-                   check=True)
-    ok(f"systemd user service installed: {unit_path.name}")
+    subprocess.run([*ctl, "daemon-reload"], check=True)
+    subprocess.run([*ctl, "enable", "--now", "memento-embedding"], check=True)
+    ok(f"systemd {scope_label} service installed: {unit_path}")
 
-    # Lingering so service survives logout (headless server use case).
-    r = subprocess.run(
-        ["loginctl", "show-user", os.environ.get("USER", ""), "--property=Linger"],
-        capture_output=True, text=True,
-    )
-    if "Linger=no" in r.stdout:
-        warn(
-            "Service will stop when you log out. To keep it running headless, run:\n"
-            f"    sudo loginctl enable-linger {os.environ.get('USER', '$USER')}"
+    if not is_system:
+        # Lingering so service survives logout (headless server use case).
+        # System-scope services don't need this — they start at boot.
+        r = subprocess.run(
+            ["loginctl", "show-user", os.environ.get("USER", ""), "--property=Linger"],
+            capture_output=True, text=True,
         )
+        if "Linger=no" in r.stdout:
+            warn(
+                "Service will stop when you log out. To keep it running headless, run:\n"
+                f"    sudo loginctl enable-linger {os.environ.get('USER', '$USER')}"
+            )
 
 
 def install_windows(model: str = "BAAI/bge-m3") -> None:
@@ -316,14 +349,22 @@ def uninstall(remove_model_cache: bool = False, remove_venv: bool = False) -> No
                 if p.exists():
                     p.unlink()
     elif IS_LINUX:
-        unit_dir = Path.home() / ".config" / "systemd" / "user"
-        for name in ("memento-embedding", "dr-embedding"):
-            subprocess.run(["systemctl", "--user", "disable", "--now", name],
-                           capture_output=True)
-            unit = unit_dir / f"{name}.service"
-            if unit.exists():
-                unit.unlink()
-                ok(f"Removed systemd unit: {unit.name}")
+        # Clean both scopes — across upgrades the install path may have
+        # switched between user and system depending on whether the
+        # installer was run as root.
+        for unit_dir, ctl in (
+            (Path.home() / ".config" / "systemd" / "user", ["systemctl", "--user"]),
+            (Path("/etc/systemd/system"), ["systemctl"]),
+        ):
+            for name in ("memento-embedding", "dr-embedding"):
+                subprocess.run([*ctl, "disable", "--now", name], capture_output=True)
+                unit = unit_dir / f"{name}.service"
+                if unit.exists():
+                    try:
+                        unit.unlink()
+                        ok(f"Removed systemd unit: {unit}")
+                    except (PermissionError, OSError) as e:
+                        warn(f"Couldn't remove {unit}: {e}")
     elif IS_WINDOWS:
         for task in ("MementoEmbedding", "DailyReportEmbedding"):
             subprocess.run(
