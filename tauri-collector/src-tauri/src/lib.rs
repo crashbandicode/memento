@@ -26,7 +26,20 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open_item, &pause_item, &resume_item, &quit_item])?;
 
+    // Reuse the bundled app icon (declared in tauri.conf.json bundle.icon[])
+    // for the tray. Without an explicit .icon() call here, Tauri creates a
+    // blank tray icon — which used to coexist alongside the one auto-built
+    // from `app.trayIcon` config, giving us two tray entries on Windows.
+    // The conf.json `trayIcon` block is gone now too, leaving this builder
+    // as the single source of truth.
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+
     let _tray = TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .icon_as_template(true)
         .menu(&menu)
         .tooltip("Memento")
         // Default Tauri behavior shows the menu on left-click too, which
