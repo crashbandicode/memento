@@ -151,19 +151,42 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         await _set_status("failed")
         return 0
 
-    # Clear old embeddings
-    await db.execute(
-        delete(DocumentEmbedding).where(DocumentEmbedding.document_id == doc.id)
+    # Upsert each chunk. Two concurrent post-ingest tasks on the same doc
+    # used to race here: both ran DELETE(doc_embeddings WHERE doc_id=X)
+    # → both saw empty → both INSERT → second one hit the
+    # uq_doc_embedding_chunk unique violation and rolled back the whole
+    # transaction. ON CONFLICT (document_id, chunk_index) DO UPDATE makes
+    # each INSERT idempotent regardless of races, and naturally clobbers
+    # stale chunks when content changes.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    rows = [
+        {
+            "document_id": doc.id,
+            "chunk_index": i,
+            "chunk_text": chunk,
+            "embedding": embedding,
+        }
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+    ]
+    stmt = pg_insert(DocumentEmbedding).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["document_id", "chunk_index"],
+        set_={
+            "chunk_text": stmt.excluded.chunk_text,
+            "embedding": stmt.excluded.embedding,
+        },
     )
+    await db.execute(stmt)
 
-    # Store new
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        db.add(DocumentEmbedding(
-            document_id=doc.id,
-            chunk_index=i,
-            chunk_text=chunk,
-            embedding=embedding,
-        ))
+    # If we ended up with more chunks than this call produced (e.g. older
+    # version of the same doc had more chunks), trim the tail. Same
+    # transaction so concurrent readers never see a half-state.
+    await db.execute(
+        delete(DocumentEmbedding).where(
+            DocumentEmbedding.document_id == doc.id,
+            DocumentEmbedding.chunk_index >= len(chunks),
+        )
+    )
 
     await db.flush()
     await _set_status("ok")
