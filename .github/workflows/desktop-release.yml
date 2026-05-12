@@ -47,18 +47,21 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: "msi nsis"
-          # macOS — both architectures. Apple Silicon is the modern default;
-          # x86_64 Intel covers the older fleet. Both produce .dmg + .app.
-          # NOT code-signed/notarized — users see Gatekeeper "Apple cannot
-          # check for malicious software" warning, bypassed via
-          # right-click → Open. Real signing needs APPLE_CERTIFICATE +
-          # APPLE_NOTARIZATION env + $99/yr Apple Developer account.
+          # macOS Apple Silicon only. Intel Mac (macos-13) dropped — every
+          # Mac shipped since late 2020 is arm64, runners are scarce, and
+          # the .dmg almost doubled total release storage for shrinking
+          # audience. Not code-signed/notarized — Gatekeeper warning
+          # bypassed via right-click → Open (or `xattr -d
+          # com.apple.quarantine /Applications/Memento.app`).
           - os: macos-latest
             target: aarch64-apple-darwin
             bundles: "app dmg"
-          - os: macos-13
-            target: x86_64-apple-darwin
-            bundles: "app dmg"
+          # Linux — AppImage works everywhere, .deb for Ubuntu/Debian.
+          # ubuntu-22.04 pins to glibc 2.35, broadly compatible (newer
+          # ubuntu-24.04 would link 2.39 and break older distros).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: "appimage deb"
 
     runs-on: ${{ matrix.os }}
 
@@ -90,6 +93,21 @@ jobs:
           workspaces: tauri-collector/src-tauri
           # bump if cargo cache gets weirdly stuck
           prefix-key: "v1-${{ matrix.target }}"
+
+      - name: Install Linux system deps (webkit2gtk + tray + AppImage tooling)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            patchelf \
+            file \
+            build-essential
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
