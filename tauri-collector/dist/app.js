@@ -19,11 +19,8 @@ const { listen } = window.__TAURI__.event;
 const { open: openDialog } = window.__TAURI__.dialog;
 const tauriShell = window.__TAURI__.shell;  // tauri-plugin-shell .open(url)
 const tauriApp = window.__TAURI__.app;      // .getVersion()
-
-// Where update-check looks. GitHub Releases API returns "latest" by
-// semver across ALL tags including PyPI v0.0.x ones, so we list and
-// filter for desktop-v* ourselves.
-const RELEASES_URL = "https://api.github.com/repos/ddong8/memento/releases?per_page=30";
+const tauriUpdater = window.__TAURI__.updater; // .check() — Tauri auto-update
+const tauriProcess = window.__TAURI__.process; // .relaunch()
 
 // Same set the Python collector knows about. Keep names in sync with
 // collector/collector/tools/*.py — these are the values used to index
@@ -187,50 +184,61 @@ async function boot() {
   checkForUpdate().catch(() => {});
 }
 
-// ─── Update check ─────────────────────────────────────────────────
+// ─── Update check (Tauri auto-updater) ────────────────────────────
+// Uses tauri-plugin-updater under the hood:
+//   1. Fetches https://github.com/.../releases/latest/download/latest.json
+//   2. Verifies the bundled .sig with our embedded ed25519 pubkey
+//   3. Downloads the signed NSIS installer to a temp dir
+//   4. Runs the installer; on Windows it self-terminates the running app,
+//      replaces files, then we call relaunch()
 async function checkForUpdate() {
   if (sessionStorage.getItem("update_dismissed")) return;
-  const currentVersion = await tauriApp.getVersion();
-  const r = await fetch(RELEASES_URL, {
-    headers: { Accept: "application/vnd.github+json" },
-  });
-  if (!r.ok) return;
-  const releases = await r.json();
-  const desktop = releases
-    .filter((rel) => rel.tag_name?.startsWith("desktop-v") && !rel.draft && !rel.prerelease)
-    .map((rel) => ({ ...rel, version: rel.tag_name.slice("desktop-v".length) }))
-    .sort((a, b) => compareVersions(b.version, a.version));
-  if (desktop.length === 0) return;
-  const latest = desktop[0];
-  if (compareVersions(latest.version, currentVersion) <= 0) return;
-  showUpdateBanner(latest.version, latest.html_url);
-}
-
-function compareVersions(a, b) {
-  const pa = a.split(".").map((x) => parseInt(x, 10) || 0);
-  const pb = b.split(".").map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const da = pa[i] || 0;
-    const db = pb[i] || 0;
-    if (da !== db) return da - db;
+  let update;
+  try {
+    update = await tauriUpdater.check();
+  } catch (e) {
+    console.warn("Update check failed:", e);
+    return;  // network down / signature invalid / endpoint 404 — silent
   }
-  return 0;
+  if (!update?.available) return;
+
+  // Mount the banner first so the user can dismiss without confirming.
+  showUpdateBanner(update.version, async () => {
+    if (!confirm(`Install Memento v${update.version} now? The app will restart automatically.`)) return;
+    const banner = document.getElementById("updateBanner");
+    banner.classList.add("hidden");
+    const status = document.createElement("div");
+    status.className = "update-banner";
+    status.textContent = `Downloading v${update.version}…`;
+    document.body.insertBefore(status, document.body.firstChild);
+    try {
+      await update.downloadAndInstall((event) => {
+        // Tauri 2.x emits {event: 'Started'|'Progress'|'Finished', ...}
+        if (event.event === "Progress") {
+          status.textContent =
+            `Downloading v${update.version}: ${(event.data.chunkLength / 1024 / 1024).toFixed(1)} MB`;
+        } else if (event.event === "Finished") {
+          status.textContent = `Installed v${update.version} — restarting…`;
+        }
+      });
+      await tauriProcess.relaunch();
+    } catch (e) {
+      status.textContent = `Update failed: ${e?.message || e}`;
+    }
+  });
 }
 
-function showUpdateBanner(version, releaseUrl) {
+function showUpdateBanner(version, onInstall) {
   const banner = document.getElementById("updateBanner");
   document.getElementById("updateBannerVersion").textContent = `v${version}`;
   const link = document.getElementById("updateBannerDownload");
-  link.href = releaseUrl;
-  link.addEventListener("click", async (e) => {
-    e.preventDefault();
-    try { await tauriShell.open(releaseUrl); }
-    catch { window.open(releaseUrl, "_blank"); }
-  });
-  document.getElementById("updateBannerDismiss").addEventListener("click", () => {
+  link.textContent = "Install";
+  link.href = "#";
+  link.onclick = (e) => { e.preventDefault(); onInstall(); };
+  document.getElementById("updateBannerDismiss").onclick = () => {
     banner.classList.add("hidden");
     sessionStorage.setItem("update_dismissed", "1");
-  });
+  };
   banner.classList.remove("hidden");
 }
 

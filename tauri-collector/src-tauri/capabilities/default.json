@@ -13,6 +13,8 @@
     "log:default",
     "autostart:default",
     "dialog:default",
+    "updater:default",
+    "process:default",
 
     "shell:default",
     "shell:allow-execute",
