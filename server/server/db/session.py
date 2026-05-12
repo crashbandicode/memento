@@ -11,12 +11,14 @@ from ..config import settings
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
-    # Postgres default max_connections=100. With api + celery_worker +
-    # celery_beat each owning a pool, total has to leave room. 25+25 per
-    # service * 3 services = 150 max < 100 would breach. Keep total per
-    # service ≤ 32 so 3 services + admin/migration < 100.
-    pool_size=20,
-    max_overflow=12,
+    # docker-compose.yml bumps Postgres max_connections to 200, so we have
+    # ~50 connection budget per service across api / celery-worker /
+    # celery-beat + admin/migration headroom. Pool 30+30=60 gives the
+    # ingest semaphore (24 concurrent) breathing room when each ingest
+    # holds a connection 1-3s while waiting on post-ingest queueing,
+    # without starving the every-10s collector heartbeats + command polls.
+    pool_size=30,
+    max_overflow=30,
     pool_recycle=3600,
     pool_timeout=10,  # fail fast instead of stalling user requests 30s
 )
@@ -27,8 +29,8 @@ engine = create_async_engine(
 post_ingest_engine = create_async_engine(
     settings.database_url,
     echo=False,
-    pool_size=8,
-    max_overflow=4,
+    pool_size=12,
+    max_overflow=8,
     pool_recycle=3600,
     pool_timeout=15,
 )
