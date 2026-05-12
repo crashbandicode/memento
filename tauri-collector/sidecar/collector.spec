@@ -4,7 +4,7 @@
 # Tauri's `<triple>` naming convention and drops the binary in
 # ../src-tauri/binaries/.
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
@@ -22,11 +22,28 @@ hidden = (
     # mount time, not by the daemon. Excluded to keep the binary small.
 )
 
+# Packages with mypyc / Cython / Rust compiled artifacts that PyInstaller's
+# static analyzer can't enumerate. `tomli` 2.x ships hash-named mypyc .pyd
+# files on Windows (e.g. 3c22db458360489351e4_mypyc.cp311-win_amd64.pyd);
+# without collect_all the frozen import chain hits ModuleNotFoundError
+# the moment `collector.parsers.toml_parser` is imported.
+extra_datas = []
+extra_binaries = []
+for pkg in ("tomli", "pydantic", "pydantic_core", "watchdog", "cryptography",
+            "httpx", "httpcore"):
+    try:
+        d, b, h = collect_all(pkg)
+        extra_datas.extend(d)
+        extra_binaries.extend(b)
+        hidden.extend(h)
+    except Exception:
+        pass  # Package not installed — skip
+
 a = Analysis(
     ["entry.py"],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=extra_binaries,
+    datas=extra_datas,
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],
