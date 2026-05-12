@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-import tomli
+# Prefer stdlib tomllib (Python 3.11+) — it's a no-op for PyInstaller to
+# bundle (no extension modules) and avoids tomli 2.x's mypyc compiled .pyd
+# that PyInstaller's static analyzer misses, blowing up the frozen binary
+# with `ModuleNotFoundError: No module named '<hash>_mypyc'`.
+if sys.version_info >= (3, 11):
+    import tomllib as tomli  # type: ignore[import-not-found]
+else:
+    import tomli  # type: ignore[import-not-found]
 
 from .base import BaseParser, ParseResult
 

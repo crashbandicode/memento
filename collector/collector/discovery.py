@@ -93,7 +93,11 @@ def discover_codex() -> dict | None:
     config_file = root / "config.toml"
     if config_file.exists():
         try:
-            import tomli
+            import sys
+            if sys.version_info >= (3, 11):
+                import tomllib as tomli  # type: ignore[import-not-found]
+            else:
+                import tomli  # type: ignore[import-not-found]
             data = tomli.loads(config_file.read_text(encoding="utf-8"))
             info["model"] = data.get("model", "")
             for path in data.get("projects", {}):
