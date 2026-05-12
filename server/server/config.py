@@ -42,24 +42,17 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # CORS — which origins the browser is allowed to call the API from.
-    # The default regex covers:
-    #   - localhost / 127.0.0.1 (dev)
-    #   - RFC 1918 private networks (self-hosted LAN: 10.x / 192.168.x /
-    #     172.16-31.x)
-    #   - mem.ihasy.com (the maintainer's public deployment; harmless to
-    #     leave in — it's a literal hostname, not a wildcard)
-    # Users with a different public domain set MEMENTO_CORS_ALLOW_ORIGIN_REGEX
-    # in .env to override.
-    cors_allow_origin_regex: str = (
-        r"https?://("
-        r"localhost(:\d+)?"
-        r"|127\.0\.0\.1(:\d+)?"
-        r"|10\.\d+\.\d+\.\d+(:\d+)?"
-        r"|192\.168\.\d+\.\d+(:\d+)?"
-        r"|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+(:\d+)?"
-        r"|mem\.ihasy\.com"
-        r")"
-    )
+    # Default `.*` accepts ANY origin. Convenient for self-hosted users
+    # who put their server on whatever LAN IP / DDNS hostname / Tailscale
+    # tailnet they happen to have — no .env tweak needed.
+    #
+    # Security caveat: this means any site a logged-in user visits can
+    # make authenticated requests to their Memento API via the user's
+    # browser cookies/JWT. The JWT lives in localStorage (not a cookie),
+    # so it's not auto-sent by the browser, which mitigates most of the
+    # classic CSRF risk — but if you serve this on the public internet,
+    # set MEMENTO_CORS_ALLOW_ORIGIN_REGEX in .env to your domain(s) only.
+    cors_allow_origin_regex: str = r".*"
 
     # Registration control:
     #   open        — anyone can self-register (pending, needs admin approval)
