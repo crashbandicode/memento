@@ -248,7 +248,6 @@ function showUpdateBanner(version, onInstall) {
 function fillForm(cfg) {
   $("#serverUrl").value = cfg.server_url || "";
   $("#serverToken").value = cfg.server_token || "";
-  $("#obsidianPath").value = cfg.obsidian_vault_path || "";
   $("#autoStartDaemon").checked = cfg.auto_start_daemon ?? true;
   $("#autostart").checked = !!cfg.autostart;
 }
@@ -273,7 +272,10 @@ function readForm() {
   return {
     server_url: normalized,
     server_token: $("#serverToken").value.trim(),
-    obsidian_vault_path: $("#obsidianPath").value.trim(),
+    // obsidian_vault_path: removed from UI — collector now auto-discovers
+    // the user's vault from obsidian.json. Keep the value if it was set
+    // previously (advanced override) so existing configs aren't clobbered.
+    obsidian_vault_path: state.config?.obsidian_vault_path || "",
     auto_start_daemon: $("#autoStartDaemon").checked,
     autostart: $("#autostart").checked,
     disabled_tools: state.config?.disabled_tools || [],
@@ -340,14 +342,9 @@ $("#stopBtn").addEventListener("click", async () => {
   }
 });
 
-$("#pickObsidian").addEventListener("click", async () => {
-  try {
-    const picked = await openDialog({ directory: true, multiple: false });
-    if (typeof picked === "string") $("#obsidianPath").value = picked;
-  } catch (e) {
-    flash("err", e.message);
-  }
-});
+// (Obsidian path picker removed in v0.1.9 — the collector reads
+// obsidian.json on startup and auto-discovers the user's most recent
+// vault. Set MEMENTO_OBSIDIAN_VAULT_PATH env to override.)
 
 // ─── Tools tab ────────────────────────────────────────────────────
 function renderToolList() {
