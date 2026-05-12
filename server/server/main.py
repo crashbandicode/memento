@@ -226,10 +226,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS — regex source is settings.cors_allow_origin_regex (see config.py).
+# Self-hosted deployments on LAN IPs (192.168.x / 10.x / 172.16-31.x) are
+# allowed by default; users with a public custom domain set
+# MEMENTO_CORS_ALLOW_ORIGIN_REGEX in .env.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"(https?://localhost:\d+|https?://mem\.ihasy\.com)",
+    allow_origin_regex=settings.cors_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -41,6 +41,26 @@ class Settings(BaseSettings):
     port: int = 8000
     debug: bool = False
 
+    # CORS — which origins the browser is allowed to call the API from.
+    # The default regex covers:
+    #   - localhost / 127.0.0.1 (dev)
+    #   - RFC 1918 private networks (self-hosted LAN: 10.x / 192.168.x /
+    #     172.16-31.x)
+    #   - mem.ihasy.com (the maintainer's public deployment; harmless to
+    #     leave in — it's a literal hostname, not a wildcard)
+    # Users with a different public domain set MEMENTO_CORS_ALLOW_ORIGIN_REGEX
+    # in .env to override.
+    cors_allow_origin_regex: str = (
+        r"https?://("
+        r"localhost(:\d+)?"
+        r"|127\.0\.0\.1(:\d+)?"
+        r"|10\.\d+\.\d+\.\d+(:\d+)?"
+        r"|192\.168\.\d+\.\d+(:\d+)?"
+        r"|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+(:\d+)?"
+        r"|mem\.ihasy\.com"
+        r")"
+    )
+
     # Registration control:
     #   open        — anyone can self-register (pending, needs admin approval)
     #   invite_only — must provide a valid invite_code at registration
