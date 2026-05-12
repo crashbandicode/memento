@@ -30,7 +30,12 @@ name: Release to PyPI
 on:
   push:
     tags:
-      - "v*"
+      # PyPI releases use `pypi-v*` prefix to leave the bare `v*` namespace
+      # for the desktop app (`desktop-release.yml`). Bump example:
+      #   git tag pypi-v0.0.10 && git push --tags
+      # The same version must be set in collector/mcp_server/memento_brain
+      # pyproject.toml beforehand — verify-version below fails fast otherwise.
+      - "pypi-v*"
 
 concurrency:
   group: release-${{ github.ref }}
@@ -46,17 +51,17 @@ jobs:
       - uses: actions/checkout@v4
       - id: extract
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME#pypi-v}"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
           echo "Tag version: $TAG"
       - name: Check pyproject versions all match tag
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME#pypi-v}"
           fail=0
           for pkg in collector mcp_server memento_brain; do
             ver=$(grep -E '^version = ' "$pkg/pyproject.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
             if [ "$ver" != "$TAG" ]; then
-              echo "::error::$pkg/pyproject.toml has version=$ver but tag is v$TAG"
+              echo "::error::$pkg/pyproject.toml has version=$ver but tag is pypi-v$TAG"
               fail=1
             else
               echo "✓ $pkg → $ver"

@@ -99,17 +99,16 @@ tag (or trigger manually) and grab the `.msi`/`.exe` from the workflow.
 
 ```sh
 # From your dev machine
-git tag desktop-v0.1.0
-git push origin desktop-v0.1.0
+git tag v0.1.19
+git push origin v0.1.19
 ```
 
 The workflow builds the PyInstaller sidecar, runs `cargo tauri build`,
-and uploads `Memento_*.msi` + `Memento_*-setup.exe` as a new GitHub
-Release tagged `desktop-v0.1.0`.
+and uploads `Memento_*.msi` / `.exe` / `.dmg` / `.AppImage` as a new
+GitHub Release tagged `v0.1.19`.
 
-The `desktop-v*` tag namespace is **separate** from the `v*` PyPI
-release tags (`release.yml`), so you can ship desktop installers
-independently of collector/MCP server PyPI releases.
+PyPI releases live under `pypi-v*` (see `release.yml`) so they don't
+collide with this workflow.
 
 #### Trigger a build without releasing
 
