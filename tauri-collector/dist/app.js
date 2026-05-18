@@ -269,8 +269,13 @@ function showUpdateBanner(version, onInstall) {
   banner.classList.remove("hidden");
 }
 
+// Default to the public hosted instance so the common path is:
+// register on mem.ihasy.com → copy token → open app (URL already
+// filled) → paste token → Save. Self-hosters just overwrite it.
+const DEFAULT_SERVER_URL = "https://mem.ihasy.com";
+
 function fillForm(cfg) {
-  $("#serverUrl").value = cfg.server_url || "";
+  $("#serverUrl").value = cfg.server_url || DEFAULT_SERVER_URL;
   $("#serverToken").value = cfg.server_token || "";
   $("#autoStartDaemon").checked = cfg.auto_start_daemon ?? true;
   $("#autostart").checked = !!cfg.autostart;
