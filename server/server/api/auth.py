@@ -106,9 +106,14 @@ async def register(
         user_status = "active"
         token = secrets.token_hex(32)
     else:
-        # Open self-register: pending, needs admin approval
-        role, user_status = "pending", "pending"
-        token = None
+        # Open self-register: instant active + token, NO admin gate.
+        # The "register → wait for admin → approve → then fetch token"
+        # round-trip was the #1 onboarding complaint. `open` now means
+        # genuinely open — you self-register and immediately get a
+        # collector token to start syncing. Operators who want a human
+        # gate set registration_mode = invite_only (or closed).
+        role, user_status = "viewer", "active"
+        token = secrets.token_hex(32)
 
     user = User(
         email=req.email,

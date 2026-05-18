@@ -48,16 +48,22 @@ export default function RegisterPage() {
   };
 
   if (registered) {
-    const isOwner = registered.role === "owner" && registered.status === "active" && !!registered.collector_token;
+    // Show the collector-token panel whenever the server handed one back
+    // — that now covers owner (first user), invite-accepted users, AND
+    // open self-register (which is instant-active since the approval gate
+    // was removed). Only a still-"pending" account (operator set
+    // registration_mode without auto-token) falls through to the
+    // wait-for-approval message.
+    const hasToken = registered.status === "active" && !!registered.collector_token;
     return (
-      <Wrap wide={isOwner}>
-        <div style={{ textAlign: isOwner ? "left" : "center" }}>
+      <Wrap wide={hasToken}>
+        <div style={{ textAlign: hasToken ? "left" : "center" }}>
           <div
             style={{
               width: 56, height: 56, borderRadius: 16,
               background: "linear-gradient(135deg,#10B981,#34D399)",
               display: "flex", alignItems: "center", justifyContent: "center",
-              margin: isOwner ? "0 0 16px" : "0 auto 16px",
+              margin: hasToken ? "0 0 16px" : "0 auto 16px",
               boxShadow: "0 12px 40px -10px rgba(16,185,129,0.5)",
             }}
           >
@@ -66,10 +72,10 @@ export default function RegisterPage() {
           <h2 style={{ margin: 0, fontSize: 22, fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.03em" }}>
             {t.auth.registerSuccess}
           </h2>
-          {isOwner ? (
+          {hasToken ? (
             <>
               <p style={{ fontSize: 13, color: "var(--aurora-fg2)", margin: "10px 0 4px", fontWeight: 500 }}>
-                {t.auth.ownerWelcome}
+                {registered.role === "owner" ? t.auth.ownerWelcome : t.auth.memberWelcome}
               </p>
               <p style={{ fontSize: 12, color: "var(--aurora-fg3)", margin: "0 0 18px" }}>
                 {t.auth.tokenSaveHint}
