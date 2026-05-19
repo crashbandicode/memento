@@ -1,6 +1,6 @@
 [package]
 name = "memento-app"
-version = "0.1.20"
+version = "0.1.21"
 description = "Memento desktop — manages the local collector daemon"
 authors = ["ddong8"]
 license = "AGPL-3.0-only"
@@ -27,6 +27,9 @@ tauri-plugin-process = "2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# In-app register/login HTTP. rustls (not native-tls) so Windows/Linux CI
+# cross-builds don't need OpenSSL headers.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml_edit = "0.22"   # Codex stores MCP config as TOML; toml_edit preserves user comments + formatting
 tokio = { version = "1", features = ["full"] }
 

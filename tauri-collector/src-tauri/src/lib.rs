@@ -4,6 +4,7 @@
 // today but Cargo.toml declares `[lib]` to match this convention, so
 // `cargo metadata` rejects the crate without lib.rs.
 
+mod auth;
 mod config;
 mod ipc;
 mod mcp_configs;
@@ -198,6 +199,7 @@ pub fn run() {
             ipc::sidecar_start,
             ipc::sidecar_stop,
             ipc::detect_legacy_install,
+            auth::auth_request,
         ])
         .on_window_event(|window, event| {
             // Intercept "close window" (X button / Cmd-W / Alt-F4) — hide

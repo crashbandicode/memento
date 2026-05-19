@@ -53,10 +53,17 @@ function activateTab(name) {
   const panel = document.querySelector(`.panel[data-panel="${name}"]`);
   if (tab) tab.classList.add("active");
   if (panel) panel.classList.add("active");
-  // Dashboard runs in fullscreen mode — hides topbar + tabs, gives the
-  // iframe the whole window minus its toolbar.
-  document.body.classList.toggle("dashboard-fullscreen", name === "dashboard");
-  if (name === "dashboard") openDashboard();
+  // Dashboard runs in fullscreen mode (hides topbar + tabs) ONLY when a
+  // server is actually configured and the iframe is shown. In the empty
+  // state we must keep the tabs visible — otherwise the back button (which
+  // lives inside the hidden iframe toolbar) is gone too and the user is
+  // trapped with no way back to the Server tab. openDashboard() owns the
+  // fullscreen decision; every other tab exits fullscreen.
+  if (name === "dashboard") {
+    openDashboard();
+  } else {
+    document.body.classList.remove("dashboard-fullscreen");
+  }
 }
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -64,6 +71,9 @@ document.querySelectorAll(".tab").forEach((tab) => {
 });
 
 document.getElementById("dashboardBackToSettings")?.addEventListener("click", () => {
+  activateTab("server");
+});
+document.getElementById("dashboardEmptyToServer")?.addEventListener("click", () => {
   activateTab("server");
 });
 
@@ -97,10 +107,13 @@ function openDashboard() {
   if (!apiUrl) {
     empty.style.display = "block";
     frame.classList.add("hidden");
+    // Not configured yet — stay windowed so the tabs remain reachable.
+    document.body.classList.remove("dashboard-fullscreen");
     return;
   }
   empty.style.display = "none";
   frame.classList.remove("hidden");
+  document.body.classList.add("dashboard-fullscreen");
   const target = `${deriveWebUrl(apiUrl)}/app`;
   if (iframe.src !== target) {
     iframe.src = target;
@@ -370,6 +383,61 @@ $("#stopBtn").addEventListener("click", async () => {
     flash("err", e.message);
   }
 });
+
+// ─── In-app register / login ──────────────────────────────────────
+// So the user never has to open a browser: the Rust side (auth.rs) hits
+// the server's /api/auth/{register,login} endpoints and hands back a
+// collector token, which we fill in + save + launch like a manual paste.
+async function runAuth(mode) {
+  const serverUrl = normalizeApiUrl($("#serverUrl").value);
+  if (!serverUrl) return flash("err", t("auth.needUrl"));
+  const email = $("#authEmail").value.trim();
+  const password = $("#authPassword").value;
+  if (!email || !password) return flash("err", t("auth.needCreds"));
+  const invite = $("#authInvite").value.trim();
+
+  const btns = [$("#authRegisterBtn"), $("#authLoginBtn"), $("#saveBtn")];
+  btns.forEach((b) => (b.disabled = true));
+  flash("ok", t("auth.working"));
+  try {
+    const res = await invoke("auth_request", {
+      args: {
+        server_url: serverUrl,
+        mode,
+        email,
+        password,
+        name: null,
+        invite_code: invite || null,
+      },
+    });
+    // Reflect what the server accepted (URL may have been normalized).
+    $("#serverUrl").value = res.server_url || serverUrl;
+    $("#serverToken").value = res.collector_token;
+    $("#authPassword").value = "";
+
+    const cfg = readForm();
+    await invoke("save_config", { cfg });
+    state.config = cfg;
+    try {
+      await invoke("configure_mcp", {
+        serverUrl: cfg.server_url,
+        serverToken: cfg.server_token,
+      });
+    } catch (e) {
+      console.warn("configure_mcp failed:", e);
+    }
+    flash("ok", mode === "register" ? t("auth.okRegistered") : t("auth.okLoggedIn"));
+    try { await invoke("sidecar_start"); } catch (e) { console.warn("sidecar_start:", e); }
+    setTimeout(() => activateTab("dashboard"), 600);
+  } catch (e) {
+    flash("err", e?.message || String(e));
+  } finally {
+    btns.forEach((b) => (b.disabled = false));
+  }
+}
+
+$("#authRegisterBtn").addEventListener("click", () => runAuth("register"));
+$("#authLoginBtn").addEventListener("click", () => runAuth("login"));
 
 // (Obsidian path picker removed in v0.1.9 — the collector reads
 // obsidian.json on startup and auto-discovers the user's most recent

@@ -73,6 +73,27 @@
         <p class="hint" data-i18n="field.token.hint">Get this from Settings → Users → Reset collector token on the web UI.</p>
       </div>
 
+      <details class="auth-box" id="authBox">
+        <summary data-i18n="auth.or">No token? Register or sign in here — no browser needed</summary>
+        <div class="field">
+          <input type="text" id="authEmail" inputmode="email" autocomplete="username"
+                 data-i18n-attr="placeholder:auth.email" placeholder="Email" />
+        </div>
+        <div class="field">
+          <input type="password" id="authPassword" autocomplete="current-password"
+                 data-i18n-attr="placeholder:auth.password" placeholder="Password" />
+        </div>
+        <div class="field">
+          <input type="text" id="authInvite" autocomplete="off"
+                 data-i18n-attr="placeholder:auth.invite" placeholder="Invite code (optional)" />
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="authRegisterBtn" data-i18n="auth.register">Register &amp; get token</button>
+          <button class="btn" id="authLoginBtn" data-i18n="auth.login">Sign in &amp; get token</button>
+        </div>
+        <p class="hint" data-i18n="auth.hint">We fill the token in for you and start syncing — fill the Server URL above first.</p>
+      </details>
+
       <div class="field">
         <label class="toggle">
           <input type="checkbox" id="autoStartDaemon" />
@@ -96,6 +117,7 @@
     <section class="panel" data-panel="dashboard">
       <div id="dashboardEmpty" class="dashboard-empty">
         <p data-i18n="dashboard.empty">Configure the server URL on the Server tab, then come back here to see the dashboard.</p>
+        <button class="btn primary" id="dashboardEmptyToServer" data-i18n="dashboard.toServer">⚙ Go to Server settings</button>
       </div>
       <div id="dashboardFrame" class="dashboard-frame hidden">
         <div class="dashboard-toolbar">
