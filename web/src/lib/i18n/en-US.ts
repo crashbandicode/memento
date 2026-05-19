@@ -412,6 +412,18 @@ const enUS: Translations = {
     install_copied: "Copied",
     install_note: "Generates random secrets, brings up the Docker stack, creates the first user, installs the collector. Requires Docker + Python 3.11+.",
 
+    desktop_title: "Desktop app",
+    desktop_sub: "Prefer a GUI? Grab the app — bundled collector + MCP, no Python, auto-updating",
+    desktop_macos: "macOS",
+    desktop_windows: "Windows",
+    desktop_linux: "Linux",
+    desktop_macos_ext: ".dmg (Apple Silicon)",
+    desktop_windows_ext: ".exe (installer)",
+    desktop_linux_ext: ".AppImage / .deb",
+    desktop_btn: "Download",
+    desktop_note: "On first launch, open the Server tab and enter your server URL + token (no account? register right in the app) — no browser needed. CLI users can keep using the pip method below.",
+
+    footer_download: "Download app",
     footer_tagline: "A shared brain for your AI coding tools · Local-first · Open source",
     footer_docs: "Docs",
     footer_api: "API reference",

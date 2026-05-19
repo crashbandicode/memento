@@ -218,6 +218,28 @@ Optional commands:
 
 ## 💻 Adding more devices
 
+Connect every Mac / Windows / Linux box where you use AI tools. Two ways:
+
+### Option 1: Desktop app (recommended)
+
+No command line, no Python on the machine — just grab the app. It **bundles the collector + MCP sidecar** (frozen, no Python needed), auto-updates, and lives in the system tray.
+
+**[⬇️ Download the latest release from GitHub](https://github.com/ddong8/memento/releases/latest)**
+
+| Platform | Installer |
+|---|---|
+| **macOS** (Apple Silicon) | `.dmg` — drag into Applications |
+| **Windows** | `.exe` — NSIS installer |
+| **Linux** | `.AppImage` (run directly) or `.deb` (`sudo dpkg -i`) |
+
+First launch: on the **Server** tab enter your server URL + collector token → **Save** → **Start collector**. No account? Register right inside the app — no browser needed. The client checks for updates and prompts you to install them automatically.
+
+> If macOS says it "can't verify the developer", right-click the icon → Open, or run `xattr -dr com.apple.quarantine /Applications/Memento.app`.
+
+### Option 2: Command line (pip)
+
+For servers / headless / CLI-first setups:
+
 ```bash
 pip install memento-brain-collector   # collector only
 # or pip install memento-brain         # bundles collector + MCP memory together
@@ -230,6 +252,7 @@ memento-collector setup                # interactive: server URL + token
 
 - **Ran `./install.sh`** → printed at the end and stored in `.env.local`
 - **Web register** → `/auth/register`; the first user is auto-owner and the token is shown immediately. Later you can grab it from the avatar menu → Profile.
+- **Desktop app** → use "Register new account" on the Server tab; the token is filled in for you on success.
 
 ### Daemon control
 

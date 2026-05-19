@@ -218,6 +218,28 @@ git clone https://github.com/ddong8/memento.git && cd memento
 
 ## 💻 在额外设备上接入
 
+把你日常用 AI 工具的每台 Mac / Windows / Linux 接到服务端,有两种方式:
+
+### 方式一:桌面客户端(推荐)
+
+不想碰命令行、机器上没装 Python 的,直接下客户端 —— **内置采集器 + MCP sidecar**(冻结打包,无需 Python),自动更新,系统托盘常驻。
+
+**[⬇️ 前往 GitHub Releases 下载最新版](https://github.com/ddong8/memento/releases/latest)**
+
+| 平台 | 安装包 |
+|---|---|
+| **macOS**(Apple Silicon) | `.dmg` — 拖进 Applications 即可 |
+| **Windows** | `.exe` — NSIS 安装版 |
+| **Linux** | `.AppImage`(直接跑)或 `.deb`(`sudo dpkg -i`) |
+
+首次打开:**Server** 标签填服务器地址 + collector token → **Save** → **Start collector**。没有账号可以直接在 app 内注册,全程不用开浏览器。客户端会在升级时自动检查并提示安装。
+
+> macOS 首次打开若提示"无法验证开发者",右键图标 → 打开,或 `xattr -dr com.apple.quarantine /Applications/Memento.app`。
+
+### 方式二:命令行(pip)
+
+适合服务器 / headless / 习惯 CLI 的环境:
+
 ```bash
 pip install memento-brain-collector   # 只装采集器
 # 或 pip install memento-brain         # 一并装齐 collector + MCP memory
@@ -230,6 +252,7 @@ memento-collector setup                # 交互式填 URL + token
 
 - **跑过 `./install.sh`** → 末尾会打印,同时存到 `.env.local`
 - **Web 注册** → `/auth/register` 第一个用户自动 owner + 显示 token;之后任意时刻头像 → 个人资料
+- **桌面客户端** → Server 标签直接"注册新账号",成功后自动填好 token
 
 ### 守护进程
 

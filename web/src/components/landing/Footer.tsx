@@ -30,6 +30,9 @@ export function Footer() {
           <FooterLink href="https://github.com/ddong8/memento">
             {t.landing.footer_github}
           </FooterLink>
+          <FooterLink href="https://github.com/ddong8/memento/releases/latest">
+            {t.landing.footer_download}
+          </FooterLink>
           <FooterLink href="/install">{t.landing.footer_install}</FooterLink>
           <FooterLink href="/docs">{t.landing.footer_api}</FooterLink>
         </div>

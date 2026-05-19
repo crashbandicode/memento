@@ -426,6 +426,18 @@ const zhCN = {
     install_copied: "已复制",
     install_note: "脚本会生成随机密钥、起 Docker 栈、建首用户、装采集器。需要 Docker + Python 3.11+",
 
+    desktop_title: "桌面客户端",
+    desktop_sub: "不想碰命令行?下载客户端 —— 内置采集器 + MCP,免装 Python,自动更新",
+    desktop_macos: "macOS",
+    desktop_windows: "Windows",
+    desktop_linux: "Linux",
+    desktop_macos_ext: ".dmg (Apple Silicon)",
+    desktop_windows_ext: ".exe (安装版)",
+    desktop_linux_ext: ".AppImage / .deb",
+    desktop_btn: "下载",
+    desktop_note: "首次打开在 Server 标签填服务器地址 + token(没有账号可直接在 app 内注册)即可开始采集,全程不开浏览器。习惯命令行的可继续用下方 pip 方式。",
+
+    footer_download: "下载客户端",
     footer_tagline: "给你的 AI 工具建个共享大脑 · 本地优先 · 开源",
     footer_docs: "文档",
     footer_api: "API 文档",
