@@ -1,17 +1,12 @@
 "use client";
 
-import { useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { useI18n } from "@/lib/i18n";
-import { api } from "@/lib/api-client";
 import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
-import { TokenDisplay } from "@/components/TokenDisplay";
 
 export default function ProfilePage() {
-  const { user, token, setUser, logout } = useAuth();
+  const { user, logout } = useAuth();
   const { t } = useI18n();
-  const [rotating, setRotating] = useState(false);
-  const [notice, setNotice] = useState("");
 
   if (!user) {
     return (
@@ -20,22 +15,6 @@ export default function ProfilePage() {
       </div>
     );
   }
-
-  const handleRotate = async () => {
-    if (!token) return;
-    if (!confirm(t.profile.rotateConfirm)) return;
-    setRotating(true);
-    setNotice("");
-    try {
-      const fresh = await api.rotateCollectorToken(token);
-      setUser(fresh);
-      setNotice(t.profile.rotateSuccess);
-    } catch (err: unknown) {
-      setNotice(err instanceof Error ? err.message : "error");
-    } finally {
-      setRotating(false);
-    }
-  };
 
   return (
     <div className="max-w-2xl mx-auto">
@@ -53,39 +32,6 @@ export default function ProfilePage() {
           label={t.profile.status}
           valueNode={<Chip tone={user.status === "active" ? "success" : "warn"}>{user.status}</Chip>}
         />
-      </Glass>
-
-      <SectionLabel>{t.profile.collectorToken}</SectionLabel>
-      <Glass padding={22} radius={20} style={{ marginBottom: 20 }}>
-        {user.collector_token ? (
-          <>
-            <TokenDisplay token={user.collector_token} maskByDefault={true} />
-            <p style={{ fontSize: 12, color: "var(--aurora-fg4)", marginTop: 14, lineHeight: 1.55 }}>
-              {t.profile.rotateHint}
-            </p>
-            <div style={{ marginTop: 12 }}>
-              <Btn size="sm" icon="refresh" onClick={handleRotate} disabled={rotating}>
-                {rotating ? "…" : t.profile.rotate}
-              </Btn>
-            </div>
-          </>
-        ) : (
-          <p style={{ fontSize: 13, color: "var(--aurora-fg3)" }}>{t.profile.noToken}</p>
-        )}
-        {notice && (
-          <div
-            style={{
-              marginTop: 14,
-              padding: "8px 12px",
-              borderRadius: 10,
-              background: "rgba(16,185,129,0.10)",
-              color: "#065F46",
-              fontSize: 12,
-            }}
-          >
-            {notice}
-          </div>
-        )}
       </Glass>
 
       <div style={{ textAlign: "right" }}>

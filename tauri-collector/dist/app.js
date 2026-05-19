@@ -315,7 +315,6 @@ const DEFAULT_SERVER_URL = "https://mem.ihasy.com";
 
 function fillForm(cfg) {
   $("#serverUrl").value = cfg.server_url || DEFAULT_SERVER_URL;
-  $("#serverToken").value = cfg.server_token || "";
   $("#autoStartDaemon").checked = cfg.auto_start_daemon ?? true;
   $("#autostart").checked = cfg.autostart ?? true;
 }
@@ -339,7 +338,9 @@ function readForm() {
   }
   return {
     server_url: normalized,
-    server_token: $("#serverToken").value.trim(),
+    // Token is never shown/edited in the UI anymore — it's assigned
+    // invisibly on register/login and only lives in the saved config.
+    server_token: state.config?.server_token || "",
     // obsidian_vault_path: removed from UI — collector now auto-discovers
     // the user's vault from obsidian.json. Keep the value if it was set
     // previously (advanced override) so existing configs aren't clobbered.
@@ -420,7 +421,6 @@ async function runAuth(mode) {
   const email = $("#authEmail").value.trim();
   const password = $("#authPassword").value;
   if (!email || !password) return flash("err", t("auth.needCreds"));
-  const invite = $("#authInvite").value.trim();
 
   const btns = [$("#authRegisterBtn"), $("#authLoginBtn"), $("#saveBtn")];
   btns.forEach((b) => (b.disabled = true));
@@ -433,13 +433,15 @@ async function runAuth(mode) {
         email,
         password,
         name: null,
-        invite_code: invite || null,
+        invite_code: null,
       },
     });
     // Reflect what the server accepted (URL may have been normalized).
     $("#serverUrl").value = res.server_url || serverUrl;
-    $("#serverToken").value = res.collector_token;
     $("#authPassword").value = "";
+    // Token is assigned silently — stash it in state so readForm() picks
+    // it up; there is no token input in the UI anymore.
+    state.config = { ...(state.config || {}), server_token: res.collector_token };
 
     const cfg = readForm();
     await invoke("save_config", { cfg });
