@@ -71,6 +71,37 @@ async fn error_detail(resp: reqwest::Response) -> String {
     format!("HTTP {status}")
 }
 
+/// Exchange the saved collector token for a short-lived web JWT so the
+/// embedded dashboard can be opened already-authenticated (no second
+/// login). Hits /api/auth/token-exchange, which any per-user collector
+/// token can call. Minted fresh on every dashboard open so expiry is a
+/// non-issue.
+#[tauri::command]
+pub async fn mint_web_token(server_url: String, collector_token: String) -> Result<String, CmdError> {
+    let base = normalize_api_url(&server_url);
+    if base.is_empty() || collector_token.is_empty() {
+        return Err(CmdError {
+            message: "Server URL or token missing".into(),
+        });
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(concat!("memento-app/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let resp = client
+        .post(format!("{base}/api/auth/token-exchange"))
+        .header("X-Collector-Token", collector_token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(CmdError {
+            message: error_detail(resp).await,
+        });
+    }
+    let tok: TokenResponse = resp.json().await?;
+    Ok(tok.access_token)
+}
+
 #[tauri::command]
 pub async fn auth_request(args: AuthArgs) -> Result<AuthResult, CmdError> {
     let base = normalize_api_url(&args.server_url);

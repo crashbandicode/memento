@@ -98,8 +98,9 @@ function deriveWebUrl(apiUrl) {
   return base;
 }
 
-function openDashboard() {
+async function openDashboard() {
   const apiUrl = (state.config?.server_url || "").trim();
+  const token = (state.config?.server_token || "").trim();
   const empty = document.getElementById("dashboardEmpty");
   const frame = document.getElementById("dashboardFrame");
   const iframe = document.getElementById("dashboardIframe");
@@ -114,19 +115,44 @@ function openDashboard() {
   empty.style.display = "none";
   frame.classList.remove("hidden");
   document.body.classList.add("dashboard-fullscreen");
-  const target = `${deriveWebUrl(apiUrl)}/app`;
-  if (iframe.src !== target) {
-    iframe.src = target;
+  const webBase = deriveWebUrl(apiUrl);
+  // Show the clean /app URL (never the token-bearing handoff URL).
+  urlEl.textContent = `${webBase}/app`;
+
+  // Already loaded for this server — don't re-mint + reload every time
+  // the user flips back to the Dashboard tab.
+  if (state.dashboardLoadedFor === apiUrl && iframe.src && iframe.src !== "about:blank") {
+    return;
   }
-  urlEl.textContent = target;
+
+  // Single sign-on: mint a fresh web JWT from the saved collector token
+  // and load the dashboard through the web app's /auth/handoff route so
+  // the user isn't asked to log in a second time. If minting fails
+  // (offline / old server without the route) fall back to /app, which
+  // just shows the normal web login.
+  let target = `${webBase}/app`;
+  if (token) {
+    try {
+      const jwt = await invoke("mint_web_token", {
+        serverUrl: apiUrl,
+        collectorToken: token,
+      });
+      if (jwt) target = `${webBase}/auth/handoff#token=${encodeURIComponent(jwt)}`;
+    } catch (e) {
+      console.warn("mint_web_token failed — dashboard will ask for login:", e);
+    }
+  }
+  iframe.src = target;
+  state.dashboardLoadedFor = apiUrl;
 }
 
 document.getElementById("dashboardReload")?.addEventListener("click", () => {
   const iframe = document.getElementById("dashboardIframe");
-  // Re-assigning src forces a fresh load even if it's the same URL.
-  const current = iframe.src;
   iframe.src = "about:blank";
-  setTimeout(() => { iframe.src = current; }, 50);
+  // Force a full re-mint (the previous JWT may have expired) by clearing
+  // the "already loaded" marker, then re-run the SSO open flow.
+  state.dashboardLoadedFor = null;
+  setTimeout(() => { openDashboard(); }, 50);
 });
 
 document.getElementById("dashboardOpenExternal")?.addEventListener("click", async () => {

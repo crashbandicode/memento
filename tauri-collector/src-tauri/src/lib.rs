@@ -200,6 +200,7 @@ pub fn run() {
             ipc::sidecar_stop,
             ipc::detect_legacy_install,
             auth::auth_request,
+            auth::mint_web_token,
         ])
         .on_window_event(|window, event| {
             // Intercept "close window" (X button / Cmd-W / Alt-F4) — hide

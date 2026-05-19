@@ -18,7 +18,7 @@ interface AuthState {
 const AuthContext = createContext<AuthState | null>(null);
 
 /** Routes that don't require authentication — landing and auth pages. */
-const PUBLIC_PATHS = ["/", "/auth/login", "/auth/register"];
+const PUBLIC_PATHS = ["/", "/auth/login", "/auth/register", "/auth/handoff"];
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
