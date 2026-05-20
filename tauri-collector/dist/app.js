@@ -151,11 +151,21 @@ async function openDashboard() {
 
 document.getElementById("dashboardReload")?.addEventListener("click", () => {
   const iframe = document.getElementById("dashboardIframe");
-  iframe.src = "about:blank";
-  // Force a full re-mint (the previous JWT may have expired) by clearing
-  // the "already loaded" marker, then re-run the SSO open flow.
-  state.dashboardLoadedFor = null;
-  setTimeout(() => { openDashboard(); }, 50);
+  // Just refresh the current iframe page — same origin (allow-same-origin
+  // is set), so we keep the user on whatever sub-page they were on, their
+  // JWT stays in localStorage, and we avoid a re-mint + SSO handoff round
+  // trip. The old behavior would forcibly navigate the iframe through
+  // /auth/handoff, which on a prod server with an out-of-date web build
+  // (no /auth/handoff route + AuthProvider that doesn't whitelist it)
+  // ends up bouncing the user to /auth/login — looking like a logout.
+  try {
+    iframe.contentWindow?.location.reload();
+  } catch {
+    // Cross-origin / window disposed — fall back to the full re-open
+    // flow (this will mint a fresh web JWT and SSO back in).
+    state.dashboardLoadedFor = null;
+    openDashboard();
+  }
 });
 
 document.getElementById("dashboardOpenExternal")?.addEventListener("click", async () => {
