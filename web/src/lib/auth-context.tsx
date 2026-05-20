@@ -20,6 +20,34 @@ const AuthContext = createContext<AuthState | null>(null);
 /** Routes that don't require authentication — landing and auth pages. */
 const PUBLIC_PATHS = ["/", "/auth/login", "/auth/register", "/auth/handoff"];
 
+/// Post the user's collector token to the parent window (the Memento
+/// desktop app) so it can configure + start the collector daemon. Only
+/// fires when we know we're embedded by the desktop client: the URL
+/// carries `?embed=memento` on first arrival, persisted via
+/// sessionStorage so it survives the login redirect chain.
+function maybePostTokenToDesktop(collectorToken: string | null | undefined) {
+  if (typeof window === "undefined" || !collectorToken) return;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("embed") === "memento") {
+      sessionStorage.setItem("memento_embed", "1");
+    }
+    if (sessionStorage.getItem("memento_embed") !== "1") return;
+    if (window.parent && window.parent !== window) {
+      // targetOrigin "*": the parent is the desktop's tauri:// custom
+      // protocol whose origin we can't reliably know — token also lives
+      // in this iframe's localStorage so this hand-off doesn't widen
+      // exposure beyond what the iframe itself already has.
+      window.parent.postMessage(
+        { type: "memento:token", collector_token: collectorToken },
+        "*",
+      );
+    }
+  } catch {
+    /* sessionStorage / postMessage unavailable — silent */
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
   // Lazy-init token from localStorage — avoids setState-in-effect rule and
@@ -35,6 +63,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
   const pathname = usePathname();
   const router = useRouter();
+
+  // Sticky embed marker: the desktop loads the iframe with ?embed=memento
+  // on the first request, but AuthProvider's redirect to /auth/login
+  // strips query params. Stash it in sessionStorage on mount so login /
+  // register success can still tell whether to post the token back.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("embed") === "memento") {
+      try { sessionStorage.setItem("memento_embed", "1"); } catch { /* noop */ }
+    }
+  }, []);
 
   useEffect(() => {
     // Only fetch /me if we have a token carried over from a previous session.
@@ -68,6 +108,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("dr_token", res.access_token);
     const me = await api.getMe(res.access_token);
     setUser(me);
+    // Desktop hand-off: when the web is loaded inside the Memento
+    // desktop client's dashboard iframe, mark sessionStorage on first
+    // visit (?embed=memento) and on every login success post the
+    // collector token back to the parent window so the desktop can
+    // configure + start the collector daemon.
+    maybePostTokenToDesktop(me.collector_token);
   };
 
   const register = async (email: string, password: string, name?: string, inviteCode?: string) => {

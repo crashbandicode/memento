@@ -125,12 +125,15 @@ async function openDashboard() {
     return;
   }
 
-  // Single sign-on: mint a fresh web JWT from the saved collector token
-  // and load the dashboard through the web app's /auth/handoff route so
-  // the user isn't asked to log in a second time. If minting fails
-  // (offline / old server without the route) fall back to /app, which
-  // just shows the normal web login.
-  let target = `${webBase}/app`;
+  // Two paths into the dashboard:
+  //   1. We already have a token — mint a fresh web JWT and SSO through
+  //      /auth/handoff so the iframe lands on /app logged-in.
+  //   2. First-time / no token — load /app?embed=memento so the web's
+  //      login flow knows it's embedded by us and will postMessage the
+  //      collector token back after the user authenticates (see the
+  //      message listener below). The /app route will redirect to
+  //      /auth/login, which preserves the embed marker via sessionStorage.
+  let target = `${webBase}/app?embed=memento`;
   if (token) {
     try {
       const jwt = await invoke("mint_web_token", {
@@ -351,98 +354,50 @@ function readForm() {
   };
 }
 
-// ─── Server tab actions ───────────────────────────────────────────
+// ─── Server tab — only action is Save ─────────────────────────────
+// The minimal flow: user fills the server URL (+ optional toggles) and
+// hits Save. Save persists the config + jumps to the Dashboard tab,
+// where the embedded web login/register happens. Once the user logs in
+// inside that iframe the web posts the collector token back to the
+// desktop via window.postMessage (see the listener below), and only
+// then is the collector daemon configured + started.
 $("#saveBtn").addEventListener("click", async () => {
   const cfg = readForm();
   try {
     await invoke("save_config", { cfg });
     state.config = cfg;
-    // Also configure MCP server entries in every AI tool's config that
-    // exists on disk. Best-effort — missing tool configs are silently
-    // skipped; existing entries for other MCP servers are preserved.
-    let mcpMsg = "";
-    if (cfg.server_url && cfg.server_token) {
-      try {
-        const report = await invoke("configure_mcp", {
-          serverUrl: cfg.server_url,
-          serverToken: cfg.server_token,
-        });
-        if (report.configured?.length) {
-          mcpMsg = `· ${t("save.mcpConfigured")} ${report.configured.join(", ")}`;
-        }
-      } catch (e) {
-        console.warn("configure_mcp failed:", e);
-      }
-    }
-    flash("ok", `${t("save.ok")}${mcpMsg ? " " + mcpMsg : ""}`);
-    // Once they have a server URL configured, jump them straight to the
-    // dashboard — they're done configuring, they want to see their data.
-    if (cfg.server_url && cfg.server_token) {
-      setTimeout(() => activateTab("dashboard"), 400);
-    }
+    flash("ok", t("save.ok"));
+    // Always go to the dashboard — first-time users will see the web
+    // login page in the iframe; returning users with a saved token will
+    // be SSO'd straight in. Either way, this tab is "done".
+    setTimeout(() => activateTab("dashboard"), 300);
   } catch (e) {
     flash("err", e.message);
   }
 });
 
-$("#startBtn").addEventListener("click", async () => {
-  // Save first so the daemon picks up the latest values.
-  try {
-    const cfg = readForm();
-    await invoke("save_config", { cfg });
-    state.config = cfg;
-  } catch (e) {
-    return flash("err", e.message);
+// ─── Token hand-off from the embedded dashboard ───────────────────
+// First-time flow: the iframe shows the web's login/register page, the
+// user authenticates, and the web (knowing it's embedded by us) posts
+// `{ type: "memento:token", collector_token }` to window.parent. We
+// validate the message origin against the configured server, then save
+// the token and (re)start the collector — the only place this app
+// learns the token at all.
+window.addEventListener("message", async (evt) => {
+  const data = evt.data;
+  if (!data || data.type !== "memento:token" || !data.collector_token) return;
+  const apiUrl = (state.config?.server_url || "").trim();
+  if (!apiUrl) return;
+  // Origin guard: only accept messages from the configured web origin.
+  // deriveWebUrl maps the saved API base to the web origin.
+  let expectedOrigin = "";
+  try { expectedOrigin = new URL(deriveWebUrl(apiUrl)).origin; } catch { /* invalid url */ }
+  if (!expectedOrigin || evt.origin !== expectedOrigin) {
+    console.warn("memento:token from unexpected origin", evt.origin);
+    return;
   }
   try {
-    await invoke("sidecar_start");
-    flash("ok", t("msg.startSent"));
-  } catch (e) {
-    flash("err", e.message);
-  }
-});
-
-$("#stopBtn").addEventListener("click", async () => {
-  try {
-    await invoke("sidecar_stop");
-    flash("ok", t("msg.stopped"));
-  } catch (e) {
-    flash("err", e.message);
-  }
-});
-
-// ─── In-app register / login ──────────────────────────────────────
-// So the user never has to open a browser: the Rust side (auth.rs) hits
-// the server's /api/auth/{register,login} endpoints and hands back a
-// collector token, which we fill in + save + launch like a manual paste.
-async function runAuth(mode) {
-  const serverUrl = normalizeApiUrl($("#serverUrl").value);
-  if (!serverUrl) return flash("err", t("auth.needUrl"));
-  const email = $("#authEmail").value.trim();
-  const password = $("#authPassword").value;
-  if (!email || !password) return flash("err", t("auth.needCreds"));
-
-  const btns = [$("#authRegisterBtn"), $("#authLoginBtn"), $("#saveBtn")];
-  btns.forEach((b) => (b.disabled = true));
-  flash("ok", t("auth.working"));
-  try {
-    const res = await invoke("auth_request", {
-      args: {
-        server_url: serverUrl,
-        mode,
-        email,
-        password,
-        name: null,
-        invite_code: null,
-      },
-    });
-    // Reflect what the server accepted (URL may have been normalized).
-    $("#serverUrl").value = res.server_url || serverUrl;
-    $("#authPassword").value = "";
-    // Token is assigned silently — stash it in state so readForm() picks
-    // it up; there is no token input in the UI anymore.
-    state.config = { ...(state.config || {}), server_token: res.collector_token };
-
+    state.config = { ...(state.config || {}), server_token: data.collector_token };
     const cfg = readForm();
     await invoke("save_config", { cfg });
     state.config = cfg;
@@ -451,29 +406,19 @@ async function runAuth(mode) {
         serverUrl: cfg.server_url,
         serverToken: cfg.server_token,
       });
-    } catch (e) {
-      console.warn("configure_mcp failed:", e);
-    }
-    $("#authEmail").value = "";
-    flash("ok", mode === "register" ? t("auth.okRegistered") : t("auth.okLoggedIn"));
-    // Start collecting immediately — the whole point of register/login is
-    // "I'm done, just run it". The earlier objection (dumped into a web
-    // login screen) is gone now that the dashboard does SSO via the saved
-    // token, so jumping there is seamless. Stop first so a collector that
-    // was already running (old token / different account) is killed and
-    // replaced — never two instances, always the just-saved config.
+    } catch (e) { console.warn("configure_mcp:", e); }
+    // Replace any running collector with one that uses the new token.
     try { await invoke("sidecar_stop"); } catch (e) { console.warn("sidecar_stop:", e); }
     try { await invoke("sidecar_start"); } catch (e) { console.warn("sidecar_start:", e); }
-    setTimeout(() => activateTab("dashboard"), 600);
+    // Reload the iframe via the SSO handoff so it's fully logged in
+    // (the in-iframe login already authenticated it, but reloading via
+    // the handoff URL guarantees a consistent /app state).
+    state.dashboardLoadedFor = null;
+    openDashboard();
   } catch (e) {
-    flash("err", e?.message || String(e));
-  } finally {
-    btns.forEach((b) => (b.disabled = false));
+    console.warn("memento:token handler:", e);
   }
-}
-
-$("#authRegisterBtn").addEventListener("click", () => runAuth("register"));
-$("#authLoginBtn").addEventListener("click", () => runAuth("login"));
+});
 
 // (Obsidian path picker removed in v0.1.9 — the collector reads
 // obsidian.json on startup and auto-discovers the user's most recent

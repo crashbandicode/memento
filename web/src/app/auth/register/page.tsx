@@ -42,6 +42,26 @@ export default function RegisterPage() {
     try {
       const info = await register(email, password, name || undefined, inviteCode || undefined);
       setRegistered(info);
+      // Hand the brand-new token off to the Memento desktop app when
+      // the page is embedded in its dashboard iframe (?embed=memento).
+      if (typeof window !== "undefined" && info.collector_token) {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          if (params.get("embed") === "memento") {
+            sessionStorage.setItem("memento_embed", "1");
+          }
+          if (
+            sessionStorage.getItem("memento_embed") === "1" &&
+            window.parent &&
+            window.parent !== window
+          ) {
+            window.parent.postMessage(
+              { type: "memento:token", collector_token: info.collector_token },
+              "*",
+            );
+          }
+        } catch { /* noop */ }
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t.auth.invalidCredentials);
     }

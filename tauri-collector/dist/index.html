@@ -66,21 +66,6 @@
       </div>
 
       <div class="field">
-        <label data-i18n="auth.account">Account</label>
-        <input type="text" id="authEmail" inputmode="email" autocomplete="username"
-               data-i18n-attr="placeholder:auth.email" placeholder="Email" />
-      </div>
-      <div class="field">
-        <input type="password" id="authPassword" autocomplete="current-password"
-               data-i18n-attr="placeholder:auth.password" placeholder="Password" />
-      </div>
-      <div class="actions">
-        <button class="btn primary" id="authRegisterBtn" data-i18n="auth.register">Register</button>
-        <button class="btn" id="authLoginBtn" data-i18n="auth.login">Sign in</button>
-      </div>
-      <p class="hint" data-i18n="auth.hint">Sign in or register and syncing starts automatically — nothing else to set up.</p>
-
-      <div class="field">
         <label class="toggle">
           <input type="checkbox" id="autoStartDaemon" />
           <span data-i18n="toggle.autoStart">Auto-start collector when the app launches</span>
@@ -93,8 +78,6 @@
 
       <div class="actions">
         <button class="btn primary" id="saveBtn" data-i18n="btn.save">Save</button>
-        <button class="btn" id="startBtn" data-i18n="btn.start">Start collector</button>
-        <button class="btn ghost" id="stopBtn" data-i18n="btn.stop">Stop</button>
       </div>
       <p class="notice" id="serverNotice"></p>
     </section>
