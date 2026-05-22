@@ -14,7 +14,22 @@ import json
 import logging
 import os
 import sys
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+class DualStackHTTPServer(HTTPServer):
+    """Listen on both IPv4 and IPv6. Without this, the default HTTPServer
+    binds AF_INET only, but docker DNS for a service alias returns AAAA
+    records first — clients that follow RFC 6555 happy-eyeballs spend
+    seconds timing out the IPv6 attempt before falling back to IPv4.
+    Binding to `::` with IPV6_V6ONLY=0 means the same socket accepts
+    both v4 and v6 traffic, no client-side workaround needed."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("embedding_server")
@@ -75,9 +90,9 @@ def main():
 
     _load_model(args.model)
 
-    HTTPServer.allow_reuse_address = True
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
-    logger.info("Embedding server running on port %d", args.port)
+    DualStackHTTPServer.allow_reuse_address = True
+    server = DualStackHTTPServer(("::", args.port), Handler)
+    logger.info("Embedding server running on port %d (dual-stack)", args.port)
     server.serve_forever()
 
 

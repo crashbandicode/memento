@@ -23,7 +23,10 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from install_lib import bootstrap_user, collector_setup, docker_up, embedding_host, env_gen
+from install_lib import (
+    bootstrap_user, collector_setup, docker_up, embedding_docker, embedding_host,
+    env_gen,
+)
 from install_lib.platform_utils import C, REPO_ROOT, fail, heading, info, ok, step
 
 
@@ -59,9 +62,24 @@ def _cmd_install(args: argparse.Namespace) -> int:
 
 
 def _cmd_embedding(args: argparse.Namespace) -> int:
-    heading("Embedding host service")
-    with step("Install embedding (venv + torch + sentence-transformers + model)"):
-        embedding_host.install()
+    """`./install.sh embedding` — default is Docker; `--native` reverts to
+    the old host-venv install (needed for NVIDIA CUDA / Apple MPS GPU)."""
+    if args.native:
+        heading("Embedding (native host install — GPU mode)")
+        with step("Install embedding (venv + torch + sentence-transformers + model)"):
+            embedding_host.install()
+        info(
+            "Native install uses host.docker.internal:8002. If api/celery were\n"
+            "started before with a different URL, restart them so the daemon\n"
+            "picks up MEMENTO_EMBEDDING_SERVER_URL: "
+            "`docker compose up -d --force-recreate api celery-worker celery-beat`."
+        )
+        return 0
+
+    heading("Embedding (Docker — recommended)")
+    with step("Build + start `embedding` compose profile (~5–15 min first time)"):
+        embedding_docker.install()
+    info("Semantic search & MCP memory_search are now wired up.")
     return 0
 
 
@@ -134,9 +152,11 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         info("Stopping collector service…")
         subprocess.run(["memento-collector", "uninstall"], check=False)
 
-    # 2. Embedding
+    # 2. Embedding — both install paths idempotently torn down so users
+    # who switched modes don't get orphaned containers / launch agents.
     info("Removing embedding service…")
     embedding_host.uninstall(remove_model_cache=deep, remove_venv=deep)
+    embedding_docker.uninstall(remove_image=deep)
 
     # 3. Docker
     info("Stopping Docker stack…")
@@ -185,7 +205,14 @@ def main(argv: list[str] | None = None) -> int:
                            help="Use local editable collector via `pip install -e ./collector`")
     p_install.set_defaults(func=_cmd_install)
 
-    p_emb = sub.add_parser("embedding", help="Install embedding host service")
+    p_emb = sub.add_parser(
+        "embedding",
+        help="Install embedding server (Docker default; pass --native for GPU)",
+    )
+    p_emb.add_argument(
+        "--native", action="store_true",
+        help="Use host venv install instead of Docker (needed for CUDA / MPS GPU).",
+    )
     p_emb.set_defaults(func=_cmd_embedding)
 
     p_doc = sub.add_parser("doctor", help="Print service status")

@@ -55,9 +55,47 @@ services:
     volumes:
       - miniodata:/data
 
-  # BGE-M3 embedding server runs on host (MPS GPU acceleration)
-  # Start: launchctl load ~/Library/LaunchAgents/com.memento.embedding.plist
-  # API connects via host.docker.internal:8002
+  # BGE-M3 embedding server.
+  #
+  # Two install paths — pick ONE; they conflict on host port 8002.
+  #
+  # 1. Docker (default, easy):
+  #      ./install.sh embedding        # builds + brings up this service
+  #    or directly:
+  #      docker compose --profile embedding up -d --build embedding
+  #    CPU only — works the same on Mac / Linux / Win Docker Desktop.
+  #    Model is baked into the image so first-start is fast; rebuild
+  #    only needed when MODEL_NAME changes.
+  #
+  # 2. Host venv (advanced, needed for GPU):
+  #      ./install.sh embedding --native
+  #    Use this when you want NVIDIA CUDA or Apple Silicon MPS. The
+  #    compose service stays off (no profile activated) and the API
+  #    reaches the host via host.docker.internal:8002.
+  embedding:
+    profiles: ["embedding"]
+    build:
+      context: ./embedding
+      dockerfile: Dockerfile
+      args:
+        MODEL_NAME: ${MEMENTO_EMBEDDING_MODEL_NAME:-BAAI/bge-m3}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    container_name: memento_embedding
+    restart: unless-stopped
+    expose:
+      - "8002"
+    # No host port mapping by default — the api/celery containers
+    # reach it via docker DNS (`embedding:8002`). Uncomment the ports
+    # block below if you want to hit it from the host too, but mind
+    # the conflict with a native install.
+    # ports:
+    #   - "8002:8002"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 4
 
   # FastAPI server
   api:
@@ -85,7 +123,11 @@ services:
       MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
-      MEMENTO_EMBEDDING_SERVER_URL: ${MEMENTO_EMBEDDING_SERVER_URL:-http://host.docker.internal:8002}
+      # Default points at the in-compose embedding container (`embedding`
+      # service, activated via `--profile embedding`). Users running the
+      # native host install override this in .env to
+      # `http://host.docker.internal:8002`.
+      MEMENTO_EMBEDDING_SERVER_URL: ${MEMENTO_EMBEDDING_SERVER_URL:-http://embedding:8002}
       MEMENTO_GEOIP_DB: /data/geoip/GeoLite2-City.mmdb
     # Linux Docker (non-Docker-Desktop) doesn't auto-resolve
     # host.docker.internal — embedding server runs on the host at :8002,

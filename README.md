@@ -72,7 +72,7 @@ graph TB
             S3[("MinIO<br/>S3 兼容")]
         end
 
-        EMB["BGE-M3 Embedding<br/>:8002 宿主进程"]
+        EMB["BGE-M3 Embedding<br/>:8002 (Docker / 宿主)"]
 
         NGX --> API
         NGX --> WEB
@@ -196,7 +196,8 @@ git clone https://github.com/ddong8/memento.git && cd memento
 
 | 命令 | 说明 |
 |---|---|
-| `./install.sh embedding` | 装宿主 BGE-M3 服务(~1.3 GB,语义搜索 / MCP 召回必需) |
+| `./install.sh embedding` | 装 BGE-M3 嵌入服务(Docker 模式,~1.3 GB,语义搜索 / MCP 召回必需) |
+| `./install.sh embedding --native` | 改用宿主 venv 安装(NVIDIA CUDA / Apple MPS GPU 加速场景) |
 | `./install.sh doctor` | 检查所有服务状态 |
 | `./install.sh update` | git pull + 重建 + 升级 |
 | `./install.sh uninstall` | 停服务,保留数据和配置 |
@@ -346,7 +347,7 @@ LLM 自动从同步进来的对话和文档里抽:
 | 数据库 | PostgreSQL 16 (+ pgvector + pg_trgm), Redis 7, MinIO (S3 兼容) |
 | 前端 | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
 | AI 摘要 / 图谱 | Anthropic Claude API + OpenAI 兼容端点(Kimi / DashScope...) |
-| Embedding | BGE-M3 宿主运行(macOS MPS / Linux CUDA / CPU 回退) |
+| Embedding | BGE-M3,默认 Docker 容器(CPU);`--native` 模式跑宿主 venv 用 macOS MPS / Linux CUDA |
 | GeoIP | MaxMind GeoLite2 / db-ip city-lite(离线 mmdb) |
 | 部署 | Docker Compose(7 服务) |
 
@@ -426,7 +427,7 @@ memento/
 | `MEMENTO_S3_BUCKET` | memento | 大文件 bucket |
 | `MEMENTO_ANTHROPIC_API_KEY` | — | Claude API(AI 摘要) |
 | `MEMENTO_AI_API_KEY` / `_BASE_URL` / `_MODEL` | — / dashscope / kimi-k2.5 | OpenAI 兼容备用 |
-| `MEMENTO_EMBEDDING_SERVER_URL` | http://host.docker.internal:8002 | 宿主 BGE-M3 服务 |
+| `MEMENTO_EMBEDDING_SERVER_URL` | http://embedding:8002 | Docker 模式默认;`--native` 装的宿主服务请改为 `http://host.docker.internal:8002` |
 | `MEMENTO_GEOIP_DB` | /data/geoip/GeoLite2-City.mmdb | GeoIP 数据库路径 |
 | `MEMENTO_DEBUG` | `0` | 设 `1` 允许 dev 默认值启动 |
 | `MEMENTO_PORT` | 8000 | API 监听端口 |

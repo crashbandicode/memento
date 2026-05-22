@@ -196,7 +196,8 @@ Optional commands:
 
 | Command | Description |
 |---|---|
-| `./install.sh embedding` | Install host BGE-M3 service (~1.3 GB; required for semantic search / MCP recall) |
+| `./install.sh embedding` | Install BGE-M3 embedding server (Docker mode, ~1.3 GB; required for semantic search / MCP recall) |
+| `./install.sh embedding --native` | Switch to host-venv install (use this if you have NVIDIA CUDA or Apple MPS GPU) |
 | `./install.sh doctor` | Check status of all services |
 | `./install.sh update` | git pull + rebuild + upgrade |
 | `./install.sh uninstall` | Stop services; keep data and config |
