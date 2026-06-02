@@ -66,6 +66,13 @@ pub fn apply_autostart(app: &AppHandle, want: bool) {
 #[tauri::command]
 pub fn configure_mcp(server_url: String, server_token: String) -> CmdResult<crate::mcp_configs::McpWriteReport> {
     let report = crate::mcp_configs::write_all(&server_url, &server_token)?;
+    // Stamp the current app version on successful write so the
+    // post-update auto-refresh in lib.rs setup() doesn't redundantly
+    // rewrite on the very next launch.
+    if let Ok(mut cfg) = Config::load() {
+        cfg.mcp_configured_for_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        let _ = cfg.save();
+    }
     Ok(report)
 }
 

@@ -47,6 +47,13 @@ pub struct Config {
     /// Default on.
     #[serde(default = "default_true")]
     pub auto_start_daemon: bool,
+
+    /// The app version that last wrote MCP entries into AI tool configs.
+    /// Used to trigger an auto re-configure after auto-update so newly
+    /// installed AI IDEs get picked up and any schema bumps land without
+    /// the user having to click Save in the Server tab.
+    #[serde(default)]
+    pub mcp_configured_for_version: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -66,6 +73,7 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             autostart: true,
             auto_start_daemon: true,
+            mcp_configured_for_version: None,
         }
     }
 }

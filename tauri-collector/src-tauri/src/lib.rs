@@ -172,10 +172,46 @@ pub fn run() {
             build_tray(app.handle())?;
 
             // Auto-start the daemon if the user enabled it in settings.
-            let cfg = crate::config::Config::load().unwrap_or_default();
+            let mut cfg = crate::config::Config::load().unwrap_or_default();
             // Reconcile OS launch-at-login with the saved/default setting
             // (defaults ON for fresh installs).
             crate::ipc::apply_autostart(app.handle(), cfg.autostart);
+
+            // Auto-refresh MCP entries in AI tool configs after an app
+            // upgrade. The bundled sidecars (collector + MCP) get replaced
+            // on auto-update, but the per-IDE config files were written
+            // by an older version of the app — they may now point at a
+            // stale binary path, or miss entries for IDEs the user has
+            // installed since. We compare the "last configured" version
+            // against the current CARGO_PKG_VERSION and silently rewrite
+            // when they differ. Best-effort: failure here shouldn't block
+            // the app boot.
+            let current_version = env!("CARGO_PKG_VERSION");
+            let needs_rewrite = !cfg.server_url.is_empty()
+                && !cfg.server_token.is_empty()
+                && cfg.mcp_configured_for_version.as_deref()
+                    != Some(current_version);
+            if needs_rewrite {
+                match crate::mcp_configs::write_all(
+                    &cfg.server_url,
+                    &cfg.server_token,
+                ) {
+                    Ok(_) => {
+                        cfg.mcp_configured_for_version =
+                            Some(current_version.to_string());
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!(
+                                "post-update mcp save_config failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "post-update configure_mcp failed: {e}"
+                        );
+                    }
+                }
+            }
             if cfg.auto_start_daemon
                 && !cfg.server_url.is_empty()
                 && !cfg.server_token.is_empty()

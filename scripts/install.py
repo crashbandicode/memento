@@ -107,12 +107,23 @@ def _cmd_update(args: argparse.Namespace) -> int:
         ["docker", "compose", "up", "-d", "--build"],
         check=True, cwd=str(REPO_ROOT),
     )
-    info("Upgrading collector via pip…")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-U", "--user", "memento-brain-collector"],
-        check=False,
-    )
-    # embedding (if installed) — restart via its service manager
+    # Upgrade every pip-installed Memento package that's actually present.
+    # Trying to `pip install -U` an uninstalled package would needlessly
+    # *install* it; we check first so a user who only has the collector
+    # doesn't get the MCP server forced onto their system.
+    info("Upgrading pip packages…")
+    for pkg in ("memento-brain-collector", "memento-brain-memory", "memento-brain"):
+        probe = subprocess.run(
+            [sys.executable, "-m", "pip", "show", pkg],
+            capture_output=True,
+        )
+        if probe.returncode == 0:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", "--user", pkg],
+                check=False,
+            )
+    # Embedding (if installed) restarts via its own service manager
+    # (launchd / systemd / Docker restart policy) — nothing to do here.
     ok("Update complete. Run `./install.sh doctor` to verify.")
     return 0
 
