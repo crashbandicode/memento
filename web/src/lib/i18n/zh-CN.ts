@@ -253,7 +253,7 @@ const zhCN = {
   },
   profile: {
     title: "个人资料",
-    subtitle: "账号信息与 Collector Token",
+    subtitle: "账号信息与备份",
     role: "角色",
     status: "状态",
     email: "邮箱",
@@ -265,6 +265,17 @@ const zhCN = {
     rotateConfirm: "确认重新生成 collector token？所有在用采集器需重新配置。",
     rotateSuccess: "已重新生成，请复制新 token 并到各采集器重新 setup。",
     logout: "退出登录",
+    backup: "备份与导入",
+    backupDesc: "把你的所有数据(文档、对话、知识图谱、日报、分享链接)打包成一个 .zip,用来本地存档或迁移到另一个 Memento 实例。",
+    exportBtn: "导出全部数据",
+    exporting: "打包中…",
+    includeLogs: "包含审计日志(IP 已粗化到 /24)",
+    restoreDesc: "从之前导出的 .zip 恢复。会在本账号下新增一台「Imported on …」设备,所有数据挂在它名下;后悔的话删掉这台设备就回滚了。",
+    importBtn: "从备份导入",
+    importing: "恢复中…",
+    importPick: "选择 .zip 文件",
+    importSuccess: "导入成功",
+    importWarnings: "导入告警",
   },
 
   // Admin

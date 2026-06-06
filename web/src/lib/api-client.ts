@@ -369,6 +369,46 @@ export const api = {
   getMe: (token: string) => apiFetch<UserInfo>("/api/auth/me", { token }),
   refreshToken: (token: string) =>
     apiFetch<TokenResponse>("/api/auth/refresh", { method: "POST", token }),
+  // === Account-level backup/restore ===
+  //
+  // exportData hits a binary endpoint so we go around apiFetch's
+  // JSON-only flow: fresh fetch with the Bearer header, response.blob()
+  // to get the .zip body, then trigger a download via a hidden <a>.
+  //
+  // importData uploads a multipart body — also off the apiFetch path
+  // because that helper hardcodes Content-Type: application/json.
+  exportData: async (token: string, includeLogs: boolean): Promise<{ blob: Blob; filename: string; counts: string }> => {
+    const url = `${getApiBase()}/api/data/export?include_access_logs=${includeLogs ? "true" : "false"}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Export failed: HTTP ${res.status} ${await res.text()}`);
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename="?([^";]+)"?/i);
+    const filename = m?.[1] ?? `memento-export-${new Date().toISOString().slice(0, 10)}.zip`;
+    return {
+      blob: await res.blob(),
+      filename,
+      counts: res.headers.get("X-Memento-Counts") || "",
+    };
+  },
+  importData: async (token: string, file: File): Promise<{
+    ok: boolean;
+    machine_id: string;
+    counts: Record<string, number>;
+    warnings: string[];
+  }> => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${getApiBase()}/api/data/import`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`Import failed: HTTP ${res.status} ${txt}`);
+    }
+    return await res.json();
+  },
   rotateCollectorToken: (token: string) =>
     apiFetch<UserInfo>("/api/auth/me/rotate-collector-token", { method: "POST", token }),
   getProjectTimeline: (projectId: string, offset = 0, limit = 50, category?: string, order = "desc") => {

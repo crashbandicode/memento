@@ -243,7 +243,7 @@ const enUS: Translations = {
   },
   profile: {
     title: "Profile",
-    subtitle: "Account info & Collector Token",
+    subtitle: "Account info & backup",
     role: "Role",
     status: "Status",
     email: "Email",
@@ -255,6 +255,17 @@ const enUS: Translations = {
     rotateConfirm: "Regenerate collector token? All running collectors will need to be reconfigured.",
     rotateSuccess: "New token generated. Copy it and re-run setup on each collector.",
     logout: "Log out",
+    backup: "Backup & restore",
+    backupDesc: "Bundle all of your data (documents, conversations, knowledge graph, daily reports, share links) into a single .zip for archiving or migration to another Memento instance.",
+    exportBtn: "Export all my data",
+    exporting: "Packaging…",
+    includeLogs: "Include audit log (IPs coarsened to /24)",
+    restoreDesc: "Restore from a previously exported .zip. A new \"Imported on …\" machine is added to your account and all imported data lives under it — delete that machine to roll back if you change your mind.",
+    importBtn: "Restore from backup",
+    importing: "Restoring…",
+    importPick: "Choose .zip file",
+    importSuccess: "Import complete",
+    importWarnings: "Import warnings",
   },
 
   admin: {
