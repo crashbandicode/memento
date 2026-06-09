@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from fastapi.responses import Response
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Project, Tool, User
+from ..db.models import (
+    ConversationMessage, Document, KnowledgeEntity, KnowledgeObservation,
+    KnowledgeRelation, Project, Tool, User,
+)
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_parser import parse_conversation
@@ -580,3 +585,205 @@ async def get_project_conversations(
     }
     await cache_set(cache_key, payload, ttl_seconds=30)
     return payload
+
+
+# Heuristic: documents we want to drop on the floor when bootstrapping a
+# new AI session. .meta.json is the Claude Code subagent sidecar (no
+# conversation content); .metadata.json and .resolved are transient
+# variants. Same noise filter the timeline uses.
+def _is_export_noise(path: str) -> bool:
+    return (
+        ".resolved" in path
+        or ".meta.json" in path
+        or ".metadata.json" in path
+    )
+
+
+# Category order in the rendered Markdown. Memory / plan / identity go
+# first because that's the "give the new AI context" payload; long
+# conversation transcripts last because they're the bulk. Anything not
+# in this list is appended in alphabetical order under a "Other" group.
+_CATEGORY_ORDER = ["memory", "plan", "identity", "config", "skill", "learning", "note", "conversation"]
+_CATEGORY_HEADERS_ZH = {
+    "memory": "记忆", "plan": "计划", "identity": "身份卡",
+    "config": "配置", "skill": "技能", "learning": "学习笔记",
+    "note": "笔记", "conversation": "对话",
+}
+
+
+@router.get("/{project_id}/export.md")
+async def export_project_markdown(
+    project_id: uuid.UUID,
+    include_conversations: bool = Query(True, description="Include the full conversation transcripts (can be very long)"),
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> Response:
+    """Render a single project's documents + knowledge-graph context as a
+    Markdown blob that can be dropped into a fresh AI project as
+    ``MEMENTO-CONTEXT.md``. This is the "one-shot dump" alternative to
+    the live MCP path — useful for portable / offline handoff.
+
+    Same ownership filter as the rest of the project routes (admin /
+    owner see everything via apply_user_filter shortcut).
+    """
+    mids = await user_machine_ids(db, _user)
+
+    project = (await db.execute(
+        select(Project).where(Project.id == project_id)
+    )).scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404)
+
+    # Pull all docs for this project (no 50-row cap; this is an export).
+    docs_q = (
+        select(Document)
+        .where(Document.project_id == project_id)
+        .order_by(Document.synced_at.desc())
+    )
+    docs_q = apply_user_filter(docs_q, mids, Document.machine_id)
+    docs = [d for d in (await db.execute(docs_q)).scalars().all()
+            if not _is_export_noise(d.relative_path)]
+
+    # Knowledge-graph: any entity whose name fuzzy-matches the project
+    # title. Mirrors what memory_context does for MCP, so the Markdown
+    # carries the same context an AI calling memory_context would see.
+    ent_q = (
+        select(KnowledgeEntity)
+        .where(or_(
+            KnowledgeEntity.name.ilike(f"%{project.title}%"),
+            KnowledgeEntity.name.ilike(f"%{project.slug}%"),
+        ))
+        .limit(20)
+    )
+    if mids is not None:
+        # Non-admin: only entities owned by the caller.
+        ent_q = ent_q.where(KnowledgeEntity.user_id == _user.id)
+    entities = (await db.execute(ent_q)).scalars().all()
+
+    lines: list[str] = []
+    title = project.title or project.slug or "Untitled project"
+    lines.append(f"# Memento context — {title}")
+    lines.append("")
+    lines.append(
+        f"**Tool**: `{project.tool_id or 'unknown'}`  ·  "
+        f"**Documents**: {len(docs)}  ·  "
+        f"**Exported**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    if project.source_path:
+        lines.append(f"**Source path**: `{project.source_path}`")
+    lines.append("")
+    lines.append(
+        "> This file was exported from Memento as a one-shot bootstrap of\n"
+        "> a project's prior context. Drop it into a fresh project as\n"
+        "> `MEMENTO-CONTEXT.md` and add to your `CLAUDE.md` / `AGENTS.md`:\n"
+        "> `Read MEMENTO-CONTEXT.md for prior conversations and decisions on this project.`"
+    )
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Group docs by category.
+    by_cat: dict[str, list[Document]] = {}
+    for d in docs:
+        by_cat.setdefault(d.category or "other", []).append(d)
+
+    ordered_cats = (
+        [c for c in _CATEGORY_ORDER if c in by_cat]
+        + sorted([c for c in by_cat if c not in _CATEGORY_ORDER])
+    )
+
+    for cat in ordered_cats:
+        if cat == "conversation" and not include_conversations:
+            continue
+        bucket = by_cat[cat]
+        if not bucket:
+            continue
+        zh = _CATEGORY_HEADERS_ZH.get(cat, cat)
+        lines.append(f"## {cat.title()} / {zh}  ({len(bucket)})")
+        lines.append("")
+        for d in bucket:
+            doc_title = d.title or (d.relative_path.rsplit("/", 1)[-1] if d.relative_path else d.category)
+            stamp = d.synced_at.strftime("%Y-%m-%d") if d.synced_at else ""
+            lines.append(f"### {doc_title}")
+            lines.append(f"*{d.relative_path}*  ·  *{stamp}*")
+            lines.append("")
+            # For conversations, prefer the AI summary if we have one —
+            # the raw JSONL is too long to inline. For everything else,
+            # the full content is the point.
+            if cat == "conversation" and d.ai_summary:
+                lines.append(d.ai_summary)
+            elif d.content:
+                # Fence as plain text. Don't trust the source for
+                # well-formed markdown — but we DO trust it not to be
+                # binary because the model rejects binary content_types
+                # upstream. Cap per-doc to 200 KB so a single 1 MB
+                # conversation log doesn't dominate the file; the AI
+                # can call memory_open(id) for the rest.
+                blob = d.content if len(d.content) < 200_000 else d.content[:200_000] + "\n\n…(truncated; call memory_open() for full text)"
+                lines.append(blob)
+            else:
+                lines.append("*(empty)*")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    if entities:
+        lines.append("## Knowledge graph")
+        lines.append("")
+        ent_ids = [e.id for e in entities]
+        # Fetch relations + observations in two batched queries.
+        rels = (await db.execute(
+            select(KnowledgeRelation, KnowledgeEntity)
+            .join(KnowledgeEntity, KnowledgeRelation.target_id == KnowledgeEntity.id)
+            .where(KnowledgeRelation.source_id.in_(ent_ids))
+        )).all()
+        rels_by_source: dict[uuid.UUID, list[tuple[str, str]]] = {}
+        for r, target in rels:
+            rels_by_source.setdefault(r.source_id, []).append((r.relation_type, target.name))
+
+        obs = (await db.execute(
+            select(KnowledgeObservation)
+            .where(KnowledgeObservation.entity_id.in_(ent_ids))
+            .order_by(KnowledgeObservation.observed_at.desc())
+        )).scalars().all()
+        obs_by_entity: dict[uuid.UUID, list[KnowledgeObservation]] = {}
+        for o in obs:
+            obs_by_entity.setdefault(o.entity_id, []).append(o)
+
+        for e in entities:
+            lines.append(f"### {e.name}  *({e.entity_type})*")
+            if e.summary:
+                lines.append("")
+                lines.append(e.summary)
+            ent_rels = rels_by_source.get(e.id, [])
+            if ent_rels:
+                lines.append("")
+                lines.append("**Relations**:")
+                for rel_type, target_name in ent_rels[:10]:
+                    lines.append(f"- {rel_type} → **{target_name}**")
+            ent_obs = obs_by_entity.get(e.id, [])
+            if ent_obs:
+                lines.append("")
+                lines.append("**Recent observations**:")
+                for o in ent_obs[:10]:
+                    date_str = o.observed_at.strftime("%Y-%m-%d") if o.observed_at else ""
+                    prefix = f"[{date_str}] " if date_str else ""
+                    lines.append(f"- {prefix}{o.content}")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    md = "\n".join(lines)
+    # Per RFC 6266: file name with simple ASCII fallback + filename* for
+    # unicode. The slug is already URL-safe; project.title may have
+    # CJK so we just send ASCII fallback derived from slug.
+    safe = "".join(c for c in (project.slug or "project") if c.isalnum() or c in "-_")[:64]
+    return Response(
+        content=md,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="memento-context-{safe}.md"',
+            # nginx-friendly: don't buffer multi-MB markdown.
+            "X-Accel-Buffering": "no",
+        },
+    )

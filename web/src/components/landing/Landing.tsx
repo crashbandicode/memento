@@ -1,5 +1,6 @@
 "use client";
 
+import { BootstrapBlock } from "./BootstrapBlock";
 import { DesktopBlock } from "./DesktopBlock";
 import { Features } from "./Features";
 import { Footer } from "./Footer";
@@ -17,6 +18,7 @@ export function Landing() {
       <Features />
       <ToolMatrix />
       <HowItWorks />
+      <BootstrapBlock />
       <InstallBlock />
       <DesktopBlock />
       <Footer />

@@ -452,12 +452,34 @@ const zhCN = {
     desktop_btn: "下载",
     desktop_note: "首次打开在 Server 标签填服务器地址 + token(没有账号可直接在 app 内注册)即可开始采集,全程不开浏览器。习惯命令行的可继续用下方 pip 方式。",
 
+    bootstrap_kicker: "项目记忆迁移",
+    bootstrap_title: "把一个项目的完整记忆喂给新开的 Claude Code / Codex",
+    bootstrap_subtitle: "你已经在 Memento 里攒了几百条对话和计划。新启动一个 AI 项目时,把这些上下文一键交接过去 —— 不用复制粘贴。",
+    bootstrap_path_live_title: "MCP 直连 (推荐)",
+    bootstrap_path_live_subtitle: "新项目接 memento-memory MCP,需要时按需拉,还能继续写新观察。装了桌面客户端就已经自动配好;pip 用户 `memento-collector setup` 一遍即可。",
+    bootstrap_path_live_b1: "在新项目根目录建 CLAUDE.md / AGENTS.md,粘下面这段。",
+    bootstrap_path_live_b2: "下次 claude/codex 进这个目录,它会主动调 memory_context 把项目记忆灌进来。",
+    bootstrap_path_live_b3: "AI 还能调 memory_store 反向写回新观察 —— 记忆在两个项目之间互通。",
+    bootstrap_path_dump_title: "一次性 Markdown 导出",
+    bootstrap_path_dump_subtitle: "适合离线场景、给同事发整段背景、或不想接 MCP 的轻量用法。Memento 会把项目的所有 memory / plan / identity 文件 + 知识图谱打包成单个 .md。",
+    bootstrap_path_dump_b1: "Web 进 /projects/<id>,右上角点「导出 .md」。",
+    bootstrap_path_dump_b2: "把下载的 memento-context-*.md 拷到新项目里改名 MEMENTO-CONTEXT.md。",
+    bootstrap_path_dump_b3: "CLAUDE.md 里加一句「Read MEMENTO-CONTEXT.md before starting」。",
+    bootstrap_path_dump_tip: "导出文件只是冷启动用,不会自动跟上你之后的新对话。需要持续同步,选左侧的 MCP 路径。",
+
     footer_download: "下载客户端",
     footer_tagline: "给你的 AI 工具建个共享大脑 · 本地优先 · 开源",
     footer_docs: "文档",
     footer_api: "API 文档",
     footer_install: "安装说明",
     footer_github: "GitHub",
+  },
+
+  // Project detail / list page
+  projects_page: {
+    exportMd: "导出 .md",
+    exportMdHint: "把项目的全部记忆/计划/身份卡 + 知识图谱打包成一个 Markdown 文件,用来喂给新开的 AI 项目",
+    exportFailed: "导出失败",
   },
 
   // Categories

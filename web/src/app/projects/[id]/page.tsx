@@ -29,6 +29,28 @@ export default function ProjectDetailPage() {
     authFetch(`${getApiBase()}/api/projects/${projectId}`).then((r) => r.json()).then(setProject).catch(console.error);
   }, [projectId]);
 
+  // Hit the server's per-project markdown export endpoint and trigger
+  // a browser download. authFetch attaches the JWT; we read the body
+  // as a Blob and click an off-DOM <a download> — same pattern the
+  // account-level export uses on the Profile page.
+  const handleExportMarkdown = async (pid: string, slug: string) => {
+    try {
+      const res = await authFetch(`${getApiBase()}/api/projects/${pid}/export.md`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `memento-context-${slug || "project"}.md`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e: unknown) {
+      alert(t.projects_page.exportFailed + ": " + (e instanceof Error ? e.message : String(e)));
+    }
+  };
+
   if (!project) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
 
   const byCategory: Record<string, typeof project.documents> = {};
@@ -54,6 +76,15 @@ export default function ProjectDetailPage() {
         subtitle={<span style={{ fontFamily: "ui-monospace,monospace" }}>{project.source_path}</span>}
         right={
           <>
+            <Btn
+              variant="ghost"
+              size="sm"
+              icon="arrow_down"
+              onClick={() => handleExportMarkdown(projectId, project.slug || project.title || "project")}
+              title={t.projects_page.exportMdHint}
+            >
+              {t.projects_page.exportMd}
+            </Btn>
             <Link href={`/projects/${projectId}/conversations`} style={{ textDecoration: "none" }}>
               <Btn variant="glass" size="sm" icon="message">{t.conversations}</Btn>
             </Link>

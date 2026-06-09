@@ -438,12 +438,33 @@ const enUS: Translations = {
     desktop_btn: "Download",
     desktop_note: "On first launch, open the Server tab and enter your server URL + token (no account? register right in the app) — no browser needed. CLI users can keep using the pip method below.",
 
+    bootstrap_kicker: "Project memory hand-off",
+    bootstrap_title: "Hand a project's full memory to a fresh Claude Code / Codex session",
+    bootstrap_subtitle: "You've already built up hundreds of conversations and plans in Memento. When you start a new AI project, transfer that context in one move — no copy-pasting.",
+    bootstrap_path_live_title: "Live via MCP (recommended)",
+    bootstrap_path_live_subtitle: "Hook the new project into the memento-memory MCP server. The AI pulls context on demand and can write new observations back. Desktop client users get this for free; pip users run `memento-collector setup` once.",
+    bootstrap_path_live_b1: "Drop a CLAUDE.md / AGENTS.md into the new project, paste the snippet below.",
+    bootstrap_path_live_b2: "Next time claude/codex enters this directory, it loads project context via memory_context() automatically.",
+    bootstrap_path_live_b3: "The AI can also call memory_store to write new observations back — memory stays linked across projects.",
+    bootstrap_path_dump_title: "One-shot Markdown dump",
+    bootstrap_path_dump_subtitle: "Good for offline transfer, handing background to a teammate, or keeping the new project off Memento. We bundle all memory/plan/identity files + the knowledge graph into one .md.",
+    bootstrap_path_dump_b1: "On the web, open /projects/<id> and click \"Export .md\" in the top right.",
+    bootstrap_path_dump_b2: "Drop the downloaded memento-context-*.md into the new project, rename to MEMENTO-CONTEXT.md.",
+    bootstrap_path_dump_b3: "Add to CLAUDE.md: \"Read MEMENTO-CONTEXT.md before starting.\"",
+    bootstrap_path_dump_tip: "This dump is a cold-start snapshot only — it won't follow your future conversations. For a live link, use the MCP path on the left.",
+
     footer_download: "Download app",
     footer_tagline: "A shared brain for your AI coding tools · Local-first · Open source",
     footer_docs: "Docs",
     footer_api: "API reference",
     footer_install: "Install guide",
     footer_github: "GitHub",
+  },
+
+  projects_page: {
+    exportMd: "Export .md",
+    exportMdHint: "Bundle this project's memory/plan/identity files + knowledge graph into one Markdown file, ready to feed a fresh AI project.",
+    exportFailed: "Export failed",
   },
 
   category: {
