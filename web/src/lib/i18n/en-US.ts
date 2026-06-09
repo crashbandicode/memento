@@ -208,6 +208,10 @@ const enUS: Translations = {
     registered: "Registered",
     snippetCollectorOnly: "collector only",
     snippetMetaOption: "or install everything in one command:",
+    delete: "Delete",
+    deleteHint: "Delete this device and all its data (irreversible)",
+    deleteConfirm: "Delete \"{name}\"? This will permanently remove {count} files and all related data. Cannot be undone.\n\nUse this to undo an import — just delete the corresponding \"Imported …\" device.",
+    deleteFailed: "Delete failed",
   },
 
   auth: {

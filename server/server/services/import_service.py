@@ -331,13 +331,36 @@ async def run_import(
     # uq_documents_machine_tool_path. One-per-source preserves all
     # docs cleanly. The label carries the original machine name so a
     # user who restored once can still tell their devices apart.
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ts_long = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    ts_short = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    def _import_name(orig: str | None) -> str:
+        """Build a clean import label that *doesn't* nest when you import
+        an export of an import. Strips any earlier ``Imported:``/``Imported on``
+        prefix from the source name and stamps THIS import's timestamp."""
+        clean = (orig or "").strip()
+        # Strip layers of nesting: "Imported: Imported: laptop" → "laptop"
+        while True:
+            if clean.startswith("Imported: "):
+                clean = clean[len("Imported: "):].lstrip()
+                continue
+            if clean.startswith("Imported on "):
+                # Old fallback-style label — drop the whole thing, no
+                # original name to preserve.
+                clean = ""
+                break
+            break
+        clean = clean[:120]
+        if clean:
+            return f"Imported {ts_short}: {clean}"
+        return f"Imported {ts_short}"
+
     mach_rows = _load("machines.jsonl")
     machine_id_map: dict[str, uuid.UUID] = {}
     # Fallback machine for documents that reference a machine_id not
     # in the export (shouldn't normally happen, but defensive).
     fallback_machine = Machine(
-        name=f"Imported on {ts}",
+        name=_import_name(None),
         collector_token_hash=hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
         collector_version=None,
         user_id=caller_user_id,
@@ -347,9 +370,8 @@ async def run_import(
         old_id = r.get("id")
         if not old_id:
             continue
-        orig_name = (r.get("name") or "machine")[:200]
         m = Machine(
-            name=f"Imported: {orig_name}",
+            name=_import_name(r.get("name")),
             collector_token_hash=hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
             collector_version=r.get("collector_version"),
             user_id=caller_user_id,
@@ -360,6 +382,8 @@ async def run_import(
     await db.flush()
     fallback_machine_id: uuid.UUID = fallback_machine.id
     counts["machines"] = len(machine_id_map) + 1  # +1 for fallback
+    # ts_long retained for any callers/logs that previously formatted it
+    _ = ts_long
 
     # === 3. Tools (ensure-existence) ===
     docs_rows = _load("documents.jsonl")

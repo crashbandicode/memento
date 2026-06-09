@@ -5,7 +5,7 @@ import { useI18n } from "@/lib/i18n";
 import { useNow } from "@/lib/use-now";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { ToolGlyph, PlatformGlyph, Icon } from "@/components/aurora/Icon";
-import { Glass, TopBar } from "@/components/aurora/primitives";
+import { Btn, Glass, TopBar } from "@/components/aurora/primitives";
 
 interface Device {
   id: string;
@@ -36,6 +36,8 @@ export default function DevicesPage() {
   const timeAgo = useTimeAgo(t);
   const now = useNow();
 
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
   useEffect(() => {
     authFetch(`${getApiBase()}/api/devices`)
       .then((r) => r.json())
@@ -50,6 +52,32 @@ export default function DevicesPage() {
       })
       .catch(console.error);
   }, []);
+
+  // Delete a device and ALL its data — irreversible. Used both for
+  // rolling back an unwanted import (each import creates a fresh
+  // "Imported …" Machine row that owns all the restored docs) and for
+  // retiring an old physical device. The server already cascades the
+  // purge to documents/messages/embeddings/sync_state and drops orphan
+  // projects and knowledge entities; see api/devices.py.
+  const handleDelete = async (d: Device) => {
+    const docs = d.document_count;
+    if (!confirm(t.devices.deleteConfirm.replace("{name}", d.name).replace("{count}", String(docs)))) {
+      return;
+    }
+    setDeletingId(d.id);
+    try {
+      const res = await authFetch(`${getApiBase()}/api/devices/${d.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || `HTTP ${res.status}`);
+      }
+      setDevices((prev) => prev.filter((x) => x.id !== d.id));
+    } catch (e: unknown) {
+      alert(t.devices.deleteFailed + ": " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -153,6 +181,16 @@ memento-collector setup`}
                       </div>
                     ))}
                   </div>
+                  <Btn
+                    size="sm"
+                    variant="ghost"
+                    icon="trash"
+                    onClick={() => handleDelete(d)}
+                    disabled={deletingId === d.id}
+                    title={t.devices.deleteHint}
+                  >
+                    {deletingId === d.id ? "…" : t.devices.delete}
+                  </Btn>
                 </div>
 
                 {discoveries[d.id] && Object.keys(discoveries[d.id]).length > 0 && (

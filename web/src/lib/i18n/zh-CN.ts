@@ -217,6 +217,10 @@ const zhCN = {
     registered: "注册于",
     snippetCollectorOnly: "只装采集器",
     snippetMetaOption: "或一条命令装齐 collector + MCP memory:",
+    delete: "删除",
+    deleteHint: "删除设备和它名下的所有数据(不可撤销)",
+    deleteConfirm: "确认删除「{name}」?会一并清掉它名下的 {count} 个文件和所有附带数据,不可撤销。\n\n常用于撤销一次导入(把对应的「Imported …」设备删掉即可)。",
+    deleteFailed: "删除失败",
   },
 
   // Auth
