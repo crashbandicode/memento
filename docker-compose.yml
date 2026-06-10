@@ -5,6 +5,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: memento_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: memento
       POSTGRES_USER: postgres
@@ -34,6 +35,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: memento_redis
+    restart: unless-stopped
     ports:
       - "6380:6379"
     healthcheck:
@@ -45,6 +47,7 @@ services:
   # MinIO (S3-compatible storage for large files)
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -108,6 +111,10 @@ services:
         # for users on slow PyPI links. Empty = standard pypi.org.
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     container_name: memento_api
+    # Auto-restart on OOM / crash. Previously absent, which caused a
+    # production outage when api was OOM-killed (exit 137) and never
+    # came back until manually restarted.
+    restart: unless-stopped
     ports:
       - "8001:8000"
     environment:
@@ -155,6 +162,7 @@ services:
       dockerfile: server/Dockerfile
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    restart: unless-stopped
     command: celery -A server.tasks.celery_app worker --loglevel=info
     environment:
       MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
@@ -182,6 +190,7 @@ services:
       dockerfile: server/Dockerfile
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    restart: unless-stopped
     command: celery -A server.tasks.celery_app beat --loglevel=info
     environment:
       MEMENTO_REDIS_URL: redis://redis:6379/0
@@ -195,6 +204,7 @@ services:
       context: ./web
       dockerfile: Dockerfile
     container_name: memento_web
+    restart: unless-stopped
     ports:
       - "3001:3000"
     depends_on:
