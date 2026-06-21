@@ -1,0 +1,124 @@
+name: Build & Deploy (k3s via Fleet)
+
+# 推送到 main 且改了服务端/前端代码时:云端构建 server/web 镜像 → 推 GHCR →
+# 回写 deploy/k8s/kustomization.yaml 的镜像 tag。集群里的 Rancher Fleet 监听
+# 本仓库 deploy/k8s/,检测到 tag 改动后自动部署到 NAS k3s(pull 式,适配家庭 NAT)。
+#
+# 安全说明(公开仓库):构建跑在 GitHub 托管 runner 上,不在自家网络;只在
+# push 到 main 触发(没有 pull_request,fork PR 不会触发),因此只会构建已合入
+# main 的代码。集群密钥不在本仓库——Secret 留在 k3s 内,清单只用 secretKeyRef 引用。
+#
+# 防递归:bump job 用默认 GITHUB_TOKEN 提交回写,GitHub 对 GITHUB_TOKEN 推送
+# 的 commit 不会再触发 workflow(这才是真正的防循环机制;[skip ci] 对 GitHub
+# Actions 无效,只是给其它工具看的)。另外 deploy/k8s/** 不在下方 paths 内,双保险。
+#
+# ⚠️ 首跑前置(一次性):首次构建会以 PRIVATE 创建 GHCR 包,集群无 pull secret
+# 会 ImagePullBackOff。首次成功后须把两个包设为 Public(见 nas-memento-cicd 文档),
+# 之后永久公开。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "mcp_server/**"
+      - "web/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true   # 自动部署只关心最新 commit,新 push 取消在途旧 run,避免回写撞车
+
+permissions:
+  contents: write   # 回写镜像 tag 到 deploy/k8s
+  packages: write   # 推送镜像到 GHCR
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ddong8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.vars.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vars
+        run: echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── server(context=仓库根,COPY server/ mcp_server/ deploy/bootstrap/)──
+      - name: Build & push server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/memento-server:${{ steps.vars.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/memento-server:latest
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+      # ── web(context=web)──
+      - name: Build & push web
+        uses: docker/build-push-action@v6
+        with:
+          context: web
+          file: web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/memento-web:${{ steps.vars.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/memento-web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  bump:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize
+        run: |
+          curl -sfL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Pin image tags & push (triggers Fleet)
+        env:
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          ( cd deploy/k8s && kustomize edit set image \
+              "${REGISTRY}/${OWNER}/memento-server=${REGISTRY}/${OWNER}/memento-server:${SHA}" \
+              "${REGISTRY}/${OWNER}/memento-web=${REGISTRY}/${OWNER}/memento-web:${SHA}" )
+          # 断言 tag 确实回写成功
+          grep -q "memento-server" deploy/k8s/kustomization.yaml && grep -q "${SHA}" deploy/k8s/kustomization.yaml \
+            || { echo "镜像 tag 回写失败"; exit 1; }
+          git add deploy/k8s/kustomization.yaml
+          if git diff --cached --quiet; then
+            echo "镜像 tag 未变,跳过提交"
+            exit 0
+          fi
+          git commit -m "ci(deploy): memento 镜像 -> ${SHA} [skip ci]"
+          # 串行 run 之间可能有新 commit 落到 main,push 前先 rebase,失败重试
+          for i in 1 2 3; do
+            if git pull --rebase origin main && git push; then
+              echo "已回写并推送,Fleet 将拉取部署"
+              exit 0
+            fi
+            echo "push 撞车,重试 $i ..."
+            sleep 3
+          done
+          echo "回写 push 失败"; exit 1

@@ -18,6 +18,8 @@ node_modules/
 # Env
 .env
 .env.local
+.env.bak
+*.env.bak
 
 # Install script artifacts
 .venv-embedding/

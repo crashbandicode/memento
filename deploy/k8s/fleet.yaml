@@ -1,0 +1,5 @@
+# Rancher Fleet bundle 配置。Fleet GitRepo 监听本目录,用 kustomize 渲染后
+# 部署到 NAS k3s 的 memento 命名空间。
+# 只管「无状态应用 + configmap」;Secret(memento-secret)与有状态组件
+# (postgres/redis/minio + PVC)不在此,留在集群内手工维护(公开仓库不能放密钥)。
+defaultNamespace: memento

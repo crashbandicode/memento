@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: celery-worker } }
+  template:
+    metadata: { labels: { app: celery-worker } }
+    spec:
+      containers:
+        - name: celery-worker
+          image: ghcr.io/ddong8/memento-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["celery", "-A", "server.tasks.celery_app", "worker", "--loglevel=info"]
+          envFrom:
+            - configMapRef: { name: memento-config }
+            - secretRef: { name: memento-secret }
+          env:
+            - name: MEMENTO_S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: memento-secret, key: MINIO_ROOT_USER } }
+            - name: MEMENTO_S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: memento-secret, key: MINIO_ROOT_PASSWORD } }
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-beat
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: celery-beat } }
+  template:
+    metadata: { labels: { app: celery-beat } }
+    spec:
+      containers:
+        - name: celery-beat
+          image: ghcr.io/ddong8/memento-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["celery", "-A", "server.tasks.celery_app", "beat", "--loglevel=info"]
+          envFrom:
+            - configMapRef: { name: memento-config }
+            - secretRef: { name: memento-secret }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

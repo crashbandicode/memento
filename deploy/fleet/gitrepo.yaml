@@ -1,0 +1,22 @@
+# Rancher Fleet GitRepo —— 驱动 CI/CD 的「拉取」一半。
+# 这个对象本身不由 Fleet 部署,而是一次性 apply 到本地集群(NAS k3s)的
+# fleet-local workspace,告诉 Fleet 去监听本仓库 deploy/k8s/ 并自动部署。
+#
+# 应用方式(在 NAS 上):
+#   docker exec -i k3s-server kubectl apply -f - < deploy/fleet/gitrepo.yaml
+# 验证:
+#   kubectl -n fleet-local get gitrepo,bundle,bundledeployment
+#
+# 公开仓库,无需 clientSecretName。NAS 在 NAT 后无法收 GitHub webhook,
+# 因此靠 pollingInterval 轮询(部署延迟 ≈ 一个轮询周期)。
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: memento
+  namespace: fleet-local        # 本地集群(NAS k3s)所在的 Fleet workspace
+spec:
+  repo: https://github.com/ddong8/memento
+  branch: main
+  paths:
+    - deploy/k8s
+  pollingInterval: 60s
