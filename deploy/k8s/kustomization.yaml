@@ -4,10 +4,10 @@ kind: Kustomization
 namespace: memento
 
 resources:
-  - api.yaml
-  - celery.yaml
-  - web.yaml
-  - ingress.yaml
+- api.yaml
+- celery.yaml
+- web.yaml
+- ingress.yaml
 
 # memento-config 用 generator:内容变化时名字带新 hash → 自动滚动 api/worker/beat,
 # 避免改了 EMBEDDING_SERVER_URL / AI_MODEL 却不生效。kustomize 会自动把各 Deployment
@@ -15,20 +15,22 @@ resources:
 # embedding 跑在 Mac mini 上(原生 CPU,见 nas-memento-cicd 文档),集群经局域网直连;
 # Mac 的 LAN IP 必须在路由器做 DHCP 保留以稳定(否则 IP 变了要改这里并重新部署)。
 configMapGenerator:
-  - name: memento-config
-    literals:
-      - MEMENTO_REDIS_URL=redis://redis:6379/0
-      - MEMENTO_S3_ENDPOINT=http://minio:9000
-      - MEMENTO_EMBEDDING_SERVER_URL=http://192.168.1.87:18002
-      - MEMENTO_AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
-      - MEMENTO_AI_MODEL=glm-5.2
-      - MEMENTO_PORT=8000
+- literals:
+  - MEMENTO_REDIS_URL=redis://redis:6379/0
+  - MEMENTO_S3_ENDPOINT=http://minio:9000
+  - MEMENTO_EMBEDDING_SERVER_URL=http://192.168.1.87:18002
+  - MEMENTO_AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+  - MEMENTO_AI_MODEL=glm-5.2
+  - MEMENTO_PORT=8000
+  name: memento-config
 
 # 镜像 tag 由 .github/workflows/deploy.yml 在每次构建后用
 # `kustomize edit set image` 回写为该 commit 的 sha,Fleet 监听到改动后部署。
 # 初始 latest 仅占位;首跑后即被替换成不可变的 12 位 sha。
 images:
-  - name: ghcr.io/ddong8/memento-server
-    newTag: latest
-  - name: ghcr.io/ddong8/memento-web
-    newTag: latest
+- name: ghcr.io/ddong8/memento-server
+  newName: ghcr.io/ddong8/memento-server
+  newTag: 3f63a083a967
+- name: ghcr.io/ddong8/memento-web
+  newName: ghcr.io/ddong8/memento-web
+  newTag: 3f63a083a967
