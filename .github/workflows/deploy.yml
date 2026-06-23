@@ -91,8 +91,11 @@ jobs:
 
       - name: Install kustomize
         run: |
-          curl -sfL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-          sudo mv kustomize /usr/local/bin/
+          # 直接下载固定版二进制(走 release CDN),不用 install_kustomize.sh —— 后者查
+          # GitHub API 取最新版,在共享 runner 上常撞未认证限流(60/h)导致 bump 失败。
+          curl -sfL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar -xz
+          sudo install -m 0755 kustomize /usr/local/bin/kustomize
+          kustomize version
 
       - name: Pin image tags & push (triggers Fleet)
         env:
