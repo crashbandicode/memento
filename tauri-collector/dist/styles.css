@@ -389,11 +389,26 @@ body.dashboard-fullscreen .panel[data-panel="dashboard"].active {
 }
 
 /* ─── Logs ────────────────────────────────────────────────────────── */
+/* Active logs panel fills the available viewport height so the log view
+   grows with the window (default .panel.active is display:block, which
+   collapses to log-toolbar height + 360px no matter how big the window). */
+.panel[data-panel="logs"].active {
+  display: flex;
+  flex-direction: column;
+  /* topbar(~58) + tabs(~46) + main vertical padding(52) ≈ 156 */
+  height: calc(100vh - 156px);
+}
+/* Widen main when logs tab is active — 760px is fine for forms but
+   wastes >half the screen on 1080p+ when looking at log lines. */
+body:has(.panel[data-panel="logs"].active) main {
+  max-width: 1400px;
+}
 .log-toolbar {
   display: flex;
   gap: 10px;
   align-items: center;
   margin-bottom: 10px;
+  flex-shrink: 0;
 }
 .log-view {
   background: rgba(0, 0, 0, 0.30);
@@ -404,7 +419,8 @@ body.dashboard-fullscreen .panel[data-panel="dashboard"].active {
   font-size: 11.5px;
   line-height: 1.55;
   color: var(--fg2);
-  height: 360px;
+  flex: 1;
+  min-height: 200px;
   overflow-y: auto;
   margin: 0;
   white-space: pre-wrap;
