@@ -294,9 +294,16 @@ function DevicesTab({ headers, flash }: { headers: Headers; flash: Flash }) {
   const { t, locale } = useI18n();
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [latestVer, setLatestVer] = useState<{ collector: string | null; memory: string | null }>({ collector: null, memory: null });
 
   useEffect(() => {
     authFetch(`${getApiBase()}/api/devices`, { headers }).then((r) => r.json()).then(setDevices).catch((e) => flash("err", e.message));
+    authFetch(`${getApiBase()}/api/devices/collector-latest-version`, { headers })
+      .then((r) => r.json())
+      .then((d: { collector?: string | null; memory?: string | null }) => {
+        setLatestVer({ collector: d.collector ?? null, memory: d.memory ?? null });
+      })
+      .catch(() => { /* PyPI unreachable — fall back to neutral button */ });
   }, [headers, flash]);
 
   const dateFmt = locale === "zh-CN" ? "zh-CN" : "en-US";
@@ -330,12 +337,23 @@ function DevicesTab({ headers, flash }: { headers: Headers; flash: Flash }) {
 
   const update = async (d: DeviceInfo) => {
     await authFetch(`${getApiBase()}/api/devices/${d.id}/command?action=update`, { method: "POST", headers });
-    flash("ok", fmt(t.admin.updateSuccess, { name: d.name }));
+    if (latestVer.collector) {
+      flash("ok", fmt(t.admin.updateNotifiedVersion, { name: d.name, version: latestVer.collector }));
+    } else {
+      flash("ok", fmt(t.admin.updateSuccess, { name: d.name }));
+    }
   };
 
   return (
     <Glass padding={6} radius={20}>
-      {devices.map((d, i) => (
+      {devices.map((d, i) => {
+        const isUpToDate = latestVer.collector != null && d.collector_version === latestVer.collector;
+        const updateLabel = isUpToDate
+          ? t.admin.collectorUpToDate
+          : latestVer.collector != null
+            ? fmt(t.admin.updateToVersion, { version: latestVer.collector })
+            : t.admin.updateCollector;
+        return (
         <div key={d.id} style={{
           display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
           borderTop: i === 0 ? "none" : "1px solid var(--aurora-border)", flexWrap: "wrap",
@@ -363,7 +381,7 @@ function DevicesTab({ headers, flash }: { headers: Headers; flash: Flash }) {
             {d.last_heartbeat ? new Date(d.last_heartbeat).toLocaleString(dateFmt) : t.admin.neverSynced}
           </span>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <Btn variant="glass" size="sm" icon="refresh" onClick={() => update(d)}>{t.admin.updateCollector}</Btn>
+            <Btn variant="glass" size="sm" icon="refresh" onClick={() => update(d)} disabled={isUpToDate}>{updateLabel}</Btn>
             <Btn size="sm" onClick={() => resync(d)} disabled={busy === d.id}>
               {busy === d.id ? "…" : t.admin.resync}
             </Btn>
@@ -372,7 +390,8 @@ function DevicesTab({ headers, flash }: { headers: Headers; flash: Flash }) {
             </Btn>
           </div>
         </div>
-      ))}
+        );
+      })}
       {devices.length === 0 && (
         <div style={{ textAlign: "center", color: "var(--aurora-fg4)", fontSize: 13, padding: 24 }}>
           {t.devices.noDevices}

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
 from collections import defaultdict
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,11 @@ router = APIRouter(prefix="/api/devices", tags=["devices"])
 # Format: {device_id: [{id, action, created_at}, ...]}
 _command_queue: dict[str, list[dict]] = defaultdict(list)
 _cmd_counter = 0
+
+# In-memory PyPI version cache: {package_name: (version_or_none, expires_monotonic)}
+# 5-minute TTL — uses time.monotonic() so clock changes can't break TTL math.
+_PYPI_CACHE_TTL = 300.0
+_pypi_version_cache: dict[str, tuple[str | None, float]] = {}
 
 
 def _enqueue_command(device_collector_id: str, action: str) -> int:
@@ -269,6 +276,55 @@ async def send_command_by_collector_id(
             raise HTTPException(status_code=404, detail="Device not found")
     cmd_id = _enqueue_command(collector_id, action)
     return {"status": "queued", "command_id": cmd_id, "action": action}
+
+
+async def _fetch_pypi_version(client: httpx.AsyncClient, package: str) -> str | None:
+    """Fetch the latest version of a package from PyPI. Returns None on any failure."""
+    resp = await client.get(f"https://pypi.org/pypi/{package}/json")
+    resp.raise_for_status()
+    return resp.json()["info"]["version"]
+
+
+async def _get_cached_pypi_version(client: httpx.AsyncClient, package: str) -> str | None:
+    """Return cached version if fresh, else fetch + cache. None on fetch failure."""
+    now = time.monotonic()
+    cached = _pypi_version_cache.get(package)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    try:
+        version = await _fetch_pypi_version(client, package)
+    except Exception:
+        version = None
+    _pypi_version_cache[package] = (version, now + _PYPI_CACHE_TTL)
+    return version
+
+
+@router.get("/collector-latest-version")
+async def get_collector_latest_version(
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Return the latest available collector + MCP memory versions from PyPI.
+
+    Cached for 5 minutes in-process. Returns null for any package whose PyPI
+    fetch failed (never 500s) so the admin UI can still render.
+    """
+    from datetime import datetime, timezone
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        results = await asyncio.gather(
+            _get_cached_pypi_version(client, "memento-brain-collector"),
+            _get_cached_pypi_version(client, "memento-brain-memory"),
+            return_exceptions=True,
+        )
+
+    collector_v = results[0] if isinstance(results[0], (str, type(None))) else None
+    memory_v = results[1] if isinstance(results[1], (str, type(None))) else None
+
+    return {
+        "collector": collector_v,
+        "memory": memory_v,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.get("/commands")

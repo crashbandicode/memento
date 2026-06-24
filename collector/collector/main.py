@@ -187,27 +187,56 @@ def _check_and_update(logger: logging.Logger) -> None:
     try:
         from importlib.metadata import version as get_version, PackageNotFoundError
 
-        # Check collector update
+        # Log starting state up front so the user sees the check fired even
+        # if nothing needs upgrading. Guard the mcp version lookup with
+        # try/except so this initial log itself never crashes.
         current = get_version(PACKAGE_NAME)
+        try:
+            _mcp_current_for_log = get_version("memento-brain-memory")
+        except PackageNotFoundError:
+            _mcp_current_for_log = "not installed"
+        logger.info(
+            "Checking PyPI for updates (collector=%s, mcp=%s)",
+            current, _mcp_current_for_log,
+        )
+
+        # Check collector update
         latest = _get_pypi_latest(PACKAGE_NAME)
         needs_restart = False
+        any_upgrade = False
 
-        if latest and latest != current:
+        if latest is None:
+            logger.warning(
+                "PyPI lookup failed for memento-brain-collector "
+                "(network/proxy/timeout) — try again later"
+            )
+        elif latest == current:
+            logger.info("Collector already up to date (%s)", current)
+        elif latest != current:
             logger.info("Collector update available: %s → %s", current, latest)
             if _upgrade_package(PACKAGE_NAME, latest, logger):
                 logger.info("Collector upgraded to %s", latest)
                 needs_restart = True
+                any_upgrade = True
 
         # Also check MCP server update (installed as dependency)
         try:
             mcp_current = get_version("memento-brain-memory")
             mcp_latest = _get_pypi_latest("memento-brain-memory")
-            if mcp_latest and mcp_latest != mcp_current:
+            if mcp_latest is None:
+                logger.warning("PyPI lookup failed for memento-brain-memory")
+            elif mcp_latest == mcp_current:
+                logger.info("MCP server already up to date (%s)", mcp_current)
+            elif mcp_latest != mcp_current:
                 logger.info("MCP server update available: %s → %s", mcp_current, mcp_latest)
                 if _upgrade_package("memento-brain-memory", mcp_latest, logger):
                     logger.info("MCP server upgraded to %s (restart AI IDE to activate)", mcp_latest)
+                    any_upgrade = True
         except PackageNotFoundError:
-            logger.debug("memento-brain-memory not installed, skipping MCP upgrade")
+            logger.info("memento-brain-memory not installed, skipping MCP upgrade")
+
+        if not any_upgrade:
+            logger.info("Update check complete — no upgrades needed")
 
         # Restart collector if it was upgraded
         if needs_restart:
