@@ -411,14 +411,16 @@ body:has(.panel[data-panel="logs"].active) main {
   flex-shrink: 0;
 }
 .log-view {
-  background: rgba(0, 0, 0, 0.30);
+  /* Terminal-style: solid black + bright text. Both themes use the same
+     colors here — log readability shouldn't depend on dark/light mode. */
+  background: #0a0a0a;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 12px 14px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
   line-height: 1.55;
-  color: var(--fg2);
+  color: #e6e6e6;
   flex: 1;
   min-height: 200px;
   overflow-y: auto;
@@ -426,6 +428,7 @@ body:has(.panel[data-panel="logs"].active) main {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.log-view::selection { background: #3a3a3a; color: #ffffff; }
 
 /* ─── About ───────────────────────────────────────────────────────── */
 .kv {
