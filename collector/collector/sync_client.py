@@ -16,6 +16,9 @@ from .queue import QueueItem, SyncQueue
 logger = logging.getLogger("collector.sync")
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
+CHUNK_UPLOAD_MAX_ATTEMPTS = 4
+CHUNK_RETRY_BASE_SECONDS = 0.5
+CHUNK_RETRY_MAX_SECONDS = 4.0
 
 
 class SyncClient:
@@ -235,11 +238,6 @@ class SyncClient:
             for index in range(total_chunks):
                 if not self._running or self._pause_requested.is_set():
                     return False
-                if not self._queue.renew_lease(
-                    item, lease_seconds=self._config.queue_lease_seconds,
-                ):
-                    logger.warning("Lease lost during upload: %s", payload["relative_path"])
-                    return False
 
                 chunk = stream.read(CHUNK_SIZE)
                 if not chunk:
@@ -251,18 +249,66 @@ class SyncClient:
                     "total_chunks": total_chunks,
                     "upload_id": upload_id,
                 }
-                resp = self._client.post(
-                    "/api/ingest/file/chunk",
-                    data={"metadata": json.dumps(chunk_meta)},
-                    files={"content": (f"chunk_{index}.txt", chunk, "text/plain")},
-                )
-                if resp.status_code not in (200, 201):
+                encoded_meta = json.dumps(chunk_meta)
+
+                for attempt in range(1, CHUNK_UPLOAD_MAX_ATTEMPTS + 1):
+                    if not self._running or self._pause_requested.is_set():
+                        return False
+                    if not self._queue.renew_lease(
+                        item, lease_seconds=self._config.queue_lease_seconds,
+                    ):
+                        logger.warning(
+                            "Lease lost during upload: %s", payload["relative_path"],
+                        )
+                        return False
+
+                    retry_reason: str | None = None
+                    try:
+                        resp = self._client.post(
+                            "/api/ingest/file/chunk",
+                            data={"metadata": encoded_meta},
+                            files={
+                                "content": (
+                                    f"chunk_{index}.txt", chunk, "text/plain",
+                                ),
+                            },
+                        )
+                    except httpx.TransportError as exc:
+                        retry_reason = f"{type(exc).__name__}: {exc}"
+                    else:
+                        if resp.status_code in (200, 201):
+                            break
+                        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                            retry_reason = f"HTTP {resp.status_code}"
+                        else:
+                            logger.warning(
+                                "Chunk %d/%d failed permanently (%s) for %s",
+                                index + 1, total_chunks, resp.status_code,
+                                payload["relative_path"],
+                            )
+                            return False
+
+                    if attempt >= CHUNK_UPLOAD_MAX_ATTEMPTS:
+                        logger.warning(
+                            "Chunk %d/%d exhausted %d attempts (%s) for %s",
+                            index + 1, total_chunks, CHUNK_UPLOAD_MAX_ATTEMPTS,
+                            retry_reason, payload["relative_path"],
+                        )
+                        return False
+
+                    delay = min(
+                        CHUNK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                        CHUNK_RETRY_MAX_SECONDS,
+                    )
                     logger.warning(
-                        "Chunk %d/%d failed (%s) for %s",
-                        index + 1, total_chunks, resp.status_code,
+                        "Chunk %d/%d retry %d/%d in %.1fs (%s) for %s",
+                        index + 1, total_chunks, attempt + 1,
+                        CHUNK_UPLOAD_MAX_ATTEMPTS, delay, retry_reason,
                         payload["relative_path"],
                     )
-                    return False
+                    self._sleep_interruptibly(delay)
+                    if not self._running or self._pause_requested.is_set():
+                        return False
 
         logger.info("Chunked upload complete: %s", payload["relative_path"])
         return True
