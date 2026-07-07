@@ -158,8 +158,8 @@ async def get_conversation_messages(
                 "role": m.role or m.message_type,
                 "content": m.content,
                 "thinking": (m.metadata_ or {}).get("thinking") if m.metadata_ else None,
-                "tool_name": "",
-                "tool_input": "",
+                "tool_name": (m.metadata_ or {}).get("tool_name", ""),
+                "tool_input": (m.metadata_ or {}).get("tool_input", ""),
                 "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                 "raw_type": m.message_type or "",
             }

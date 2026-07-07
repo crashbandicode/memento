@@ -51,6 +51,19 @@ DEFAULT_SENSITIVE_KEYS = frozenset({
     "privateKey", "private_key", "credentials",
 })
 
+# CSI/OSC terminal formatting has no meaning once text leaves a terminal. In
+# particular, PowerShell Select-String inserts reverse-video markers around
+# matches; without stripping, the web UI displays them as ESC glyphs.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
+    r"|\x9B[0-?]*[ -/]*[@-~]"
+)
+
+
+def strip_terminal_sequences(text: str) -> str:
+    """Remove ANSI CSI/OSC terminal control sequences from synced text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
 
 @dataclass
 class SanitizeResult:
@@ -62,7 +75,7 @@ class SanitizeResult:
 def sanitize_text(text: str) -> SanitizeResult:
     """Apply regex-based sanitization to text content."""
     count = 0
-    result = text
+    result = strip_terminal_sequences(text)
     for pattern, replacement in _PATTERNS:
         result, n = pattern.subn(replacement, result)
         count += n

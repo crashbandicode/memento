@@ -67,6 +67,22 @@ _RESANITIZE_PATTERNS = [
     ), "[PRIVATE_KEY_REDACTED]"),
 ]
 
+_GENERATED_CONVERSATION_TITLE_RE = re.compile(
+    r"^(?:"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|(?:agent|session|rollout|conversation|chat)[-_][a-z0-9_-]{8,}"
+    r")$",
+    re.IGNORECASE,
+)
+_CLAUDE_LOCAL_COMMAND_PREFIXES = (
+    "<command-name",
+    "<command-message",
+    "<command-args",
+    "<local-command-caveat",
+    "<local-command-stdout",
+    "<local-command-stderr",
+)
+
 
 def _resanitize(text: str) -> tuple[str, bool]:
     """Server-side re-sanitization. Returns (cleaned_text, had_sensitive)."""
@@ -76,6 +92,56 @@ def _resanitize(text: str) -> tuple[str, bool]:
         if n > 0:
             found = True
     return text, found
+
+
+def _has_generated_conversation_title(title: str | None) -> bool:
+    """Return whether a source title is an opaque machine-generated identifier."""
+    candidate = (title or "").strip().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    candidate = re.sub(r"\.(?:jsonl?|md|txt)$", "", candidate, flags=re.IGNORECASE)
+    return bool(_GENERATED_CONVERSATION_TITLE_RE.fullmatch(candidate))
+
+
+def _friendly_conversation_title(content: str, max_length: int = 96) -> str | None:
+    """Build a compact thread name from the first meaningful human prompt."""
+    text = (content or "").strip()
+    if not text or text.lower().startswith(_CLAUDE_LOCAL_COMMAND_PREFIXES):
+        return None
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[#>*`\-\s]+", "", text).strip()
+    if not text:
+        return None
+    if len(text) <= max_length:
+        return text
+
+    shortened = text[: max_length - 1].rstrip()
+    if " " in shortened:
+        shortened = shortened.rsplit(" ", 1)[0]
+    return shortened.rstrip(".,;:-") + "…"
+
+
+async def _apply_friendly_conversation_title(
+    db: AsyncSession, doc: Document,
+) -> str | None:
+    """Replace opaque transcript identifiers with the first real user prompt."""
+    if not _has_generated_conversation_title(doc.title):
+        return doc.title
+
+    result = await db.execute(
+        select(ConversationMessage.content)
+        .where(
+            ConversationMessage.document_id == doc.id,
+            ConversationMessage.role == "user",
+        )
+        .order_by(ConversationMessage.line_number.asc())
+        .limit(25)
+    )
+    for content in result.scalars():
+        friendly = _friendly_conversation_title(content or "")
+        if friendly:
+            doc.title = friendly
+            return friendly
+    return doc.title
 
 
 _WORKSPACE_PATTERNS = [
@@ -384,19 +450,7 @@ async def ingest_file(
         )
         db.add(version)
 
-    # Refresh the content_tsv full-text index from the current (possibly
-    # delta-appended) content + title. Runs inside the ingest transaction
-    # via a bound SQL expression so the tokenized string is passed as a
-    # parameter, not compiled into SQL.
     from sqlalchemy import func as _func, update as _update
-    from .tokenize import tokenize_for_index as _tok
-    tsv_input = _tok(f"{doc.title or ''} {doc.content or ''}")
-    await db.execute(
-        _update(Document)
-        .where(Document.id == doc.id)
-        .values(content_tsv=_func.to_tsvector("simple", tsv_input))
-    )
-
     await db.flush()
 
     # Bump the parent project's updated_at so the projects list (sorted
@@ -439,6 +493,18 @@ async def ingest_file(
         or (content_type == "json" and tool_id == "hermes")
     ):
         await _extract_messages(db, doc, content, mode)
+        title = await _apply_friendly_conversation_title(db, doc) or title
+
+    # Refresh the content_tsv full-text index after conversation extraction so
+    # an opaque source filename can be replaced by its human-readable prompt.
+    # The tokenized value is bound as a parameter, not compiled into SQL.
+    from .tokenize import tokenize_for_index as _tok
+    tsv_input = _tok(f"{doc.title or ''} {doc.content or ''}")
+    await db.execute(
+        _update(Document)
+        .where(Document.id == doc.id)
+        .values(content_tsv=_func.to_tsvector("simple", tsv_input))
+    )
 
     # Update sync state
     await _update_sync_state(db, tool_id, relative_path, content_hash, offset, machine_id)
@@ -537,7 +603,11 @@ async def _extract_messages(
     db: AsyncSession, doc: Document, content: str, mode: str,
 ) -> None:
     """Parse conversation content and store normalized messages."""
-    from .conversation_parser import _iter_json_objects, parse_conversation_line
+    from .conversation_parser import (
+        _iter_json_objects,
+        parse_conversation_line,
+        strip_terminal_sequences,
+    )
 
     # Hermes stores a whole session as a single top-level JSON, not JSONL.
     # Always full-replace (file is rewritten on each turn).
@@ -605,11 +675,14 @@ async def _extract_messages(
         # on their side, so this doesn't inflate message counts.
         normalized = parse_conversation_line(line, tool_id)
         if normalized and normalized.role in ("user", "assistant", "tool", "system"):
+            clean_content = strip_terminal_sequences(normalized.content).replace("\x00", "")
+            if not clean_content.strip():
+                continue
             # Deduplicate: same role + content + timestamp (within same second).
             # This prevents event_msg/user_message and response_item/user duplicates
             # while keeping genuinely repeated inputs across different turns.
             ts_bucket = (normalized.timestamp or "")[:19]  # truncate to second
-            dedupe_key = hashlib.md5(f"{normalized.role}:{ts_bucket}:{normalized.content}".encode()).hexdigest()
+            dedupe_key = hashlib.md5(f"{normalized.role}:{ts_bucket}:{clean_content}".encode()).hexdigest()
             if dedupe_key in seen_contents:
                 continue
             seen_contents.add(dedupe_key)
@@ -623,13 +696,17 @@ async def _extract_messages(
 
             meta = {}
             if normalized.thinking:
-                meta["thinking"] = normalized.thinking.replace("\x00", "")
+                meta["thinking"] = strip_terminal_sequences(normalized.thinking).replace("\x00", "")
+            if normalized.tool_name:
+                meta["tool_name"] = normalized.tool_name
+            if normalized.tool_input:
+                meta["tool_input"] = strip_terminal_sequences(normalized.tool_input).replace("\x00", "")
             batch.append(ConversationMessage(
                 document_id=doc.id,
                 line_number=line_num,
                 message_type=normalized.raw_type or normalized.role,
                 role=normalized.role,
-                content=normalized.content.replace("\x00", ""),
+                content=clean_content,
                 metadata_=meta,
                 timestamp=ts,
             ))

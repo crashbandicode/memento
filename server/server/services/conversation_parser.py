@@ -25,6 +25,21 @@ class NormalizedMessage:
     raw_type: str = ""  # Original message type
 
 
+# Terminal programs commonly decorate matches and status text with ANSI CSI
+# sequences (for example PowerShell Select-String emits ESC[7m / ESC[0m).
+# Conversation viewers are not terminal emulators, so retaining these bytes
+# produces visible replacement glyphs and misleading text.
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
+    r"|\x9B[0-?]*[ -/]*[@-~]"
+)
+
+
+def strip_terminal_sequences(text: str) -> str:
+    """Remove ANSI CSI/OSC terminal control sequences from plain text."""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
     """Parse a single JSONL line into a NormalizedMessage, or None if it should be skipped."""
     try:
@@ -44,6 +59,48 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             message = obj.get("message", {})
             role = message.get("role", msg_type)
             raw_content = message.get("content", "")
+
+            # Claude Code records slash commands as synthetic user messages.
+            # They are useful session context, but they are not human prompts;
+            # normalize them into compact tool rows instead of purple bubbles.
+            local_command = _extract_local_command(raw_content)
+            if role == "user" and local_command is not None:
+                tool_name, tool_input, output = local_command
+                return NormalizedMessage(
+                    role="tool",
+                    content=output or f"[{tool_name}]",
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timestamp=timestamp,
+                    raw_type="local_command",
+                )
+
+            # Claude's API represents a tool result as a message whose outer
+            # role is "user".  It is not human input: the content blocks are
+            # typed tool_result and must render as a tool card, otherwise large
+            # terminal dumps become giant purple User bubbles.
+            tool_result = _extract_tool_result_content(raw_content)
+            if role == "user" and tool_result is not None:
+                return NormalizedMessage(
+                    role="tool",
+                    content=tool_result or "(tool returned no textual output)",
+                    tool_name="Tool result",
+                    timestamp=timestamp,
+                    raw_type="tool_result",
+                )
+
+            tool_use = _extract_tool_use(raw_content)
+            if role == "assistant" and tool_use is not None:
+                tool_name, tool_input = tool_use
+                return NormalizedMessage(
+                    role="tool",
+                    content=f"[{tool_name}]",
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timestamp=timestamp,
+                    raw_type="tool_use",
+                )
+
             # Extract thinking separately from final text (Claude extended thinking)
             thinking = _extract_thinking_parts(raw_content)
             content = _extract_content(raw_content)
@@ -292,7 +349,9 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
 
 _SYSTEM_TAGS = (
     "ide_opened_file|ide_selection|system-reminder|"
-    "user-prompt-submit-hook|task-notification"
+    "user-prompt-submit-hook|task-notification|"
+    "command-name|command-message|command-args|"
+    "local-command-caveat|local-command-stdout|local-command-stderr"
 )
 _SYSTEM_TAG_RE = re.compile(
     rf"<(?:{_SYSTEM_TAGS})[^>]*>.*?</(?:{_SYSTEM_TAGS})>",
@@ -306,9 +365,97 @@ _SYSTEM_LINE_RE = re.compile(
 
 def _strip_system_tags(text: str) -> str:
     """Remove IDE/system injection tags and system lines from message content."""
+    text = strip_terminal_sequences(text)
     text = _SYSTEM_TAG_RE.sub("", text)
     text = _SYSTEM_LINE_RE.sub("", text)
     return text.strip()
+
+
+def _extract_tool_result_content(content) -> str | None:
+    """Return Claude/OpenClaw tool-result text, or None if no such block exists."""
+    if not isinstance(content, list):
+        return None
+
+    found = False
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") not in ("tool_result", "toolResult"):
+            continue
+        found = True
+        result = item.get("content", item.get("output", ""))
+        if isinstance(result, list):
+            nested: list[str] = []
+            for block in result:
+                if isinstance(block, dict):
+                    text = block.get("text", block.get("content", ""))
+                    if text:
+                        nested.append(str(text))
+                elif block is not None:
+                    nested.append(str(block))
+            result = "\n".join(nested)
+        elif isinstance(result, (dict, list)):
+            result = json.dumps(result, ensure_ascii=False, indent=2)
+        if result:
+            parts.append(str(result))
+
+    if not found:
+        return None
+    return strip_terminal_sequences("\n\n".join(parts)).strip()
+
+
+def _extract_local_command(content) -> tuple[str, str, str] | None:
+    """Return Claude Code slash-command context as (name, input, output)."""
+    if not isinstance(content, str):
+        return None
+
+    def tag_value(name: str) -> str:
+        match = re.search(
+            rf"<{name}[^>]*>(.*?)</{name}>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        return strip_terminal_sequences(match.group(1)).strip() if match else ""
+
+    command_name = tag_value("command-name")
+    command_args = tag_value("command-args")
+    stdout = tag_value("local-command-stdout")
+    stderr = tag_value("local-command-stderr")
+
+    if command_name:
+        return command_name, command_args, stdout or stderr
+    if stdout:
+        return "Local command result", "", stdout
+    if stderr:
+        return "Local command error", "", stderr
+    return None
+
+
+def _extract_tool_use(content) -> tuple[str, str] | None:
+    """Return a standalone Claude tool invocation as (name, formatted input)."""
+    if not isinstance(content, list):
+        return None
+
+    # If the assistant included visible prose alongside the invocation, keep
+    # the whole message as assistant text rather than discarding that prose.
+    if any(
+        isinstance(item, dict)
+        and item.get("type") == "text"
+        and str(item.get("text", "")).strip()
+        for item in content
+    ):
+        return None
+
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") not in ("tool_use", "toolCall"):
+            continue
+        name = str(item.get("name") or "Tool")
+        value = item.get("input") if "input" in item else item.get("arguments", {})
+        if isinstance(value, str):
+            tool_input = value
+        else:
+            tool_input = json.dumps(value, ensure_ascii=False, indent=2)
+        return name, strip_terminal_sequences(tool_input).strip()
+    return None
 
 
 def _extract_thinking_parts(content) -> str:
