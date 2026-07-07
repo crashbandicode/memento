@@ -30,7 +30,13 @@ class Machine(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    collector_token_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Despite the legacy column name, this stores the collector's persistent
+    # device ID.  A device must have exactly one row: initial collector scans
+    # upload several files concurrently, so application-level lookup alone is
+    # not enough to prevent duplicate registrations.
+    collector_token_hash: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True,
+    )
     collector_version: Mapped[str | None] = mapped_column(String(50))
     user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

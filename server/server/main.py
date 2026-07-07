@@ -35,6 +35,14 @@ def _run_migrations(conn) -> None:
     if "user_id" not in machine_cols:
         conn.execute(text("ALTER TABLE machines ADD COLUMN user_id UUID REFERENCES users(id)"))
 
+    # A collector starts with a concurrent upload burst.  Enforce one machine
+    # row per persistent device ID at the database boundary; ensure_device()
+    # also takes a transaction-scoped advisory lock to avoid insert races.
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_machines_collector_token_hash "
+        "ON machines (collector_token_hash)"
+    ))
+
     # User.collector_token
     user_cols = {c["name"] for c in insp.get_columns("users")}
     if "collector_token" not in user_cols:

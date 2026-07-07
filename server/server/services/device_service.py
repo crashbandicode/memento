@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from passlib.hash import sha256_crypt
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import Machine
@@ -19,7 +19,15 @@ async def ensure_device(
     user_id: "uuid.UUID | None" = None,
 ) -> Machine:
     """Find or create a machine record for this device."""
-    import uuid
+    # The collector drains its initial queue concurrently.  Serialize the
+    # first registration for a given device inside Postgres so two requests
+    # cannot both observe a missing row and insert duplicates.  The schema's
+    # unique index remains the final integrity guard.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:device_id))"),
+        {"device_id": device_id},
+    )
+
     result = await db.execute(
         select(Machine).where(Machine.collector_token_hash == device_id)
     )
