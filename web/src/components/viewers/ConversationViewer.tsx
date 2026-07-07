@@ -2,7 +2,7 @@
 
 import { memo, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { api, ConversationMessage } from "@/lib/api-client";
+import { api, ConversationMessage, ConversationPrompt } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
@@ -47,6 +47,9 @@ export default function ConversationViewer({
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
+  const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
+  const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
+  const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
@@ -80,66 +83,313 @@ export default function ConversationViewer({
     offsetRef.current = 0;
     loadingRef.current = false;
     setHasMore(true);
+    setPrompts([]);
+    setActivePromptLine(null);
+    setPendingPromptLine(null);
     loadMore();
+    api.getPrompts(documentId)
+      .then((response) => {
+        setPrompts(response.prompts);
+        setActivePromptLine(response.prompts[0]?.line_number ?? null);
+      })
+      .catch((error) => console.error("Failed to load prompt outline:", error));
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (pendingPromptLine === null) return;
+    const target = document.getElementById(`conversation-line-${pendingPromptLine}`);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    setPendingPromptLine(null);
+  }, [messages, pendingPromptLine]);
 
   const handleScroll = () => {
     const el = containerRef.current;
     if (!el) return;
+    const promptElements = el.querySelectorAll<HTMLElement>("[data-prompt-line]");
+    const containerTop = el.getBoundingClientRect().top;
+    let currentLine: number | null = null;
+    for (const promptElement of promptElements) {
+      if (promptElement.getBoundingClientRect().top - containerTop > 120) break;
+      currentLine = Number(promptElement.dataset.promptLine);
+    }
+    if (currentLine !== null) {
+      setActivePromptLine((previous) => previous === currentLine ? previous : currentLine);
+    }
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
       loadMore();
     }
   };
 
+  const navigateToPrompt = async (prompt: ConversationPrompt) => {
+    const anchorId = `conversation-line-${prompt.line_number}`;
+    if (!document.getElementById(anchorId) && !loadingRef.current) {
+      loadingRef.current = true;
+      setLoading(true);
+      try {
+        const collected: ConversationMessage[] = [];
+        let total = totalMessages;
+        while (offsetRef.current < prompt.line_number) {
+          const remaining = prompt.line_number - offsetRef.current;
+          const response = await api.getMessages(
+            documentId,
+            offsetRef.current,
+            Math.min(200, Math.max(50, remaining)),
+          );
+          total = response.total;
+          if (response.messages.length === 0) break;
+          collected.push(...response.messages);
+          offsetRef.current += response.messages.length;
+        }
+        if (collected.length > 0) {
+          setMessages((previous) => {
+            const existingIds = new Set(previous.map((message) => message.id));
+            return [
+              ...previous,
+              ...collected.filter((message) => !existingIds.has(message.id)),
+            ];
+          });
+        }
+        setHasMore(offsetRef.current < total);
+      } catch (error) {
+        console.error("Failed to load prompt target:", error);
+      } finally {
+        setLoading(false);
+        loadingRef.current = false;
+      }
+    }
+
+    setActivePromptLine(prompt.line_number);
+    setPendingPromptLine(prompt.line_number);
+  };
+
   return (
-    <div
-      ref={containerRef}
-      onScroll={handleScroll}
-      className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
-    >
-      <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 16, textAlign: "center" }}>
-        {fmt(t.conversation.messagesTotal, { total: totalMessages, loaded: messages.length })}
-      </div>
+    <div style={{ position: "relative" }}>
+      <div
+        ref={containerRef}
+        onScroll={handleScroll}
+        className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
+      >
+        <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 16, textAlign: "center" }}>
+          {fmt(t.conversation.messagesTotal, { total: totalMessages, loaded: messages.length })}
+        </div>
 
-      <div className="space-y-3 max-w-4xl mx-auto pb-8">
-        {messages.map((msg, idx) => (
-          <ChatBubble key={`${msg.id}-${idx}`} msg={msg} locale={locale} t={t} />
-        ))}
-
-        {artifacts && artifacts.length > 0 && !hasMore && (
-          <>
-            <div style={{ display: "flex", justifyContent: "center" }}>
+        <div className="space-y-3 max-w-4xl mx-auto pb-8">
+          {messages.map((msg, idx) => {
+            const isHumanPrompt = (msg.role || msg.message_type) === "user"
+              && !msg.content.includes("[Subagent Context]");
+            return (
               <div
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  padding: "4px 12px",
-                  borderRadius: 9999,
-                  border: "1px solid var(--aurora-border)",
-                  background: "rgba(251,191,36,0.12)",
-                  color: "#A16207",
-                  fontSize: 11,
-                  fontWeight: 600,
-                }}
+                key={`${msg.id}-${idx}`}
+                id={`conversation-line-${msg.line_number}`}
+                data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
+                style={{ scrollMarginTop: 16 }}
               >
-                <Icon name="file_text" size={12} /> Brain Artifacts ({artifacts.length})
+                <ChatBubble msg={msg} locale={locale} t={t} />
               </div>
-            </div>
-            {artifacts.map((art) => (
-              <ArtifactBubble key={art.id} artifact={art} />
-            ))}
-          </>
+            );
+          })}
+
+          {artifacts && artifacts.length > 0 && !hasMore && (
+            <>
+              <div style={{ display: "flex", justifyContent: "center" }}>
+                <div
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "4px 12px",
+                    borderRadius: 9999,
+                    border: "1px solid var(--aurora-border)",
+                    background: "rgba(251,191,36,0.12)",
+                    color: "#A16207",
+                    fontSize: 11,
+                    fontWeight: 600,
+                  }}
+                >
+                  <Icon name="file_text" size={12} /> Brain Artifacts ({artifacts.length})
+                </div>
+              </div>
+              {artifacts.map((art) => (
+                <ArtifactBubble key={art.id} artifact={art} />
+              ))}
+            </>
+          )}
+        </div>
+
+        {loading && (
+          <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.loadingMore}</div>
+        )}
+        {!hasMore && messages.length > 0 && (
+          <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.allLoaded}</div>
         )}
       </div>
 
-      {loading && (
-        <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.loadingMore}</div>
-      )}
-      {!hasMore && messages.length > 0 && (
-        <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.allLoaded}</div>
-      )}
+      <PromptNavigator
+        prompts={prompts}
+        activeLine={activePromptLine}
+        label={t.conversation.promptNavigator}
+        onSelect={navigateToPrompt}
+      />
     </div>
+  );
+}
+
+function promptSnippet(value: string): string {
+  return cleanTerminalText(value)
+    .replace(/```[\s\S]*?```/g, " code ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[#>*_`~\[\]()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function PromptNavigator({
+  prompts,
+  activeLine,
+  label,
+  onSelect,
+}: {
+  prompts: ConversationPrompt[];
+  activeLine: number | null;
+  label: string;
+  onSelect: (prompt: ConversationPrompt) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (prompts.length === 0) return null;
+
+  return (
+    <aside
+      data-prompt-navigator
+      aria-label={label}
+      className="hidden xl:flex"
+      onMouseEnter={() => setExpanded(true)}
+      onMouseLeave={() => setExpanded(false)}
+      onFocus={() => setExpanded(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setExpanded(false);
+      }}
+      style={{
+        position: "absolute",
+        top: 34,
+        right: -38,
+        bottom: 44,
+        zIndex: 40,
+        width: expanded ? 300 : 28,
+        flexDirection: "column",
+        border: "1px solid var(--aurora-border)",
+        borderRadius: 14,
+        background: "color-mix(in srgb, var(--aurora-surface-solid) 92%, transparent)",
+        boxShadow: expanded
+          ? "0 20px 48px -18px rgba(15,23,42,0.28)"
+          : "0 6px 18px -10px rgba(15,23,42,0.3)",
+        backdropFilter: "blur(18px)",
+        overflow: "hidden",
+        transition: "width .18s ease, box-shadow .18s ease",
+      }}
+    >
+      {expanded && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "10px 11px 8px",
+            borderBottom: "1px solid var(--aurora-border)",
+            color: "var(--aurora-fg3)",
+            flex: "0 0 auto",
+          }}
+        >
+          <Icon name="message" size={13} style={{ color: "var(--aurora-accent)" }} />
+          <span style={{ fontSize: 11, fontWeight: 650 }}>{label}</span>
+          <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--aurora-fg4)" }}>
+            {prompts.length}
+          </span>
+        </div>
+      )}
+
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          padding: expanded ? "6px" : "8px 7px",
+        }}
+      >
+        {prompts.map((prompt, index) => {
+          const snippet = promptSnippet(prompt.content) || `Prompt ${index + 1}`;
+          const active = prompt.line_number === activeLine;
+          return (
+            <button
+              key={`${prompt.id}-${prompt.line_number}`}
+              type="button"
+              data-prompt-item={prompt.line_number}
+              title={snippet}
+              onClick={() => onSelect(prompt)}
+              style={{
+                width: "100%",
+                minHeight: expanded ? 34 : 10,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                marginBottom: expanded ? 2 : 5,
+                padding: expanded ? "6px 7px" : 0,
+                border: 0,
+                borderRadius: expanded ? 8 : 999,
+                background: expanded
+                  ? active
+                    ? "color-mix(in srgb, var(--aurora-accent) 10%, transparent)"
+                    : "transparent"
+                  : active
+                    ? "var(--aurora-accent)"
+                    : "var(--aurora-border)",
+                color: active ? "var(--aurora-accent)" : "var(--aurora-fg3)",
+                textAlign: "left",
+                cursor: "pointer",
+              }}
+            >
+              {expanded ? (
+                <>
+                  <span
+                    style={{
+                      width: 18,
+                      height: 18,
+                      borderRadius: 999,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flex: "0 0 auto",
+                      background: active
+                        ? "color-mix(in srgb, var(--aurora-accent) 14%, transparent)"
+                        : "var(--aurora-chip)",
+                      fontSize: 8.5,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {index + 1}
+                  </span>
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontSize: 10.5,
+                      lineHeight: 1.3,
+                    }}
+                  >
+                    {snippet}
+                  </span>
+                </>
+              ) : (
+                <span className="sr-only">{snippet}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </aside>
   );
 }
 

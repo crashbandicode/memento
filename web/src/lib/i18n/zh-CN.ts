@@ -172,6 +172,9 @@ const zhCN = {
     brainArtifacts: "brain 文件",
     browserFrames: "浏览器截图",
     browserHighlights: "浏览器高亮",
+    lowActivity: "低活动对话",
+    lowActivityHint: "空白、单向或非常短的对话收纳在这里。",
+    promptNavigator: "提示词导航",
   },
 
   // Daily

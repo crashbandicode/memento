@@ -7,6 +7,7 @@ import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
 interface ProjectDetail {
   id: string;
@@ -15,7 +16,16 @@ interface ProjectDetail {
   tool_id: string;
   source_path: string;
   visibility: string;
-  documents: { id: string; relative_path: string; category: string; title: string; file_size_bytes: number; synced_at: string }[];
+  documents: {
+    id: string;
+    relative_path: string;
+    category: string;
+    title: string;
+    file_size_bytes: number;
+    synced_at: string;
+    message_count?: number;
+    is_low_activity?: boolean;
+  }[];
 }
 
 export default function ProjectDetailPage() {
@@ -95,33 +105,54 @@ export default function ProjectDetailPage() {
         }
       />
 
-      {Object.entries(byCategory).map(([cat, docs]) => (
-        <div key={cat} style={{ marginBottom: 24 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "8px 4px 12px" }}>
-            <CategoryIcon category={cat} size={16} />
-            <SectionLabel style={{ margin: 0 }}>
-              {(t.category as Record<string, string>)[cat] || cat}{" "}
-              <span style={{ textTransform: "none", color: "var(--aurora-fg4)", fontWeight: 400 }}>({docs.length})</span>
-            </SectionLabel>
+      {Object.entries(byCategory).map(([cat, docs]) => {
+        const visibleDocs = cat === "conversation"
+          ? docs.filter((doc) => !doc.is_low_activity)
+          : docs;
+        const lowActivityDocs = cat === "conversation"
+          ? docs.filter((doc) => doc.is_low_activity)
+          : [];
+        const renderDoc = (d: (typeof docs)[number]) => {
+          const href = cat === "conversation" ? `/conversations/${d.id}` : `/documents/${d.id}`;
+          return (
+            <DocRow
+              key={d.id}
+              href={href}
+              category={cat}
+              title={d.title || d.relative_path.split("/").pop() || ""}
+              path={d.relative_path}
+              size={cat === "conversation" && typeof d.message_count === "number"
+                ? `${d.message_count} msgs`
+                : `${(d.file_size_bytes / 1024).toFixed(1)}KB`}
+              date={new Date(d.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+            />
+          );
+        };
+
+        return (
+          <div key={cat} style={{ marginBottom: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "8px 4px 12px" }}>
+              <CategoryIcon category={cat} size={16} />
+              <SectionLabel style={{ margin: 0 }}>
+                {(t.category as Record<string, string>)[cat] || cat}{" "}
+                <span style={{ textTransform: "none", color: "var(--aurora-fg4)", fontWeight: 400 }}>({docs.length})</span>
+              </SectionLabel>
+            </div>
+            {visibleDocs.length > 0 && (
+              <Glass padding={6} radius={18}>
+                {visibleDocs.map(renderDoc)}
+              </Glass>
+            )}
+            <LowActivitySection
+              count={lowActivityDocs.length}
+              title={t.conversation.lowActivity}
+              description={t.conversation.lowActivityHint}
+            >
+              {lowActivityDocs.map(renderDoc)}
+            </LowActivitySection>
           </div>
-          <Glass padding={6} radius={18}>
-            {docs.map((d) => {
-              const href = cat === "conversation" ? `/conversations/${d.id}` : `/documents/${d.id}`;
-              return (
-                <DocRow
-                  key={d.id}
-                  href={href}
-                  category={cat}
-                  title={d.title || d.relative_path.split("/").pop() || ""}
-                  path={d.relative_path}
-                  size={`${(d.file_size_bytes / 1024).toFixed(1)}KB`}
-                  date={new Date(d.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                />
-              );
-            })}
-          </Glass>
-        </div>
-      ))}
+        );
+      })}
 
       {project.documents.length === 0 && (
         <Glass padding={40} radius={20} style={{ textAlign: "center" }}>

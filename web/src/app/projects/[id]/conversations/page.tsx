@@ -9,6 +9,7 @@ import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, TopBar } from "@/components/aurora/primitives";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
 interface Message {
   role: string;
@@ -32,6 +33,7 @@ interface Session {
   conversation_id: string;
   timestamp: string;
   message_count: number;
+  is_low_activity: boolean;
   messages: Message[];
   artifacts: Artifact[];
 }
@@ -94,6 +96,9 @@ export default function ProjectConversationsPage() {
     return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
   }
 
+  const visibleSessions = sessions.filter((session) => !session.is_low_activity);
+  const lowActivitySessions = sessions.filter((session) => session.is_low_activity);
+
   return (
     <div className="max-w-3xl mx-auto pb-12">
       <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg4)", marginBottom: 8 }}>
@@ -120,10 +125,22 @@ export default function ProjectConversationsPage() {
 
       {/* Continuous conversation flow */}
       <div className="space-y-0">
-        {sessions.map((session, sIdx) => (
+        {visibleSessions.map((session, sIdx) => (
           <SessionBlock key={session.session_id || sIdx} session={session} dateFmt={dateFmt} locale={locale} t={t} />
         ))}
       </div>
+
+      <LowActivitySection
+        count={lowActivitySessions.length}
+        title={t.conversation.lowActivity}
+        description={t.conversation.lowActivityHint}
+      >
+        <div className="space-y-0">
+          {lowActivitySessions.map((session, sIdx) => (
+            <SessionBlock key={session.session_id || `low-${sIdx}`} session={session} dateFmt={dateFmt} locale={locale} t={t} />
+          ))}
+        </div>
+      </LowActivitySection>
 
       {hasMore && (
         <div style={{ textAlign: "center", marginTop: 24 }}>

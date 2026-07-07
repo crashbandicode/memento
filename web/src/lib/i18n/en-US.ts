@@ -166,6 +166,9 @@ const enUS: Translations = {
     brainArtifacts: "brain artifacts",
     browserFrames: "browser frames",
     browserHighlights: "browser highlights",
+    lowActivity: "Low activity",
+    lowActivityHint: "Empty, one-sided, or very short threads are tucked away here.",
+    promptNavigator: "Prompt navigator",
   },
 
   daily: {

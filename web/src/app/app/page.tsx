@@ -9,6 +9,7 @@ import { useNow } from "@/lib/use-now";
 import { timeAgo } from "@/lib/constants";
 import { Icon, ToolGlyph, PlatformGlyph, TOOL_HUE } from "@/components/aurora/Icon";
 import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora/primitives";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
 interface DashboardData {
   tools: {
@@ -27,6 +28,7 @@ interface DashboardData {
     synced_at: string;
     project_title: string | null;
     message_count: number;
+    is_low_activity: boolean;
   }[];
   daily: { date: string; count: number }[];
   tool_daily: Record<string, { date: string; count: number }[]>;
@@ -75,6 +77,11 @@ export default function Dashboard() {
 
   const { stats, tools, recent_conversations, daily, devices } = data;
   const maxDaily = Math.max(...daily.map((d) => d.count), 1);
+  const activeRecentConversations = recent_conversations
+    .filter((conversation) => !conversation.is_low_activity)
+    .slice(0, 10);
+  const lowActivityConversations = recent_conversations
+    .filter((conversation) => conversation.is_low_activity);
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -263,19 +270,41 @@ export default function Dashboard() {
               {recent_conversations.length === 0 ? (
                 <p style={{ padding: 14, fontSize: 13, color: "var(--aurora-fg4)" }}>{t.noData}</p>
               ) : (
-                recent_conversations.map((conv) => (
-                  <RecentRow
-                    key={conv.id}
-                    toolId={conv.tool_id}
-                    title={conv.title || "Untitled"}
-                    subtitle={[
-                      conv.project_title,
-                      `${conv.message_count} msg`,
-                      timeAgo(conv.synced_at),
-                    ].filter(Boolean).join(" · ")}
-                    href={`/conversations/${conv.id}`}
-                  />
-                ))
+                <>
+                  {activeRecentConversations.map((conv) => (
+                    <RecentRow
+                      key={conv.id}
+                      toolId={conv.tool_id}
+                      title={conv.title || "Untitled"}
+                      subtitle={[
+                        conv.project_title,
+                        `${conv.message_count} msg`,
+                        timeAgo(conv.synced_at),
+                      ].filter(Boolean).join(" · ")}
+                      href={`/conversations/${conv.id}`}
+                    />
+                  ))}
+                  <LowActivitySection
+                    compact
+                    count={lowActivityConversations.length}
+                    title={t.conversation.lowActivity}
+                    description={t.conversation.lowActivityHint}
+                  >
+                    {lowActivityConversations.map((conv) => (
+                      <RecentRow
+                        key={conv.id}
+                        toolId={conv.tool_id}
+                        title={conv.title || "Untitled"}
+                        subtitle={[
+                          conv.project_title,
+                          `${conv.message_count} msg`,
+                          timeAgo(conv.synced_at),
+                        ].filter(Boolean).join(" · ")}
+                        href={`/conversations/${conv.id}`}
+                      />
+                    ))}
+                  </LowActivitySection>
+                </>
               )}
             </Glass>
           </div>

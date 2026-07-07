@@ -213,6 +213,17 @@ export interface MessagesResponse {
   messages: ConversationMessage[];
 }
 
+export interface ConversationPrompt {
+  id: number;
+  line_number: number;
+  content: string;
+  timestamp: string | null;
+}
+
+export interface ConversationPromptsResponse {
+  prompts: ConversationPrompt[];
+}
+
 export interface DailyDate {
   date: string;
   document_count: number;
@@ -341,6 +352,8 @@ export const api = {
   getConversation: (id: string) => apiFetch<ConversationMeta>(`/api/conversations/${id}`),
   getMessages: (id: string, offset = 0, limit = 50) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
+  getPrompts: (id: string) =>
+    apiFetch<ConversationPromptsResponse>(`/api/conversations/${id}/prompts`),
   getDailyDates: (days = 30) => {
     const tz = new Date().getTimezoneOffset();
     return apiFetch<DailyDate[]>(`/api/daily?days=${days}&tz_offset=${tz}`);

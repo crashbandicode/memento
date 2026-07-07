@@ -1,9 +1,91 @@
 "use client";
 
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.min.css";
+
+const markdownComponents: Components = {
+  table: ({ children, ...props }) => (
+    <div
+      style={{
+        width: "100%",
+        margin: "12px 0 14px",
+        overflowX: "auto",
+        border: "1px solid var(--aurora-border)",
+        borderRadius: 10,
+        background: "var(--aurora-surface-solid)",
+      }}
+    >
+      <table
+        {...props}
+        style={{
+          width: "100%",
+          minWidth: 520,
+          margin: 0,
+          borderCollapse: "collapse",
+          fontSize: "0.92em",
+          lineHeight: 1.45,
+        }}
+      >
+        {children}
+      </table>
+    </div>
+  ),
+  th: ({ children, ...props }) => (
+    <th
+      {...props}
+      style={{
+        padding: "8px 10px",
+        borderRight: "1px solid var(--aurora-border)",
+        borderBottom: "1px solid var(--aurora-border)",
+        background: "color-mix(in srgb, var(--aurora-chip) 72%, var(--aurora-surface-solid))",
+        color: "var(--aurora-fg2)",
+        fontWeight: 650,
+        textAlign: "left",
+        verticalAlign: "top",
+      }}
+    >
+      {children}
+    </th>
+  ),
+  td: ({ children, ...props }) => (
+    <td
+      {...props}
+      style={{
+        padding: "8px 10px",
+        borderRight: "1px solid var(--aurora-border)",
+        borderBottom: "1px solid var(--aurora-border)",
+        color: "var(--aurora-fg2)",
+        verticalAlign: "top",
+        overflowWrap: "anywhere",
+      }}
+    >
+      {children}
+    </td>
+  ),
+  p: ({ children, ...props }) => (
+    <p {...props} style={{ margin: "0 0 9px", lineHeight: 1.62 }}>
+      {children}
+    </p>
+  ),
+  ul: ({ children, ...props }) => (
+    <ul {...props} style={{ margin: "7px 0 10px", paddingLeft: 22 }}>
+      {children}
+    </ul>
+  ),
+  ol: ({ children, ...props }) => (
+    <ol {...props} style={{ margin: "7px 0 10px", paddingLeft: 22 }}>
+      {children}
+    </ol>
+  ),
+  li: ({ children, ...props }) => (
+    <li {...props} style={{ margin: "3px 0", paddingLeft: 2 }}>
+      {children}
+    </li>
+  ),
+};
 
 export default function MarkdownViewer({ content }: { content: string }) {
   return (
@@ -41,6 +123,7 @@ export default function MarkdownViewer({ content }: { content: string }) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
+        components={markdownComponents}
       >
         {content}
       </ReactMarkdown>
