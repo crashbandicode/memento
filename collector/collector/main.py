@@ -108,7 +108,7 @@ def _run_initial_scan(watcher: FileWatcher, logger: logging.Logger) -> None:
 
 
 def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatcher,
-                   logger: logging.Logger) -> None:
+                   sync_client: SyncClient, logger: logging.Logger) -> None:
     """Poll server for pending commands (resync, etc.)."""
     try:
         import httpx
@@ -151,19 +151,35 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
                     pass
 
             if action == "resync":
-                logger.info("Received resync — clearing cache + full re-scan")
-                queue.clear_all_state()
+                logger.info("Received resync — draining uploads before full re-scan")
+                if not watcher.cancel_scan(timeout=60):
+                    logger.error("Resync aborted: current scan did not stop")
+                    watcher.allow_scan()
+                    continue
+                if not sync_client.pause(timeout=75):
+                    logger.error("Resync aborted: upload batch did not drain")
+                    watcher.allow_scan()
+                    sync_client.resume()
+                    continue
                 try:
-                    from .parsers import antigravity_export as _ag
-                    _ag._last_hashes.clear()
-                    _ag._title_map_cache = None  # Force re-read on next export
-                except Exception:
-                    pass
+                    queue.clear_all_state()
+                    try:
+                        from .parsers import antigravity_export as _ag
+                        _ag._last_hashes.clear()
+                        _ag._title_map_cache = None  # Force re-read on next export
+                    except Exception:
+                        pass
+                finally:
+                    watcher.allow_scan()
+                    sync_client.resume()
                 threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
                 logger.info("Resync triggered — cache cleared, re-scan started")
             elif action == "update":
-                logger.info("Received update command from server")
-                threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+                if config.auto_update_enabled:
+                    logger.info("Received update command from server")
+                    threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+                else:
+                    logger.info("Ignoring update command: auto-update is disabled")
     except Exception:
         pass  # Server unreachable, skip
 
@@ -171,7 +187,8 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
 def _get_pypi_latest(package: str) -> str | None:
     """Query PyPI for latest version of a package."""
     try:
-        import urllib.request, json as _json
+        import json as _json
+        import urllib.request
         req = urllib.request.Request(
             f"https://pypi.org/pypi/{package}/json",
             headers={"Accept": "application/json"},
@@ -194,6 +211,15 @@ def _upgrade_package(package: str, version: str, logger: logging.Logger) -> bool
         logger.warning("Upgrade %s failed: %s", package, result.stderr[:300])
         return False
     return True
+
+
+def _is_newer_version(candidate: str, installed: str) -> bool:
+    """Return true only for an actual upgrade, never for a downgrade."""
+    try:
+        from packaging.version import Version
+        return Version(candidate) > Version(installed)
+    except Exception:
+        return False
 
 
 def _check_and_update(logger: logging.Logger) -> None:
@@ -243,12 +269,17 @@ def _check_and_update(logger: logging.Logger) -> None:
             )
         elif latest == current:
             logger.info("Collector already up to date (%s)", current)
-        elif latest != current:
+        elif _is_newer_version(latest, current):
             logger.info("Collector update available: %s → %s", current, latest)
             if _upgrade_package(PACKAGE_NAME, latest, logger):
                 logger.info("Collector upgraded to %s", latest)
                 needs_restart = True
                 any_upgrade = True
+        else:
+            logger.info(
+                "Installed collector %s is newer than PyPI %s; keeping local build",
+                current, latest,
+            )
 
         # Also check MCP server update (installed as dependency)
         try:
@@ -258,11 +289,16 @@ def _check_and_update(logger: logging.Logger) -> None:
                 logger.warning("PyPI lookup failed for memento-brain-memory")
             elif mcp_latest == mcp_current:
                 logger.info("MCP server already up to date (%s)", mcp_current)
-            elif mcp_latest != mcp_current:
+            elif _is_newer_version(mcp_latest, mcp_current):
                 logger.info("MCP server update available: %s → %s", mcp_current, mcp_latest)
                 if _upgrade_package("memento-brain-memory", mcp_latest, logger):
                     logger.info("MCP server upgraded to %s (restart AI IDE to activate)", mcp_latest)
                     any_upgrade = True
+            else:
+                logger.info(
+                    "Installed MCP server %s is newer than PyPI %s; keeping local build",
+                    mcp_current, mcp_latest,
+                )
         except PackageNotFoundError:
             logger.info("memento-brain-memory not installed, skipping MCP upgrade")
 
@@ -321,7 +357,7 @@ def _run_antigravity_export(queue: SyncQueue, logger: logging.Logger) -> None:
                 relative_path=f"conversations/{conv['cascade_id']}.jsonl",
                 content=content,
                 content_hash=conv.get("content_hash", f"ag-{hash(content) & 0xFFFFFFFF:08x}"),
-                file_size=len(content.encode("utf-8")),
+                file_size=len(content),
                 sync_strategy="full",
                 metadata=meta,
             )
@@ -416,7 +452,10 @@ def main() -> None:
         logger.warning("No AI tools found on this device!")
 
     # Initialize queue + sync client + watcher
-    queue = SyncQueue(config.queue_db_path)
+    queue = SyncQueue(
+        config.queue_db_path,
+        spool_threshold=config.queue_spool_threshold,
+    )
     sync_client = SyncClient(queue, config)
     watcher = FileWatcher(available, queue, config)
 
@@ -447,7 +486,8 @@ def main() -> None:
     logger.info("Collector running. Watching for file changes...")
 
     # 4. Auto-update check on startup (non-blocking)
-    threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+    if config.auto_update_enabled:
+        threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
 
     # 5. Antigravity export on startup (real-time updates handled by main FileWatcher)
     has_antigravity = any(t.name == "antigravity" for t in available)
@@ -479,10 +519,10 @@ def main() -> None:
             # Poll server commands every 30s
             if now - last_command_poll > COMMAND_POLL_INTERVAL:
                 last_command_poll = now
-                _poll_commands(config, queue, watcher, logger)
+                _poll_commands(config, queue, watcher, sync_client, logger)
 
             # Auto-update check every hour
-            if now - last_update_check > AUTO_UPDATE_INTERVAL:
+            if config.auto_update_enabled and now - last_update_check > AUTO_UPDATE_INTERVAL:
                 last_update_check = now
                 threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
 

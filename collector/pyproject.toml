@@ -38,6 +38,7 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "packaging>=23.0",
     "cryptography>=41.0",
     "memento-brain-memory>=0.0.1",
 ]

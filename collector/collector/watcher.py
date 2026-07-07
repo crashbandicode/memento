@@ -23,7 +23,7 @@ from .parsers.sqlite_parser import SqliteParser
 from .parsers.toml_parser import TomlParser
 from .queue import SyncQueue
 from .sanitizer import sanitize_json, sanitize_text
-from .tools.base import BaseTool, ContentType, FileClassification, SyncStrategy
+from .tools.base import BaseTool, ContentType, SyncStrategy
 
 logger = logging.getLogger("collector.watcher")
 
@@ -68,6 +68,7 @@ class _DebouncedHandler(FileSystemEventHandler):
         self._pending: dict[str, float] = {}
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
+        self._stopped = False
 
     def _is_excluded(self, path: str) -> bool:
         norm = normalize_path(path)
@@ -84,27 +85,44 @@ class _DebouncedHandler(FileSystemEventHandler):
             return
 
         with self._lock:
+            if self._stopped:
+                return
             self._pending[path] = time.time()
-
-        # Reset debounce timer
-        if self._timer is not None:
-            self._timer.cancel()
-        self._timer = threading.Timer(self._debounce, self._flush)
-        self._timer.daemon = True
-        self._timer.start()
+            # Reset debounce timer while holding the state lock so stop() and
+            # event delivery cannot leave an untracked callback behind.
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._debounce, self._flush)
+            self._timer.daemon = True
+            self._timer.start()
 
     def _flush(self) -> None:
         with self._lock:
+            if self._stopped:
+                self._pending.clear()
+                return
             paths = list(self._pending.keys())
             self._pending.clear()
 
         for path_str in paths:
+            with self._lock:
+                if self._stopped:
+                    return
             path = Path(path_str)
             if path.exists() and path.is_file():
                 try:
                     self._callback(path)
                 except Exception:
                     logger.exception("Error processing %s", path)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._pending.clear()
+            timer = self._timer
+            self._timer = None
+        if timer is not None:
+            timer.cancel()
 
 
 class FileWatcher:
@@ -120,6 +138,11 @@ class FileWatcher:
         self._queue = queue
         self._config = config
         self._observer = Observer()
+        self._stop_event = threading.Event()
+        self._scan_cancel_event = threading.Event()
+        self._scan_lock = threading.Lock()
+        self._processing_lock = threading.Lock()
+        self._handlers: list[_DebouncedHandler] = []
         self._tool_map: dict[str, BaseTool] = {}  # root_path_str -> tool
 
         # Build parser registry
@@ -175,6 +198,7 @@ class FileWatcher:
                     self._observer.schedule(
                         handler, watch_dir, recursive=True,
                     )
+                    self._handlers.append(handler)
                     logger.info(
                         "Watching %s (%s) at %s",
                         tool.display_name, tool.name, watch_dir,
@@ -241,7 +265,7 @@ class FileWatcher:
                 content_hash=conv.get(
                     "content_hash", f"ag-{hash(content) & 0xFFFFFFFF:08x}",
                 ),
-                file_size=len(content.encode("utf-8")),
+                file_size=len(content),
                 sync_strategy="full",
                 metadata=meta,
             )
@@ -251,7 +275,15 @@ class FileWatcher:
             )
 
     def _on_file_changed(self, path: Path) -> None:
-        """Process a detected file change."""
+        """Serialize parsing and make shutdown a hard callback boundary."""
+        if self._stop_event.is_set():
+            return
+        with self._processing_lock:
+            if self._stop_event.is_set():
+                return
+            self._process_file_changed(path)
+
+    def _process_file_changed(self, path: Path) -> None:
         tool = self._find_tool(path)
         if tool is None:
             return
@@ -337,19 +369,11 @@ class FileWatcher:
             relative_path=classification.relative_path,
             content=parsed_content,
             content_hash=current_hash,
-            file_size=len(parsed_content.encode("utf-8")),
+            file_size=len(parsed_content),
             sync_strategy=classification.sync_strategy.value,
             is_partial=is_partial,
             offset=new_offset,
             metadata=classification.metadata,
-        )
-
-        # Update file state
-        self._queue.update_file_state(
-            classification.tool_name,
-            classification.relative_path,
-            current_hash,
-            new_offset,
         )
 
         logger.info(
@@ -362,8 +386,19 @@ class FileWatcher:
         )
 
     def initial_scan(self) -> int:
-        """Do an initial full scan of all watched files. Returns count queued."""
-        count = 0
+        """Scan newest files first while keeping the durable spool bounded."""
+        if not self._scan_lock.acquire(blocking=False):
+            logger.info("Initial scan already running; ignoring duplicate request")
+            return 0
+        try:
+            return self._initial_scan()
+        finally:
+            self._scan_lock.release()
+
+    def _initial_scan(self) -> int:
+        if self._scan_cancel_event.is_set() or self._stop_event.is_set():
+            return 0
+        candidates: dict[str, tuple[float, Path]] = {}
         for tool in self._tools:
             if not tool.is_available():
                 continue
@@ -386,23 +421,59 @@ class FileWatcher:
                     for f in files_iter:
                         if f.is_file():
                             try:
-                                self._on_file_changed(f)
-                                count += 1
-                            except Exception:
-                                logger.debug("Error scanning %s", f)
+                                candidates[str(f)] = (f.stat().st_mtime, f)
+                            except OSError:
+                                logger.debug("Cannot stat %s", f)
                 except OSError:
                     logger.debug("Cannot scan %s", base)
 
             # Special: Antigravity exports are deferred to periodic task (non-blocking)
             # See main.py AG_EXPORT_INTERVAL for aghistory + vscdb extraction
 
+        count = 0
+        for _mtime, path in sorted(candidates.values(), key=lambda item: item[0], reverse=True):
+            if self._stop_event.is_set() or self._scan_cancel_event.is_set():
+                break
+            high_water = self._config.queue_high_water_bytes
+            while high_water > 0 and self._queue.outstanding_bytes() >= high_water:
+                if (self._stop_event.wait(0.5)
+                        or self._scan_cancel_event.is_set()):
+                    return count
+            try:
+                self._on_file_changed(path)
+                count += 1
+            except Exception:
+                logger.debug("Error scanning %s", path)
+
         return count
+
+    def cancel_scan(self, timeout: float = 60) -> bool:
+        """Cancel and join the current scan without stopping file watching."""
+        self._scan_cancel_event.set()
+        if self._scan_lock.acquire(timeout=timeout):
+            self._scan_lock.release()
+            return True
+        return False
+
+    def allow_scan(self) -> None:
+        self._scan_cancel_event.clear()
 
     def start(self) -> None:
         self._observer.start()
         logger.info("File watcher started")
 
     def stop(self) -> None:
+        self._stop_event.set()
+        self._scan_cancel_event.set()
+        for handler in self._handlers:
+            handler.stop()
         self._observer.stop()
         self._observer.join(timeout=5)
+        # A timer may already have entered its callback when cancelled.
+        with self._processing_lock:
+            pass
+        if self._scan_lock.acquire(timeout=60):
+            self._scan_lock.release()
+        else:
+            logger.warning("Initial scan did not stop within 60 seconds")
         logger.info("File watcher stopped")

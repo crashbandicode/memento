@@ -1,4 +1,4 @@
-"""HTTP sync client — uploads queued items to the server, with chunked upload for large files."""
+"""HTTP queue drain with byte-bounded leases and streaming large uploads."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from typing import BinaryIO
 
 import httpx
 
@@ -14,17 +15,20 @@ from .queue import QueueItem, SyncQueue
 
 logger = logging.getLogger("collector.sync")
 
-CHUNK_SIZE = 2 * 1024 * 1024  # 2MB per chunk
+CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
 
 
 class SyncClient:
-    """Background worker that drains the queue and uploads to the server."""
+    """Background worker that safely drains leased queue items."""
 
     def __init__(self, queue: SyncQueue, config: CollectorConfig) -> None:
         self._queue = queue
         self._config = config
         self._running = False
         self._thread: threading.Thread | None = None
+        self._pause_requested = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
         try:
             from importlib.metadata import version
             collector_version = version("memento-brain-collector")
@@ -32,16 +36,16 @@ class SyncClient:
             collector_version = "dev"
 
         from concurrent.futures import ThreadPoolExecutor
-        # 10 concurrent uploads: network upload is IO-bound, doubling worker
-        # count roughly halves drain time on big resyncs. Server-side 24-slot
-        # ingest semaphore + 32 DB pool keep headroom for 2-3 devices each at 10.
-        self._pool = ThreadPoolExecutor(max_workers=10)
+        self._pool = ThreadPoolExecutor(max_workers=config.max_concurrent_uploads)
         from .tls import SSL_CONTEXT
         self._client = httpx.Client(
             base_url=config.server.url,
             timeout=httpx.Timeout(60.0, connect=10.0),
             verify=SSL_CONTEXT,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(
+                max_connections=max(8, config.max_concurrent_uploads * 2),
+                max_keepalive_connections=max(4, config.max_concurrent_uploads),
+            ),
             headers={
                 "X-Collector-Token": config.server.token,
                 "X-Device-Id": config.device_id,
@@ -52,6 +56,7 @@ class SyncClient:
         )
 
     def start(self) -> None:
+        self._pause_requested.clear()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="sync-worker")
         self._thread.start()
@@ -59,56 +64,101 @@ class SyncClient:
 
     def stop(self) -> None:
         self._running = False
+        self._pause_requested.clear()
         if self._thread:
-            self._thread.join(timeout=10)
-        self._pool.shutdown(wait=False)
+            # An in-flight HTTP request has a 60-second timeout. Waiting here
+            # prevents queue/client teardown from racing upload callbacks.
+            self._thread.join(timeout=70)
+        self._pool.shutdown(wait=True, cancel_futures=True)
         self._client.close()
         logger.info("Sync client stopped")
+
+    def pause(self, timeout: float = 75) -> bool:
+        """Stop claiming work and wait for the active upload batch to drain."""
+        self._pause_requested.set()
+        if not self._running:
+            return True
+        return self._idle.wait(timeout=timeout)
+
+    def resume(self) -> None:
+        self._pause_requested.clear()
+
+    def _sleep_interruptibly(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while self._running and not self._pause_requested.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.2))
 
     def _run(self) -> None:
         from concurrent.futures import as_completed
         backoff = 1.0
         while self._running:
+            if self._pause_requested.is_set():
+                self._idle.set()
+                time.sleep(0.05)
+                continue
+            self._idle.clear()
+            if self._pause_requested.is_set():
+                self._idle.set()
+                continue
+
+            delay = 0.0
             try:
-                items = self._queue.peek_batch(self._config.batch_size)
+                items = self._queue.claim_batch(
+                    batch_size=min(
+                        self._config.batch_size,
+                        self._config.max_concurrent_uploads,
+                    ),
+                    max_bytes=self._config.max_in_flight_bytes,
+                    lease_seconds=self._config.queue_lease_seconds,
+                )
                 if not items:
-                    time.sleep(self._config.sync_interval)
+                    delay = self._config.sync_interval
                     backoff = 1.0
-                    continue
-
-                # Upload items concurrently (reuse persistent thread pool)
-                synced = 0
-                futures = {
-                    self._pool.submit(self._upload, item): item
-                    for item in items
-                    if self._running
-                }
-                for future in as_completed(futures):
-                    item = futures[future]
-                    try:
-                        if future.result():
-                            self._queue.mark_synced(item.id)
-                            synced += 1
-                        else:
-                            self._queue.mark_failed(item.id)
-                    except Exception:
-                        self._queue.mark_failed(item.id)
-
-                if synced == 0 and items:
-                    time.sleep(min(backoff, 30.0))
-                    backoff = min(backoff * 2, 30.0)
                 else:
-                    backoff = 1.0
+                    futures = {
+                        self._pool.submit(self._upload, item): item
+                        for item in items
+                    }
+                    synced = 0
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            if future.result():
+                                if self._queue.mark_synced(item):
+                                    synced += 1
+                            else:
+                                self._queue.mark_failed(item, "upload returned false")
+                        except Exception as exc:
+                            logger.exception(
+                                "Upload worker failed for %s/%s",
+                                item.tool_name, item.relative_path,
+                            )
+                            self._queue.mark_failed(item, str(exc))
 
-                self._queue.cleanup_synced()
+                    if synced == 0:
+                        delay = min(backoff, 30.0)
+                        backoff = min(backoff * 2, 30.0)
+                    else:
+                        backoff = 1.0
+                    self._queue.cleanup_synced()
 
             except Exception:
                 logger.exception("Sync worker error")
-                time.sleep(min(backoff, 60.0))
-                backoff *= 2
+                delay = min(backoff, 60.0)
+                backoff = min(backoff * 2, 60.0)
+            finally:
+                self._idle.set()
+
+            if delay:
+                self._sleep_interruptibly(delay)
 
     def _upload(self, item: QueueItem) -> bool:
-        """Upload a single queue item. Auto-selects strategy based on size."""
+        """Upload one leased item without materializing large payloads."""
+        if not self._running or self._pause_requested.is_set():
+            return False
         payload = {
             "tool": item.tool_name,
             "category": item.category,
@@ -117,33 +167,30 @@ class SyncClient:
             "hash": item.content_hash,
             "mode": "delta" if item.is_partial else "full",
             "offset": item.offset,
-            "file_size": item.file_size,
+            "file_size": item.payload_bytes,
             "sync_strategy": item.sync_strategy,
             "metadata": item.metadata,
             "timestamp": item.created_at,
         }
 
         try:
-            content_bytes = item.content.encode("utf-8")
-            size = len(content_bytes)
-
+            size = item.payload_bytes
             if size <= self._config.large_file_threshold:
-                # Small file: JSON payload
-                payload["content"] = item.content
+                payload["content"] = self._queue.read_payload_text(item)
                 return self._upload_json(payload)
-            elif size <= CHUNK_SIZE:
-                # Medium file: single multipart upload
-                return self._upload_multipart(payload, content_bytes)
-            else:
-                # Large file: chunked upload
-                return self._upload_chunked(payload, content_bytes)
+            if size <= CHUNK_SIZE:
+                with self._queue.open_payload(item) as stream:
+                    return self._upload_multipart(payload, stream)
+            return self._upload_chunked(payload, item)
 
         except httpx.ConnectError:
             logger.warning("Server unreachable, will retry later")
             return False
         except httpx.TimeoutException:
-            logger.warning("Upload timeout for %s/%s (%d bytes)",
-                           item.tool_name, item.relative_path, item.file_size)
+            logger.warning(
+                "Upload timeout for %s/%s (%d bytes)",
+                item.tool_name, item.relative_path, item.payload_bytes,
+            )
             return False
         except Exception:
             logger.exception("Upload error for %s/%s", item.tool_name, item.relative_path)
@@ -153,56 +200,69 @@ class SyncClient:
         resp = self._client.post("/api/ingest/file", json=payload)
         if resp.status_code in (200, 201):
             return True
-        logger.warning("Server %s for %s/%s: %s",
-                        resp.status_code, payload["tool"], payload["relative_path"], resp.text[:200])
+        logger.warning(
+            "Server %s for %s/%s: %s",
+            resp.status_code, payload["tool"], payload["relative_path"], resp.text[:200],
+        )
         return False
 
-    def _upload_multipart(self, payload: dict, content_bytes: bytes) -> bool:
+    def _upload_multipart(self, payload: dict, content_stream: BinaryIO) -> bool:
         resp = self._client.post(
             "/api/ingest/file/upload",
             data={"metadata": json.dumps(payload)},
-            files={"content": ("content.txt", content_bytes, "text/plain")},
+            files={"content": ("content.txt", content_stream, "text/plain")},
         )
         if resp.status_code in (200, 201):
             return True
-        logger.warning("Server %s for multipart %s/%s",
-                        resp.status_code, payload["tool"], payload["relative_path"])
+        logger.warning(
+            "Server %s for multipart %s/%s",
+            resp.status_code, payload["tool"], payload["relative_path"],
+        )
         return False
 
-    def _upload_chunked(self, payload: dict, content_bytes: bytes) -> bool:
-        """Upload large files in chunks. Server reassembles."""
-        total_size = len(content_bytes)
+    def _upload_chunked(self, payload: dict, item: QueueItem) -> bool:
+        """Stream a large spool file in fixed-size chunks."""
+        total_size = item.payload_bytes
         total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         upload_id = f"{payload['tool']}/{payload['relative_path']}/{payload['hash'][:8]}"
 
-        logger.info("Chunked upload: %s (%d bytes, %d chunks)",
-                     payload["relative_path"], total_size, total_chunks)
+        logger.info(
+            "Chunked upload: %s (%d bytes, %d chunks)",
+            payload["relative_path"], total_size, total_chunks,
+        )
 
-        for i in range(total_chunks):
-            if not self._running:
-                return False
+        with self._queue.open_payload(item) as stream:
+            for index in range(total_chunks):
+                if not self._running or self._pause_requested.is_set():
+                    return False
+                if not self._queue.renew_lease(
+                    item, lease_seconds=self._config.queue_lease_seconds,
+                ):
+                    logger.warning("Lease lost during upload: %s", payload["relative_path"])
+                    return False
 
-            start = i * CHUNK_SIZE
-            end = min(start + CHUNK_SIZE, total_size)
-            chunk = content_bytes[start:end]
-
-            chunk_meta = {
-                **payload,
-                "chunk_index": i,
-                "total_chunks": total_chunks,
-                "upload_id": upload_id,
-            }
-
-            resp = self._client.post(
-                "/api/ingest/file/chunk",
-                data={"metadata": json.dumps(chunk_meta)},
-                files={"content": (f"chunk_{i}.txt", chunk, "text/plain")},
-            )
-
-            if resp.status_code not in (200, 201):
-                logger.warning("Chunk %d/%d failed (%s) for %s",
-                                i + 1, total_chunks, resp.status_code, payload["relative_path"])
-                return False
+                chunk = stream.read(CHUNK_SIZE)
+                if not chunk:
+                    logger.warning("Payload ended early: %s", payload["relative_path"])
+                    return False
+                chunk_meta = {
+                    **payload,
+                    "chunk_index": index,
+                    "total_chunks": total_chunks,
+                    "upload_id": upload_id,
+                }
+                resp = self._client.post(
+                    "/api/ingest/file/chunk",
+                    data={"metadata": json.dumps(chunk_meta)},
+                    files={"content": (f"chunk_{index}.txt", chunk, "text/plain")},
+                )
+                if resp.status_code not in (200, 201):
+                    logger.warning(
+                        "Chunk %d/%d failed (%s) for %s",
+                        index + 1, total_chunks, resp.status_code,
+                        payload["relative_path"],
+                    )
+                    return False
 
         logger.info("Chunked upload complete: %s", payload["relative_path"])
         return True

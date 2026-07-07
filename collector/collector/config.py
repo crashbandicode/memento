@@ -81,8 +81,6 @@ def _tool_root_paths() -> dict[str, Path]:
     """Default tool paths per platform. All tools use ~/.toolname on Unix,
     and %APPDATA%/.toolname or %LOCALAPPDATA%/toolname on Windows."""
     if SYSTEM == "Windows":
-        appdata = Path(os.environ.get("APPDATA", str(HOME / "AppData" / "Roaming")))
-        localappdata = Path(os.environ.get("LOCALAPPDATA", str(HOME / "AppData" / "Local")))
         return {
             "claude_code": HOME / ".claude",          # Claude Code uses ~/.claude on all platforms
             "openclaw": HOME / ".openclaw",
@@ -165,6 +163,12 @@ class CollectorConfig(BaseSettings):
     large_file_threshold: int = 1_048_576  # 1 MB
     batch_size: int = 20
     sync_interval: float = 0.5  # seconds between sync cycles when queue empty
+    queue_spool_threshold: int = 4 * 1024 * 1024
+    queue_high_water_bytes: int = 512 * 1024 * 1024
+    max_in_flight_bytes: int = 128 * 1024 * 1024
+    max_concurrent_uploads: int = 4
+    queue_lease_seconds: int = 300
+    auto_update_enabled: bool = True
 
     # Obsidian vault path (user-configurable, auto-discovered)
     obsidian_vault_path: Path = Field(default_factory=_default_obsidian_path)
