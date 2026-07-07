@@ -40,11 +40,11 @@ RUN pip install ${PIP_INDEX_URL:+--index-url $PIP_INDEX_URL} \
 
 COPY embedding_server.py .
 
-# Multi-source model fetch — mirrors scripts/install_lib/embedding_host.py
-# so users on either side of the GFW get a working source.
-#   1. ModelScope — best from inside CN, no HF rate limits
-#   2. HuggingFace direct
-#   3. hf-mirror.com — HK-based HF proxy, last resort
+# Multi-source model fetch. Prefer HuggingFace here because
+# SentenceTransformer downloads only the files required to load the model.
+# ModelScope snapshot_download otherwise fetches every published weight format
+# (PyTorch, ONNX, and OpenVINO), multiplying this image by several gigabytes.
+# The ModelScope fallback excludes non-PyTorch exports for the same reason.
 # Writes the resolved load path to /app/.model_path; runtime reads it.
 RUN python - <<'PY'
 import os, sys
@@ -52,23 +52,29 @@ model = os.environ['MODEL_NAME']
 load_path = None
 
 try:
-    from modelscope import snapshot_download
-    p = snapshot_download(model)
     from sentence_transformers import SentenceTransformer
-    SentenceTransformer(p)
-    load_path = p
-    print(f"OK: modelscope -> {p}")
+    SentenceTransformer(model)
+    load_path = model
+    print("OK: huggingface direct")
 except Exception as e:
-    print(f"modelscope failed: {e}", file=sys.stderr)
+    print(f"huggingface direct failed: {e}", file=sys.stderr)
 
 if load_path is None:
     try:
+        from modelscope import snapshot_download
+        p = snapshot_download(
+            model,
+            ignore_patterns=[
+                "*.onnx", "*.onnx_data", "onnx/**",
+                "openvino/**", "*.xml", "*.ot",
+            ],
+        )
         from sentence_transformers import SentenceTransformer
-        SentenceTransformer(model)
-        load_path = model
-        print("OK: huggingface direct")
+        SentenceTransformer(p)
+        load_path = p
+        print(f"OK: modelscope -> {p}")
     except Exception as e:
-        print(f"huggingface direct failed: {e}", file=sys.stderr)
+        print(f"modelscope failed: {e}", file=sys.stderr)
 
 if load_path is None:
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
