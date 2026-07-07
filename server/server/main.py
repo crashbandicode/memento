@@ -5,13 +5,15 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import admin, auth, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
+from .services.device_service import DeviceOwnershipError
 
 
 def _run_migrations(conn) -> None:
@@ -201,6 +203,48 @@ def _run_migrations(conn) -> None:
         conn.execute(text("UPDATE machines SET user_id = :uid WHERE user_id IS NULL"),
                      {"uid": owner_id})
 
+    # Older ingest code created every SyncState with machine_id=NULL even
+    # though the corresponding Document was device-scoped. Backfill only
+    # one-to-one, unambiguous tool/path identities. Ambiguous legacy data is
+    # deliberately left untouched for manual review rather than guessed.
+    if "sync_state" in tables and "documents" in tables:
+        conn.execute(text("""
+            WITH document_identity AS (
+                SELECT
+                    tool_id,
+                    relative_path,
+                    MAX(machine_id::text)::uuid AS machine_id,
+                    MAX(content_hash) AS content_hash
+                FROM documents
+                WHERE machine_id IS NOT NULL
+                GROUP BY tool_id, relative_path
+                HAVING COUNT(DISTINCT machine_id) = 1
+            ), unique_null_state AS (
+                SELECT tool_id, relative_path
+                FROM sync_state
+                WHERE machine_id IS NULL
+                GROUP BY tool_id, relative_path
+                HAVING COUNT(*) = 1
+            )
+            UPDATE sync_state AS state
+            SET machine_id = identity.machine_id
+            FROM document_identity AS identity
+            JOIN unique_null_state AS legacy
+              ON legacy.tool_id IS NOT DISTINCT FROM identity.tool_id
+             AND legacy.relative_path = identity.relative_path
+            WHERE state.machine_id IS NULL
+              AND state.tool_id IS NOT DISTINCT FROM identity.tool_id
+              AND state.relative_path = identity.relative_path
+              AND state.last_hash IS NOT DISTINCT FROM identity.content_hash
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_state AS scoped
+                  WHERE scoped.machine_id = identity.machine_id
+                    AND scoped.tool_id IS NOT DISTINCT FROM identity.tool_id
+                    AND scoped.relative_path = identity.relative_path
+              )
+        """))
+
     # pg_trgm extension (required for trigram indexes below)
     sp = conn.begin_nested()
     try:
@@ -265,7 +309,8 @@ async def _warm_embedding_server() -> None:
     the actual encode pipeline has JIT/cache warmup that can push 5-10 s
     on a cold CPU). 5 s delay lets the api itself finish lifespan first.
     """
-    import asyncio, logging
+    import asyncio
+    import logging
     log = logging.getLogger("memento.warmup")
     await asyncio.sleep(5)
     try:
@@ -302,6 +347,14 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(DeviceOwnershipError)
+async def device_ownership_error_handler(
+    _request: Request, _exc: DeviceOwnershipError,
+) -> JSONResponse:
+    """Reject cross-account collector device reuse without exposing details."""
+    return JSONResponse(status_code=403, content={"detail": "Collector device is not authorized"})
 
 # CORS — regex source is settings.cors_allow_origin_regex (see config.py).
 # Self-hosted deployments on LAN IPs (192.168.x / 10.x / 172.16-31.x) are

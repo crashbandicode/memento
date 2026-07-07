@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
-from passlib.hash import sha256_crypt
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import Machine
+
+
+class DeviceOwnershipError(PermissionError):
+    """Raised when a collector device identifier belongs to another user."""
 
 
 async def ensure_device(
@@ -16,7 +20,7 @@ async def ensure_device(
     device_id: str,
     device_name: str,
     device_platform: str,
-    user_id: "uuid.UUID | None" = None,
+    user_id: uuid.UUID | None = None,
 ) -> Machine:
     """Find or create a machine record for this device."""
     # The collector drains its initial queue concurrently.  Serialize the
@@ -44,6 +48,8 @@ async def ensure_device(
         db.add(machine)
         await db.flush()
     else:
+        if user_id and machine.user_id and machine.user_id != user_id:
+            raise DeviceOwnershipError("collector device belongs to another user")
         machine.name = device_name
         machine.last_heartbeat = now
         # Bind to user if not already bound

@@ -130,6 +130,7 @@ services:
       MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
+      MEMENTO_INGEST_SPOOL_DIR: /data/ingest-spool
       # Default points at the in-compose embedding container (`embedding`
       # service, activated via `--profile embedding`). Users running the
       # native host install override this in .env to
@@ -147,6 +148,9 @@ services:
       # on-demand by scripts/download_geoip.sh; mount is optional — service
       # gracefully degrades to "country/city unknown" if missing.
       - ./server/data/geoip:/data/geoip:ro
+      # Durable handoff for chunked uploads. The API only stages chunks here;
+      # the dedicated ingest worker below assembles and ingests ready jobs.
+      - ingest_spool:/data/ingest-spool
     depends_on:
       postgres:
         condition: service_healthy
@@ -183,6 +187,43 @@ services:
       minio:
         condition: service_started
 
+  # Dedicated, serialized finalizer for durable chunked uploads. Keeping this
+  # on its own queue prevents multi-hundred-megabyte transcript parsing from
+  # competing with summaries, embeddings, backups, or scheduled maintenance.
+  celery-ingest-worker:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    container_name: memento_celery_ingest_worker
+    restart: unless-stopped
+    command: >
+      celery -A server.tasks.celery_app worker
+      --loglevel=info
+      --queues=ingest
+      --concurrency=1
+      --prefetch-multiplier=1
+      --max-tasks-per-child=1
+    environment:
+      MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
+      MEMENTO_REDIS_URL: redis://redis:6379/0
+      MEMENTO_ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
+      MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
+      MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
+      MEMENTO_EMBEDDING_SERVER_URL: ${MEMENTO_EMBEDDING_SERVER_URL:-http://embedding:8002}
+      MEMENTO_INGEST_SPOOL_DIR: /data/ingest-spool
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ingest_spool:/data/ingest-spool
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # Celery beat (scheduled tasks: daily digest)
   celery-beat:
     build:
@@ -213,3 +254,4 @@ services:
 volumes:
   pgdata:
   miniodata:
+  ingest_spool:

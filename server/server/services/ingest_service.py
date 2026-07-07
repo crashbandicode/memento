@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
 import re
 from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..db.models import (
+    ConversationMessage, Document, DocumentVersion, Machine, Project, SyncState,
+    Tool,
+)
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
 # Cap concurrent post-ingest work (each holds a DB connection + a BGE-M3 slot
 # for ~10s). Without this, a re-sync storm exhausts the connection pool and
 # user web requests time out.
-_post_ingest_semaphore: "asyncio.Semaphore | None" = None
+_post_ingest_semaphore: asyncio.Semaphore | None = None
 # Cap concurrent ingest endpoint handlers: each holds a main-pool connection
 # for the entire write transaction (documents + conversation_messages +
 # tsvector update). 16 leaves headroom in the 32-slot main pool for login,
 # dashboard, search, etc. — collector storms can't starve the web UI.
-_ingest_semaphore: "asyncio.Semaphore | None" = None
+_ingest_semaphore: asyncio.Semaphore | None = None
 
 
-def _get_post_ingest_semaphore() -> "asyncio.Semaphore":
+def _get_post_ingest_semaphore() -> asyncio.Semaphore:
     global _post_ingest_semaphore
     if _post_ingest_semaphore is None:
         import asyncio as _asyncio
@@ -28,20 +36,12 @@ def _get_post_ingest_semaphore() -> "asyncio.Semaphore":
     return _post_ingest_semaphore
 
 
-def _get_ingest_semaphore() -> "asyncio.Semaphore":
+def _get_ingest_semaphore() -> asyncio.Semaphore:
     global _ingest_semaphore
     if _ingest_semaphore is None:
         import asyncio as _asyncio
         _ingest_semaphore = _asyncio.Semaphore(24)
     return _ingest_semaphore
-
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from ..config import settings
-from ..db.models import (
-    ConversationMessage, Document, DocumentVersion, Project, SyncState, Tool,
-)
 
 # Known tool display names
 TOOL_DISPLAY_NAMES = {
@@ -274,6 +274,48 @@ async def ensure_project(
     return project
 
 
+def _scoped_document_select(
+    tool_id: str,
+    relative_path: str,
+    machine_id: str | None,
+    user_id: str | None,
+):
+    """Select one source document without crossing device/user boundaries."""
+    statement = select(Document).where(
+        Document.tool_id == tool_id,
+        Document.relative_path == relative_path,
+        Document.machine_id == machine_id,
+    )
+    if user_id is not None:
+        statement = statement.where(
+            Document.machine_id.in_(
+                select(Machine.id).where(Machine.user_id == user_id)
+            )
+        )
+    return statement
+
+
+def _scoped_sync_state_select(
+    tool_id: str,
+    relative_path: str,
+    machine_id: str | None,
+    user_id: str | None,
+):
+    """Select sync state using the same ownership key as its document."""
+    statement = select(SyncState).where(
+        SyncState.tool_id == tool_id,
+        SyncState.relative_path == relative_path,
+        SyncState.machine_id == machine_id,
+    )
+    if user_id is not None:
+        statement = statement.where(
+            SyncState.machine_id.in_(
+                select(Machine.id).where(Machine.user_id == user_id)
+            )
+        )
+    return statement
+
+
 async def ingest_file(
     db: AsyncSession,
     tool_id: str,
@@ -289,6 +331,7 @@ async def ingest_file(
     timestamp: float | None = None,
     machine_id: str | None = None,
     user_id: str | None = None,
+    schedule_post_ingest: bool = True,
 ) -> Document:
     """Process and store an ingested file."""
     # Fast-path dedup: if this exact (tool_id, relative_path, content_hash,
@@ -299,12 +342,9 @@ async def ingest_file(
     #   - races UPDATE on the same Document row
     #   - fires a redundant post-ingest task that re-embeds 50 chunks
     # all to write the same bytes back to the same row.
-    sync_row = (await db.execute(
-        select(SyncState).where(
-            SyncState.tool_id == tool_id,
-            SyncState.relative_path == relative_path,
-        )
-    )).scalar_one_or_none()
+    sync_row = (await db.execute(_scoped_sync_state_select(
+        tool_id, relative_path, machine_id, user_id,
+    ))).scalar_one_or_none()
     if (
         sync_row is not None
         and sync_row.last_hash == content_hash
@@ -313,12 +353,9 @@ async def ingest_file(
         # Touch last_synced_at so dashboards know we still see this file,
         # but skip all the actual ingestion work + the post-ingest task.
         sync_row.last_synced_at = datetime.now(timezone.utc)
-        existing_doc = (await db.execute(
-            select(Document).where(
-                Document.tool_id == tool_id,
-                Document.relative_path == relative_path,
-            )
-        )).scalar_one_or_none()
+        existing_doc = (await db.execute(_scoped_document_select(
+            tool_id, relative_path, machine_id, user_id,
+        ))).scalar_one_or_none()
         if existing_doc is not None:
             return existing_doc
 
@@ -379,22 +416,29 @@ async def ingest_file(
     if not project_id:
         session_id = metadata.get("session_id") or metadata.get("cascade_id")
         if session_id:
+            project_statement = select(Document.project_id).where(
+                Document.tool_id == tool_id,
+                Document.metadata_["session_id"].astext == session_id,
+                Document.project_id.isnot(None),
+                Document.machine_id == machine_id,
+            )
+            if user_id is not None:
+                project_statement = project_statement.where(
+                    Document.machine_id.in_(
+                        select(Machine.id).where(Machine.user_id == user_id)
+                    )
+                )
             existing = await db.execute(
-                select(Document.project_id)
-                .where(Document.tool_id == tool_id, Document.metadata_["session_id"].astext == session_id, Document.project_id.isnot(None))
-                .limit(1)
+                project_statement.limit(1)
             )
             row = existing.scalar_one_or_none()
             if row:
                 project_id = row
 
     # Find existing document
-    result = await db.execute(
-        select(Document).where(
-            Document.tool_id == tool_id,
-            Document.relative_path == relative_path,
-        )
-    )
+    result = await db.execute(_scoped_document_select(
+        tool_id, relative_path, machine_id, user_id,
+    ))
     doc = result.scalar_one_or_none()
 
     now = datetime.now(timezone.utc)
@@ -507,7 +551,9 @@ async def ingest_file(
     )
 
     # Update sync state
-    await _update_sync_state(db, tool_id, relative_path, content_hash, offset, machine_id)
+    await _update_sync_state(
+        db, tool_id, relative_path, content_hash, offset, machine_id, user_id,
+    )
 
     # Trigger AI summary generation (async via Celery)
     if category in ("memory", "identity", "plan", "note", "learning") and len(content) > 50:
@@ -532,23 +578,21 @@ async def ingest_file(
 
     # Generate embeddings + extract knowledge graph (async, non-blocking)
     # Must keep a reference to the task to prevent GC
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except Exception:
-        pass
+    if schedule_post_ingest:
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        except Exception:
+            pass
 
     return doc
 
 
 async def _run_post_ingest(doc_id, tool_id: str, category: str) -> None:
     """Post-ingest: generate embeddings and extract knowledge (best-effort, own session)."""
-    import logging
-    logger = logging.getLogger("post_ingest")
-
     # Only process conversations and memory — skip configs, extensions, etc.
     if category not in ("conversation", "memory", "learning", "plan", "identity"):
         return
@@ -789,19 +833,18 @@ async def _update_sync_state(
     content_hash: str,
     offset: int,
     machine_id: str | None,
+    user_id: str | None = None,
 ) -> None:
     """Update server-side sync state."""
-    result = await db.execute(
-        select(SyncState).where(
-            SyncState.tool_id == tool_id,
-            SyncState.relative_path == relative_path,
-        )
-    )
+    result = await db.execute(_scoped_sync_state_select(
+        tool_id, relative_path, machine_id, user_id,
+    ))
     state = result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
 
     if state is None:
         state = SyncState(
+            machine_id=machine_id,
             tool_id=tool_id,
             relative_path=relative_path,
             last_hash=content_hash,

@@ -54,6 +54,8 @@ celery_app = Celery(
         "server.tasks.knowledge_retry",
         "server.tasks.tsvector_backfill",
         "server.tasks.db_backup",
+        "server.tasks.ingest_spool",
+        "server.tasks.post_ingest",
     ],
 )
 
@@ -71,10 +73,20 @@ celery_app.conf.update(
     # if worker dies mid-task, Redis requeues it to another worker.
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    task_routes={
+        "server.tasks.ingest_spool.*": {"queue": "ingest"},
+    },
 )
 
 # Scheduled tasks
 celery_app.conf.beat_schedule = {
+    # Recover durably staged uploads if Redis/API/worker restarted between
+    # final-chunk acknowledgement and task completion.
+    "ingest-spool-recovery": {
+        "task": "server.tasks.ingest_spool.recover_spooled_ingests",
+        "schedule": crontab(minute="*/5"),
+        "options": {"queue": "ingest"},
+    },
     "daily-digest": {
         "task": "server.tasks.daily_digest.generate_daily_digest",
         "schedule": crontab(hour=23, minute=30),  # Run at 23:30 every day

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, Header, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,8 +16,14 @@ from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
 from ..services.ingest_service import ingest_file, _get_ingest_semaphore
+from ..services.ingest_spool import (
+    MAX_CHUNK_BYTES,
+    ChunkValidationError,
+    stage_chunk,
+)
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
+logger = logging.getLogger("ingest")
 
 
 async def throttle_ingest():
@@ -149,10 +157,6 @@ async def ingest_sqlite_rows(
     return IngestResponse(document_id=str(doc.id), message="SQLite rows ingested")
 
 
-# In-memory chunk buffer for chunked uploads
-_chunk_buffers: dict[str, dict] = {}
-
-
 @router.post("/file/chunk", response_model=IngestResponse)
 async def ingest_file_chunk(
     metadata: str = Form(...),
@@ -164,58 +168,60 @@ async def ingest_file_chunk(
     x_device_name: str = Header("unknown"),
     x_device_platform: str = Header("unknown"),
 ) -> IngestResponse:
-    """Receive a chunk of a large file. Assembles and ingests when all chunks arrive."""
-    meta = json.loads(metadata)
-    chunk_data = await content.read()
-    upload_id = meta["upload_id"]
-    chunk_index = meta["chunk_index"]
-    total_chunks = meta["total_chunks"]
+    """Durably stage a chunk and enqueue finalization after the last one."""
+    try:
+        meta = json.loads(metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="metadata must be valid JSON") from exc
+    if not isinstance(meta, dict):
+        raise HTTPException(status_code=400, detail="metadata must be a JSON object")
+    chunk_data = await content.read(MAX_CHUNK_BYTES + 1)
 
-    # Initialize buffer
-    if upload_id not in _chunk_buffers:
-        _chunk_buffers[upload_id] = {
-            "meta": meta,
-            "chunks": {},
-            "total_chunks": total_chunks,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+    # Validate device ownership in a short, committed transaction before any
+    # durable acknowledgement. This transaction does not span parsing/ingest.
+    await ensure_device(
+        db,
+        x_device_id,
+        x_device_name,
+        x_device_platform,
+        user_id=_collector_user.id,
+    )
+    await db.commit()
+    try:
+        job_id, complete = await asyncio.to_thread(
+            stage_chunk,
+            meta=meta,
+            chunk_data=chunk_data,
+            user_id=str(_collector_user.id),
+            device_id=x_device_id,
+            device_name=x_device_name,
+            device_platform=x_device_platform,
+        )
+    except ChunkValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _chunk_buffers[upload_id]["chunks"][chunk_index] = chunk_data
-
-    # Check if all chunks received
-    buf = _chunk_buffers[upload_id]
-    if len(buf["chunks"]) < total_chunks:
+    if not complete:
         return IngestResponse(
             document_id="pending",
-            message=f"Chunk {chunk_index + 1}/{total_chunks} received",
+            message=f"Chunk {int(meta['chunk_index']) + 1}/{int(meta['total_chunks'])} received",
         )
 
-    # All chunks received — assemble and ingest
-    full_content = b"".join(buf["chunks"][i] for i in range(total_chunks))
-    del _chunk_buffers[upload_id]
-
-    file_content = full_content.decode("utf-8", errors="replace")
-    machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
-
-    doc = await ingest_file(
-        db=db,
-        tool_id=meta["tool"],
-        category=meta["category"],
-        content_type=meta["content_type"],
-        relative_path=meta["relative_path"],
-        content=file_content,
-        content_hash=meta["hash"],
-        file_size=len(full_content),
-        mode=meta.get("mode", "full"),
-        offset=meta.get("offset", 0),
-        metadata=meta.get("metadata", {}),
-        timestamp=meta.get("timestamp"),
-        machine_id=str(machine.id),
-        user_id=str(_collector_user.id),
-    )
+    # The ready marker and every chunk are fsynced before this response. Celery
+    # is an acceleration path; the periodic recovery task owns enqueueing if
+    # Redis is momentarily unavailable here.
+    try:
+        from ..tasks.ingest_spool import process_spooled_ingest
+        await asyncio.to_thread(
+            process_spooled_ingest.apply_async,
+            args=[job_id],
+            queue="ingest",
+            retry=False,
+        )
+    except Exception:
+        logger.exception("Ready spool job %s could not be queued; recovery will retry", job_id)
     return IngestResponse(
-        document_id=str(doc.id),
-        message=f"Assembled {total_chunks} chunks ({len(full_content)} bytes), ingested",
+        document_id=f"queued:{job_id}",
+        message=f"Received {int(meta['total_chunks'])} chunks; durable ingest queued",
     )
 
 
@@ -243,7 +249,7 @@ async def ingest_discovery(
                     proj["path"] = _re.sub(r"^\\\\?\?\\", "", unquote(proj["path"]))
 
     discovery_content = json.dumps(tools_data, indent=2, ensure_ascii=False)
-    doc = await ingest_file(
+    await ingest_file(
         db=db, tool_id="system", category="discovery", content_type="json",
         relative_path=f"discovery/{device_id}.json",
         content=discovery_content, content_hash=f"discovery-{device_id}",
