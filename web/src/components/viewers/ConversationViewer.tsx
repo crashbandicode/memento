@@ -15,6 +15,26 @@ interface Artifact {
   file_size_bytes: number;
 }
 
+const ANSI_ESCAPE_RE = /\u001B(?:\][^\u0007]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])|\u009B[0-?]*[ -/]*[@-~]/g;
+
+function cleanTerminalText(value: string): string {
+  return value.replace(ANSI_ESCAPE_RE, "");
+}
+
+function cleanToolOutput(value: string): string {
+  return cleanTerminalText(value).replace(/^\[Result\]\s*/, "").trim();
+}
+
+function formatToolText(value: string): string {
+  const clean = cleanTerminalText(value).trim();
+  if (!clean || !/^[\[{]/.test(clean)) return clean;
+  try {
+    return JSON.stringify(JSON.parse(clean), null, 2);
+  } catch {
+    return clean;
+  }
+}
+
 export default function ConversationViewer({
   documentId,
   totalMessages,
@@ -81,7 +101,7 @@ export default function ConversationViewer({
         {fmt(t.conversation.messagesTotal, { total: totalMessages, loaded: messages.length })}
       </div>
 
-      <div className="space-y-4 max-w-3xl mx-auto pb-8">
+      <div className="space-y-3 max-w-4xl mx-auto pb-8">
         {messages.map((msg, idx) => (
           <ChatBubble key={`${msg.id}-${idx}`} msg={msg} locale={locale} t={t} />
         ))}
@@ -134,8 +154,9 @@ export const ChatBubble = memo(function ChatBubble({
 }) {
   const role = msg.role || msg.message_type || "unknown";
   const toolName = msg.tool_name ?? "";
-  const toolInput = msg.tool_input ?? "";
-  const thinking = msg.thinking?.trim() || "";
+  const content = cleanTerminalText(msg.content);
+  const toolInput = cleanTerminalText(msg.tool_input ?? "");
+  const thinking = cleanTerminalText(msg.thinking?.trim() || "");
   const [expanded, setExpanded] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
 
@@ -145,11 +166,11 @@ export const ChatBubble = memo(function ChatBubble({
   // dispatch, not a human chat. Render these as a gray "子任务派发" card
   // (centered, muted) so users don't mistake them for their own chat input.
   if (role === "user") {
-    const isSubagentDispatch = msg.content.startsWith("[Subagent Context]")
-      || msg.content.includes("\n[Subagent Context]");
+    const isSubagentDispatch = content.startsWith("[Subagent Context]")
+      || content.includes("\n[Subagent Context]");
     if (isSubagentDispatch) {
-      const isLong = msg.content.length > 300;
-      const displayContent = isLong && !expanded ? msg.content.slice(0, 300) + "..." : msg.content;
+      const isLong = content.length > 300;
+      const displayContent = isLong && !expanded ? content.slice(0, 300) + "..." : content;
       return (
         <div style={{ display: "flex", justifyContent: "center", margin: "6px 0" }}>
           <div
@@ -209,35 +230,54 @@ export const ChatBubble = memo(function ChatBubble({
       );
     }
 
-    const isLong = msg.content.length > 500;
-    const displayContent = isLong && !expanded ? msg.content.slice(0, 500) + "..." : msg.content;
+    const isLong = content.length > 500;
+    const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
     return (
-      <div style={{ display: "flex", justifyContent: "flex-end" }}>
-        <div style={{ maxWidth: "78%", minWidth: 0 }}>
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
+      <div style={{ display: "flex", justifyContent: "flex-start" }}>
+        <div style={{ width: "100%", minWidth: 0 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
+            <span
+              aria-hidden="true"
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 999,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "color-mix(in srgb, var(--aurora-accent) 14%, transparent)",
+                color: "var(--aurora-accent)",
+                fontSize: 9,
+                fontWeight: 700,
+              }}
+            >
+              Y
+            </span>
+            <span style={{ fontSize: 10.5, fontWeight: 600, color: "var(--aurora-accent)" }}>You</span>
             {msg.timestamp && (
               <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
                 {new Date(msg.timestamp).toLocaleString(locale)}
               </span>
             )}
-            <span style={{ fontSize: 10.5, fontWeight: 600, color: "var(--aurora-accent)" }}>User</span>
           </div>
           <div
             style={{
               padding: "12px 16px",
-              borderRadius: "20px 20px 6px 20px",
-              background: "var(--aurora-accent)",
-              color: "#fff",
+              borderRadius: 12,
+              background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
+              color: "var(--aurora-fg1)",
               fontSize: 13.5,
               lineHeight: 1.55,
               letterSpacing: "-0.005em",
-              whiteSpace: "pre-wrap",
               wordBreak: "break-word",
               overflowWrap: "anywhere",
-              boxShadow: "0 6px 18px -6px color-mix(in srgb, var(--aurora-accent) 50%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--aurora-accent) 20%, var(--aurora-border))",
+              boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
             }}
           >
-            {displayContent}
+            <div className="prose prose-sm max-w-none">
+              <MarkdownViewer content={displayContent} />
+            </div>
             {isLong && (
               <button
                 onClick={() => setExpanded(!expanded)}
@@ -245,7 +285,7 @@ export const ChatBubble = memo(function ChatBubble({
                   display: "block",
                   marginTop: 6,
                   fontSize: 11,
-                  color: "rgba(255,255,255,0.85)",
+                  color: "var(--aurora-accent)",
                   background: "transparent",
                   border: 0,
                   cursor: "pointer",
@@ -260,16 +300,34 @@ export const ChatBubble = memo(function ChatBubble({
     );
   }
 
-  // Assistant — left aligned, glass white
+  // Assistant — a quiet neutral surface keeps each response visually bounded
+  // without competing with the stronger accent used for human prompts.
   if (role === "assistant") {
-    const isLong = msg.content.length > 500;
-    const displayContent = isLong && !expanded ? msg.content.slice(0, 500) + "..." : msg.content;
-    const hasSeparateThinking = Boolean(thinking && thinking !== msg.content.trim());
+    const isLong = content.length > 500;
+    const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
+    const hasSeparateThinking = Boolean(thinking && thinking !== content.trim());
 
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
-        <div style={{ maxWidth: "78%", minWidth: 0 }}>
+        <div style={{ width: "100%", minWidth: 0, padding: "3px 4px 8px" }}>
           <div style={{ display: "flex", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
+            <span
+              aria-hidden="true"
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 999,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "color-mix(in srgb, #10B981 13%, transparent)",
+                color: "#059669",
+                fontSize: 9,
+                fontWeight: 700,
+              }}
+            >
+              A
+            </span>
             <span style={{ fontSize: 10.5, fontWeight: 600, color: "#10B981" }}>Assistant</span>
             {msg.timestamp && (
               <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
@@ -280,14 +338,14 @@ export const ChatBubble = memo(function ChatBubble({
           <div
             style={{
               padding: "12px 16px",
-              borderRadius: "20px 20px 20px 6px",
-              background: "var(--aurora-surface-solid)",
               color: "var(--aurora-fg1)",
               fontSize: 13.5,
               lineHeight: 1.55,
               letterSpacing: "-0.005em",
+              background: "color-mix(in srgb, var(--aurora-chip) 34%, var(--aurora-surface-solid))",
               border: "1px solid var(--aurora-border)",
-              boxShadow: "0 1px 0 rgba(255,255,255,0.5) inset",
+              borderRadius: 12,
+              boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
             }}
           >
             <div className="prose prose-sm max-w-none">
@@ -335,63 +393,97 @@ export const ChatBubble = memo(function ChatBubble({
     );
   }
 
-  // Tool use — centered
+  // Tool use — compact SpecStory-style accordion. Tool input and terminal
+  // output stay collapsed until requested, keeping long agent sessions easy
+  // to scan while retaining every detail.
   if (role === "tool") {
+    const toolLabel = toolName || "Tool result";
+    const cleanedOutput = cleanToolOutput(content);
+    // Parser placeholders identify a standalone invocation but contain no
+    // actual output. Keep those as quiet one-line context rather than opening
+    // an accordion whose only content repeats the tool name.
+    const output = cleanedOutput === `[${toolLabel}]` ? "" : cleanedOutput;
+    const formattedInput = formatToolText(toolInput);
+    const formattedOutput = formatToolText(output);
+    const previewSource = formattedInput || formattedOutput;
+    const preview = previewSource.replace(/\s+/g, " ").trim();
+    const hasDetails = Boolean(formattedInput || formattedOutput);
+
     return (
-      <div style={{ display: "flex", justifyContent: "center" }}>
+      <div style={{ display: "flex", justifyContent: "flex-start", margin: "2px 4px" }}>
         <div
           style={{
-            background: "var(--aurora-chip)",
+            width: expanded ? "100%" : "fit-content",
+            minWidth: expanded ? 0 : 240,
+            background: "var(--aurora-surface-solid)",
             border: "1px solid var(--aurora-border)",
-            borderRadius: 14,
-            padding: "8px 14px",
-            fontSize: 12,
-            color: "var(--aurora-fg2)",
-            maxWidth: "90%",
+            borderRadius: 10,
+            color: "var(--aurora-fg1)",
+            maxWidth: "100%",
+            overflow: "hidden",
+            boxShadow: "0 1px 2px rgba(15,23,42,0.03)",
           }}
         >
-          <div style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--aurora-fg3)", marginBottom: toolInput || msg.content ? 6 : 0 }}>
-            <Icon name="terminal" size={13} style={{ color: "var(--aurora-accent)" }} />
-            <span style={{ fontFamily: "ui-monospace,monospace", fontWeight: 600, fontSize: 11.5 }}>{toolName || "Tool"}</span>
-          </div>
-          {toolInput && (
-            <pre
-              style={{
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-                maxHeight: 128,
-                overflow: "hidden",
-                background: "var(--aurora-surface-solid)",
-                border: "1px solid var(--aurora-border)",
-                borderRadius: 8,
-                padding: 8,
-                fontFamily: "ui-monospace,monospace",
-                fontSize: 11,
-                color: "var(--aurora-fg2)",
-              }}
-            >
-              {toolInput}
-            </pre>
-          )}
-          {msg.content && msg.content !== `[${toolName}]` && (
-            <pre
-              style={{
-                marginTop: 4,
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-                maxHeight: 180,
-                overflow: "hidden",
-                background: "var(--aurora-surface-solid)",
-                border: "1px solid var(--aurora-border)",
-                borderRadius: 8,
-                padding: 8,
-                fontFamily: "ui-monospace,monospace",
-                fontSize: 11,
-                color: "var(--aurora-fg3)",
-              }}
-            >
-              {msg.content.length > 500 ? msg.content.slice(0, 500) + "..." : msg.content}
-            </pre>
+          <button
+            type="button"
+            data-conversation-tool={toolLabel}
+            aria-expanded={expanded}
+            onClick={() => hasDetails && setExpanded(!expanded)}
+            style={{
+              width: "100%",
+              minHeight: 38,
+              display: "flex",
+              alignItems: "center",
+              gap: 9,
+              padding: "8px 12px",
+              border: 0,
+              background: "transparent",
+              color: "inherit",
+              cursor: hasDetails ? "pointer" : "default",
+              textAlign: "left",
+            }}
+          >
+            <Icon name="terminal" size={13} style={{ color: "#F97316", flex: "0 0 auto" }} />
+            <span style={{ fontWeight: 600, fontSize: 12, whiteSpace: "nowrap" }}>{toolLabel}</span>
+            {!expanded && preview && (
+              <span
+                title={preview}
+                style={{
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: "var(--aurora-fg4)",
+                  fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
+                  fontSize: 10.5,
+                }}
+              >
+                {preview}
+              </span>
+            )}
+            {hasDetails && (
+              <span style={{ marginLeft: "auto", display: "inline-flex", color: "var(--aurora-fg4)" }}>
+                <Icon
+                  name="chevron_down"
+                  size={13}
+                  style={{
+                    transform: expanded ? "rotate(180deg)" : "none",
+                    transition: "transform .15s ease",
+                  }}
+                />
+              </span>
+            )}
+          </button>
+
+          {expanded && hasDetails && (
+            <div style={{ borderTop: "1px solid var(--aurora-border)", padding: "11px 12px 12px" }}>
+              {formattedInput && (
+                <ToolCodeBlock label="Input" value={formattedInput} />
+              )}
+              {formattedOutput && (
+                <ToolCodeBlock label="Output" value={formattedOutput} topSpacing={Boolean(formattedInput)} />
+              )}
+            </div>
           )}
         </div>
       </div>
@@ -413,11 +505,56 @@ export const ChatBubble = memo(function ChatBubble({
         }}
       >
         <span style={{ fontWeight: 600 }}>System: </span>
-        {msg.content.length > 200 ? msg.content.slice(0, 200) + "..." : msg.content}
+        {content.length > 200 ? content.slice(0, 200) + "..." : content}
       </div>
     </div>
   );
 });
+
+function ToolCodeBlock({
+  label,
+  value,
+  topSpacing = false,
+}: {
+  label: string;
+  value: string;
+  topSpacing?: boolean;
+}) {
+  return (
+    <div style={{ marginTop: topSpacing ? 12 : 0 }}>
+      <div
+        style={{
+          marginBottom: 5,
+          color: "var(--aurora-fg4)",
+          fontSize: 9.5,
+          fontWeight: 700,
+          letterSpacing: "0.08em",
+          textTransform: "uppercase",
+        }}
+      >
+        {label}
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: "10px 11px",
+          maxHeight: 320,
+          overflow: "auto",
+          whiteSpace: "pre",
+          background: "color-mix(in srgb, var(--aurora-chip) 58%, var(--aurora-surface-solid))",
+          border: "1px solid var(--aurora-border)",
+          borderRadius: 8,
+          color: "var(--aurora-fg2)",
+          fontFamily: "ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace",
+          fontSize: 11.5,
+          lineHeight: 1.55,
+        }}
+      >
+        {value}
+      </pre>
+    </div>
+  );
+}
 
 function ArtifactBubble({ artifact }: { artifact: Artifact }) {
   const [expanded, setExpanded] = useState(false);
@@ -484,7 +621,7 @@ function ArtifactBubble({ artifact }: { artifact: Artifact }) {
                 background: "var(--aurora-surface-solid)",
               }}
             >
-              <MarkdownViewer content={artifact.content} />
+              <MarkdownViewer content={cleanTerminalText(artifact.content)} />
             </div>
           )}
           {expanded && !artifact.content && (
