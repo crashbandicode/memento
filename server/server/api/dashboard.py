@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..services.conversation_activity import is_low_activity_summary
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -77,7 +78,8 @@ async def get_dashboard(
             "conversation_count": categories.get("conversation", 0),
         })
 
-    # Recent conversations (last 10 across all tools)
+    # Pull enough recent conversations to keep useful threads visible even
+    # when several low-activity sessions are folded into the hidden section.
     recent_convos_q = (
         select(Document.id, Document.tool_id, Document.title,
                Document.synced_at, Document.project_id, Document.file_size_bytes,
@@ -85,32 +87,56 @@ async def get_dashboard(
         .outerjoin(Project, Document.project_id == Project.id)
         .where(Document.category == "conversation")
         .order_by(Document.synced_at.desc())
-        .limit(10)
+        .limit(20)
     )
     recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
     convos_rows = list((await db.execute(recent_convos_q)).all())
 
-    # Batch message counts for these 10 docs in one GROUP BY instead of one
-    # COUNT per iteration (N+1 → 1 round-trip).
-    msg_counts: dict = {}
+    # Batch both display counts and meaningful human/assistant activity in one
+    # GROUP BY instead of one query per document.
+    msg_activity: dict = {}
     if convos_rows:
         msg_count_q = (
-            select(ConversationMessage.document_id, func.count())
+            select(
+                ConversationMessage.document_id,
+                func.count().label("message_count"),
+                func.count().filter(ConversationMessage.role == "user").label("user_count"),
+                func.count().filter(ConversationMessage.role == "assistant").label("assistant_count"),
+                func.coalesce(
+                    func.sum(func.length(ConversationMessage.content)).filter(
+                        ConversationMessage.role.in_(("user", "assistant"))
+                    ),
+                    0,
+                ).label("human_character_count"),
+            )
             .where(ConversationMessage.document_id.in_([r.id for r in convos_rows]))
             .group_by(ConversationMessage.document_id)
         )
-        msg_counts = {did: n for did, n in (await db.execute(msg_count_q)).all()}
+        msg_activity = {
+            did: (total, users, assistants, characters)
+            for did, total, users, assistants, characters
+            in (await db.execute(msg_count_q)).all()
+        }
 
     recent_conversations = []
     for r in convos_rows:
+        total, users, assistants, characters = msg_activity.get(
+            r.id,
+            (0, 0, 0, 0),
+        )
         recent_conversations.append({
             "id": str(r.id),
             "tool_id": r.tool_id,
             "title": r.title,
             "synced_at": r.synced_at.isoformat(),
             "project_title": r.project_title,
-            "message_count": msg_counts.get(r.id, 0),
+            "message_count": total,
+            "is_low_activity": is_low_activity_summary(
+                users,
+                assistants,
+                characters,
+            ),
         })
 
     # Recent activity (last 7 days by date, timezone-adjusted)

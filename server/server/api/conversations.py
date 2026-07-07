@@ -166,3 +166,67 @@ async def get_conversation_messages(
             for m in messages
         ],
     }
+
+
+@router.get("/{doc_id}/prompts")
+async def get_conversation_prompts(
+    doc_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Return a lightweight outline of every meaningful human prompt."""
+    mids = await user_machine_ids(db, _user)
+
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404)
+    if mids is not None and doc.machine_id not in mids:
+        raise HTTPException(status_code=404)
+
+    prompts = []
+    # The viewer also parses raw content when it is present, assigning
+    # contiguous normalized line numbers. Build the outline from that same
+    # source so prompt anchors remain exact even when the stored DB rows have
+    # intentional gaps after a cleanup/backfill.
+    if doc.content:
+        parsed = parse_conversation(doc.content, doc.tool_id)
+        prompts = [
+            {
+                "id": index,
+                "line_number": index + 1,
+                "content": message.content.strip()[:500],
+                "timestamp": message.timestamp or None,
+            }
+            for index, message in enumerate(parsed)
+            if message.role == "user"
+            and message.content.strip()
+            and not message.content.lstrip().startswith("[Subagent Context]")
+        ][:2000]
+    else:
+        prompt_rows = await db.execute(
+            select(
+                ConversationMessage.id,
+                ConversationMessage.line_number,
+                ConversationMessage.content,
+                ConversationMessage.timestamp,
+            )
+            .where(
+                ConversationMessage.document_id == doc_id,
+                ConversationMessage.role == "user",
+            )
+            .order_by(ConversationMessage.line_number)
+            .limit(2000)
+        )
+        for message_id, line_number, content, timestamp in prompt_rows.all():
+            clean = (content or "").strip()
+            if not clean or clean.startswith("[Subagent Context]"):
+                continue
+            prompts.append({
+                "id": message_id,
+                "line_number": line_number,
+                "content": clean[:500],
+                "timestamp": timestamp.isoformat() if timestamp else None,
+            })
+
+    return {"prompts": prompts}
