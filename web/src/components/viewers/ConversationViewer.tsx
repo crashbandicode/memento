@@ -50,6 +50,7 @@ export default function ConversationViewer({
   const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
   const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
+  const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
@@ -86,6 +87,7 @@ export default function ConversationViewer({
     setPrompts([]);
     setActivePromptLine(null);
     setPendingPromptLine(null);
+    setNavigatingPromptLine(null);
     loadMore();
     api.getPrompts(documentId)
       .then((response) => {
@@ -100,7 +102,11 @@ export default function ConversationViewer({
     const target = document.getElementById(`conversation-line-${pendingPromptLine}`);
     if (!target) return;
     target.scrollIntoView({ behavior: "smooth", block: "start" });
-    setPendingPromptLine(null);
+    const timeout = window.setTimeout(() => {
+      setPendingPromptLine(null);
+      setNavigatingPromptLine(null);
+    }, 650);
+    return () => window.clearTimeout(timeout);
   }, [messages, pendingPromptLine]);
 
   const handleScroll = () => {
@@ -123,7 +129,22 @@ export default function ConversationViewer({
 
   const navigateToPrompt = async (prompt: ConversationPrompt) => {
     const anchorId = `conversation-line-${prompt.line_number}`;
-    if (!document.getElementById(anchorId) && !loadingRef.current) {
+    setNavigatingPromptLine(prompt.line_number);
+    if (!document.getElementById(anchorId) && loadingRef.current) {
+      await new Promise<void>((resolve) => {
+        const startedAt = Date.now();
+        const check = () => {
+          if (!loadingRef.current || Date.now() - startedAt > 10_000) resolve();
+          else window.setTimeout(check, 50);
+        };
+        check();
+      });
+      if (loadingRef.current) {
+        setNavigatingPromptLine(null);
+        return;
+      }
+    }
+    if (!document.getElementById(anchorId)) {
       loadingRef.current = true;
       setLoading(true);
       try {
@@ -153,6 +174,8 @@ export default function ConversationViewer({
         setHasMore(offsetRef.current < total);
       } catch (error) {
         console.error("Failed to load prompt target:", error);
+        setNavigatingPromptLine(null);
+        return;
       } finally {
         setLoading(false);
         loadingRef.current = false;
@@ -228,7 +251,9 @@ export default function ConversationViewer({
       <PromptNavigator
         prompts={prompts}
         activeLine={activePromptLine}
+        loadingLine={navigatingPromptLine}
         label={t.conversation.promptNavigator}
+        loadingLabel={t.loading}
         onSelect={navigateToPrompt}
       />
     </div>
@@ -247,12 +272,16 @@ function promptSnippet(value: string): string {
 function PromptNavigator({
   prompts,
   activeLine,
+  loadingLine,
   label,
+  loadingLabel,
   onSelect,
 }: {
   prompts: ConversationPrompt[];
   activeLine: number | null;
+  loadingLine: number | null;
   label: string;
+  loadingLabel: string;
   onSelect: (prompt: ConversationPrompt) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -320,6 +349,7 @@ function PromptNavigator({
         {prompts.map((prompt, index) => {
           const snippet = promptSnippet(prompt.content) || `Prompt ${index + 1}`;
           const active = prompt.line_number === activeLine;
+          const isLoading = prompt.line_number === loadingLine;
           return (
             <button
               key={`${prompt.id}-${prompt.line_number}`}
@@ -327,6 +357,8 @@ function PromptNavigator({
               data-prompt-item={prompt.line_number}
               title={snippet}
               onClick={() => onSelect(prompt)}
+              disabled={loadingLine !== null}
+              aria-busy={isLoading}
               style={{
                 width: "100%",
                 minHeight: expanded ? 34 : 10,
@@ -346,7 +378,8 @@ function PromptNavigator({
                     : "var(--aurora-border)",
                 color: active ? "var(--aurora-accent)" : "var(--aurora-fg3)",
                 textAlign: "left",
-                cursor: "pointer",
+                cursor: loadingLine !== null ? "wait" : "pointer",
+                opacity: loadingLine !== null && !isLoading ? 0.55 : 1,
               }}
             >
               {expanded ? (
@@ -367,7 +400,11 @@ function PromptNavigator({
                       fontWeight: 700,
                     }}
                   >
-                    {index + 1}
+                    {isLoading ? (
+                      <Icon name="refresh" size={10} className="animate-spin" />
+                    ) : (
+                      index + 1
+                    )}
                   </span>
                   <span
                     style={{
@@ -379,9 +416,11 @@ function PromptNavigator({
                       lineHeight: 1.3,
                     }}
                   >
-                    {snippet}
+                    {isLoading ? loadingLabel : snippet}
                   </span>
                 </>
+              ) : isLoading ? (
+                <Icon name="refresh" size={10} className="animate-spin" style={{ color: "#fff" }} />
               ) : (
                 <span className="sr-only">{snippet}</span>
               )}
