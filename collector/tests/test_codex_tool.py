@@ -143,6 +143,7 @@ def test_state_title_records_refresh_and_include_revision_and_path(
         "tool": "codex",
         "thread_id": ROOT_ID,
         "title": "Original title",
+        "title_kind": "custom",
         "revision": 100_123,
         "relative_path": str(path.relative_to(codex_tool.root_path)).replace("\\", "/"),
     }
@@ -156,6 +157,19 @@ def test_state_title_records_refresh_and_include_revision_and_path(
     second = codex_tool.thread_title_records()[ROOT_ID]
     assert second["title"] == "Explicitly renamed"
     assert second["revision"] == 200_456
+
+
+def test_title_equal_to_first_prompt_is_marked_as_fallback(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "First prompt")
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert record["title"] == "First prompt"
+    assert record["title_kind"] == "fallback"
 
 
 def test_subagent_state_titles_are_never_emitted_as_explicit_renames(

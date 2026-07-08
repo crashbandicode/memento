@@ -148,7 +148,12 @@ class ConversationTitleTests(unittest.TestCase):
                 "thread_source": "subagent",
                 "agent_path": "/root/semantic_search_dedupe",
                 "memento_title_source": "codex_explicit_rename",
-                "codex_title_revision": 200_456,
+                # A fallback event raced with a later FULL ingest. The server
+                # acknowledged its source clock without weakening the marker.
+                "codex_title_revision": 200_457,
+                "codex_title_revisions": {
+                    "019f144c-82d6-70d0-95e8-e01e7b813e98": 200_457,
+                },
             },
         )
 

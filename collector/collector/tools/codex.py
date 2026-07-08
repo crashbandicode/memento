@@ -399,11 +399,20 @@ class CodexTool(BaseTool):
             title = str(info.get("title") or "").strip()[:500]
             if not title:
                 continue
+            first_user_message = str(
+                info.get("first_user_message") or ""
+            ).strip()
+            title_kind = (
+                "fallback"
+                if first_user_message and title == first_user_message
+                else "custom"
+            )
             record = {
                 "metadata_type": "codex_thread_title",
                 "tool": self.name,
                 "thread_id": thread_id,
                 "title": title,
+                "title_kind": title_kind,
                 "revision": max(0, int(info.get("revision") or 0)),
             }
             relative_path = self._state_rollout_relative_path(

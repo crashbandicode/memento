@@ -67,6 +67,7 @@ class IngestMetadataRequest(BaseModel):
     tool: Literal["codex"]
     thread_id: UUID
     title: str = Field(min_length=1, max_length=500)
+    title_kind: Literal["custom", "fallback", "unknown"] = "unknown"
     revision: int = Field(gt=0, le=2**63 - 1)
     relative_path: str | None = Field(default=None, max_length=2000)
 
@@ -127,6 +128,7 @@ async def ingest_metadata_endpoint(
         machine_id=machine.id,
         thread_id=req.thread_id,
         title=req.title,
+        title_kind=req.title_kind,
         revision=req.revision,
         relative_path=req.relative_path,
         user_id=_collector_user.id,

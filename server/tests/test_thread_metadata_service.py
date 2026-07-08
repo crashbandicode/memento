@@ -168,6 +168,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 machine_id=machine_id,
                 thread_id=uuid.uuid4(),
                 title="New source title",
+                title_kind="custom",
                 revision=200,
                 user_id=user_id,
             )
@@ -220,6 +221,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Already applied",
+            title_kind="custom",
             revision=400,
             user_id=uuid.uuid4(),
         )
@@ -244,6 +246,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Already applied",
+            title_kind="custom",
             revision=200,
             user_id=uuid.uuid4(),
         )
@@ -266,6 +269,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Second title in this millisecond",
+            title_kind="custom",
             revision=200,
             user_id=uuid.uuid4(),
         )
@@ -288,6 +292,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Current title from restored database",
+            title_kind="custom",
             revision=100,
             user_id=uuid.uuid4(),
         )
@@ -328,6 +333,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 machine_id=source_machine,
                 thread_id=uuid.uuid4(),
                 title="Visible on canonical host",
+                title_kind="custom",
                 revision=11,
                 user_id=user_id,
             )
@@ -356,6 +362,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Codex source title",
+            title_kind="custom",
             revision=101,
             user_id=uuid.uuid4(),
         )
@@ -366,6 +373,140 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             document.metadata_["codex_title_revisions"][str(machine_id)],
             101,
         )
+
+    async def test_initial_fallback_reconciles_then_custom_title_becomes_explicit(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(title="Opaque rollout", machine_id=machine_id)
+        fallback = await apply_codex_thread_title_update(
+            _Session([document.id], [document]),
+            machine_id=machine_id,
+            thread_id=uuid.uuid4(),
+            title="Initial prompt",
+            title_kind="fallback",
+            revision=1,
+            user_id=user_id,
+        )
+        self.assertEqual((fallback.updated, fallback.ignored), (1, 0))
+        self.assertEqual(document.title, "Initial prompt")
+        self.assertEqual(
+            document.metadata_["memento_title_source"],
+            "codex_source_fallback",
+        )
+
+        custom = await apply_codex_thread_title_update(
+            _Session([document.id], [document]),
+            machine_id=machine_id,
+            thread_id=uuid.uuid4(),
+            title="netbird setup",
+            title_kind="custom",
+            revision=2,
+            user_id=user_id,
+        )
+        self.assertEqual((custom.updated, custom.ignored), (1, 0))
+        self.assertEqual(document.title, "netbird setup")
+        self.assertEqual(
+            document.metadata_["memento_title_source"],
+            "codex_explicit_rename",
+        )
+
+    async def test_fallback_acknowledges_revision_without_reverting_explicit_title(self) -> None:
+        machine_id = uuid.uuid4()
+        document = _document(
+            title="netbird setup",
+            machine_id=machine_id,
+            metadata={
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 2,
+                "codex_title_revisions": {str(machine_id): 2},
+            },
+        )
+        result = await apply_codex_thread_title_update(
+            _Session([document.id], [document]),
+            machine_id=machine_id,
+            thread_id=uuid.uuid4(),
+            title="Initial prompt",
+            title_kind="fallback",
+            revision=3,
+            user_id=uuid.uuid4(),
+        )
+
+        self.assertEqual((result.updated, result.ignored), (0, 1))
+        self.assertEqual(document.title, "netbird setup")
+        self.assertEqual(document.metadata_["codex_title_revision"], 3)
+        self.assertEqual(
+            document.metadata_["codex_title_revisions"][str(machine_id)],
+            3,
+        )
+        self.assertEqual(
+            document.metadata_["memento_title_source"],
+            "codex_explicit_rename",
+        )
+
+    async def test_fallback_cannot_revert_explicit_title_on_canonical_host(self) -> None:
+        source_machine = uuid.uuid4()
+        canonical_machine = uuid.uuid4()
+        source = _document(
+            title="netbird setup",
+            machine_id=source_machine,
+            metadata={
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 2,
+                "codex_title_revisions": {str(source_machine): 2},
+            },
+        )
+        canonical = _document(
+            title="netbird setup",
+            machine_id=canonical_machine,
+            metadata={
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 50,
+                "codex_title_revisions": {
+                    str(source_machine): 2,
+                    str(canonical_machine): 50,
+                },
+            },
+        )
+        result = await apply_codex_thread_title_update(
+            _Session([source.id], [source, canonical]),
+            machine_id=source_machine,
+            thread_id=uuid.uuid4(),
+            title="Initial prompt",
+            title_kind="fallback",
+            revision=3,
+            user_id=uuid.uuid4(),
+        )
+
+        self.assertEqual((result.updated, result.ignored), (0, 2))
+        self.assertEqual(source.title, "netbird setup")
+        self.assertEqual(canonical.title, "netbird setup")
+        self.assertEqual(
+            canonical.metadata_["codex_title_revisions"][str(source_machine)],
+            3,
+        )
+
+    async def test_legacy_unknown_title_cannot_revert_explicit_marker(self) -> None:
+        machine_id = uuid.uuid4()
+        document = _document(
+            title="netbird setup",
+            machine_id=machine_id,
+            metadata={
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 2,
+            },
+        )
+        result = await apply_codex_thread_title_update(
+            _Session([document.id], [document]),
+            machine_id=machine_id,
+            thread_id=uuid.uuid4(),
+            title="Initial prompt",
+            title_kind="unknown",
+            revision=3,
+            user_id=uuid.uuid4(),
+        )
+
+        self.assertEqual((result.updated, result.ignored), (0, 1))
+        self.assertEqual(document.title, "netbird setup")
 
     async def test_all_legacy_file_endpoints_reject_metadata_records(self) -> None:
         user = SimpleNamespace(id=uuid.uuid4())
@@ -460,6 +601,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=machine_id,
             thread_id=uuid.uuid4(),
             title="Legacy row renamed",
+            title_kind="custom",
             revision=300,
             user_id=uuid.uuid4(),
             relative_path="sessions/2026/thread.jsonl",
@@ -471,6 +613,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             machine_id=uuid.uuid4(),
             thread_id=uuid.uuid4(),
             title="Ambiguous",
+            title_kind="custom",
             revision=301,
             user_id=uuid.uuid4(),
             relative_path="sessions/2026/thread.jsonl",

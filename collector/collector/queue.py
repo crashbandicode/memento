@@ -60,6 +60,33 @@ class QueueItem:
     lease_token: str | None = None
 
 
+def _metadata_state_value(record: dict[str, Any], title: str) -> str:
+    kind = str(record.get("title_kind") or "").strip().lower()
+    if kind not in {"custom", "fallback"}:
+        return title
+    return json.dumps(
+        {"title": title, "title_kind": kind},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _decode_metadata_state_value(value: object) -> tuple[str, str]:
+    raw = str(value or "")
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return raw, "unknown"
+    if not isinstance(decoded, dict):
+        return raw, "unknown"
+    title = str(decoded.get("title") or "").strip()
+    kind = str(decoded.get("title_kind") or "").strip().lower()
+    if kind not in {"custom", "fallback"}:
+        kind = "unknown"
+    return title, kind
+
+
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
@@ -204,6 +231,46 @@ class SyncQueue:
         self._conn.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self._conn.commit()
 
+    def _protected_custom_title_locked(
+        self,
+        *,
+        tool_name: str,
+        relative_path: str,
+        incoming_fallback: str,
+        state_values: tuple[object, ...],
+    ) -> str | None:
+        """Recover the latest durable custom title before accepting a fallback."""
+        for value in state_values:
+            title, kind = _decode_metadata_state_value(value)
+            if title and (
+                kind == "custom"
+                or (kind == "unknown" and title != incoming_fallback)
+            ):
+                return title
+
+        # Upgrade recovery: pre-title-kind collectors retained queue metadata
+        # for synced/superseded rows. This lets the first upgraded poll recover
+        # a custom title even if an auto fallback was already acknowledged.
+        rows = self._conn.execute(
+            """SELECT metadata FROM queue
+               WHERE tool_name=? AND relative_path=?
+                 AND sync_strategy='metadata'
+               ORDER BY id DESC LIMIT 50""",
+            (tool_name, relative_path),
+        ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(str(row[0]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            title = str(metadata.get("title") or "").strip()
+            kind = str(metadata.get("title_kind") or "unknown").strip().lower()
+            if title and title != incoming_fallback and kind != "fallback":
+                return title
+        return None
+
     @_rollback_on_error
     def enqueue_metadata_changes(
         self,
@@ -218,6 +285,8 @@ class SyncQueue:
         Codex polling excludes subagents, while the server rejects injected
         wrapper titles, so this safe catch-up also repairs renames made before
         the collector was installed or while its queue database was absent.
+        Once a custom Codex title is durable, an automatic first-prompt fallback
+        is suppressed locally and cannot replace the queued/synced custom value.
         ``synced_value`` advances only after server acknowledgement, so restarts
         and force-resync cannot lose an update.
         """
@@ -225,10 +294,14 @@ class SyncQueue:
         queued = 0
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            for item_key, record in records.items():
-                current_value = str(record.get("title") or "").strip()
-                if not current_value:
+            for item_key, source_record in records.items():
+                record = dict(source_record)
+                current_title = str(record.get("title") or "").strip()
+                if not current_title:
                     continue
+
+                path_key = hashlib.sha256(item_key.encode("utf-8")).hexdigest()
+                relative_path = f"__metadata__/{namespace}/{path_key}"
 
                 state_row = self._conn.execute(
                     """SELECT observed_value, synced_value
@@ -236,6 +309,20 @@ class SyncQueue:
                        WHERE namespace=? AND item_key=?""",
                     (namespace, item_key),
                 ).fetchone()
+                state_values = tuple(state_row) if state_row is not None else ()
+                if str(record.get("title_kind") or "").lower() == "fallback":
+                    protected_title = self._protected_custom_title_locked(
+                        tool_name=tool_name,
+                        relative_path=relative_path,
+                        incoming_fallback=current_title,
+                        state_values=state_values,
+                    )
+                    if protected_title:
+                        current_title = protected_title
+                        record["title"] = protected_title
+                        record["title_kind"] = "custom"
+
+                current_value = _metadata_state_value(record, current_title)
                 if state_row is None:
                     self._conn.execute(
                         """INSERT INTO metadata_state (
@@ -258,8 +345,6 @@ class SyncQueue:
                         (current_value, now, namespace, item_key),
                     )
 
-                path_key = hashlib.sha256(item_key.encode("utf-8")).hexdigest()
-                relative_path = f"__metadata__/{namespace}/{path_key}"
                 active = self._conn.execute(
                     """SELECT 1 FROM queue
                        WHERE tool_name=? AND relative_path=?

@@ -52,14 +52,19 @@ class SyncQueueTests(unittest.TestCase):
         thread_id: str,
         title: str,
         revision: int,
+        *,
+        title_kind: str | None = None,
     ) -> dict[str, dict]:
-        return {thread_id: {
+        record = {
             "metadata_type": "codex_thread_title",
             "tool": "codex",
             "thread_id": thread_id,
             "title": title,
             "revision": revision,
-        }}
+        }
+        if title_kind:
+            record["title_kind"] = title_kind
+        return {thread_id: record}
 
     def _make_retries_available(self) -> None:
         with self.queue._lock:
@@ -347,6 +352,104 @@ class SyncQueueTests(unittest.TestCase):
         self.assertTrue(self.queue.mark_synced(first))
         successor = self.queue.claim_batch(batch_size=1)[0]
         self.assertEqual(successor.metadata["title"], "First renamed again")
+
+    def test_synced_custom_title_suppresses_later_first_prompt_fallback(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "Initial prompt", 1, title_kind="fallback",
+            ),
+        )
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "netbird setup", 2, title_kind="custom",
+            ),
+        )
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+
+        queued = self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "Initial prompt", 3, title_kind="fallback",
+            ),
+        )
+
+        self.assertEqual(queued, 0)
+        self.assertEqual(self.queue.pending_count(), 0)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            observed, synced = connection.execute(
+                """SELECT observed_value, synced_value FROM metadata_state
+                   WHERE namespace='codex_thread_titles' AND item_key=?""",
+                (thread_id,),
+            ).fetchone()
+        self.assertIn("netbird setup", observed)
+        self.assertEqual(observed, synced)
+
+    def test_pending_custom_title_is_not_coalesced_back_to_fallback(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "Initial prompt", 1, title_kind="fallback",
+            ),
+        )
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "netbird setup", 2, title_kind="custom",
+            ),
+        )
+
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "Initial prompt", 3, title_kind="fallback",
+            ),
+        )
+
+        pending = self.queue.claim_batch()[0]
+        self.assertEqual(pending.metadata["title"], "netbird setup")
+        self.assertEqual(pending.metadata["title_kind"], "custom")
+
+    def test_upgrade_recovers_custom_title_from_legacy_queue_history(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        # Simulate the deployed pre-title-kind collector: both values were
+        # acknowledged, but the queue still retains the custom event history.
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(thread_id, "netbird setup", 1),
+        )
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(thread_id, "Initial prompt", 2),
+        )
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+
+        queued = self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(
+                thread_id, "Initial prompt", 3, title_kind="fallback",
+            ),
+        )
+
+        self.assertEqual(queued, 1)
+        recovery = self.queue.claim_batch()[0]
+        self.assertEqual(recovery.metadata["title"], "netbird setup")
+        self.assertEqual(recovery.metadata["title_kind"], "custom")
 
     def test_metadata_pending_update_coalesces_and_revert_cancels_it(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"

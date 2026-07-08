@@ -122,6 +122,13 @@ def _has_manual_title(metadata: dict) -> bool:
     return bool(sources & _MANUAL_TITLE_SOURCES)
 
 
+def _has_explicit_codex_title(metadata: dict) -> bool:
+    return (
+        str(metadata.get("memento_title_source") or "").strip().lower()
+        == "codex_explicit_rename"
+    )
+
+
 def _title_revision_map(metadata: dict) -> dict[str, int]:
     raw = metadata.get("codex_title_revisions")
     if not isinstance(raw, dict):
@@ -195,9 +202,13 @@ async def apply_codex_thread_title_update(
     title: str,
     revision: int,
     user_id: uuid.UUID,
+    title_kind: str = "unknown",
     relative_path: str | None = None,
 ) -> ThreadTitleUpdateResult:
-    """Apply an explicit Codex rename without parsing or embedding content."""
+    """Apply a classified Codex source-title update without content ingest."""
+    title_kind = str(title_kind or "unknown").strip().lower()
+    if title_kind not in {"custom", "fallback", "unknown"}:
+        title_kind = "unknown"
     clean_title = sanitize_explicit_codex_title(title)
     if clean_title is None:
         return ThreadTitleUpdateResult(0, 0, 1, valid=False)
@@ -253,7 +264,10 @@ async def apply_codex_thread_title_update(
             source_machine=source_machine,
             revision=revision,
         )
-        if _has_manual_title(metadata):
+        preserve_title = _has_manual_title(metadata) or (
+            title_kind != "custom" and _has_explicit_codex_title(metadata)
+        )
+        if preserve_title:
             if next_revisions != revisions:
                 metadata["codex_title_revisions"] = next_revisions
                 if is_source_document:
@@ -274,7 +288,10 @@ async def apply_codex_thread_title_update(
         if is_source_document:
             # Backward compatibility for rows written before per-source clocks.
             metadata["codex_title_revision"] = revision
-        metadata["memento_title_source"] = "codex_explicit_rename"
+        metadata["memento_title_source"] = {
+            "custom": "codex_explicit_rename",
+            "fallback": "codex_source_fallback",
+        }.get(title_kind, "codex_source_unknown")
         document.metadata_ = metadata
         updated += 1
         if title_changed:
