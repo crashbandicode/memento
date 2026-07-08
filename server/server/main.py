@@ -20,6 +20,13 @@ def _run_migrations(conn) -> None:
     """Add missing columns to existing tables (lightweight migration)."""
     import secrets
     from sqlalchemy import text, inspect
+
+    # Production connections use a defensive 120-second statement timeout.
+    # One-time backfills can legitimately exceed that on multi-gigabyte
+    # transcript stores, and a cancellation rolls back the DDL with it so the
+    # restart policy repeats the same work forever. Limit this opt-out to the
+    # surrounding startup transaction; normal API queries keep their timeout.
+    conn.execute(text("SET LOCAL statement_timeout = 0"))
     insp = inspect(conn)
 
     # Enable pgvector extension
