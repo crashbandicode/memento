@@ -47,6 +47,20 @@ class SyncQueueTests(unittest.TestCase):
                 "SELECT id, content_hash, status, payload_path FROM queue ORDER BY id"
             ).fetchall()
 
+    @staticmethod
+    def _metadata_record(
+        thread_id: str,
+        title: str,
+        revision: int,
+    ) -> dict[str, dict]:
+        return {thread_id: {
+            "metadata_type": "codex_thread_title",
+            "tool": "codex",
+            "thread_id": thread_id,
+            "title": title,
+            "revision": revision,
+        }}
+
     def _make_retries_available(self) -> None:
         with self.queue._lock:
             self.queue._conn.execute(
@@ -270,6 +284,69 @@ class SyncQueueTests(unittest.TestCase):
                 (thread_id,),
             ).fetchone()
         self.assertEqual(after, ("Renamed", "Renamed"))
+
+    def test_metadata_is_claimed_before_an_older_large_payload(self) -> None:
+        self._enqueue("sessions/large.jsonl", "x" * 150_000, "large-hash")
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(thread_id, "Urgent rename", 100),
+        )
+
+        first = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]
+        self.assertEqual(first.sync_strategy, "metadata")
+        self.assertEqual(first.metadata["title"], "Urgent rename")
+        self.assertTrue(self.queue.mark_synced(first))
+        self.assertEqual(
+            self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0].content_hash,
+            "large-hash",
+        )
+
+    def test_inflight_oversize_payload_does_not_block_metadata(self) -> None:
+        self._enqueue("sessions/large.jsonl", "x" * 150_000, "large-hash")
+        large = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]
+        self.assertEqual(large.content_hash, "large-hash")
+
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(thread_id, "Rename while busy", 101),
+        )
+
+        metadata = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]
+        self.assertEqual(metadata.sync_strategy, "metadata")
+        self.assertEqual(metadata.payload_bytes, 0)
+
+    def test_metadata_priority_preserves_fifo_and_same_path_barrier(self) -> None:
+        first_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        second_id = "019f144c-82d6-70d0-95e8-e01e7b813e99"
+        records = {}
+        records.update(self._metadata_record(first_id, "First", 1))
+        records.update(self._metadata_record(second_id, "Second", 1))
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=records,
+        )
+
+        first = self.queue.claim_batch(batch_size=1)[0]
+        self.assertEqual(first.metadata["thread_id"], first_id)
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=self._metadata_record(first_id, "First renamed again", 2),
+        )
+
+        # The other metadata path remains eligible, but the successor for the
+        # active first path must wait behind its lease.
+        second = self.queue.claim_batch(batch_size=1)[0]
+        self.assertEqual(second.metadata["thread_id"], second_id)
+        self.assertEqual(self.queue.claim_batch(batch_size=1), [])
+        self.assertTrue(self.queue.mark_synced(first))
+        successor = self.queue.claim_batch(batch_size=1)[0]
+        self.assertEqual(successor.metadata["title"], "First renamed again")
 
     def test_metadata_pending_update_coalesces_and_revert_cancels_it(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"

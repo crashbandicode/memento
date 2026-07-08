@@ -574,7 +574,8 @@ class SyncQueue:
                               AND older.status='pending' AND older.id < q.id
                         )
                      )
-                   ORDER BY q.created_at ASC, q.id ASC
+                   ORDER BY CASE WHEN q.sync_strategy='metadata' THEN 0 ELSE 1 END,
+                            q.created_at ASC, q.id ASC
                    LIMIT ?""",
                 (now, now, max(batch_size * 8, batch_size)),
             ).fetchall()
@@ -588,13 +589,18 @@ class SyncQueue:
                 size = max(0, int(row[14] or 0))
                 if len(selected) >= batch_size:
                     break
-                if total_bytes and total_bytes + size > max_bytes:
+                # Metadata-only work has no payload and must remain claimable
+                # while a large file consumes the byte budget. Payload rows
+                # retain the existing FIFO barrier at the first item that does
+                # not fit, so later files cannot leapfrog it.
+                if size > 0 and total_bytes and total_bytes + size > max_bytes:
                     break
                 selected.append(row)
                 selected_paths.add(path_key)
                 total_bytes += size
-                # One oversize item is legal, but it must run alone.
-                if in_flight_bytes == 0 and len(selected) == 1 and size > max_bytes:
+                # One oversize payload is legal, but no second payload may be
+                # added. Zero-byte metadata selected before it is harmless.
+                if in_flight_bytes == 0 and size > max_bytes:
                     break
 
             for row in selected:
