@@ -63,11 +63,12 @@ class _DebouncedHandler(FileSystemEventHandler):
         excluded_patterns: list[str],
     ) -> None:
         self._callback = callback
-        self._debounce = debounce_seconds
+        self._debounce = max(0.0, debounce_seconds)
         self._excluded = excluded_patterns
-        self._pending: dict[str, float] = {}
-        self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
+        self._pending: dict[str, None] = {}
+        self._condition = threading.Condition()
+        self._deadline: float | None = None
+        self._worker: threading.Thread | None = None
         self._stopped = False
 
     def _is_excluded(self, path: str) -> bool:
@@ -84,45 +85,77 @@ class _DebouncedHandler(FileSystemEventHandler):
         if self._is_excluded(path):
             return
 
-        with self._lock:
+        with self._condition:
             if self._stopped:
                 return
-            self._pending[path] = time.time()
-            # Reset debounce timer while holding the state lock so stop() and
-            # event delivery cannot leave an untracked callback behind.
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self._debounce, self._flush)
-            self._timer.daemon = True
-            self._timer.start()
+            was_idle = self._deadline is None
+            self._pending[path] = None
+            self._deadline = time.monotonic() + self._debounce
+            if self._worker is None:
+                worker = threading.Thread(
+                    target=self._run,
+                    name=f"memento-debouncer-{id(self):x}",
+                    daemon=True,
+                )
+                self._worker = worker
+                try:
+                    worker.start()
+                except Exception:
+                    self._worker = None
+                    raise
+            # An active worker is already waiting on an earlier deadline. The
+            # new event only pushes that deadline later, so waking it for every
+            # filesystem notification turns a busy tree into a condition-lock
+            # hot loop. It will observe the extended deadline on its next
+            # scheduled wake. Only an idle worker needs an immediate signal.
+            if was_idle:
+                self._condition.notify()
 
-    def _flush(self) -> None:
-        with self._lock:
-            if self._stopped:
-                self._pending.clear()
-                return
-            paths = list(self._pending.keys())
-            self._pending.clear()
+    def _run(self) -> None:
+        """Wait for a quiet period, then dispatch one coalesced path batch."""
+        while True:
+            with self._condition:
+                while True:
+                    if self._stopped:
+                        return
+                    if self._deadline is None:
+                        self._condition.wait()
+                        continue
 
-        for path_str in paths:
-            with self._lock:
-                if self._stopped:
-                    return
-            path = Path(path_str)
-            if path.exists() and path.is_file():
+                    remaining = self._deadline - time.monotonic()
+                    if remaining > 0:
+                        self._condition.wait(timeout=remaining)
+                        continue
+
+                    paths = list(self._pending)
+                    self._pending.clear()
+                    self._deadline = None
+                    break
+
+            for path_str in paths:
+                with self._condition:
+                    if self._stopped:
+                        return
+                path = Path(path_str)
+                if not path.exists() or not path.is_file():
+                    continue
+                with self._condition:
+                    if self._stopped:
+                        return
                 try:
                     self._callback(path)
                 except Exception:
                     logger.exception("Error processing %s", path)
 
     def stop(self) -> None:
-        with self._lock:
+        with self._condition:
             self._stopped = True
             self._pending.clear()
-            timer = self._timer
-            self._timer = None
-        if timer is not None:
-            timer.cancel()
+            self._deadline = None
+            worker = self._worker
+            self._condition.notify_all()
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
 
 
 class FileWatcher:
