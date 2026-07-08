@@ -19,25 +19,13 @@ use tauri_plugin_shell::ShellExt;
 const SIDECAR_BIN: &str = "memento-collector-sidecar";
 const MAX_LOG_LINES: usize = 500;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
     pub running: bool,
     pub pid: Option<u32>,
     pub started_at: Option<u64>,
     pub exit_code: Option<i32>,
     pub last_error: Option<String>,
-}
-
-impl Default for Status {
-    fn default() -> Self {
-        Self {
-            running: false,
-            pid: None,
-            started_at: None,
-            exit_code: None,
-            last_error: None,
-        }
-    }
 }
 
 pub struct Sidecar {
