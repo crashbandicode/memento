@@ -86,16 +86,16 @@ def _run_migrations(conn) -> None:
         # newly active.  Future ingests maintain this value incrementally.
         if "conversation_messages" in tables:
             conn.execute(text(
-                "UPDATE documents AS d SET activity_at = latest.activity_at "
-                "FROM ("
-                "  SELECT document_id, MAX(timestamp) AS activity_at "
-                "  FROM conversation_messages "
-                "  WHERE timestamp IS NOT NULL "
-                "    AND role IN ('user', 'assistant') "
-                "  GROUP BY document_id"
-                ") AS latest "
-                "WHERE d.id = latest.document_id "
-                "  AND d.category = 'conversation'"
+                "UPDATE documents AS d SET activity_at = ("
+                "  SELECT cm.timestamp "
+                "  FROM conversation_messages AS cm "
+                "  WHERE cm.document_id = d.id "
+                "    AND cm.timestamp IS NOT NULL "
+                "    AND cm.role IN ('user', 'assistant') "
+                "  ORDER BY cm.timestamp DESC "
+                "  LIMIT 1"
+                ") "
+                "WHERE d.category = 'conversation'"
             ))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_documents_activity_at "
