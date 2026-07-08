@@ -40,7 +40,7 @@ from ..services.ingest_spool import (
     spool_source_lock,
     try_ready_manifest_metadata,
 )
-from .celery_app import celery_app
+from .celery_app import INGEST_RECOVERY_EXPIRES_SECONDS, celery_app
 
 logger = logging.getLogger("ingest_spool")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -441,7 +441,11 @@ def recover_spooled_ingests() -> dict:
     failed_count = len(failed_job_ids())
     blocked_count = len(blocked_job_ids())
     for job_id in job_ids:
-        process_spooled_ingest.apply_async(args=[job_id], queue="ingest")
+        process_spooled_ingest.apply_async(
+            args=[job_id],
+            queue="ingest",
+            expires=INGEST_RECOVERY_EXPIRES_SECONDS,
+        )
     return {
         "status": "queued",
         "count": len(job_ids),

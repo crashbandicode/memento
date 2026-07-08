@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
@@ -39,9 +39,14 @@ from server.services.ingest_spool import (  # noqa: E402
     superseding_ready_full_job_id,
 )
 import server.services.ingest_spool as ingest_spool  # noqa: E402
+from server.tasks.celery_app import (  # noqa: E402
+    INGEST_RECOVERY_EXPIRES_SECONDS,
+    celery_app,
+)
 from server.tasks.ingest_spool import (  # noqa: E402
     _existing_full_supersedes,
     _preflight_full_supersedes,
+    recover_spooled_ingests,
 )
 
 
@@ -788,6 +793,57 @@ class IngestSpoolTests(unittest.TestCase):
             [malformed, newer],
         )
         self.assertIn(older, ready_job_ids(self.root))
+
+    def test_periodic_recovery_expires_before_the_next_tick(self) -> None:
+        options = celery_app.conf.beat_schedule["ingest-spool-recovery"]["options"]
+
+        self.assertEqual(
+            options,
+            {
+                "queue": "ingest",
+                "expires": INGEST_RECOVERY_EXPIRES_SECONDS,
+            },
+        )
+        self.assertGreater(INGEST_RECOVERY_EXPIRES_SECONDS, 0)
+        self.assertLess(INGEST_RECOVERY_EXPIRES_SECONDS, 5 * 60)
+
+    def test_recovery_children_expire_without_mutating_durable_work(self) -> None:
+        job_id, _ = self._stage(
+            self._meta(0, 1, upload_id="recover", hash="recover"),
+            b"a",
+        )
+
+        with (
+            patch(
+                "server.tasks.ingest_spool.ready_job_ids_in_recovery_order",
+                side_effect=lambda: ready_job_ids_in_recovery_order(self.root),
+            ),
+            patch(
+                "server.tasks.ingest_spool.cleanup_stale_incomplete_jobs",
+                return_value=0,
+            ),
+            patch(
+                "server.tasks.ingest_spool.cleanup_completion_receipts",
+                return_value=0,
+            ),
+            patch("server.tasks.ingest_spool.failed_job_ids", return_value=[]),
+            patch("server.tasks.ingest_spool.blocked_job_ids", return_value=[]),
+            patch(
+                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
+            ) as apply_async,
+        ):
+            first = recover_spooled_ingests.run()
+            second = recover_spooled_ingests.run()
+
+        expected_dispatch = call(
+            args=[job_id],
+            queue="ingest",
+            expires=INGEST_RECOVERY_EXPIRES_SECONDS,
+        )
+        self.assertEqual(apply_async.call_args_list, [expected_dispatch] * 2)
+        self.assertEqual(first["count"], 1)
+        self.assertEqual(second["count"], 1)
+        self.assertEqual(ready_job_ids(self.root), [job_id])
 
     def test_source_lock_is_shared_by_every_job_for_one_path(self) -> None:
         job_id, _ = self._stage(

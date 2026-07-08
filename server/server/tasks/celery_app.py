@@ -8,6 +8,8 @@ from celery.signals import worker_process_init, task_prerun
 
 from ..config import settings
 
+INGEST_RECOVERY_EXPIRES_SECONDS = 4 * 60
+
 
 def _dispose_engines() -> None:
     try:
@@ -85,7 +87,10 @@ celery_app.conf.beat_schedule = {
     "ingest-spool-recovery": {
         "task": "server.tasks.ingest_spool.recover_spooled_ingests",
         "schedule": crontab(minute="*/5"),
-        "options": {"queue": "ingest"},
+        "options": {
+            "queue": "ingest",
+            "expires": INGEST_RECOVERY_EXPIRES_SECONDS,
+        },
     },
     "daily-digest": {
         "task": "server.tasks.daily_digest.generate_daily_digest",
