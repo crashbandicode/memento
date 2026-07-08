@@ -1143,6 +1143,13 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
             if not doc:
                 logger.info("Post-ingest: doc %s not found", doc_id)
                 return
+            # Embedding and graph helpers own short transactions and may
+            # commit or roll back internally. A rollback expires ORM state
+            # even though this session uses expire_on_commit=False, so keep
+            # log labels as plain scalars and reload the document before the
+            # next helper instead of triggering implicit async IO from an
+            # expired attribute.
+            relative_path = doc.relative_path
 
             # Embedding (skip if API not available)
             try:
@@ -1152,9 +1159,16 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
                 if count > 0:
                     await db.commit()
             except Exception as e:
-                logger.info("Embedding skipped for %s: %s", doc.relative_path, e)
+                logger.info("Embedding skipped for %s: %s", relative_path, e)
                 await db.rollback()
-                await db.refresh(doc)
+
+            # generate_document_embeddings may legitimately roll back and
+            # return zero when its exact revision claim is lost. That expires
+            # ``doc`` without entering the exception branch above.
+            doc = await db.get(Document, doc_id, populate_existing=True)
+            if not doc:
+                logger.info("Post-ingest: doc %s disappeared after embedding", doc_id)
+                return
 
             # Knowledge graph extraction
             try:
@@ -1164,22 +1178,22 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
                 await db.commit()
                 if count > 0:
                     logger.info(
-                        "Extracted %d knowledge items from %s", count, doc.relative_path
+                        "Extracted %d knowledge items from %s", count, relative_path
                     )
                 else:
-                    logger.info("No knowledge extracted from %s", doc.relative_path)
+                    logger.info("No knowledge extracted from %s", relative_path)
             except Exception as e:
                 import traceback
 
                 logger.info(
                     "Graph extraction failed for %s: %s\n%s",
-                    doc.relative_path,
+                    relative_path,
                     e,
                     traceback.format_exc(),
                 )
                 await db.rollback()
     except Exception as e:
-        logger.info("Post-ingest error: %s", e)
+        logger.info("Post-ingest error for %s/%s: %s", tool_id, doc_id, e)
 
 
 async def _extract_messages(
