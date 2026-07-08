@@ -11,8 +11,10 @@ from billiard.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import text
 
 from ..db.session import async_session_factory
+from ..services.content_sanitizer import sanitize_content_file
 from ..services.device_service import DeviceOwnershipError, ensure_device
 from ..services.ingest_service import ingest_file
+from ..services.large_content_store import store_large_content
 from ..services.ingest_spool import (
     DEFAULT_SPOOL_ROOT,
     ChunkValidationError,
@@ -32,6 +34,7 @@ from .celery_app import celery_app
 logger = logging.getLogger("ingest_spool")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_FINALIZE_RETRIES = 12
+DATABASE_CONTENT_MAX_BYTES = 64 * 1024 * 1024
 
 
 async def _ingest_ready_job(job_id: str) -> dict:
@@ -39,7 +42,10 @@ async def _ingest_ready_job(job_id: str) -> dict:
     meta = manifest["meta"]
     user_id = UUID(str(manifest["user_id"]))
     payload_bytes = payload_path.stat().st_size
-
+    externalize_content = (
+        payload_bytes > DATABASE_CONTENT_MAX_BYTES
+        and meta.get("category") == "conversation"
+    )
     # Device registration/heartbeat is its own short transaction. Holding the
     # machine row lock through a multi-minute transcript parse starves normal
     # heartbeat and dashboard traffic.
@@ -54,11 +60,37 @@ async def _ingest_ready_job(job_id: str) -> dict:
         machine_id = str(machine.id)
         await device_db.commit()
 
-    file_content = payload_path.read_text(encoding="utf-8", errors="replace")
+    content_s3_key = None
+    content_had_sensitive = False
+    ingest_path = payload_path
+    if externalize_content:
+        sanitized = await asyncio.to_thread(
+            sanitize_content_file,
+            payload_path,
+            payload_path.with_name("sanitized.bin"),
+        )
+        ingest_path = sanitized.path
+        content_had_sensitive = sanitized.had_sensitive
+        content_s3_key = await asyncio.to_thread(
+            store_large_content,
+            ingest_path,
+            user_id=str(user_id),
+            device_id=str(manifest["device_id"]),
+            job_id=job_id,
+        )
+
+    file_content = await asyncio.to_thread(
+        ingest_path.read_text,
+        encoding="utf-8",
+        errors="replace",
+    )
     async with async_session_factory() as db:
         # The compose-wide 120s guard is intentionally short for interactive
         # queries. A serialized, durable 270MB transcript ingest can exceed it.
         await db.execute(text("SET LOCAL statement_timeout = '25min'"))
+        await db.execute(
+            text("SET LOCAL idle_in_transaction_session_timeout = '25min'")
+        )
         doc = await ingest_file(
             db=db,
             tool_id=meta["tool"],
@@ -75,6 +107,10 @@ async def _ingest_ready_job(job_id: str) -> dict:
             machine_id=machine_id,
             user_id=str(user_id),
             schedule_post_ingest=False,
+            persist_content=not externalize_content,
+            content_s3_key=content_s3_key,
+            content_already_sanitized=externalize_content,
+            content_had_sensitive=content_had_sensitive,
         )
         await db.commit()
 
@@ -85,12 +121,15 @@ async def _ingest_ready_job(job_id: str) -> dict:
     # if Redis is briefly unavailable.
     try:
         from .post_ingest import process_document_post_ingest
+
         process_document_post_ingest.apply_async(
             args=[document_id, str(doc.tool_id), str(meta["category"])],
             retry=False,
         )
     except Exception:
-        logger.exception("Post-ingest follow-up could not be queued for %s", document_id)
+        logger.exception(
+            "Post-ingest follow-up could not be queued for %s", document_id
+        )
     mark_job_complete(job_id, document_id=document_id)
     remove_job(job_id)
     return {
@@ -152,7 +191,9 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                     ValueError,
                 ),
             )
-            retry_limit = 2 if isinstance(exc, SoftTimeLimitExceeded) else MAX_FINALIZE_RETRIES
+            retry_limit = (
+                2 if isinstance(exc, SoftTimeLimitExceeded) else MAX_FINALIZE_RETRIES
+            )
             if permanent or attempts >= retry_limit:
                 logger.exception(
                     "Spool ingest quarantined for %s after %s attempt(s)",
@@ -171,7 +212,9 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                     "attempts": attempts,
                 }
             countdown = min(2 ** min(attempts, 8), 300)
-            logger.exception("Spool ingest failed for %s; retrying in %ss", job_id, countdown)
+            logger.exception(
+                "Spool ingest failed for %s; retrying in %ss", job_id, countdown
+            )
             raise self.retry(exc=exc, countdown=countdown, max_retries=None)
 
 

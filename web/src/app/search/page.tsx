@@ -69,7 +69,11 @@ export default function SearchPage() {
       {result && (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {result.results.map((r) => (
-            <Link key={r.id} href={`/documents/${r.id}`} style={{ textDecoration: "none" }}>
+            <Link
+              key={r.id}
+              href={r.category === "conversation" ? `/conversations/${r.id}` : `/documents/${r.id}`}
+              style={{ textDecoration: "none" }}
+            >
               <Glass hover padding={18} radius={18}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
                   <ToolGlyph id={r.tool_id} size={26} />

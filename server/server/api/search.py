@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, select, func
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import Document, Machine, User
+from ..db.models import ConversationMessage, Document, Machine, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.user_filter import user_machine_ids, apply_user_filter
@@ -53,18 +53,46 @@ async def search(
     if tsquery:
         conds.append(Document.content_tsv.op("@@")(func.to_tsquery("simple", tsquery)))
 
-    query = select(Document).where(or_(*conds))
+    content_match_position = func.strpos(func.lower(Document.content), q.lower())
+    bounded_content_snippet = case(
+        (
+            and_(
+                Document.category != "conversation",
+                Document.content.is_not(None),
+                content_match_position > 0,
+            ),
+            func.substr(
+                Document.content,
+                func.greatest(content_match_position - 100, 1),
+                len(q) + 200,
+            ),
+        ),
+        else_="",
+    ).label("content_snippet")
+    query = select(
+        Document.id.label("id"),
+        Document.tool_id.label("tool_id"),
+        Document.relative_path.label("relative_path"),
+        Document.category.label("category"),
+        Document.title.label("title"),
+        Document.file_size_bytes.label("file_size_bytes"),
+        Document.synced_at.label("synced_at"),
+        bounded_content_snippet,
+    ).where(or_(*conds))
 
     if tool:
         query = query.where(Document.tool_id == tool)
     if category:
         query = query.where(Document.category == category)
     if device_id:
-        query = query.where(Document.machine_id.in_(
-            select(Machine.id).where(Machine.collector_token_hash == device_id)
-        ))
+        query = query.where(
+            Document.machine_id.in_(
+                select(Machine.id).where(Machine.collector_token_hash == device_id)
+            )
+        )
     if days:
         from datetime import datetime, timedelta, timezone
+
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         query = query.where(Document.synced_at >= cutoff)
     query = apply_user_filter(query, mids, Document.machine_id)
@@ -78,37 +106,59 @@ async def search(
         .offset(offset)
         .limit(limit)
     )
-    rows = (await db.execute(paged)).all()
-    docs = [r[0] for r in rows]
-    total = rows[0][-1] if rows else 0
+    rows = (await db.execute(paged)).mappings().all()
+    total = rows[0]["_total"] if rows else 0
+
+    # Fetch at most one bounded matching normalized message per conversation
+    # result. The main page query selects metadata plus a SQL-bounded snippet,
+    # never a potentially 64 MiB Document.content value.
+    conversation_ids = [row["id"] for row in rows if row["category"] == "conversation"]
+    normalized_snippets: dict = {}
+    if conversation_ids:
+        ranked = (
+            select(
+                ConversationMessage.document_id.label("document_id"),
+                func.left(ConversationMessage.content, 500).label("content"),
+                func.row_number()
+                .over(
+                    partition_by=ConversationMessage.document_id,
+                    order_by=ConversationMessage.line_number,
+                )
+                .label("row_number"),
+            )
+            .where(
+                ConversationMessage.document_id.in_(conversation_ids),
+                ConversationMessage.content.ilike(search_term),
+            )
+            .subquery()
+        )
+        snippet_rows = (
+            await db.execute(
+                select(ranked.c.document_id, ranked.c.content).where(
+                    ranked.c.row_number == 1
+                )
+            )
+        ).all()
+        normalized_snippets = {
+            document_id: content for document_id, content in snippet_rows
+        }
 
     items = []
-    for d in docs:
-        # Extract a snippet around the match
-        snippet = ""
-        if d.content:
-            lower_content = d.content.lower()
-            lower_q = q.lower()
-            idx = lower_content.find(lower_q)
-            if idx >= 0:
-                start = max(0, idx - 100)
-                end = min(len(d.content), idx + len(q) + 100)
-                snippet = d.content[start:end]
-                if start > 0:
-                    snippet = "..." + snippet
-                if end < len(d.content):
-                    snippet = snippet + "..."
+    for row in rows:
+        snippet = normalized_snippets.get(row["id"], row["content_snippet"] or "")
 
-        items.append({
-            "id": str(d.id),
-            "tool_id": d.tool_id,
-            "relative_path": d.relative_path,
-            "category": d.category,
-            "title": d.title,
-            "snippet": snippet,
-            "file_size_bytes": d.file_size_bytes,
-            "synced_at": d.synced_at.isoformat(),
-        })
+        items.append(
+            {
+                "id": str(row["id"]),
+                "tool_id": row["tool_id"],
+                "relative_path": row["relative_path"],
+                "category": row["category"],
+                "title": row["title"],
+                "snippet": snippet,
+                "file_size_bytes": row["file_size_bytes"],
+                "synced_at": row["synced_at"].isoformat(),
+            }
+        )
 
     return {
         "query": q,

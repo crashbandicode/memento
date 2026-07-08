@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 
@@ -11,7 +12,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
-    ConversationMessage, Document, DocumentVersion, Machine, Project, SyncState,
+    ConversationMessage,
+    Document,
+    DocumentVersion,
+    Machine,
+    Project,
+    SyncState,
     Tool,
 )
 
@@ -32,6 +38,7 @@ def _get_post_ingest_semaphore() -> asyncio.Semaphore:
     global _post_ingest_semaphore
     if _post_ingest_semaphore is None:
         import asyncio as _asyncio
+
         _post_ingest_semaphore = _asyncio.Semaphore(8)
     return _post_ingest_semaphore
 
@@ -40,8 +47,10 @@ def _get_ingest_semaphore() -> asyncio.Semaphore:
     global _ingest_semaphore
     if _ingest_semaphore is None:
         import asyncio as _asyncio
+
         _ingest_semaphore = _asyncio.Semaphore(24)
     return _ingest_semaphore
+
 
 # Known tool display names
 TOOL_DISPLAY_NAMES = {
@@ -54,17 +63,145 @@ TOOL_DISPLAY_NAMES = {
     "hermes": "Hermes",
 }
 
+MAX_STORED_MESSAGE_CHARS = 256 * 1024
+MAX_STORED_AUXILIARY_CHARS = 128 * 1024
+MAX_STORED_TOOL_NAME_CHARS = 256
+MAX_MESSAGE_BATCH_CHARS = 4 * 1024 * 1024
+MAX_SEARCH_TEXT_CHARS = 200 * 1024
+MAX_DOCUMENT_METADATA_BYTES = 256 * 1024
+MAX_METADATA_STRING_CHARS = 16 * 1024
+MAX_USER_HISTORY_ENTRIES = 2_000
+MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
+
+_ESSENTIAL_METADATA_KEYS = {
+    "agent_id",
+    "cascade_id",
+    "cwd",
+    "first_user_message",
+    "model",
+    "project_hash",
+    "project_path",
+    "session_id",
+    "source",
+    "title",
+}
+
+
+def _bounded_message_text(value: str, limit: int) -> str:
+    """Bound a text value by UTF-8 bytes while preserving useful head/tail."""
+    if len(value) <= limit and len(value.encode("utf-8")) <= limit:
+        return value
+    marker = (
+        f"\n\n[... oversized message truncated from {len(value):,} "
+        "characters by Memento ...]\n\n"
+    )
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= limit:
+        return marker_bytes[:limit].decode("utf-8", "ignore")
+    payload_limit = max(0, limit - len(marker_bytes))
+    head_limit = payload_limit * 3 // 4
+    tail_limit = payload_limit - head_limit
+    head = value[:head_limit].encode("utf-8")[:head_limit].decode("utf-8", "ignore")
+    tail_bytes = value[-tail_limit:].encode("utf-8") if tail_limit else b""
+    tail = tail_bytes[-tail_limit:].decode("utf-8", "ignore") if tail_limit else ""
+    return head + marker + tail
+
+
+def _json_size(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _prepare_document_metadata(
+    metadata: dict,
+) -> tuple[dict, list[dict], str]:
+    """Separate transient prompt history and bound JSON stored on Document."""
+    candidate = dict(metadata or {})
+    raw_history = candidate.pop("user_history", [])
+    first_user_message = str(candidate.pop("first_user_message", "") or "")
+    first_user_message = _bounded_message_text(
+        first_user_message,
+        MAX_STORED_MESSAGE_CHARS,
+    )
+
+    history: list[dict] = []
+    history_bytes = 0
+    if isinstance(raw_history, list):
+        for entry in raw_history[:MAX_USER_HISTORY_ENTRIES]:
+            if not isinstance(entry, dict):
+                continue
+            text = _bounded_message_text(
+                str(entry.get("text", "") or ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            entry_size = len(text.encode("utf-8")) + 64
+            if history_bytes + entry_size > MAX_USER_HISTORY_BYTES:
+                break
+            history.append({"text": text, "ts": entry.get("ts", 0)})
+            history_bytes += entry_size
+
+    for key, value in list(candidate.items()):
+        if isinstance(value, str) and len(value) > MAX_METADATA_STRING_CHARS:
+            candidate[key] = _bounded_message_text(value, MAX_METADATA_STRING_CHARS)
+
+    if _json_size(candidate) > MAX_DOCUMENT_METADATA_BYTES:
+        retained = {
+            key: value
+            for key, value in candidate.items()
+            if key in _ESSENTIAL_METADATA_KEYS
+        }
+        retained["_metadata_truncated"] = True
+        candidate = retained
+
+    # Essential values are bounded above, but a pathological nested value can
+    # still exceed the total budget. Drop the largest non-marker fields until
+    # the serialized document metadata is safe for a single JSONB parameter.
+    while _json_size(candidate) > MAX_DOCUMENT_METADATA_BYTES:
+        removable = [key for key in candidate if key != "_metadata_truncated"]
+        if not removable:
+            break
+        largest = max(removable, key=lambda key: _json_size(candidate[key]))
+        candidate.pop(largest, None)
+        candidate["_metadata_truncated"] = True
+
+    return candidate, history, first_user_message
+
+
+def _is_externalized_delta_update(
+    doc: Document,
+    *,
+    mode: str,
+    persist_content: bool,
+) -> bool:
+    """Return whether an incremental tail must keep the last full S3 source."""
+    return (
+        mode == "delta"
+        and doc.content is None
+        and bool(doc.content_s3_key)
+        and persist_content
+    )
+
+
+def _history_line_number(index: int) -> int:
+    """Keep injected history in a disjoint, bounded negative key range."""
+    if not 0 <= index < MAX_USER_HISTORY_ENTRIES:
+        raise ValueError("history index is outside the bounded range")
+    return -MAX_USER_HISTORY_ENTRIES + index
+
+
 # Re-sanitize patterns (defense-in-depth)
 _RESANITIZE_PATTERNS = [
     (re.compile(r"sk-[a-zA-Z0-9]{20,}"), "[API_KEY_REDACTED]"),
     (re.compile(r"ghp_[a-zA-Z0-9]{36}"), "[GITHUB_TOKEN_REDACTED]"),
     (re.compile(r"bot\d+:[A-Za-z0-9_-]{35}"), "[TELEGRAM_BOT_TOKEN_REDACTED]"),
-    (re.compile(
-        r"-----BEGIN\s+(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-        r"[\s\S]*?"
-        r"-----END\s+(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
-        re.MULTILINE,
-    ), "[PRIVATE_KEY_REDACTED]"),
+    (
+        re.compile(
+            r"-----BEGIN\s+(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+            r"[\s\S]*?"
+            r"-----END\s+(?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+            re.MULTILINE,
+        ),
+        "[PRIVATE_KEY_REDACTED]",
+    ),
 ]
 
 _GENERATED_CONVERSATION_TITLE_RE = re.compile(
@@ -121,7 +258,8 @@ def _friendly_conversation_title(content: str, max_length: int = 96) -> str | No
 
 
 async def _apply_friendly_conversation_title(
-    db: AsyncSession, doc: Document,
+    db: AsyncSession,
+    doc: Document,
 ) -> str | None:
     """Replace opaque transcript identifiers with the first real user prompt."""
     if not _has_generated_conversation_title(doc.title):
@@ -207,12 +345,12 @@ def _prettify_project_name(raw: str) -> str:
     # Known path prefix patterns to strip (greedy match)
     # Pattern: optional drive + common dirs + optional date folders
     prefix_re = re.compile(
-        r"^(?:[A-Za-z]--?)?"                       # optional drive letter: D-- or C-
+        r"^(?:[A-Za-z]--?)?"  # optional drive letter: D-- or C-
         r"(?:Users-[^-]+-(?:Desktop-?|Documents-?)?)?"  # Users-xxx-Desktop- or Users-xxx-
-        r"(?:dev-?)?"                                # dev-
-        r"(?:python-?)?"                             # python-
-        r"(?:\d{4}-\d{2,4}-?)?"                      # 2026-0104- (year-monthday)
-        r"(?:\d{2,4}-?)?",                           # or just MMDD-
+        r"(?:dev-?)?"  # dev-
+        r"(?:python-?)?"  # python-
+        r"(?:\d{4}-\d{2,4}-?)?"  # 2026-0104- (year-monthday)
+        r"(?:\d{2,4}-?)?",  # or just MMDD-
         re.IGNORECASE,
     )
     cleaned = prefix_re.sub("", name).strip("-")
@@ -244,6 +382,7 @@ def _clean_source_path(path: str | None) -> str | None:
         path = path[8:] if len(path) > 9 and path[9:10] == ":" else path[7:]
     # URL decode
     from urllib.parse import unquote
+
     path = unquote(path)
     # Strip \\?\
     path = re.sub(r"^\\\\?\?\\", "", path)
@@ -251,7 +390,9 @@ def _clean_source_path(path: str | None) -> str | None:
 
 
 async def ensure_project(
-    db: AsyncSession, tool_id: str, project_hash: str,
+    db: AsyncSession,
+    tool_id: str,
+    project_hash: str,
     source_path: str | None = None,
 ) -> Project:
     """Ensure a project record exists for a given hash/path."""
@@ -268,7 +409,11 @@ async def ensure_project(
         )
         db.add(project)
         await db.flush()
-    elif source_path and (not project.source_path or project.source_path == project.title or len(project.source_path) < 10):
+    elif source_path and (
+        not project.source_path
+        or project.source_path == project.title
+        or len(project.source_path) < 10
+    ):
         # Update incomplete source_path with better data
         project.source_path = source_path
     return project
@@ -332,8 +477,13 @@ async def ingest_file(
     machine_id: str | None = None,
     user_id: str | None = None,
     schedule_post_ingest: bool = True,
+    persist_content: bool = True,
+    content_s3_key: str | None = None,
+    content_already_sanitized: bool = False,
+    content_had_sensitive: bool = False,
 ) -> Document:
     """Process and store an ingested file."""
+    metadata = dict(metadata or {})
     # Fast-path dedup: if this exact (tool_id, relative_path, content_hash,
     # offset) was already ingested, skip everything. Common in multi-collector
     # setups where pip + Tauri sidecar both watch the same .jsonl and resend
@@ -342,9 +492,16 @@ async def ingest_file(
     #   - races UPDATE on the same Document row
     #   - fires a redundant post-ingest task that re-embeds 50 chunks
     # all to write the same bytes back to the same row.
-    sync_row = (await db.execute(_scoped_sync_state_select(
-        tool_id, relative_path, machine_id, user_id,
-    ))).scalar_one_or_none()
+    sync_row = (
+        await db.execute(
+            _scoped_sync_state_select(
+                tool_id,
+                relative_path,
+                machine_id,
+                user_id,
+            )
+        )
+    ).scalar_one_or_none()
     if (
         sync_row is not None
         and sync_row.last_hash == content_hash
@@ -353,15 +510,33 @@ async def ingest_file(
         # Touch last_synced_at so dashboards know we still see this file,
         # but skip all the actual ingestion work + the post-ingest task.
         sync_row.last_synced_at = datetime.now(timezone.utc)
-        existing_doc = (await db.execute(_scoped_document_select(
-            tool_id, relative_path, machine_id, user_id,
-        ))).scalar_one_or_none()
-        if existing_doc is not None:
+        existing_doc = (
+            await db.execute(
+                _scoped_document_select(
+                    tool_id,
+                    relative_path,
+                    machine_id,
+                    user_id,
+                )
+            )
+        ).scalar_one_or_none()
+        pointer_is_current = (
+            persist_content
+            or not content_s3_key
+            or (
+                existing_doc is not None
+                and existing_doc.content_s3_key == content_s3_key
+            )
+        )
+        if existing_doc is not None and pointer_is_current:
             return existing_doc
 
     # Re-sanitize
     content = content.replace("\x00", "")  # PostgreSQL TEXT rejects null bytes
-    content, had_sensitive = _resanitize(content)
+    if content_already_sanitized:
+        had_sensitive = content_had_sensitive
+    else:
+        content, had_sensitive = _resanitize(content)
 
     # Ensure tool exists
     tool = await ensure_tool(db, tool_id)
@@ -372,13 +547,16 @@ async def ingest_file(
 
     # Server-side project extraction fallback
     # Trigger if: no hash, UUID-like, contains --, or looks like a path-encoded hash (Users-xxx or drive--)
-    _looks_like_hash = bool(project_hash and (
-        re.match(r"^[0-9a-f]{8}-", project_hash)
-        or "--" in project_hash
-        or re.match(r"^-?Users-", project_hash)
-        or re.match(r"^[A-Za-z]--", project_hash)
-        or len(project_hash) > 30
-    ))
+    _looks_like_hash = bool(
+        project_hash
+        and (
+            re.match(r"^[0-9a-f]{8}-", project_hash)
+            or "--" in project_hash
+            or re.match(r"^-?Users-", project_hash)
+            or re.match(r"^[A-Za-z]--", project_hash)
+            or len(project_hash) > 30
+        )
+    )
     _needs_extract = not project_hash or _looks_like_hash
     project_path: str | None = metadata.get("project_path")
 
@@ -395,7 +573,12 @@ async def ingest_file(
             # No cwd found but hash looks like encoded path — prettify it
             project_hash = _prettify_project_name(project_hash)
 
-    if _needs_extract and content and tool_id == "antigravity" and "brain" in relative_path:
+    if (
+        _needs_extract
+        and content
+        and tool_id == "antigravity"
+        and "brain" in relative_path
+    ):
         # Antigravity: extract workspace from file:// URIs in brain content
         extracted_name, extracted_path = _extract_workspace_from_content(content)
         if extracted_name:
@@ -409,7 +592,9 @@ async def ingest_file(
     if project_hash:
         if not project_path:
             project_path = metadata.get("project_path")
-        project = await ensure_project(db, tool_id, project_hash, source_path=project_path)
+        project = await ensure_project(
+            db, tool_id, project_hash, source_path=project_path
+        )
         project_id = project.id
 
     # Fallback: match project via session_id from existing documents
@@ -428,24 +613,31 @@ async def ingest_file(
                         select(Machine.id).where(Machine.user_id == user_id)
                     )
                 )
-            existing = await db.execute(
-                project_statement.limit(1)
-            )
+            existing = await db.execute(project_statement.limit(1))
             row = existing.scalar_one_or_none()
             if row:
                 project_id = row
 
     # Find existing document
-    result = await db.execute(_scoped_document_select(
-        tool_id, relative_path, machine_id, user_id,
-    ))
+    result = await db.execute(
+        _scoped_document_select(
+            tool_id,
+            relative_path,
+            machine_id,
+            user_id,
+        )
+    )
     doc = result.scalar_one_or_none()
 
+    stored_metadata, user_history, first_user_message = _prepare_document_metadata(
+        metadata
+    )
     now = datetime.now(timezone.utc)
-    title = metadata.pop("title", None) or relative_path.split("/")[-1]
+    title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
 
     if doc is None:
-        # Create new document — always store content in DB (TEXT has no size limit)
+        # Very large conversations keep their raw source in object storage.
+        # They are still fully parsed into ConversationMessage rows below.
         doc = Document(
             tool_id=tool_id,
             project_id=project_id,
@@ -454,18 +646,35 @@ async def ingest_file(
             category=category,
             content_type=content_type,
             title=title,
-            content=content,
+            content=content if persist_content else None,
+            content_s3_key=content_s3_key,
             content_hash=content_hash,
             file_size_bytes=file_size,
-            metadata_=metadata,
+            metadata_=stored_metadata,
             needs_review=had_sensitive,
             synced_at=now,
-            source_modified_at=datetime.fromtimestamp(timestamp, tz=timezone.utc) if timestamp else now,
+            source_modified_at=datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            if timestamp
+            else now,
         )
         db.add(doc)
     else:
         # Update existing document
-        if mode == "delta" and doc.content:
+        preserve_externalized_delta = _is_externalized_delta_update(
+            doc,
+            mode=mode,
+            persist_content=persist_content,
+        )
+        if not persist_content:
+            doc.content = None
+            doc.content_s3_key = content_s3_key
+        elif preserve_externalized_delta:
+            # A small incremental append must not replace a large archived
+            # transcript with only the tail. ConversationMessage rows retain
+            # the complete normalized history; the immutable S3 object remains
+            # the last full source snapshot until the next externalized FULL.
+            doc.content = None
+        elif mode == "delta" and doc.content:
             # For large files, replace instead of append to avoid unbounded growth
             if len(doc.content) + len(content) > 10_000_000:
                 doc.content = content  # Replace with latest delta
@@ -473,9 +682,17 @@ async def ingest_file(
                 doc.content = doc.content + "\n" + content
         else:
             doc.content = content
+        if persist_content and not preserve_externalized_delta:
+            doc.content_s3_key = None
         doc.content_hash = content_hash
         doc.file_size_bytes = file_size
-        doc.metadata_ = {**doc.metadata_, **metadata}
+        existing_metadata = dict(doc.metadata_ or {})
+        existing_metadata.pop("user_history", None)
+        existing_metadata.pop("first_user_message", None)
+        merged_metadata, _, _ = _prepare_document_metadata(
+            {**existing_metadata, **stored_metadata}
+        )
+        doc.metadata_ = merged_metadata
         doc.needs_review = doc.needs_review or had_sensitive
         doc.synced_at = now
         if machine_id and not doc.machine_id:
@@ -495,6 +712,7 @@ async def ingest_file(
         db.add(version)
 
     from sqlalchemy import func as _func, update as _update
+
     await db.flush()
 
     # Bump the parent project's updated_at so the projects list (sorted
@@ -516,6 +734,7 @@ async def ingest_file(
     if user_id:
         try:
             from .cache import cache_delete_prefix
+
             await cache_delete_prefix(f"daily:detail:{user_id}:")
             await cache_delete_prefix(f"daily:dates:{user_id}:")
             if doc.project_id:
@@ -532,18 +751,52 @@ async def ingest_file(
 
     # Extract conversation messages into conversation_messages table
     # For DELTA mode, only parse new content; for FULL mode, re-parse all
+    conversation_search_text = ""
     if category == "conversation" and (
-        content_type == "jsonl"
-        or (content_type == "json" and tool_id == "hermes")
+        content_type == "jsonl" or (content_type == "json" and tool_id == "hermes")
     ):
-        await _extract_messages(db, doc, content, mode)
+        await _extract_messages(
+            db,
+            doc,
+            content,
+            mode,
+            user_history=user_history,
+            first_user_message=first_user_message,
+        )
+        # Build FTS from bounded normalized rows, never from a multi-hundred-
+        # megabyte raw transcript. Ordering newest-first ensures a DELTA keeps
+        # recent prompts searchable without loading every historical row.
+        latest_search_rows = (
+            (
+                await db.execute(
+                    select(_func.left(ConversationMessage.content, 2_048))
+                    .where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.role.in_(("user", "assistant")),
+                    )
+                    .order_by(ConversationMessage.line_number.desc())
+                    .limit(200)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        conversation_search_text = _bounded_message_text(
+            "\n".join(row for row in reversed(latest_search_rows) if row),
+            MAX_SEARCH_TEXT_CHARS,
+        )
         title = await _apply_friendly_conversation_title(db, doc) or title
 
     # Refresh the content_tsv full-text index after conversation extraction so
     # an opaque source filename can be replaced by its human-readable prompt.
     # The tokenized value is bound as a parameter, not compiled into SQL.
     from .tokenize import tokenize_for_index as _tok
-    tsv_input = _tok(f"{doc.title or ''} {doc.content or ''}")
+
+    if category == "conversation":
+        searchable_content = conversation_search_text
+    else:
+        searchable_content = (doc.content or "")[:MAX_SEARCH_TEXT_CHARS]
+    tsv_input = _tok(f"{doc.title or ''} {searchable_content}")
     await db.execute(
         _update(Document)
         .where(Document.id == doc.id)
@@ -552,13 +805,23 @@ async def ingest_file(
 
     # Update sync state
     await _update_sync_state(
-        db, tool_id, relative_path, content_hash, offset, machine_id, user_id,
+        db,
+        tool_id,
+        relative_path,
+        content_hash,
+        offset,
+        machine_id,
+        user_id,
     )
 
     # Trigger AI summary generation (async via Celery)
-    if category in ("memory", "identity", "plan", "note", "learning") and len(content) > 50:
+    if (
+        category in ("memory", "identity", "plan", "note", "learning")
+        and len(content) > 50
+    ):
         try:
             from ..tasks.summary_tasks import generate_document_summary_task
+
             generate_document_summary_task.delay(str(doc.id))
         except Exception:
             pass  # Celery may not be running in dev
@@ -566,13 +829,18 @@ async def ingest_file(
     # Publish SSE event
     try:
         from .sse_service import publish_event
-        publish_event("file_synced", {
-            "document_id": str(doc.id),
-            "tool_id": tool_id,
-            "category": category,
-            "relative_path": relative_path,
-            "title": title,
-        }, user_id=user_id)
+
+        publish_event(
+            "file_synced",
+            {
+                "document_id": str(doc.id),
+                "tool_id": tool_id,
+                "category": category,
+                "relative_path": relative_path,
+                "title": title,
+            },
+            user_id=user_id,
+        )
     except Exception:
         pass
 
@@ -580,6 +848,7 @@ async def ingest_file(
     # Must keep a reference to the task to prevent GC
     if schedule_post_ingest:
         import asyncio
+
         try:
             loop = asyncio.get_running_loop()
             task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
@@ -604,14 +873,18 @@ async def _run_post_ingest(doc_id, tool_id: str, category: str) -> None:
 
 async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
     import logging
+
     logger = logging.getLogger("post_ingest")
-    logger.info("Post-ingest starting for %s/%s (category=%s)", tool_id, doc_id, category)
+    logger.info(
+        "Post-ingest starting for %s/%s (category=%s)", tool_id, doc_id, category
+    )
     try:
         from ..db.session import post_ingest_session_factory
+
         async with post_ingest_session_factory() as db:
-            doc = (await db.execute(
-                select(Document).where(Document.id == doc_id)
-            )).scalar_one_or_none()
+            doc = (
+                await db.execute(select(Document).where(Document.id == doc_id))
+            ).scalar_one_or_none()
             if not doc:
                 logger.info("Post-ingest: doc %s not found", doc_id)
                 return
@@ -619,49 +892,82 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
             # Embedding (skip if API not available)
             try:
                 from .embedding_service import generate_document_embeddings
+
                 count = await generate_document_embeddings(db, doc)
                 if count > 0:
                     await db.commit()
             except Exception as e:
                 logger.info("Embedding skipped for %s: %s", doc.relative_path, e)
                 await db.rollback()
+                await db.refresh(doc)
 
             # Knowledge graph extraction
             try:
                 from .graph_service import extract_knowledge_from_document
+
                 count = await extract_knowledge_from_document(db, doc)
+                await db.commit()
                 if count > 0:
-                    await db.commit()
-                    logger.info("Extracted %d knowledge items from %s", count, doc.relative_path)
+                    logger.info(
+                        "Extracted %d knowledge items from %s", count, doc.relative_path
+                    )
                 else:
                     logger.info("No knowledge extracted from %s", doc.relative_path)
             except Exception as e:
                 import traceback
-                logger.info("Graph extraction failed for %s: %s\n%s", doc.relative_path, e, traceback.format_exc())
+
+                logger.info(
+                    "Graph extraction failed for %s: %s\n%s",
+                    doc.relative_path,
+                    e,
+                    traceback.format_exc(),
+                )
                 await db.rollback()
     except Exception as e:
         logger.info("Post-ingest error: %s", e)
 
 
 async def _extract_messages(
-    db: AsyncSession, doc: Document, content: str, mode: str,
-) -> None:
-    """Parse conversation content and store normalized messages."""
+    db: AsyncSession,
+    doc: Document,
+    content: str,
+    mode: str,
+    *,
+    user_history: list[dict] | None = None,
+    first_user_message: str = "",
+) -> str:
+    """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
         _iter_json_objects,
         parse_conversation_line,
         strip_terminal_sequences,
     )
 
+    search_parts: list[str] = []
+    search_bytes = 0
+
+    def add_search_text(role: str, value: str) -> None:
+        nonlocal search_bytes
+        if role not in ("user", "assistant") or search_bytes >= MAX_SEARCH_TEXT_CHARS:
+            return
+        remaining = MAX_SEARCH_TEXT_CHARS - search_bytes
+        fragment = _bounded_message_text(f"[{role}] {value}\n", min(2_048, remaining))
+        encoded_size = len(fragment.encode("utf-8"))
+        search_parts.append(fragment)
+        search_bytes += encoded_size
+
     # Hermes stores a whole session as a single top-level JSON, not JSONL.
     # Always full-replace (file is rewritten on each turn).
     if doc.tool_id == "hermes":
         from sqlalchemy import delete
         from .conversation_parser import parse_conversation
+
         await db.execute(
             delete(ConversationMessage).where(ConversationMessage.document_id == doc.id)
         )
         msgs = parse_conversation(content, "hermes")
+        batch: list[ConversationMessage] = []
+        batch_bytes = 0
         for i, m in enumerate(msgs, start=1):
             ts = None
             if m.timestamp:
@@ -669,18 +975,40 @@ async def _extract_messages(
                     ts = datetime.fromisoformat(m.timestamp.replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
-            db.add(ConversationMessage(
-                document_id=doc.id,
-                line_number=i,
-                message_type=m.role,
-                role=m.role,
-                content=(m.content or "").replace("\x00", ""),
-                metadata_={"tool_name": m.tool_name} if m.tool_name else {},
-                timestamp=ts,
-            ))
-        if msgs:
+            clean_content = _bounded_message_text(
+                (m.content or "").replace("\x00", ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            tool_name = _bounded_message_text(
+                m.tool_name or "",
+                MAX_STORED_TOOL_NAME_CHARS,
+            )
+            batch.append(
+                ConversationMessage(
+                    document_id=doc.id,
+                    line_number=i,
+                    message_type=_bounded_message_text(m.role, 50),
+                    role=m.role,
+                    content=clean_content,
+                    metadata_={"tool_name": tool_name} if tool_name else {},
+                    timestamp=ts,
+                )
+            )
+            add_search_text(m.role, clean_content)
+            batch_bytes += (
+                len(clean_content.encode("utf-8"))
+                + len(tool_name.encode("utf-8"))
+                + 256
+            )
+            if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
+                db.add_all(batch)
+                await db.flush()
+                batch = []
+                batch_bytes = 0
+        if batch:
+            db.add_all(batch)
             await db.flush()
-        return
+        return "".join(search_parts)
 
     # Get current max line number for delta mode
     if mode == "delta":
@@ -695,6 +1023,7 @@ async def _extract_messages(
     else:
         # Full mode: clear existing messages
         from sqlalchemy import delete
+
         await db.execute(
             delete(ConversationMessage).where(ConversationMessage.document_id == doc.id)
         )
@@ -702,7 +1031,8 @@ async def _extract_messages(
 
     tool_id = doc.tool_id
     line_num = start_line
-    batch = []
+    batch: list[ConversationMessage] = []
+    batch_bytes = 0
     seen_contents: set[str] = set()  # Deduplicate identical messages
     # Walk the content with the tolerant JSON iterator so pretty-printed
     # multi-line entries from Claude Code (Windows 2.1.x) don't get
@@ -719,48 +1049,79 @@ async def _extract_messages(
         # on their side, so this doesn't inflate message counts.
         normalized = parse_conversation_line(line, tool_id)
         if normalized and normalized.role in ("user", "assistant", "tool", "system"):
-            clean_content = strip_terminal_sequences(normalized.content).replace("\x00", "")
-            if not clean_content.strip():
+            full_clean_content = strip_terminal_sequences(normalized.content).replace(
+                "\x00", ""
+            )
+            if not full_clean_content.strip():
                 continue
+            clean_content = _bounded_message_text(
+                full_clean_content,
+                MAX_STORED_MESSAGE_CHARS,
+            )
             # Deduplicate: same role + content + timestamp (within same second).
             # This prevents event_msg/user_message and response_item/user duplicates
             # while keeping genuinely repeated inputs across different turns.
             ts_bucket = (normalized.timestamp or "")[:19]  # truncate to second
-            dedupe_key = hashlib.md5(f"{normalized.role}:{ts_bucket}:{clean_content}".encode()).hexdigest()
+            dedupe_hash = hashlib.md5()
+            dedupe_hash.update(f"{normalized.role}:{ts_bucket}:".encode())
+            dedupe_hash.update(clean_content.encode("utf-8"))
+            dedupe_key = dedupe_hash.hexdigest()
             if dedupe_key in seen_contents:
                 continue
             seen_contents.add(dedupe_key)
-
             ts = None
             if normalized.timestamp:
                 try:
-                    ts = datetime.fromisoformat(normalized.timestamp.replace("Z", "+00:00"))
+                    ts = datetime.fromisoformat(
+                        normalized.timestamp.replace("Z", "+00:00")
+                    )
                 except (ValueError, AttributeError):
                     pass
 
             meta = {}
             if normalized.thinking:
-                meta["thinking"] = strip_terminal_sequences(normalized.thinking).replace("\x00", "")
+                meta["thinking"] = _bounded_message_text(
+                    strip_terminal_sequences(normalized.thinking).replace("\x00", ""),
+                    MAX_STORED_AUXILIARY_CHARS,
+                )
             if normalized.tool_name:
-                meta["tool_name"] = normalized.tool_name
+                meta["tool_name"] = _bounded_message_text(
+                    normalized.tool_name,
+                    MAX_STORED_TOOL_NAME_CHARS,
+                )
             if normalized.tool_input:
-                meta["tool_input"] = strip_terminal_sequences(normalized.tool_input).replace("\x00", "")
-            batch.append(ConversationMessage(
-                document_id=doc.id,
-                line_number=line_num,
-                message_type=normalized.raw_type or normalized.role,
-                role=normalized.role,
-                content=clean_content,
-                metadata_=meta,
-                timestamp=ts,
-            ))
+                meta["tool_input"] = _bounded_message_text(
+                    strip_terminal_sequences(normalized.tool_input).replace("\x00", ""),
+                    MAX_STORED_AUXILIARY_CHARS,
+                )
+            batch.append(
+                ConversationMessage(
+                    document_id=doc.id,
+                    line_number=line_num,
+                    message_type=_bounded_message_text(
+                        normalized.raw_type or normalized.role,
+                        50,
+                    ),
+                    role=normalized.role,
+                    content=clean_content,
+                    metadata_=meta,
+                    timestamp=ts,
+                )
+            )
+            add_search_text(normalized.role, clean_content)
+            batch_bytes += (
+                len(clean_content.encode("utf-8"))
+                + sum(len(str(value).encode("utf-8")) for value in meta.values())
+                + 256
+            )
             line_num += 1
 
             # Flush in batches to avoid memory issues with large files
-            if len(batch) >= 100:
+            if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
                 db.add_all(batch)
                 await db.flush()
                 batch = []
+                batch_bytes = 0
 
     if batch:
         db.add_all(batch)
@@ -768,12 +1129,10 @@ async def _extract_messages(
 
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.
-    user_history = (doc.metadata_ or {}).get("user_history", [])
     if user_history and isinstance(user_history, list):
         # Inject history entries that aren't already in DB (by content dedup)
         existing = await db.execute(
-            select(ConversationMessage.content)
-            .where(
+            select(ConversationMessage.content).where(
                 ConversationMessage.document_id == doc.id,
                 ConversationMessage.role == "user",
             )
@@ -789,21 +1148,28 @@ async def _extract_messages(
             ts = None
             if ts_epoch:
                 ts = datetime.fromtimestamp(ts_epoch, tz=timezone.utc)
-            db.add(ConversationMessage(
-                document_id=doc.id,
-                line_number=-1000 + injected,  # Negative = injected from history
-                message_type="history_user_message",
-                role="user",
-                content=text.replace("\x00", ""),
-                metadata_={},
-                timestamp=ts,
-            ))
+            clean_history = _bounded_message_text(
+                text.replace("\x00", ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            db.add(
+                ConversationMessage(
+                    document_id=doc.id,
+                    line_number=_history_line_number(injected),
+                    message_type="history_user_message"[:50],
+                    role="user",
+                    content=clean_history,
+                    metadata_={},
+                    timestamp=ts,
+                )
+            )
+            add_search_text("user", clean_history)
             injected += 1
         if injected:
             await db.flush()
     elif not user_history:
         # Fallback: first_user_message from state_5.sqlite
-        first_user_msg = (doc.metadata_ or {}).get("first_user_message", "").strip()
+        first_user_msg = (first_user_message or "").strip()
         if first_user_msg:
             existing_user = await db.execute(
                 select(ConversationMessage.id)
@@ -814,16 +1180,25 @@ async def _extract_messages(
                 .limit(1)
             )
             if existing_user.scalar_one_or_none() is None:
-                db.add(ConversationMessage(
-                    document_id=doc.id,
-                    line_number=0,
-                    message_type="first_user_message",
-                    role="user",
-                    content=first_user_msg.replace("\x00", ""),
-                    metadata_={},
-                    timestamp=doc.source_modified_at or doc.synced_at,
-                ))
+                clean_first_user = _bounded_message_text(
+                    first_user_msg.replace("\x00", ""),
+                    MAX_STORED_MESSAGE_CHARS,
+                )
+                db.add(
+                    ConversationMessage(
+                        document_id=doc.id,
+                        line_number=0,
+                        message_type="first_user_message",
+                        role="user",
+                        content=clean_first_user,
+                        metadata_={},
+                        timestamp=doc.source_modified_at or doc.synced_at,
+                    )
+                )
+                add_search_text("user", clean_first_user)
                 await db.flush()
+
+    return "".join(search_parts)
 
 
 async def _update_sync_state(
@@ -836,9 +1211,14 @@ async def _update_sync_state(
     user_id: str | None = None,
 ) -> None:
     """Update server-side sync state."""
-    result = await db.execute(_scoped_sync_state_select(
-        tool_id, relative_path, machine_id, user_id,
-    ))
+    result = await db.execute(
+        _scoped_sync_state_select(
+            tool_id,
+            relative_path,
+            machine_id,
+            user_id,
+        )
+    )
     state = result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
 

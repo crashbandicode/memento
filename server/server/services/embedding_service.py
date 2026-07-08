@@ -12,10 +12,10 @@ from __future__ import annotations
 import logging
 import os
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import Document, DocumentEmbedding
+from ..db.models import ConversationMessage, Document, DocumentEmbedding
 
 logger = logging.getLogger("embedding_service")
 
@@ -32,7 +32,9 @@ _server_available: bool | None = None  # None = not checked yet
 _last_check_time: float = 0  # Retry every 60s after failure
 
 
-def _chunk_text(text: str, chunk_chars: int = CHUNK_SIZE, overlap_chars: int = CHUNK_OVERLAP) -> list[str]:
+def _chunk_text(
+    text: str, chunk_chars: int = CHUNK_SIZE, overlap_chars: int = CHUNK_OVERLAP
+) -> list[str]:
     """Split text into overlapping chunks with smart boundary detection."""
     if len(text) <= chunk_chars:
         return [text]
@@ -52,7 +54,9 @@ def _chunk_text(text: str, chunk_chars: int = CHUNK_SIZE, overlap_chars: int = C
     return [c for c in chunks if len(c) > 50]
 
 
-async def _call_embedding_server(texts: list[str], timeout: float = 120.0) -> list[list[float]] | None:
+async def _call_embedding_server(
+    texts: list[str], timeout: float = 120.0
+) -> list[list[float]] | None:
     """Call the external embedding HTTP server.
 
     timeout: total request timeout per batch. Default 120s is for the
@@ -64,16 +68,18 @@ async def _call_embedding_server(texts: list[str], timeout: float = 120.0) -> li
     """
     global _server_available, _last_check_time
     import time
+
     if _server_available is False and (time.time() - _last_check_time) < 60:
         return None
 
     try:
         import httpx
+
         all_embeddings: list[list[float]] = []
         batch_size = 10
         async with httpx.AsyncClient(timeout=timeout) as client:
             for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
+                batch = texts[i : i + batch_size]
                 resp = await client.post(
                     f"{EMBEDDING_SERVER_URL}/embed",
                     json={"texts": batch},
@@ -87,9 +93,12 @@ async def _call_embedding_server(texts: list[str], timeout: float = 120.0) -> li
         return all_embeddings
     except Exception as e:
         import time
+
         _last_check_time = time.time()
         if _server_available is not True:
-            logger.info("Embedding server not available at %s: %s", EMBEDDING_SERVER_URL, e)
+            logger.info(
+                "Embedding server not available at %s: %s", EMBEDDING_SERVER_URL, e
+            )
         else:
             logger.warning("Embedding call failed: %s", e)
         _server_available = False
@@ -124,15 +133,46 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
 
     await _set_status(doc.embedding_status or "pending", bump_attempts=True)
 
-    if not doc.content or len(doc.content) < 100:
-        await _set_status("skipped")
-        return 0
-
     if doc.content_type in ("sqlite", "sqlite_export", "binary"):
         await _set_status("skipped")
         return 0
 
-    chunks = _chunk_text(doc.content)
+    embedding_content = doc.content or ""
+    if not embedding_content and doc.category == "conversation":
+        rows = (
+            (
+                await db.execute(
+                    select(func.left(ConversationMessage.content, 4_000))
+                    .where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.role.in_(("user", "assistant")),
+                    )
+                    .order_by(ConversationMessage.line_number)
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        parts: list[str] = []
+        used = 0
+        for message in rows:
+            fragment = (message or "").strip()
+            if not fragment:
+                continue
+            remaining = 100_000 - used
+            if remaining <= 0:
+                break
+            fragment = fragment[:remaining]
+            parts.append(fragment)
+            used += len(fragment)
+        embedding_content = "\n\n".join(parts)
+
+    if len(embedding_content) < 100:
+        await _set_status("skipped")
+        return 0
+
+    chunks = _chunk_text(embedding_content)
     if not chunks:
         await _set_status("skipped")
         return 0
@@ -140,6 +180,10 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     # Cap at 50 chunks per document (~100KB) to avoid overloading embedding server
     if len(chunks) > 50:
         chunks = chunks[:50]
+    # The normalized-message SELECT above starts a transaction. Release it
+    # before a multi-minute model call so Postgres does not terminate the
+    # connection under idle_in_transaction_session_timeout.
+    await db.commit()
     logger.info("Embedding %d chunks for %s", len(chunks), doc.relative_path)
     embeddings = await _call_embedding_server(chunks)
     if embeddings is None:
@@ -147,7 +191,11 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         return 0
 
     if len(embeddings[0]) != EMBEDDING_DIM:
-        logger.warning("Embedding dim mismatch: got %d, expected %d", len(embeddings[0]), EMBEDDING_DIM)
+        logger.warning(
+            "Embedding dim mismatch: got %d, expected %d",
+            len(embeddings[0]),
+            EMBEDDING_DIM,
+        )
         await _set_status("failed")
         return 0
 
@@ -159,6 +207,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     # each INSERT idempotent regardless of races, and naturally clobbers
     # stale chunks when content changes.
     from sqlalchemy.dialects.postgresql import insert as pg_insert
+
     rows = [
         {
             "document_id": doc.id,
@@ -190,5 +239,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
 
     await db.flush()
     await _set_status("ok")
-    logger.info("Generated %d embeddings for %s/%s", len(chunks), doc.tool_id, doc.relative_path)
+    logger.info(
+        "Generated %d embeddings for %s/%s", len(chunks), doc.tool_id, doc.relative_path
+    )
     return len(chunks)

@@ -179,6 +179,7 @@ services:
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
       MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
+      MEMENTO_EMBEDDING_SERVER_URL: ${MEMENTO_EMBEDDING_SERVER_URL:-http://embedding:8002}
     depends_on:
       postgres:
         condition: service_healthy
@@ -186,6 +187,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   # Dedicated, serialized finalizer for durable chunked uploads. Keeping this
   # on its own queue prevents multi-hundred-megabyte transcript parsing from
@@ -208,6 +211,10 @@ services:
     environment:
       MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
       MEMENTO_REDIS_URL: redis://redis:6379/0
+      MEMENTO_S3_ENDPOINT: http://minio:9000
+      MEMENTO_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MEMENTO_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MEMENTO_S3_BUCKET: ${MEMENTO_S3_BUCKET:-memento}
       MEMENTO_ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
@@ -223,6 +230,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio:
+        condition: service_started
 
   # Celery beat (scheduled tasks: daily digest)
   celery-beat:

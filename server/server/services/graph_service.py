@@ -6,20 +6,23 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
-    Document, KnowledgeEntity, KnowledgeObservation, KnowledgeRelation, Machine,
+    Document,
+    KnowledgeEntity,
+    KnowledgeObservation,
+    KnowledgeRelation,
+    Machine,
 )
 
 logger = logging.getLogger("graph_service")
 
 _EXTRACTION_TEMPLATE = (
     "分析以下 AI 编程对话，提取结构化知识。用中文回复。\n\n"
-    '返回 JSON 对象：\n'
+    "返回 JSON 对象：\n"
     '{"entities": [{"name": "实体名", "type": "project|tool|technology|concept|person|file", "summary": "简要描述"}],\n'
     ' "relations": [{"source": "实体1", "target": "实体2", "type": "uses|creates|depends_on|fixes|discussed"}],\n'
     ' "observations": [{"entity": "实体名", "content": "学到了什么、做了什么决定"}]}\n\n'
@@ -37,11 +40,15 @@ async def _call_llm(prompt: str) -> dict | None:
     """Call LLM for entity extraction via OpenAI-compatible API. Returns parsed JSON or None."""
     # Use existing MEMENTO_AI_* config
     api_key = os.environ.get("MEMENTO_AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("MEMENTO_AI_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
+    base_url = os.environ.get(
+        "MEMENTO_AI_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1"
+    )
     model = os.environ.get("MEMENTO_AI_MODEL", "kimi-k2.5")
     if not api_key:
         # Try Anthropic as fallback
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("MEMENTO_ANTHROPIC_API_KEY")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
+            "MEMENTO_ANTHROPIC_API_KEY"
+        )
         if anthropic_key:
             return await _call_anthropic(prompt, anthropic_key)
         logger.debug("No AI API key set, skipping graph extraction")
@@ -49,10 +56,13 @@ async def _call_llm(prompt: str) -> dict | None:
 
     try:
         import openai
+
         client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
         response = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": prompt + "\n\nRespond with JSON only."}],
+            messages=[
+                {"role": "user", "content": prompt + "\n\nRespond with JSON only."}
+            ],
             max_tokens=2000,
         )
         text = response.choices[0].message.content or "{}"
@@ -83,11 +93,14 @@ async def _call_anthropic(prompt: str, api_key: str) -> dict | None:
     """Call Anthropic Claude for entity extraction."""
     try:
         import anthropic
+
         client = anthropic.AsyncAnthropic(api_key=api_key)
         response = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
-            messages=[{"role": "user", "content": prompt + "\n\nRespond with JSON only."}],
+            messages=[
+                {"role": "user", "content": prompt + "\n\nRespond with JSON only."}
+            ],
         )
         text = response.content[0].text
         # Extract JSON from response
@@ -101,7 +114,9 @@ async def _call_anthropic(prompt: str, api_key: str) -> dict | None:
 
 
 async def extract_knowledge_from_document(
-    db: AsyncSession, doc: Document, user_id: uuid.UUID | None = None,
+    db: AsyncSession,
+    doc: Document,
+    user_id: uuid.UUID | None = None,
 ) -> int:
     """Extract entities, relations, and observations from a document. Returns count of items created.
 
@@ -112,32 +127,31 @@ async def extract_knowledge_from_document(
       * 'ok'      — extraction completed (zero entities is still 'ok' —
         the LLM saw the doc and decided there's nothing graph-worthy).
     """
-    if not doc.content or len(doc.content) < 200:
+    if doc.category not in ("conversation", "memory", "learning", "plan"):
         doc.knowledge_status = "skipped"
         return 0
 
-    if doc.category not in ("conversation", "memory", "learning", "plan"):
+    if doc.category != "conversation" and (not doc.content or len(doc.content) < 200):
         doc.knowledge_status = "skipped"
         return 0
 
     # Skip if already extracted for this content version (hash-based dedup)
     import hashlib
-    content_hash = hashlib.md5(doc.content[:4000].encode()).hexdigest()
-    existing_obs = (await db.execute(
-        select(KnowledgeObservation.id)
-        .where(KnowledgeObservation.source_document_id == doc.id)
-        .limit(1)
-    )).scalar_one_or_none()
+
+    content_hash = (
+        doc.content_hash or hashlib.md5((doc.content or "")[:4000].encode()).hexdigest()
+    )
+    existing_obs = (
+        await db.execute(
+            select(KnowledgeObservation.id)
+            .where(KnowledgeObservation.source_document_id == doc.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
     if existing_obs and doc.metadata_.get("_graph_hash") == content_hash:
         doc.knowledge_status = "ok"
         return 0  # Already extracted for this content version
-
-    # Clear old observations from this document
-    from sqlalchemy import delete
-    await db.execute(
-        delete(KnowledgeObservation).where(KnowledgeObservation.source_document_id == doc.id)
-    )
 
     # Content prep — the LLM only sees ~4000 chars, so what those 4000
     # chars ARE matters a lot. For conversation docs the raw .jsonl
@@ -153,19 +167,19 @@ async def extract_knowledge_from_document(
     # original head-of-content path.
     content = ""
     if doc.category == "conversation":
-        msg_rows = (await db.execute(
-            select(KnowledgeObservation.__table__)  # type: ignore[arg-type]
-        )) if False else None  # placeholder so import order doesn't drift
         from ..db.models import ConversationMessage
-        rows = (await db.execute(
-            select(ConversationMessage.role, ConversationMessage.content)
-            .where(
-                ConversationMessage.document_id == doc.id,
-                ConversationMessage.role.in_(("user", "assistant")),
+
+        rows = (
+            await db.execute(
+                select(ConversationMessage.role, ConversationMessage.content)
+                .where(
+                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.role.in_(("user", "assistant")),
+                )
+                .order_by(ConversationMessage.line_number)
+                .limit(200)
             )
-            .order_by(ConversationMessage.line_number)
-            .limit(200)
-        )).all()
+        ).all()
         chunks: list[str] = []
         used = 0
         for role, c in rows:
@@ -173,8 +187,11 @@ async def extract_knowledge_from_document(
             if not text:
                 continue
             # Drop tool-result noise that often pads user-role messages
-            if text.startswith("[Result]") or text.startswith("[Tool:") \
-                    or text.startswith('{"tool_use_id"'):
+            if (
+                text.startswith("[Result]")
+                or text.startswith("[Tool:")
+                or text.startswith('{"tool_use_id"')
+            ):
                 continue
             chunk = f"[{role}] {text}\n"
             if used + len(chunk) > 4000:
@@ -191,23 +208,42 @@ async def extract_knowledge_from_document(
     else:
         content = (doc.content or "")[:4000]
 
+    if len(content) < 200:
+        doc.knowledge_status = "skipped"
+        return 0
+
     prompt = _EXTRACTION_TEMPLATE + content
 
     # Charge an attempt up front so a hung LLM still counts toward the
-    # cap (otherwise a stuck call would never block subsequent retries).
+    # cap (otherwise a stuck call would never block subsequent retries). Commit
+    # the read/preparation transaction before the network call so Postgres does
+    # not kill an idle-in-transaction connection while the model is working.
     doc.knowledge_attempts = (doc.knowledge_attempts or 0) + 1
+    await db.commit()
     result = await _call_llm(prompt)
     if not result:
         doc.knowledge_status = "failed"
         return 0
 
+    # Keep the last good graph across transient LLM failures. Replace it only
+    # after a valid extraction result is available in this same transaction.
+    from sqlalchemy import delete
+
+    await db.execute(
+        delete(KnowledgeObservation).where(
+            KnowledgeObservation.source_document_id == doc.id
+        )
+    )
+
     count = 0
 
     # Get or determine user_id from document's machine
     if not user_id and doc.machine_id:
-        machine = (await db.execute(
-            select(Machine.user_id).where(Machine.id == doc.machine_id)
-        )).scalar_one_or_none()
+        machine = (
+            await db.execute(
+                select(Machine.user_id).where(Machine.id == doc.machine_id)
+            )
+        ).scalar_one_or_none()
         user_id = machine
 
     # Process entities
@@ -223,16 +259,22 @@ async def extract_knowledge_from_document(
         # pulled out the same name. Schema already has
         # UniqueConstraint(user_id, name, entity_type); this query was missing
         # the user_id predicate, silently cross-pollinating knowledge graphs.
-        existing = (await db.execute(
-            select(KnowledgeEntity).where(
-                KnowledgeEntity.name == name,
-                KnowledgeEntity.entity_type == etype,
-                KnowledgeEntity.user_id == user_id,
-            ).limit(1)
-        )).scalar_one_or_none()
+        existing = (
+            await db.execute(
+                select(KnowledgeEntity)
+                .where(
+                    KnowledgeEntity.name == name,
+                    KnowledgeEntity.entity_type == etype,
+                    KnowledgeEntity.user_id == user_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
         if existing:
-            if e.get("summary") and (not existing.summary or len(e["summary"]) > len(existing.summary)):
+            if e.get("summary") and (
+                not existing.summary or len(e["summary"]) > len(existing.summary)
+            ):
                 existing.summary = e["summary"]
             entity_map[name] = existing
         else:
@@ -253,22 +295,28 @@ async def extract_knowledge_from_document(
         target = entity_map.get(r.get("target", ""))
         if source and target and source.id != target.id:
             # Check if relation exists
-            existing_rel = (await db.execute(
-                select(KnowledgeRelation).where(
-                    KnowledgeRelation.source_id == source.id,
-                    KnowledgeRelation.target_id == target.id,
-                    KnowledgeRelation.relation_type == r.get("type", "related"),
-                ).limit(1)
-            )).scalar_one_or_none()
+            existing_rel = (
+                await db.execute(
+                    select(KnowledgeRelation)
+                    .where(
+                        KnowledgeRelation.source_id == source.id,
+                        KnowledgeRelation.target_id == target.id,
+                        KnowledgeRelation.relation_type == r.get("type", "related"),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
 
             if existing_rel:
                 existing_rel.strength = (existing_rel.strength or 1.0) + 1.0
             else:
-                db.add(KnowledgeRelation(
-                    source_id=source.id,
-                    target_id=target.id,
-                    relation_type=r.get("type", "related"),
-                ))
+                db.add(
+                    KnowledgeRelation(
+                        source_id=source.id,
+                        target_id=target.id,
+                        relation_type=r.get("type", "related"),
+                    )
+                )
                 count += 1
 
     # Process observations
@@ -277,11 +325,13 @@ async def extract_knowledge_from_document(
         entity = entity_map.get(entity_name)
         content_text = o.get("content", "").strip()
         if entity and content_text:
-            db.add(KnowledgeObservation(
-                entity_id=entity.id,
-                content=content_text,
-                source_document_id=doc.id,
-            ))
+            db.add(
+                KnowledgeObservation(
+                    entity_id=entity.id,
+                    content=content_text,
+                    source_document_id=doc.id,
+                )
+            )
             count += 1
 
     # Mark this content version as extracted
@@ -291,5 +341,7 @@ async def extract_knowledge_from_document(
     doc.knowledge_status = "ok"
 
     await db.flush()
-    logger.info("Extracted %d knowledge items from %s/%s", count, doc.tool_id, doc.relative_path)
+    logger.info(
+        "Extracted %d knowledge items from %s/%s", count, doc.tool_id, doc.relative_path
+    )
     return count
