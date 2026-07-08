@@ -26,6 +26,7 @@ interface DashboardData {
     id: string;
     tool_id: string;
     title: string;
+    activity_at?: string | null;
     synced_at: string;
     project_title: string | null;
     message_count: number;
@@ -304,7 +305,7 @@ export default function Dashboard() {
                       subtitle={[
                         conv.project_title,
                         `${conv.message_count} msg`,
-                        timeAgo(conv.synced_at),
+                        timeAgo(conv.activity_at || conv.synced_at),
                       ].filter(Boolean).join(" · ")}
                       href={`/conversations/${conv.id}`}
                       subagentCount={conv.subagent_count}
@@ -325,7 +326,7 @@ export default function Dashboard() {
                         subtitle={[
                           conv.project_title,
                           `${conv.message_count} msg`,
-                          timeAgo(conv.synced_at),
+                          timeAgo(conv.activity_at || conv.synced_at),
                         ].filter(Boolean).join(" · ")}
                         href={`/conversations/${conv.id}`}
                         subagentCount={conv.subagent_count}

@@ -132,6 +132,7 @@ export interface DocumentSummary {
   content_type: string;
   title: string | null;
   file_size_bytes: number;
+  activity_at?: string | null;
   synced_at: string;
   ai_summary?: string | null;
 }
@@ -164,6 +165,8 @@ export interface ConversationSubagentSummary {
   parent_thread_id?: string | null;
   relative_path?: string | null;
   timestamp?: string | null;
+  activity_at?: string | null;
+  synced_at?: string | null;
 }
 
 export interface ConversationMeta {
@@ -176,6 +179,7 @@ export interface ConversationMeta {
   subagent_count?: number;
   is_subagent_orphan?: boolean;
   subagents?: ConversationSubagentSummary[];
+  activity_at?: string | null;
   synced_at: string;
 }
 
@@ -265,6 +269,7 @@ export interface SearchResult {
     title: string | null;
     snippet: string;
     file_size_bytes: number;
+    activity_at?: string | null;
     synced_at: string;
     subagent_count?: number;
     is_subagent_orphan?: boolean;

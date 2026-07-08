@@ -57,7 +57,11 @@ export default function ConversationPage() {
           />
           {plans.length > 0 && <Chip tone="warn">{plans.length} artifacts</Chip>}
           {hasDiagnostics && diagnostics.step_fetch_failed && <Chip tone="danger">{t.conversation.stepFetchFailed}</Chip>}
-          <span>{t.synced}: {new Date(meta.synced_at).toLocaleString(locale)}</span>
+          <span>
+            {t.conversation.lastActivity}: {new Date(
+              meta.activity_at || meta.synced_at,
+            ).toLocaleString(locale)}
+          </span>
         </div>
       </div>
       {hasDiagnostics && diagnostics && (

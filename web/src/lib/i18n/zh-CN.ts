@@ -175,6 +175,12 @@ const zhCN = {
     lowActivity: "低活动对话",
     lowActivityHint: "空白、单向或非常短的对话收纳在这里。",
     promptNavigator: "提示词导航",
+    lastActivity: "最近活动",
+    diagram: "图表",
+    renderingDiagram: "正在渲染图表...",
+    diagramError: "无法渲染此图表，源代码保留在下方。",
+    diagramTooLarge: "此图表过大，无法安全渲染，源代码保留在下方。",
+    viewDiagramSource: "查看图表源代码",
   },
 
   // Daily

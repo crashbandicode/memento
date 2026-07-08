@@ -1,12 +1,36 @@
 "use client";
 
+import { Children, isValidElement, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import MermaidDiagram from "./MermaidDiagram";
 import "highlight.js/styles/github-dark.min.css";
 
+function nodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) return nodeText(node.props.children);
+  return "";
+}
+
+function mermaidSource(children: ReactNode): string | null {
+  const childNodes = Children.toArray(children);
+  if (childNodes.length !== 1) return null;
+  const child = childNodes[0];
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) return null;
+  if (!/(?:^|\s)language-mermaid(?:\s|$)/i.test(child.props.className ?? "")) return null;
+  return nodeText(child.props.children).replace(/\n$/, "");
+}
+
 const markdownComponents: Components = {
+  pre: ({ children, ...props }) => {
+    const source = mermaidSource(children);
+    return source === null
+      ? <pre {...props}>{children}</pre>
+      : <MermaidDiagram source={source} />;
+  },
   table: ({ children, ...props }) => (
     <div
       style={{
@@ -122,7 +146,7 @@ export default function MarkdownViewer({ content }: { content: string }) {
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        rehypePlugins={[[rehypeHighlight, { plainText: ["mermaid"] }]]}
         components={markdownComponents}
       >
         {content}

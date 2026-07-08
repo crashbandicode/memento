@@ -23,6 +23,7 @@ interface ProjectDetail {
     category: string;
     title: string;
     file_size_bytes: number;
+    activity_at?: string | null;
     synced_at: string;
     message_count?: number;
     is_low_activity?: boolean;
@@ -141,7 +142,9 @@ export default function ProjectDetailPage() {
               size={cat === "conversation" && typeof d.message_count === "number"
                 ? `${d.message_count} msgs`
                 : `${(d.file_size_bytes / 1024).toFixed(1)}KB`}
-              date={new Date(d.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+              date={new Date(
+                cat === "conversation" && d.activity_at ? d.activity_at : d.synced_at,
+              ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
               subagentCount={d.subagent_count}
               isSubagentOrphan={d.is_subagent_orphan}
             />

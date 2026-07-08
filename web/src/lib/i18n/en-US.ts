@@ -169,6 +169,12 @@ const enUS: Translations = {
     lowActivity: "Low activity",
     lowActivityHint: "Empty, one-sided, or very short threads are tucked away here.",
     promptNavigator: "Prompt navigator",
+    lastActivity: "Last activity",
+    diagram: "Diagram",
+    renderingDiagram: "Rendering diagram...",
+    diagramError: "This diagram could not be rendered. Its source is available below.",
+    diagramTooLarge: "This diagram is too large to render safely. Its source is available below.",
+    viewDiagramSource: "View diagram source",
   },
 
   daily: {
