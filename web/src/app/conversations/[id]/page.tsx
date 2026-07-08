@@ -7,6 +7,7 @@ import { fmt, useI18n } from "@/lib/i18n";
 import ConversationViewer from "@/components/viewers/ConversationViewer";
 import { ToolGlyph } from "@/components/aurora/Icon";
 import { Chip } from "@/components/aurora/primitives";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 interface RelatedPlan {
   id: string;
@@ -49,6 +50,11 @@ export default function ConversationPage() {
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
           <Chip>{meta.tool_id}</Chip>
           <span>{meta.message_count} {t.conversation.messages}</span>
+          <SubagentBadge
+            count={meta.subagent_count}
+            orphan={meta.is_subagent_orphan}
+            subagents={meta.subagents}
+          />
           {plans.length > 0 && <Chip tone="warn">{plans.length} artifacts</Chip>}
           {hasDiagnostics && diagnostics.step_fetch_failed && <Chip tone="danger">{t.conversation.stepFetchFailed}</Chip>}
           <span>{t.synced}: {new Date(meta.synced_at).toLocaleString(locale)}</span>

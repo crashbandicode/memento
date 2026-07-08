@@ -3,15 +3,26 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { authFetch, getApiBase } from "@/lib/api-client";
+import {
+  authFetch,
+  getApiBase,
+  type ConversationSubagentSummary,
+} from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, TopBar } from "@/components/aurora/primitives";
 import LowActivitySection from "@/components/conversations/LowActivitySection";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
+import {
+  conversationSessionKey,
+  mergeConversationSessions,
+} from "@/lib/conversation-sessions";
 
 interface Message {
+  id: number;
+  line_number: number;
   role: string;
   content: string;
   tool_name?: string;
@@ -28,12 +39,16 @@ interface Artifact {
 }
 
 interface Session {
+  logical_session_id?: string | null;
   session_id: string;
   title: string;
   conversation_id: string;
   timestamp: string;
   message_count: number;
   is_low_activity: boolean;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+  subagents?: ConversationSubagentSummary[];
   messages: Message[];
   artifacts: Artifact[];
 }
@@ -59,37 +74,59 @@ export default function ProjectConversationsPage() {
   const [hasMore, setHasMore] = useState(true);
   const [order, setOrder] = useState<"asc" | "desc">("asc");
   const offsetRef = useRef(0);
+  const loadingRef = useRef(false);
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const loadMore = async (reset = false) => {
+    if (!reset && loadingRef.current) return;
+    if (reset) abortRef.current?.abort();
+
+    const requestId = ++requestRef.current;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    loadingRef.current = true;
     setLoading(true);
     try {
       const off = reset ? 0 : offsetRef.current;
-      const res = await authFetch(
-        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`
-      ).then((r) => r.json()) as ProjectConversationsResponse;
+      const response = await authFetch(
+        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`,
+        { signal: controller.signal },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const res = await response.json() as ProjectConversationsResponse;
+      if (requestId !== requestRef.current) return;
 
+      setData(res);
       if (reset) {
-        setData(res);
-        setSessions(res.sessions);
-        offsetRef.current = res.sessions.length;
+        setSessions(mergeConversationSessions([], res.sessions));
       } else {
-        if (!data) setData(res);
-        setSessions((prev) => [...prev, ...res.sessions]);
-        offsetRef.current += res.sessions.length;
+        setSessions((prev) => mergeConversationSessions(prev, res.sessions));
       }
-      setHasMore((reset ? res.sessions.length : offsetRef.current) < res.total_sessions);
+      offsetRef.current = off + res.sessions.length;
+      setHasMore(
+        res.sessions.length > 0 && offsetRef.current < res.total_sessions,
+      );
     } catch (e) {
-      console.error(e);
+      if (!(e instanceof DOMException && e.name === "AbortError")) {
+        console.error(e);
+      }
     } finally {
-      setLoading(false);
+      if (requestId === requestRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     offsetRef.current = 0;
-    setHasMore(true);
-    setSessions([]);
-    loadMore(true);
+    void loadMore(true);
+    return () => {
+      abortRef.current?.abort();
+      requestRef.current += 1;
+      loadingRef.current = false;
+    };
   }, [projectId, order]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!data && loading) {
@@ -125,8 +162,8 @@ export default function ProjectConversationsPage() {
 
       {/* Continuous conversation flow */}
       <div className="space-y-0">
-        {visibleSessions.map((session, sIdx) => (
-          <SessionBlock key={session.session_id || sIdx} session={session} dateFmt={dateFmt} locale={locale} t={t} />
+        {visibleSessions.map((session) => (
+          <SessionBlock key={conversationSessionKey(session)} session={session} dateFmt={dateFmt} locale={locale} t={t} />
         ))}
       </div>
 
@@ -136,8 +173,8 @@ export default function ProjectConversationsPage() {
         description={t.conversation.lowActivityHint}
       >
         <div className="space-y-0">
-          {lowActivitySessions.map((session, sIdx) => (
-            <SessionBlock key={session.session_id || `low-${sIdx}`} session={session} dateFmt={dateFmt} locale={locale} t={t} />
+          {lowActivitySessions.map((session) => (
+            <SessionBlock key={conversationSessionKey(session)} session={session} dateFmt={dateFmt} locale={locale} t={t} />
           ))}
         </div>
       </LowActivitySection>
@@ -186,15 +223,20 @@ const SessionBlock = memo(function SessionBlock({
           <span>{new Date(session.timestamp).toLocaleString(dateFmt)}</span>
           <span>·</span>
           <span>{session.message_count} msgs</span>
+          <SubagentBadge
+            count={session.subagent_count}
+            orphan={session.is_subagent_orphan}
+            subagents={session.subagents}
+          />
         </div>
         <div style={{ flex: 1, borderTop: "1px solid var(--aurora-border)" }} />
       </div>
 
       {/* Messages */}
       <div className="space-y-3">
-        {session.messages.map((msg, idx) => (
-          <ChatBubble key={idx} msg={{
-            id: idx, line_number: idx, role: msg.role, content: msg.content,
+        {session.messages.map((msg) => (
+          <ChatBubble key={msg.id} msg={{
+            id: msg.id, line_number: msg.line_number, role: msg.role, content: msg.content,
             tool_name: msg.tool_name, tool_input: msg.tool_input,
             timestamp: msg.timestamp || null,
           }} locale={locale} t={t} />

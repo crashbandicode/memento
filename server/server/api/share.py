@@ -50,6 +50,27 @@ router = APIRouter(prefix="/api/share", tags=["share"])
 VALID_KINDS = ("timeline", "daily", "memory")
 
 
+def _public_timeline_payload(data: dict) -> dict:
+    """Remove private child-thread routing metadata from a shared timeline."""
+
+    private_fields = {
+        "subagents",
+        "is_subagent_orphan",
+        "logical_session_id",
+    }
+    return {
+        **data,
+        "sessions": [
+            {
+                key: value
+                for key, value in session.items()
+                if key not in private_fields
+            }
+            for session in data.get("sessions", [])
+        ],
+    }
+
+
 def _gen_token() -> str:
     """24 bytes → 40-char unpadded base32, URL-safe, copy-pasteable."""
     raw = secrets.token_bytes(24)
@@ -426,7 +447,7 @@ async def get_public_share_data(
             _user=owner,
             as_of=as_of,
         )
-        return {"kind": "timeline", "data": data}
+        return {"kind": "timeline", "data": _public_timeline_payload(data)}
 
     if link.kind == "daily":
         from .daily import get_daily

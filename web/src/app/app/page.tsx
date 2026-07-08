@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
@@ -10,6 +10,7 @@ import { timeAgo } from "@/lib/constants";
 import { Icon, ToolGlyph, PlatformGlyph, TOOL_HUE } from "@/components/aurora/Icon";
 import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora/primitives";
 import LowActivitySection from "@/components/conversations/LowActivitySection";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 interface DashboardData {
   tools: {
@@ -28,6 +29,8 @@ interface DashboardData {
     synced_at: string;
     project_title: string | null;
     message_count: number;
+    subagent_count?: number;
+    is_subagent_orphan?: boolean;
     is_low_activity: boolean;
   }[];
   daily: { date: string; count: number }[];
@@ -54,19 +57,38 @@ export default function Dashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastEvent, setLastEvent] = useState("");
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   const { t } = useI18n();
   const now = useNow();
 
   const fetchData = useCallback(() => {
+    abortRef.current?.abort();
+    const requestId = ++requestRef.current;
+    const controller = new AbortController();
+    abortRef.current = controller;
     const tz = new Date().getTimezoneOffset();
-    authFetch(`${getApiBase()}/api/dashboard?tz_offset=${tz}`)
+    authFetch(`${getApiBase()}/api/dashboard?tz_offset=${tz}`, {
+      signal: controller.signal,
+    })
       .then((r) => r.json())
-      .then(setData)
-      .catch(console.error)
-      .finally(() => setLoading(false));
+      .then((nextData: DashboardData) => {
+        if (requestId === requestRef.current) setData(nextData);
+      })
+      .catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.error(error);
+        }
+      })
+      .finally(() => {
+        if (requestId === requestRef.current) setLoading(false);
+      });
   }, []);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    fetchData();
+    return () => abortRef.current?.abort();
+  }, [fetchData]);
   useSSE((event) => {
     setLastEvent(`${event.data.tool_id}: ${event.data.title || event.data.relative_path}`);
     fetchData();
@@ -75,7 +97,10 @@ export default function Dashboard() {
   if (loading) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
   if (!data) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>Failed to load dashboard</div>;
 
-  const { stats, tools, recent_conversations, daily, devices } = data;
+  const { stats, tools, daily, devices } = data;
+  const recent_conversations = [
+    ...new Map(data.recent_conversations.map((item) => [item.id, item])).values(),
+  ];
   const maxDaily = Math.max(...daily.map((d) => d.count), 1);
   const activeRecentConversations = recent_conversations
     .filter((conversation) => !conversation.is_low_activity)
@@ -282,6 +307,8 @@ export default function Dashboard() {
                         timeAgo(conv.synced_at),
                       ].filter(Boolean).join(" · ")}
                       href={`/conversations/${conv.id}`}
+                      subagentCount={conv.subagent_count}
+                      isSubagentOrphan={conv.is_subagent_orphan}
                     />
                   ))}
                   <LowActivitySection
@@ -301,6 +328,8 @@ export default function Dashboard() {
                           timeAgo(conv.synced_at),
                         ].filter(Boolean).join(" · ")}
                         href={`/conversations/${conv.id}`}
+                        subagentCount={conv.subagent_count}
+                        isSubagentOrphan={conv.is_subagent_orphan}
                       />
                     ))}
                   </LowActivitySection>
@@ -420,8 +449,15 @@ memento-collector setup`}
 }
 
 function RecentRow({
-  toolId, title, subtitle, href,
-}: { toolId: string; title: string; subtitle: string; href: string }) {
+  toolId, title, subtitle, href, subagentCount, isSubagentOrphan,
+}: {
+  toolId: string;
+  title: string;
+  subtitle: string;
+  href: string;
+  subagentCount?: number;
+  isSubagentOrphan?: boolean;
+}) {
   const [h, setH] = useState(false);
   return (
     <Link
@@ -465,6 +501,9 @@ function RecentRow({
           }}
         >
           {subtitle}
+        </div>
+        <div style={{ marginTop: subagentCount ? 5 : 0 }}>
+          <SubagentBadge count={subagentCount} orphan={isSubagentOrphan} />
         </div>
       </div>
       <Icon name="chevron_right" size={14} style={{ color: "var(--aurora-fg4)" }} />

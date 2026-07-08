@@ -8,6 +8,7 @@ import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
 import LowActivitySection from "@/components/conversations/LowActivitySection";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 interface ProjectDetail {
   id: string;
@@ -25,6 +26,8 @@ interface ProjectDetail {
     synced_at: string;
     message_count?: number;
     is_low_activity?: boolean;
+    subagent_count?: number;
+    is_subagent_orphan?: boolean;
   }[];
 }
 
@@ -36,7 +39,18 @@ export default function ProjectDetailPage() {
   const dateFmt = locale === "zh-CN" ? "zh-CN" : "en-US";
 
   useEffect(() => {
-    authFetch(`${getApiBase()}/api/projects/${projectId}`).then((r) => r.json()).then(setProject).catch(console.error);
+    const controller = new AbortController();
+    authFetch(`${getApiBase()}/api/projects/${projectId}`, {
+      signal: controller.signal,
+    })
+      .then((r) => r.json())
+      .then(setProject)
+      .catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.error(error);
+        }
+      });
+    return () => controller.abort();
   }, [projectId]);
 
   // Hit the server's per-project markdown export endpoint and trigger
@@ -63,8 +77,11 @@ export default function ProjectDetailPage() {
 
   if (!project) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
 
+  const documents = [
+    ...new Map(project.documents.map((document) => [document.id, document])).values(),
+  ];
   const byCategory: Record<string, typeof project.documents> = {};
-  for (const d of project.documents) (byCategory[d.category] ??= []).push(d);
+  for (const d of documents) (byCategory[d.category] ??= []).push(d);
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -125,6 +142,8 @@ export default function ProjectDetailPage() {
                 ? `${d.message_count} msgs`
                 : `${(d.file_size_bytes / 1024).toFixed(1)}KB`}
               date={new Date(d.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+              subagentCount={d.subagent_count}
+              isSubagentOrphan={d.is_subagent_orphan}
             />
           );
         };
@@ -154,7 +173,7 @@ export default function ProjectDetailPage() {
         );
       })}
 
-      {project.documents.length === 0 && (
+      {documents.length === 0 && (
         <Glass padding={40} radius={20} style={{ textAlign: "center" }}>
           <p style={{ color: "var(--aurora-fg4)", fontSize: 13 }}>{t.noData}</p>
         </Glass>
@@ -164,8 +183,17 @@ export default function ProjectDetailPage() {
 }
 
 function DocRow({
-  href, category, title, path, size, date,
-}: { href: string; category: string; title: string; path: string; size: string; date: string }) {
+  href, category, title, path, size, date, subagentCount, isSubagentOrphan,
+}: {
+  href: string;
+  category: string;
+  title: string;
+  path: string;
+  size: string;
+  date: string;
+  subagentCount?: number;
+  isSubagentOrphan?: boolean;
+}) {
   const [h, setH] = useState(false);
   return (
     <Link
@@ -198,6 +226,9 @@ function DocRow({
         </div>
         <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {path}
+        </div>
+        <div style={{ marginTop: subagentCount ? 5 : 0 }}>
+          <SubagentBadge count={subagentCount} orphan={isSubagentOrphan} />
         </div>
       </div>
       <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{size}</span>

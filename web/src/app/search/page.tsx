@@ -7,6 +7,7 @@ import { useI18n, fmt } from "@/lib/i18n";
 import { useDevice } from "@/lib/device-context";
 import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, GhostInput, TopBar } from "@/components/aurora/primitives";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 export default function SearchPage() {
   const [query, setQuery] = useState("");
@@ -69,12 +70,11 @@ export default function SearchPage() {
       {result && (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {result.results.map((r) => (
-            <Link
-              key={r.id}
-              href={r.category === "conversation" ? `/conversations/${r.id}` : `/documents/${r.id}`}
-              style={{ textDecoration: "none" }}
-            >
-              <Glass hover padding={18} radius={18}>
+            <Glass key={r.id} hover padding={18} radius={18}>
+              <Link
+                href={r.category === "conversation" ? `/conversations/${r.id}` : `/documents/${r.id}`}
+                style={{ display: "block", textDecoration: "none" }}
+              >
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
                   <ToolGlyph id={r.tool_id} size={26} />
                   <Chip>{r.category}</Chip>
@@ -138,8 +138,18 @@ export default function SearchPage() {
                       : r.snippet}
                   </div>
                 )}
-              </Glass>
-            </Link>
+              </Link>
+              {Boolean(r.subagent_count) && (
+                <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--aurora-border)" }}>
+                  <SubagentBadge
+                    count={r.subagent_count}
+                    orphan={r.is_subagent_orphan}
+                    subagents={r.subagents}
+                    matchedSubagentId={r.matched_subagent_id}
+                  />
+                </div>
+              )}
+            </Glass>
           ))}
           {result.results.length === 0 && (
             <Glass padding={36} radius={20} style={{ textAlign: "center" }}>

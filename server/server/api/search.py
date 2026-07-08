@@ -9,6 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import ConversationMessage, Document, Machine, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    build_subagent_summaries,
+    current_thread_id,
+    fold_codex_subagents,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -77,7 +83,8 @@ async def search(
         Document.title.label("title"),
         Document.file_size_bytes.label("file_size_bytes"),
         Document.synced_at.label("synced_at"),
-        bounded_content_snippet,
+        Document.source_modified_at.label("source_modified_at"),
+        Document.metadata_.label("metadata"),
     ).where(or_(*conds))
 
     if tool:
@@ -97,22 +104,132 @@ async def search(
         query = query.where(Document.synced_at >= cutoff)
     query = apply_user_filter(query, mids, Document.machine_id)
 
-    # Fetch page + total in one query. COUNT(*) OVER () reuses the same bitmap
-    # index plan as the page query, avoiding a separate seq-scan-based count.
-    total_col = func.count().over().label("_total")
-    paged = (
-        query.add_columns(total_col)
-        .order_by(Document.synced_at.desc())
-        .offset(offset)
-        .limit(limit)
+    # Fetch lightweight matching metadata first, fold logical Codex threads,
+    # then paginate. Applying OFFSET before folding made page totals wrong and
+    # let multi-host copies leak back in at page boundaries. No transcript
+    # content is selected in this phase; bounded snippets are fetched only for
+    # the final page below.
+    all_rows = (
+        await db.execute(
+            query.order_by(Document.synced_at.desc(), Document.id.desc())
+        )
+    ).mappings().all()
+    root_thread_ids: set[str] = set()
+    for row in all_rows:
+        if row["category"] != "conversation" or row["tool_id"] != "codex":
+            continue
+        metadata = row["metadata"] or {}
+        if (
+            str(metadata.get("thread_source") or "").strip().lower()
+            == "subagent"
+            and metadata.get("root_session_id")
+        ):
+            root_thread_ids.add(str(metadata["root_session_id"]))
+        else:
+            thread_id = current_thread_id(metadata)
+            if thread_id:
+                root_thread_ids.add(thread_id)
+
+    hierarchy_rows = {row["id"]: row for row in all_rows}
+    if root_thread_ids:
+        root_ids = list(root_thread_ids)
+        companions_q = select(
+            Document.id.label("id"),
+            Document.tool_id.label("tool_id"),
+            Document.relative_path.label("relative_path"),
+            Document.category.label("category"),
+            Document.title.label("title"),
+            Document.file_size_bytes.label("file_size_bytes"),
+            Document.synced_at.label("synced_at"),
+            Document.source_modified_at.label("source_modified_at"),
+            Document.metadata_.label("metadata"),
+        ).where(
+            Document.tool_id == "codex",
+            Document.category == "conversation",
+            or_(
+                Document.metadata_["session_id"].astext.in_(root_ids),
+                Document.metadata_["thread_id"].astext.in_(root_ids),
+                Document.metadata_["root_session_id"].astext.in_(root_ids),
+            ),
+        )
+        if device_id:
+            companions_q = companions_q.where(
+                Document.machine_id.in_(
+                    select(Machine.id).where(
+                        Machine.collector_token_hash == device_id
+                    )
+                )
+            )
+        companions_q = apply_user_filter(
+            companions_q,
+            mids,
+            Document.machine_id,
+        )
+        companion_rows = (await db.execute(companions_q)).mappings().all()
+        hierarchy_rows.update({row["id"]: row for row in companion_rows})
+
+    conversation_refs = [
+        ConversationRef(
+            document_id=row["id"],
+            tool_id=row["tool_id"],
+            relative_path=row["relative_path"],
+            metadata=row["metadata"],
+            title=row["title"],
+            source_modified_at=row["source_modified_at"],
+            synced_at=row["synced_at"],
+            file_size_bytes=row["file_size_bytes"],
+        )
+        for row in hierarchy_rows.values()
+        if row["category"] == "conversation"
+    ]
+    hierarchy = fold_codex_subagents(conversation_refs)
+    subagents_by_document = build_subagent_summaries(
+        hierarchy,
+        conversation_refs,
     )
-    rows = (await db.execute(paged)).mappings().all()
-    total = rows[0]["_total"] if rows else 0
+    rows_by_id = hierarchy_rows
+    folded_rows: list[tuple[dict, dict]] = []
+    emitted_ids: set = set()
+    for matching_row in all_rows:
+        canonical_id = hierarchy.canonical_document_ids.get(
+            matching_row["id"],
+            matching_row["id"],
+        )
+        if canonical_id in emitted_ids:
+            continue
+        # Position the canonical card at its best/newest matching member while
+        # keeping the card link/title pointed at the canonical document.
+        folded_rows.append((rows_by_id.get(canonical_id, matching_row), matching_row))
+        emitted_ids.add(canonical_id)
+    total = len(folded_rows)
+    page_rows = folded_rows[offset:offset + limit]
+    rows = [presentation for presentation, _match in page_rows]
+
+    non_conversation_ids = [
+        row["id"] for row in rows if row["category"] != "conversation"
+    ]
+    content_snippets: dict = {}
+    if non_conversation_ids:
+        snippet_rows = (
+            await db.execute(
+                select(Document.id, bounded_content_snippet).where(
+                    Document.id.in_(non_conversation_ids)
+                )
+            )
+        ).all()
+        content_snippets = {
+            document_id: snippet or ""
+            for document_id, snippet in snippet_rows
+        }
 
     # Fetch at most one bounded matching normalized message per conversation
     # result. The main page query selects metadata plus a SQL-bounded snippet,
     # never a potentially 64 MiB Document.content value.
-    conversation_ids = [row["id"] for row in rows if row["category"] == "conversation"]
+    conversation_ids = [
+        match["id"]
+        for _presentation, match in page_rows
+        if match["category"] == "conversation"
+    ]
     normalized_snippets: dict = {}
     if conversation_ids:
         ranked = (
@@ -122,7 +239,10 @@ async def search(
                 func.row_number()
                 .over(
                     partition_by=ConversationMessage.document_id,
-                    order_by=ConversationMessage.line_number,
+                    order_by=(
+                        ConversationMessage.line_number,
+                        ConversationMessage.id,
+                    ),
                 )
                 .label("row_number"),
             )
@@ -144,8 +264,21 @@ async def search(
         }
 
     items = []
-    for row in rows:
-        snippet = normalized_snippets.get(row["id"], row["content_snippet"] or "")
+    for row, matching_row in page_rows:
+        snippet = normalized_snippets.get(
+            matching_row["id"],
+            content_snippets.get(matching_row["id"], ""),
+        )
+        matching_metadata = matching_row["metadata"] or {}
+        matched_subagent_id = (
+            str(matching_row["id"])
+            if (
+                str(matching_metadata.get("thread_source") or "").strip().lower()
+                == "subagent"
+                and matching_row["id"] != row["id"]
+            )
+            else None
+        )
 
         items.append(
             {
@@ -157,6 +290,12 @@ async def search(
                 "snippet": snippet,
                 "file_size_bytes": row["file_size_bytes"],
                 "synced_at": row["synced_at"].isoformat(),
+                "subagent_count": hierarchy.subagent_counts.get(row["id"], 0),
+                "is_subagent_orphan": (
+                    row["id"] in hierarchy.orphan_document_ids
+                ),
+                "subagents": subagents_by_document.get(row["id"], []),
+                "matched_subagent_id": matched_subagent_id,
             }
         )
 

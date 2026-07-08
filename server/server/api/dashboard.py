@@ -12,6 +12,11 @@ from ..db.models import ConversationMessage, Document, Machine, Project, Tool, U
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import is_low_activity_summary
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    build_subagent_summaries,
+    fold_codex_subagents,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -78,20 +83,44 @@ async def get_dashboard(
             "conversation_count": categories.get("conversation", 0),
         })
 
-    # Pull enough recent conversations to keep useful threads visible even
-    # when several low-activity sessions are folded into the hidden section.
+    # Fetch lightweight metadata for the complete visible conversation set so
+    # a root that falls outside the newest 20 rows can still absorb its newer
+    # Codex subagents.  Transcript content is never loaded here.
     recent_convos_q = (
         select(Document.id, Document.tool_id, Document.title,
                Document.synced_at, Document.project_id, Document.file_size_bytes,
-               Project.title.label("project_title"))
+               Project.title.label("project_title"), Document.relative_path,
+               Document.metadata_, Document.source_modified_at)
         .outerjoin(Project, Document.project_id == Project.id)
         .where(Document.category == "conversation")
-        .order_by(Document.synced_at.desc())
-        .limit(20)
+        .order_by(Document.synced_at.desc(), Document.id.desc())
     )
     recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
-    convos_rows = list((await db.execute(recent_convos_q)).all())
+    all_convo_rows = list((await db.execute(recent_convos_q)).all())
+    conversation_refs = [
+        ConversationRef(
+            document_id=row[0],
+            tool_id=row[1],
+            relative_path=row[7],
+            metadata=row[8],
+            title=row[2],
+            source_modified_at=row[9],
+            synced_at=row[3],
+            file_size_bytes=row[5],
+        )
+        for row in all_convo_rows
+    ]
+    conversation_hierarchy = fold_codex_subagents(conversation_refs)
+    subagents_by_document = build_subagent_summaries(
+        conversation_hierarchy,
+        conversation_refs,
+    )
+    convos_rows = [
+        row
+        for row in all_convo_rows
+        if row.id in conversation_hierarchy.visible_document_ids
+    ][:20]
 
     # Batch both display counts and meaningful human/assistant activity in one
     # GROUP BY instead of one query per document.
@@ -132,6 +161,11 @@ async def get_dashboard(
             "synced_at": r.synced_at.isoformat(),
             "project_title": r.project_title,
             "message_count": total,
+            "subagent_count": conversation_hierarchy.subagent_counts.get(r.id, 0),
+            "is_subagent_orphan": (
+                r.id in conversation_hierarchy.orphan_document_ids
+            ),
+            "subagents": subagents_by_document.get(r.id, []),
             "is_low_activity": is_low_activity_summary(
                 users,
                 assistants,

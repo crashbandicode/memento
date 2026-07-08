@@ -3,13 +3,23 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { getApiBase, authFetch, ConversationMessage } from "@/lib/api-client";
+import {
+  getApiBase,
+  authFetch,
+  ConversationMessage,
+  type ConversationSubagentSummary,
+} from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, TopBar } from "@/components/aurora/primitives";
 import { ShareModal } from "@/components/ShareModal";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
+import {
+  conversationSessionKey,
+  mergeConversationSessions,
+} from "@/lib/conversation-sessions";
 
 interface Artifact {
   id: string;
@@ -20,11 +30,15 @@ interface Artifact {
 }
 
 interface Session {
+  logical_session_id?: string | null;
   session_id: string;
   title: string;
   conversation_id: string;
   timestamp: string;
   message_count: number;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+  subagents?: ConversationSubagentSummary[];
   messages: (ConversationMessage & { subagent_name?: string })[];
   artifacts: Artifact[];
 }
@@ -48,39 +62,61 @@ export default function ProjectTimelinePage() {
   const [order, setOrder] = useState<"asc" | "desc">("asc");
   const [shareOpen, setShareOpen] = useState(false);
   const offsetRef = useRef(0);
+  const loadingRef = useRef(false);
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const loadMore = async (reset = false) => {
+    if (!reset && loadingRef.current) return;
+    if (reset) abortRef.current?.abort();
+
+    const requestId = ++requestRef.current;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    loadingRef.current = true;
     setLoading(true);
     try {
       const off = reset ? 0 : offsetRef.current;
       // 每个 session 卡展示完整消息——用户优先看全貌，不做截断。
       // 大 session（几千条）首屏会慢一点但不丢内容。
-      const res: ProjectConversationsResponse = await authFetch(
-        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`
-      ).then((r) => r.json());
+      const response = await authFetch(
+        `${getApiBase()}/api/projects/${projectId}/conversations?session_offset=${off}&session_limit=5&order=${order}`,
+        { signal: controller.signal },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const res: ProjectConversationsResponse = await response.json();
+      if (requestId !== requestRef.current) return;
 
+      setData(res);
       if (reset) {
-        setData(res);
-        setSessions(res.sessions);
-        offsetRef.current = res.sessions.length;
+        setSessions(mergeConversationSessions([], res.sessions));
       } else {
-        if (!data) setData(res);
-        setSessions((prev) => [...prev, ...res.sessions]);
-        offsetRef.current += res.sessions.length;
+        setSessions((prev) => mergeConversationSessions(prev, res.sessions));
       }
-      setHasMore((reset ? res.sessions.length : offsetRef.current) < res.total_sessions);
+      offsetRef.current = off + res.sessions.length;
+      setHasMore(
+        res.sessions.length > 0 && offsetRef.current < res.total_sessions,
+      );
     } catch (e) {
-      console.error(e);
+      if (!(e instanceof DOMException && e.name === "AbortError")) {
+        console.error(e);
+      }
     } finally {
-      setLoading(false);
+      if (requestId === requestRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     offsetRef.current = 0;
-    setHasMore(true);
-    setSessions([]);
-    loadMore(true);
+    void loadMore(true);
+    return () => {
+      abortRef.current?.abort();
+      requestRef.current += 1;
+      loadingRef.current = false;
+    };
   }, [projectId, order]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!data && loading) {
@@ -116,8 +152,8 @@ export default function ProjectTimelinePage() {
 
       {/* Continuous message flow */}
       <div className="space-y-3">
-        {sessions.map((session, sIdx) => (
-          <SessionMessages key={session.session_id || sIdx} session={session} dateFmt={dateFmt} locale={locale} t={t} />
+        {sessions.map((session) => (
+          <SessionMessages key={conversationSessionKey(session)} session={session} dateFmt={dateFmt} locale={locale} t={t} />
         ))}
       </div>
 
@@ -265,6 +301,16 @@ const SessionMessages = memo(function SessionMessages({
         <div style={{ flex: 1, borderTop: "1px solid var(--aurora-border)", minWidth: 20 }} />
       </button>
 
+      {Boolean(session.subagent_count) && (
+        <div className="max-w-3xl mx-auto" style={{ marginTop: -16, marginBottom: 12 }}>
+          <SubagentBadge
+            count={session.subagent_count}
+            orphan={session.is_subagent_orphan}
+            subagents={session.subagents}
+          />
+        </div>
+      )}
+
       {!expanded && (firstUserMsg || lastAssistantMsg) && (
         <div className="space-y-4 max-w-3xl mx-auto" style={{ marginBottom: 12 }}>
           {firstUserMsg && (
@@ -313,21 +359,21 @@ const SessionMessages = memo(function SessionMessages({
       {expanded && (
       /* Messages with subagent groups collapsed inline */
       <div className="space-y-4 max-w-3xl mx-auto">
-        {groups.map((g, gIdx) => {
+        {groups.map((g) => {
           if (g.type === "msg") {
             const m = g.item.msg;
             const cm: ConversationMessage = {
-              id: gIdx, line_number: gIdx + 1, role: m.role, content: m.content,
+              id: m.id, line_number: m.line_number, role: m.role, content: m.content,
               thinking: m.thinking || null, tool_name: m.tool_name || "",
               tool_input: m.tool_input || "", raw_type: m.raw_type || "",
               timestamp: m.timestamp || null,
             };
-            return <ChatBubble key={`${session.session_id}-${gIdx}`} msg={cm} locale={locale} t={t} />;
+            return <ChatBubble key={m.id} msg={cm} locale={locale} t={t} />;
           }
           // Subagent group — collapsed inline
           return (
             <details
-              key={`${session.session_id}-sub-${gIdx}`}
+              key={`sub-${g.items[0]?.msg.id ?? g.name}`}
               style={{
                 border: "1px solid var(--aurora-border)",
                 borderRadius: 14,
@@ -352,15 +398,15 @@ const SessionMessages = memo(function SessionMessages({
                 <span style={{ opacity: 0.7 }}>· {g.items.length}</span>
               </summary>
               <div className="space-y-3" style={{ padding: "12px 8px", borderTop: "1px solid var(--aurora-border)", background: "var(--aurora-surface-solid)" }}>
-                {g.items.map((item, iIdx) => {
+                {g.items.map((item) => {
                   const m = item.msg;
                   const cm: ConversationMessage = {
-                    id: iIdx, line_number: iIdx + 1, role: m.role, content: m.content,
+                    id: m.id, line_number: m.line_number, role: m.role, content: m.content,
                     thinking: m.thinking || null, tool_name: m.tool_name || "",
                     tool_input: m.tool_input || "", raw_type: m.raw_type || "",
                     timestamp: m.timestamp || null,
                   };
-                  return <ChatBubble key={`sub-${gIdx}-${iIdx}`} msg={cm} locale={locale} t={t} />;
+                  return <ChatBubble key={m.id} msg={cm} locale={locale} t={t} />;
                 })}
               </div>
             </details>

@@ -154,6 +154,18 @@ export interface DocumentDetail {
   updated_at: string | null;
 }
 
+export interface ConversationSubagentSummary {
+  id: string;
+  session_id: string | null;
+  title: string;
+  agent_nickname?: string | null;
+  agent_path?: string | null;
+  agent_depth?: number | null;
+  parent_thread_id?: string | null;
+  relative_path?: string | null;
+  timestamp?: string | null;
+}
+
 export interface ConversationMeta {
   id: string;
   tool_id: string;
@@ -161,6 +173,9 @@ export interface ConversationMeta {
   relative_path: string;
   metadata: Record<string, unknown>;
   message_count: number;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+  subagents?: ConversationSubagentSummary[];
   synced_at: string;
 }
 
@@ -251,11 +266,17 @@ export interface SearchResult {
     snippet: string;
     file_size_bytes: number;
     synced_at: string;
+    subagent_count?: number;
+    is_subagent_orphan?: boolean;
+    subagents?: ConversationSubagentSummary[];
+    matched_subagent_id?: string | null;
   }[];
 }
 
 // Timeline
 export interface TimelinePreviewMessage {
+  id: number;
+  line_number: number;
   role: string;
   content: string;
   tool_name?: string;
@@ -276,6 +297,9 @@ export interface TimelineConversation {
   message_count: number;
   preview_messages: TimelinePreviewMessage[];
   file_size_bytes: number;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+  subagents?: ConversationSubagentSummary[];
 }
 
 export interface TimelineEvent {
@@ -297,6 +321,9 @@ export interface TimelineEvent {
   file_size_bytes?: number;
   preview_messages?: TimelinePreviewMessage[];
   message_count?: number;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+  subagents?: ConversationSubagentSummary[];
   content_preview?: string;
 }
 

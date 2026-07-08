@@ -7,11 +7,17 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..db.models import ConversationMessage, Document, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_parser import parse_conversation, count_conversation_messages
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    build_subagent_summaries,
+    fold_codex_subagents,
+)
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -43,6 +49,50 @@ async def get_conversation(
             select(func.count()).where(ConversationMessage.document_id == doc_id)
         )
         message_count = count_result.scalar() or 0
+
+    subagents: list[dict] = []
+    is_subagent_orphan = False
+    if doc.tool_id == "codex":
+        hierarchy_q = (
+            select(Document)
+            .options(load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+                Document.source_modified_at,
+                Document.synced_at,
+                Document.file_size_bytes,
+            ))
+            .where(
+                Document.tool_id == "codex",
+                Document.category == "conversation",
+            )
+        )
+        if mids is not None:
+            hierarchy_q = hierarchy_q.where(Document.machine_id.in_(mids))
+        hierarchy_docs = (await db.execute(hierarchy_q)).scalars().all()
+        hierarchy_refs = [
+            ConversationRef(
+                document_id=item.id,
+                tool_id=item.tool_id,
+                relative_path=item.relative_path,
+                metadata=item.metadata_,
+                title=item.title,
+                source_modified_at=item.source_modified_at,
+                synced_at=item.synced_at,
+                file_size_bytes=item.file_size_bytes,
+            )
+            for item in hierarchy_docs
+        ]
+        hierarchy = fold_codex_subagents(hierarchy_refs)
+        subagents = build_subagent_summaries(
+            hierarchy,
+            hierarchy_refs,
+        ).get(doc.id, [])
+        is_subagent_orphan = doc.id in hierarchy.orphan_document_ids
 
     # Find related brain artifacts (same session_id)
     related_plans = []
@@ -84,6 +134,9 @@ async def get_conversation(
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
         "message_count": message_count,
+        "subagent_count": len(subagents),
+        "is_subagent_orphan": is_subagent_orphan,
+        "subagents": subagents,
         "synced_at": doc.synced_at.isoformat(),
         "related_plans": related_plans,
     }

@@ -9,6 +9,7 @@ import { Btn, Glass, Chip } from "@/components/aurora/primitives";
 import { Icon } from "@/components/aurora/Icon";
 import { ChatBubble } from "@/components/viewers/ConversationViewer";
 import MarkdownViewer from "@/components/viewers/MarkdownViewer";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 interface ShareMeta {
   kind: "timeline" | "daily" | "memory";
@@ -27,6 +28,8 @@ type ShareData =
   | { kind: "memory"; data: MemoryData };
 
 interface SessionMessage {
+  id: number;
+  line_number: number;
   role: string;
   content: string;
   thinking?: string | null;
@@ -41,11 +44,14 @@ interface SessionArtifact {
   content: string | null;
 }
 interface Session {
+  logical_session_id?: string | null;
   session_id: string;
   title: string;
   conversation_id: string;
   timestamp: string;
   message_count: number;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
   messages: SessionMessage[];
   artifacts: SessionArtifact[];
   truncated?: boolean;
@@ -205,7 +211,7 @@ export default function PublicSharePage() {
       {payload.kind === "memory" && <MemoryView data={payload.data} />}
 
       <div style={{ marginTop: 40, textAlign: "center", fontSize: 11, color: "var(--aurora-fg4)" }}>
-        Powered by Memento · <a href="/" style={{ color: "var(--aurora-accent)" }}>memento</a>
+        Powered by Memento · <Link href="/" style={{ color: "var(--aurora-accent)" }}>memento</Link>
       </div>
     </div>
   );
@@ -230,12 +236,15 @@ function TimelineView({ data, locale, t }: { data: TimelineData; locale: string;
           <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 10 }}>
             {new Date(s.timestamp).toLocaleString()} · {s.message_count} msgs
             {s.truncated && " (preview)"}
+            <span style={{ display: "inline-flex", marginLeft: 8 }}>
+              <SubagentBadge count={s.subagent_count} orphan={s.is_subagent_orphan} />
+            </span>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {s.messages.map((m, i) => (
+            {s.messages.map((m) => (
               <ChatBubble
-                key={i}
-                msg={{ id: i, line_number: i, role: m.role, content: m.content,
+                key={m.id}
+                msg={{ id: m.id, line_number: m.line_number, role: m.role, content: m.content,
                        tool_name: m.tool_name, tool_input: m.tool_input, timestamp: m.timestamp ?? null }}
                 locale={locale}
                 t={t}

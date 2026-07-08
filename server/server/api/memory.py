@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -15,6 +15,12 @@ from ..db.models import (
 )
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    build_subagent_summaries,
+    current_thread_id,
+    fold_codex_subagents,
+)
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
@@ -413,35 +419,102 @@ async def semantic_search(
     qvec = embeds[0]
     dist_col = DocumentEmbedding.embedding.cosine_distance(qvec).label("dist")
 
-    stmt = (
+    ranked_chunks_q = (
         select(
-            DocumentEmbedding.chunk_text,
-            Document.id, Document.tool_id, Document.title,
-            Document.relative_path, Document.category, Document.synced_at,
+            DocumentEmbedding.chunk_text.label("chunk_text"),
+            Document.id.label("document_id"),
+            Document.tool_id.label("tool_id"),
+            Document.title.label("title"),
+            Document.relative_path.label("relative_path"),
+            Document.category.label("category"),
+            Document.synced_at.label("synced_at"),
+            Document.source_modified_at.label("source_modified_at"),
+            Document.metadata_.label("metadata"),
+            Document.file_size_bytes.label("file_size_bytes"),
             dist_col,
+            func.row_number().over(
+                partition_by=Document.id,
+                order_by=(dist_col.asc(), DocumentEmbedding.id),
+            ).label("chunk_rank"),
         )
         .join(Document, DocumentEmbedding.document_id == Document.id)
         .where(Document.embedding_status == "ok")
-        .order_by(dist_col.asc())
-        .limit(limit * 4)  # Overfetch: multiple chunks per doc; we'll dedup
     )
     if tool_filter:
-        stmt = stmt.where(Document.tool_id == tool_filter)
+        ranked_chunks_q = ranked_chunks_q.where(Document.tool_id == tool_filter)
     if days:
         from datetime import datetime, timedelta, timezone
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        stmt = stmt.where(Document.synced_at >= cutoff)
+        ranked_chunks_q = ranked_chunks_q.where(Document.synced_at >= cutoff)
     if mids is not None:
-        stmt = stmt.where(Document.machine_id.in_(mids))
+        ranked_chunks_q = ranked_chunks_q.where(Document.machine_id.in_(mids))
 
-    rows = (await db.execute(stmt)).all()
+    ranked_chunks = ranked_chunks_q.subquery()
+    stmt = (
+        select(
+            ranked_chunks.c.chunk_text,
+            ranked_chunks.c.document_id,
+            ranked_chunks.c.tool_id,
+            ranked_chunks.c.title,
+            ranked_chunks.c.relative_path,
+            ranked_chunks.c.category,
+            ranked_chunks.c.synced_at,
+            ranked_chunks.c.source_modified_at,
+            ranked_chunks.c.metadata,
+            ranked_chunks.c.file_size_bytes,
+            ranked_chunks.c.dist,
+        )
+        .where(ranked_chunks.c.chunk_rank == 1)
+        .order_by(ranked_chunks.c.dist.asc(), ranked_chunks.c.document_id)
+    )
 
-    seen: dict = {}
-    for chunk, did, tid, title, rpath, cat, synced, dist in rows:
-        if did in seen:
+    # Rank one best chunk per document in SQL, then page document candidates
+    # until enough *logical* groups exist. A root with hundreds of subagents no
+    # longer consumes 50 chunks per child or defeats a fixed overfetch window.
+    batch_size = max(100, limit * 10)
+    rows: list = []
+    logical_groups: set[tuple[str, str]] = set()
+    scanned = 0
+    while len(logical_groups) < limit:
+        batch = (
+            await db.execute(
+                stmt.offset(scanned).limit(batch_size)
+            )
+        ).all()
+        if not batch:
+            break
+        rows.extend(batch)
+        scanned += len(batch)
+        for row in batch:
+            _chunk, did, tid, _title, _path, category, _synced, \
+                _source_modified, metadata, _file_size, _dist = row
+            values = metadata or {}
+            if category == "conversation" and tid == "codex":
+                if (
+                    str(values.get("thread_source") or "").strip().lower()
+                    == "subagent"
+                    and values.get("root_session_id")
+                ):
+                    logical_id = str(values["root_session_id"])
+                else:
+                    logical_id = current_thread_id(values) or str(did)
+                logical_groups.add(("codex", logical_id))
+            else:
+                logical_groups.add(("document", str(did)))
+        if len(batch) < batch_size:
+            break
+
+    best_by_document: dict = {}
+    ranked_documents: list = []
+    for (
+        chunk, did, tid, title, rpath, cat, synced, source_modified,
+        metadata, file_size, dist,
+    ) in rows:
+        if did in best_by_document:
             continue
-        seen[did] = {
+        item = {
             "id": str(did),
+            "_document_id": did,
             "tool_id": tid,
             "title": title or (rpath.split("/")[-1] if rpath else ""),
             "relative_path": rpath,
@@ -449,11 +522,136 @@ async def semantic_search(
             "snippet": (chunk or "")[:400],
             "synced_at": synced.isoformat() if synced else None,
             "score": round(1.0 - float(dist), 4),
+            "_metadata": metadata,
+            "_source_modified_at": source_modified,
+            "_synced_at_value": synced,
+            "_file_size_bytes": file_size,
         }
-        if len(seen) >= limit:
+        best_by_document[did] = item
+        ranked_documents.append(item)
+
+    # Pull lightweight root/sibling metadata for every Codex group represented
+    # by the ranked candidates. This lets a matching child navigate through its
+    # canonical root even when the root's own embedding scored outside the
+    # vector window.
+    root_thread_ids = {
+        group_id
+        for group_kind, group_id in logical_groups
+        if group_kind == "codex"
+    }
+    companion_cards: dict = {}
+    if root_thread_ids:
+        root_ids = list(root_thread_ids)
+        companions_q = select(
+            Document.id,
+            Document.tool_id,
+            Document.title,
+            Document.relative_path,
+            Document.category,
+            Document.synced_at,
+            Document.source_modified_at,
+            Document.metadata_,
+            Document.file_size_bytes,
+        ).where(
+            Document.tool_id == "codex",
+            Document.category == "conversation",
+            or_(
+                Document.metadata_["session_id"].astext.in_(root_ids),
+                Document.metadata_["thread_id"].astext.in_(root_ids),
+                Document.metadata_["root_session_id"].astext.in_(root_ids),
+            ),
+        )
+        if mids is not None:
+            companions_q = companions_q.where(Document.machine_id.in_(mids))
+        companion_rows = (await db.execute(companions_q)).all()
+        for (
+            did, tid, title, rpath, category, synced, source_modified,
+            metadata, file_size,
+        ) in companion_rows:
+            companion_cards[did] = {
+                "id": str(did),
+                "_document_id": did,
+                "tool_id": tid,
+                "title": title or (rpath.split("/")[-1] if rpath else ""),
+                "relative_path": rpath,
+                "category": category,
+                "synced_at": synced.isoformat() if synced else None,
+                "_metadata": metadata,
+                "_source_modified_at": source_modified,
+                "_synced_at_value": synced,
+                "_file_size_bytes": file_size,
+            }
+
+    hierarchy_cards = {
+        item["_document_id"]: item
+        for item in ranked_documents
+        if item["category"] == "conversation"
+    }
+    hierarchy_cards.update(companion_cards)
+    conversation_refs = [
+        ConversationRef(
+            document_id=item["_document_id"],
+            tool_id=item["tool_id"],
+            relative_path=item["relative_path"],
+            metadata=item["_metadata"],
+            title=item["title"],
+            source_modified_at=item["_source_modified_at"],
+            synced_at=item["_synced_at_value"],
+            file_size_bytes=item["_file_size_bytes"],
+        )
+        for item in hierarchy_cards.values()
+    ]
+    hierarchy = fold_codex_subagents(conversation_refs)
+    subagents_by_document = build_subagent_summaries(
+        hierarchy,
+        conversation_refs,
+    )
+
+    results: list[dict] = []
+    emitted: set = set()
+    for match in ranked_documents:
+        document_id = match["_document_id"]
+        canonical_id = hierarchy.canonical_document_ids.get(
+            document_id,
+            document_id,
+        )
+        if canonical_id in emitted:
+            continue
+        canonical = (
+            best_by_document.get(canonical_id)
+            or companion_cards.get(canonical_id)
+            or match
+        )
+        result = {
+            key: value
+            for key, value in canonical.items()
+            if not key.startswith("_")
+        }
+        # Preserve the best-scoring matching chunk in the folded group, even
+        # when its navigable card is the canonical root document.
+        result["snippet"] = match["snippet"]
+        result["score"] = match["score"]
+        match_metadata = match.get("_metadata") or {}
+        is_subagent_match = (
+            str(match_metadata.get("thread_source") or "").strip().lower()
+            == "subagent"
+        )
+        result["matched_subagent_id"] = (
+            str(document_id)
+            if is_subagent_match and document_id != canonical_id
+            else None
+        )
+        result["subagent_count"] = hierarchy.subagent_counts.get(canonical_id, 0)
+        result["is_subagent_orphan"] = (
+            canonical_id in hierarchy.orphan_document_ids
+        )
+        result["subagents"] = subagents_by_document.get(canonical_id, [])
+        results.append(result)
+        emitted.add(canonical_id)
+        if len(results) >= limit:
             break
 
-    return {"results": list(seen.values())}
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------
