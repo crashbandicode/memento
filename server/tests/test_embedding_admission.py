@@ -131,6 +131,7 @@ def _document(*, attempts: int = 4) -> SimpleNamespace:
         id=uuid4(),
         embedding_status="failed",
         embedding_attempts=attempts,
+        embedding_content_hash=None,
         content_hash="a" * 64,
         content_type="text/plain",
         content="durable conversation text " * 20,
@@ -158,7 +159,7 @@ async def test_busy_document_stays_pending_without_consuming_attempt(monkeypatch
         for statement in db.statements
     )
     final_sql = str(db.statements[-1].compile())
-    assert "documents.content_hash" in final_sql
+    assert "documents.embedding_content_hash" in final_sql
     assert "documents.embedding_claim_token" in final_sql
 
 
@@ -211,13 +212,19 @@ async def test_revision_change_deletes_vectors_and_resets_claim() -> None:
     doc = SimpleNamespace(
         id=uuid4(),
         content_hash="old",
+        embedding_content_hash="old-input",
         embedding_status="processing",
         embedding_attempts=4,
         embedding_claim_token="claim",
         embedding_claimed_at=object(),
     )
 
-    changed = await _invalidate_embeddings_for_revision(db, doc, "new")
+    changed = await _invalidate_embeddings_for_revision(
+        db,
+        doc,
+        "old-input",
+        "new-input",
+    )
 
     assert changed is True
     assert len(db.statements) == 1
@@ -226,19 +233,133 @@ async def test_revision_change_deletes_vectors_and_resets_claim() -> None:
     assert doc.embedding_attempts == 0
     assert doc.embedding_claim_token is None
     assert doc.embedding_claimed_at is None
+    assert doc.embedding_content_hash == "new-input"
 
 
 @pytest.mark.asyncio
-async def test_same_revision_keeps_existing_vectors() -> None:
+async def test_same_embedding_input_keeps_existing_vectors_and_claim() -> None:
     class _DB:
         async def execute(self, _statement) -> None:
             pytest.fail("same revision deleted embeddings")
 
-    doc = SimpleNamespace(content_hash="same")
+    claimed_at = object()
+    doc = SimpleNamespace(
+        content_hash="raw-old",
+        embedding_content_hash=None,
+        embedding_status="processing",
+        embedding_attempts=4,
+        embedding_claim_token="claim",
+        embedding_claimed_at=claimed_at,
+    )
 
-    changed = await _invalidate_embeddings_for_revision(_DB(), doc, "same")
+    changed = await _invalidate_embeddings_for_revision(
+        _DB(),
+        doc,
+        "same-input",
+        "same-input",
+    )
 
     assert changed is False
+    assert doc.embedding_content_hash == "same-input"
+    assert doc.embedding_status == "processing"
+    assert doc.embedding_attempts == 4
+    assert doc.embedding_claim_token == "claim"
+    assert doc.embedding_claimed_at is claimed_at
+
+
+def test_embedding_input_hash_is_stable_past_model_chunk_limit() -> None:
+    prefix = "paragraph payload " * 8_000
+    before = embedding_service._chunk_text(prefix, max_chunks=50)
+    after = embedding_service._chunk_text(
+        prefix + ("new tail that is outside the model window " * 500),
+        max_chunks=50,
+    )
+
+    assert len(before) == 50
+    assert after == before
+    assert embedding_service.embedding_input_hash(after) == (
+        embedding_service.embedding_input_hash(before)
+    )
+
+
+class _MessageRows:
+    def __init__(self, messages: list[str]) -> None:
+        self._messages = messages
+
+    def scalars(self) -> _MessageRows:
+        return self
+
+    def all(self) -> list[str]:
+        # Mirror the production SELECT's hard LIMIT 100.
+        return self._messages[: embedding_service.CONVERSATION_EMBEDDING_MESSAGE_LIMIT]
+
+
+class _MessageDB:
+    def __init__(self, messages: list[str]) -> None:
+        self.messages = messages
+
+    async def execute(self, _statement) -> _MessageRows:
+        return _MessageRows(self.messages)
+
+
+@pytest.mark.asyncio
+async def test_externalized_conversation_hash_ignores_message_101() -> None:
+    messages = [f"message {index} " + ("x" * 120) for index in range(100)]
+    db = _MessageDB(messages)
+    doc = SimpleNamespace(
+        id=uuid4(),
+        content=None,
+        category="conversation",
+        content_type="jsonl",
+    )
+
+    before_chunks, before_hash = await embedding_service.document_embedding_input(
+        db, doc
+    )
+    db.messages.append("message 101 " + ("new tail" * 100))
+    after_chunks, after_hash = await embedding_service.document_embedding_input(db, doc)
+
+    assert after_chunks == before_chunks
+    assert after_hash == before_hash
+
+
+@pytest.mark.asyncio
+async def test_externalized_conversation_hash_changes_with_bounded_prefix() -> None:
+    messages = [f"message {index} " + ("x" * 120) for index in range(100)]
+    db = _MessageDB(messages)
+    doc = SimpleNamespace(
+        id=uuid4(),
+        content=None,
+        category="conversation",
+        content_type="jsonl",
+    )
+
+    _, before_hash = await embedding_service.document_embedding_input(db, doc)
+    db.messages[0] = "changed first message " + ("y" * 120)
+    _, after_hash = await embedding_service.document_embedding_input(db, doc)
+
+    assert after_hash != before_hash
+
+
+@pytest.mark.asyncio
+async def test_embedding_hash_changes_when_short_input_becomes_embeddable() -> None:
+    db = _MessageDB(["too short"])
+    doc = SimpleNamespace(
+        id=uuid4(),
+        content=None,
+        category="conversation",
+        content_type="jsonl",
+    )
+
+    before_chunks, before_hash = await embedding_service.document_embedding_input(
+        db, doc
+    )
+    db.messages = ["x" * 120]
+    after_chunks, after_hash = await embedding_service.document_embedding_input(db, doc)
+
+    assert before_chunks == []
+    assert len(after_chunks) == 1
+    assert after_hash != before_hash
 
 
 @pytest.mark.asyncio

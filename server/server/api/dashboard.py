@@ -14,6 +14,7 @@ from ..middleware.auth import get_current_user
 from ..services.conversation_activity import is_low_activity_summary
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_logical_activity_map,
     build_subagent_summaries,
     fold_codex_subagents,
 )
@@ -90,7 +91,8 @@ async def get_dashboard(
         select(Document.id, Document.tool_id, Document.title,
                Document.synced_at, Document.project_id, Document.file_size_bytes,
                Project.title.label("project_title"), Document.relative_path,
-               Document.metadata_, Document.source_modified_at)
+               Document.metadata_, Document.source_modified_at,
+               Document.activity_at)
         .outerjoin(Project, Document.project_id == Project.id)
         .where(Document.category == "conversation")
         .order_by(Document.synced_at.desc(), Document.id.desc())
@@ -106,6 +108,7 @@ async def get_dashboard(
             metadata=row[8],
             title=row[2],
             source_modified_at=row[9],
+            activity_at=row[10],
             synced_at=row[3],
             file_size_bytes=row[5],
         )
@@ -116,11 +119,25 @@ async def get_dashboard(
         conversation_hierarchy,
         conversation_refs,
     )
-    convos_rows = [
-        row
-        for row in all_convo_rows
-        if row.id in conversation_hierarchy.visible_document_ids
-    ][:20]
+    logical_activity_by_document = build_logical_activity_map(
+        conversation_hierarchy,
+        conversation_refs,
+    )
+    convos_rows = sorted(
+        (
+            row
+            for row in all_convo_rows
+            if row.id in conversation_hierarchy.visible_document_ids
+        ),
+        key=lambda row: (
+            logical_activity_by_document.get(row.id)
+            or row.activity_at
+            or row.source_modified_at
+            or row.synced_at,
+            str(row.id),
+        ),
+        reverse=True,
+    )[:20]
 
     # Batch both display counts and meaningful human/assistant activity in one
     # GROUP BY instead of one query per document.
@@ -150,6 +167,7 @@ async def get_dashboard(
 
     recent_conversations = []
     for r in convos_rows:
+        activity_at = logical_activity_by_document.get(r.id) or r.activity_at
         total, users, assistants, characters = msg_activity.get(
             r.id,
             (0, 0, 0, 0),
@@ -158,6 +176,7 @@ async def get_dashboard(
             "id": str(r.id),
             "tool_id": r.tool_id,
             "title": r.title,
+            "activity_at": activity_at.isoformat() if activity_at else None,
             "synced_at": r.synced_at.isoformat(),
             "project_title": r.project_title,
             "message_count": total,

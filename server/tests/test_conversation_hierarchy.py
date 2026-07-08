@@ -10,7 +10,9 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_hierarchy import (  # noqa: E402
     ConversationRef,
+    build_logical_activity_map,
     build_subagent_summaries,
+    effective_conversation_timestamp,
     fold_codex_subagents,
 )
 
@@ -28,6 +30,8 @@ def _ref(
     path: str = "sessions/thread.jsonl",
     tool_id: str = "codex",
     timestamp: str = "2026-07-08T12:00:00+00:00",
+    source_timestamp: str | None = None,
+    activity_timestamp: str | None = None,
     file_size_bytes: int = 100,
 ) -> ConversationRef:
     metadata = {
@@ -48,6 +52,16 @@ def _ref(
         tool_id=tool_id,
         relative_path=path,
         metadata=metadata,
+        source_modified_at=(
+            datetime.fromisoformat(source_timestamp).astimezone(timezone.utc)
+            if source_timestamp
+            else None
+        ),
+        activity_at=(
+            datetime.fromisoformat(activity_timestamp).astimezone(timezone.utc)
+            if activity_timestamp
+            else None
+        ),
         synced_at=datetime.fromisoformat(timestamp).astimezone(timezone.utc),
         file_size_bytes=file_size_bytes,
     )
@@ -229,6 +243,7 @@ class ConversationHierarchyTests(unittest.TestCase):
             relative_path=child.relative_path,
             metadata=child.metadata,
             title="Investigate the root production incident",
+            activity_at=child.activity_at,
             synced_at=child.synced_at,
             file_size_bytes=child.file_size_bytes,
         )
@@ -237,6 +252,87 @@ class ConversationHierarchyTests(unittest.TestCase):
         summaries = build_subagent_summaries(hierarchy, [root, child])
 
         self.assertEqual(summaries["root"][0]["title"], "search pagination repair")
+
+    def test_logical_activity_uses_latest_real_child_turn(self) -> None:
+        root = _ref(
+            "root",
+            session_id="root-thread",
+            timestamp="2026-07-08T18:00:00+00:00",
+            activity_timestamp="2026-07-08T10:00:00+00:00",
+        )
+        child = _ref(
+            "child",
+            session_id="child-thread",
+            root_session_id="root-thread",
+            source="subagent",
+            timestamp="2026-07-08T12:00:00+00:00",
+            activity_timestamp="2026-07-08T15:30:00+00:00",
+        )
+
+        hierarchy = fold_codex_subagents([root, child])
+        activity = build_logical_activity_map(hierarchy, [root, child])
+        summaries = build_subagent_summaries(hierarchy, [root, child])
+
+        self.assertEqual(
+            activity["root"],
+            datetime(2026, 7, 8, 15, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            summaries["root"][0]["activity_at"],
+            "2026-07-08T15:30:00+00:00",
+        )
+        self.assertEqual(
+            summaries["root"][0]["timestamp"],
+            "2026-07-08T15:30:00+00:00",
+        )
+        self.assertEqual(
+            summaries["root"][0]["synced_at"],
+            "2026-07-08T12:00:00+00:00",
+        )
+
+    def test_logical_activity_falls_back_without_persisting_import_time(self) -> None:
+        root = _ref(
+            "root",
+            session_id="root-thread",
+            timestamp="2026-07-08T18:00:00+00:00",
+            source_timestamp="2026-07-08T11:00:00+00:00",
+        )
+        child = _ref(
+            "child",
+            session_id="child-thread",
+            root_session_id="root-thread",
+            source="subagent",
+            timestamp="2026-07-08T17:00:00+00:00",
+            source_timestamp="2026-07-08T16:00:00+00:00",
+        )
+
+        hierarchy = fold_codex_subagents([root, child])
+        activity = build_logical_activity_map(hierarchy, [root, child])
+        summaries = build_subagent_summaries(hierarchy, [root, child])
+
+        self.assertIsNone(root.activity_at)
+        self.assertIsNone(child.activity_at)
+        self.assertEqual(
+            activity["root"],
+            datetime(2026, 7, 8, 16, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            summaries["root"][0]["activity_at"],
+            "2026-07-08T16:00:00+00:00",
+        )
+
+    def test_source_fallback_is_capped_at_sync_time(self) -> None:
+        future_mtime = _ref(
+            "doc",
+            session_id="thread",
+            timestamp="2026-07-08T17:00:00+00:00",
+            source_timestamp="2026-07-09T17:00:00+00:00",
+        )
+
+        self.assertEqual(
+            effective_conversation_timestamp(future_mtime),
+            datetime(2026, 7, 8, 17, tzinfo=timezone.utc),
+        )
 
 
 if __name__ == "__main__":

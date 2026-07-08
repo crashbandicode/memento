@@ -65,6 +65,10 @@ async def _dump_async(buf: io.BytesIO) -> dict:
     counts: dict = {}
     conn = await asyncpg.connect(_libpq_url())
     try:
+        # The interactive database default intentionally cancels queries after
+        # two minutes. A full COPY snapshot is maintenance work and can exceed
+        # that on a populated instance, so opt this dedicated connection out.
+        await conn.execute("SET statement_timeout = 0")
         gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6)
         try:
             for table in TABLES:

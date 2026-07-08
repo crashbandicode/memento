@@ -72,6 +72,18 @@ class DeviceScopedSelectTests(unittest.TestCase):
         self.assertIn(machine_b, compiled_b.params.values())
         self.assertNotIn(machine_a, compiled_b.params.values())
 
+    def test_full_ingest_document_update_uses_a_row_lock(self) -> None:
+        compiled = _compile(
+            _scoped_document_select(
+                "codex",
+                "sessions/shared.jsonl",
+                str(uuid.uuid4()),
+                str(uuid.uuid4()),
+            ).with_for_update()
+        )
+
+        self.assertIn("FOR UPDATE", str(compiled))
+
     def test_sync_state_identity_includes_device_and_owner(self) -> None:
         machine_id = str(uuid.uuid4())
         user_id = str(uuid.uuid4())

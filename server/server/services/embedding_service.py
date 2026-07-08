@@ -9,7 +9,10 @@ API container calls: http://host.docker.internal:8002/embed
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -32,7 +35,22 @@ CHUNK_OVERLAP = 200
 
 _server_available: bool | None = None  # None = not checked yet
 _last_check_time: float = 0  # Retry every 60s after failure
-EMBEDDING_PROCESSING_STALE_AFTER = timedelta(minutes=25)
+try:
+    _configured_request_timeout = float(
+        os.environ.get("MEMENTO_EMBEDDING_REQUEST_TIMEOUT_SECONDS", "1200")
+    )
+except (TypeError, ValueError):
+    _configured_request_timeout = 1200.0
+if not math.isfinite(_configured_request_timeout):
+    _configured_request_timeout = 1200.0
+EMBEDDING_REQUEST_TIMEOUT_SECONDS = min(
+    1200.0,
+    max(60.0, _configured_request_timeout),
+)
+# Keep abandoned-claim recovery comfortably beyond the capped 3-CPU request
+# deadline and Celery's task margin. A legitimate 50-chunk BGE-M3 request must
+# never be reclaimed while it is still making progress.
+EMBEDDING_PROCESSING_STALE_AFTER = timedelta(minutes=35)
 CONVERSATION_EMBEDDING_MESSAGE_LIMIT = 100
 CONVERSATION_EMBEDDING_MESSAGE_CHARS = 4_000
 CONVERSATION_EMBEDDING_TOTAL_CHARS = 100_000
@@ -67,7 +85,11 @@ def conversation_embedding_content(
 
 
 def _chunk_text(
-    text: str, chunk_chars: int = CHUNK_SIZE, overlap_chars: int = CHUNK_OVERLAP
+    text: str,
+    chunk_chars: int = CHUNK_SIZE,
+    overlap_chars: int = CHUNK_OVERLAP,
+    *,
+    max_chunks: int | None = None,
 ) -> list[str]:
     """Split text into overlapping chunks with smart boundary detection."""
     if len(text) <= chunk_chars:
@@ -83,14 +105,75 @@ def _chunk_text(
                 if break_pos != -1:
                     end = break_pos + len(sep)
                     break
-        chunks.append(text[start:end].strip())
+        chunk = text[start:end].strip()
+        if len(chunk) > 50:
+            chunks.append(chunk)
+        if max_chunks is not None and len(chunks) >= max_chunks:
+            break
         start = end - overlap_chars
-    return [c for c in chunks if len(c) > 50]
+    return chunks
+
+
+def embedding_input_hash(chunks: list[str]) -> str:
+    """Hash the exact ordered JSON array submitted to the model.
+
+    Hashing the final bounded chunks (rather than the raw file) makes the
+    identity match the real model input, including chunk boundaries. JSON is
+    used so different chunk partitions cannot collide through concatenation.
+    """
+    payload = json.dumps(
+        chunks,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def document_embedding_input(
+    db: AsyncSession,
+    doc: Document,
+) -> tuple[list[str], str]:
+    """Return the exact bounded model input and its stable identity hash."""
+    if doc.content_type in ("sqlite", "sqlite_export", "binary"):
+        chunks: list[str] = []
+        return chunks, embedding_input_hash(chunks)
+
+    embedding_content = doc.content or ""
+    if not embedding_content and doc.category == "conversation":
+        rows = (
+            (
+                await db.execute(
+                    select(
+                        func.left(
+                            ConversationMessage.content,
+                            CONVERSATION_EMBEDDING_MESSAGE_CHARS,
+                        )
+                    )
+                    .where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.role.in_(("user", "assistant")),
+                    )
+                    .order_by(
+                        ConversationMessage.line_number,
+                        ConversationMessage.id,
+                    )
+                    .limit(CONVERSATION_EMBEDDING_MESSAGE_LIMIT)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        embedding_content = conversation_embedding_content(list(rows))
+
+    chunks = []
+    if len(embedding_content) >= 100:
+        chunks = _chunk_text(embedding_content, max_chunks=50)
+    return chunks, embedding_input_hash(chunks)
 
 
 async def _call_embedding_server(
     texts: list[str],
-    timeout: float = 900.0,
+    timeout: float = EMBEDDING_REQUEST_TIMEOUT_SECONDS,
     *,
     raise_on_busy: bool = False,
 ) -> list[list[float]] | None:
@@ -156,6 +239,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     """
     revision_hash = doc.content_hash
     claim_token = str(uuid4())
+    chunks, input_hash = await document_embedding_input(db, doc)
 
     async def _claim_revision() -> bool:
         """Claim one exact revision, including abandoned processing work."""
@@ -178,6 +262,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
             )
             .values(
                 embedding_status="processing",
+                embedding_content_hash=input_hash,
                 embedding_claim_token=claim_token,
                 embedding_claimed_at=func.now(),
                 updated_at=func.now(),
@@ -208,7 +293,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
             update(Document)
             .where(
                 Document.id == doc.id,
-                Document.content_hash == revision_hash,
+                Document.embedding_content_hash == input_hash,
                 Document.embedding_status == "processing",
                 Document.embedding_claim_token == claim_token,
             )
@@ -224,43 +309,9 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         await _set_status("skipped", bump_attempts=True)
         return 0
 
-    embedding_content = doc.content or ""
-    if not embedding_content and doc.category == "conversation":
-        rows = (
-            (
-                await db.execute(
-                    select(func.left(
-                        ConversationMessage.content,
-                        CONVERSATION_EMBEDDING_MESSAGE_CHARS,
-                    ))
-                    .where(
-                        ConversationMessage.document_id == doc.id,
-                        ConversationMessage.role.in_(("user", "assistant")),
-                    )
-                    .order_by(
-                        ConversationMessage.line_number,
-                        ConversationMessage.id,
-                    )
-                    .limit(CONVERSATION_EMBEDDING_MESSAGE_LIMIT)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        embedding_content = conversation_embedding_content(list(rows))
-
-    if len(embedding_content) < 100:
-        await _set_status("skipped", bump_attempts=True)
-        return 0
-
-    chunks = _chunk_text(embedding_content)
     if not chunks:
         await _set_status("skipped", bump_attempts=True)
         return 0
-
-    # Cap at 50 chunks per document (~100KB) to avoid overloading embedding server
-    if len(chunks) > 50:
-        chunks = chunks[:50]
     # The normalized-message SELECT above starts a transaction. Release it
     # before a multi-minute model call so Postgres does not terminate the
     # connection under idle_in_transaction_session_timeout.
@@ -298,15 +349,15 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         await _set_status("failed", bump_attempts=True)
         return 0
 
-    # Lock and re-check the exact revision immediately before writing vectors.
-    # A concurrent ingest either wins this row lock and changes content_hash
-    # first (making this return no row), or waits until our vectors/status are
-    # committed and then resets the newer revision to pending.
+    # Lock and re-check the exact model input immediately before writing
+    # vectors. A concurrent append outside the bounded input may change the raw
+    # file hash but can safely let this worker finish. A change within the
+    # input updates embedding_content_hash and makes this return no row.
     current_revision = await db.execute(
         select(Document.id)
         .where(
             Document.id == doc.id,
-            Document.content_hash == revision_hash,
+            Document.embedding_content_hash == input_hash,
             Document.embedding_status == "processing",
             Document.embedding_claim_token == claim_token,
         )

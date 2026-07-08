@@ -11,6 +11,7 @@ from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_logical_activity_map,
     build_subagent_summaries,
     current_thread_id,
     fold_codex_subagents,
@@ -84,6 +85,7 @@ async def search(
         Document.file_size_bytes.label("file_size_bytes"),
         Document.synced_at.label("synced_at"),
         Document.source_modified_at.label("source_modified_at"),
+        Document.activity_at.label("activity_at"),
         Document.metadata_.label("metadata"),
     ).where(or_(*conds))
 
@@ -111,7 +113,20 @@ async def search(
     # the final page below.
     all_rows = (
         await db.execute(
-            query.order_by(Document.synced_at.desc(), Document.id.desc())
+            query.order_by(
+                case(
+                    (
+                        Document.category == "conversation",
+                        func.coalesce(
+                            Document.activity_at,
+                            Document.source_modified_at,
+                            Document.synced_at,
+                        ),
+                    ),
+                    else_=Document.synced_at,
+                ).desc(),
+                Document.id.desc(),
+            )
         )
     ).mappings().all()
     root_thread_ids: set[str] = set()
@@ -142,6 +157,7 @@ async def search(
             Document.file_size_bytes.label("file_size_bytes"),
             Document.synced_at.label("synced_at"),
             Document.source_modified_at.label("source_modified_at"),
+            Document.activity_at.label("activity_at"),
             Document.metadata_.label("metadata"),
         ).where(
             Document.tool_id == "codex",
@@ -176,6 +192,7 @@ async def search(
             metadata=row["metadata"],
             title=row["title"],
             source_modified_at=row["source_modified_at"],
+            activity_at=row["activity_at"],
             synced_at=row["synced_at"],
             file_size_bytes=row["file_size_bytes"],
         )
@@ -184,6 +201,10 @@ async def search(
     ]
     hierarchy = fold_codex_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
+        hierarchy,
+        conversation_refs,
+    )
+    logical_activity_by_document = build_logical_activity_map(
         hierarchy,
         conversation_refs,
     )
@@ -201,6 +222,20 @@ async def search(
         # keeping the card link/title pointed at the canonical document.
         folded_rows.append((rows_by_id.get(canonical_id, matching_row), matching_row))
         emitted_ids.add(canonical_id)
+    folded_rows.sort(
+        key=lambda pair: (
+            (
+                logical_activity_by_document.get(pair[0]["id"])
+                or pair[0]["activity_at"]
+                or pair[0]["source_modified_at"]
+                or pair[0]["synced_at"]
+            )
+            if pair[0]["category"] == "conversation"
+            else pair[0]["synced_at"],
+            str(pair[0]["id"]),
+        ),
+        reverse=True,
+    )
     total = len(folded_rows)
     page_rows = folded_rows[offset:offset + limit]
     rows = [presentation for presentation, _match in page_rows]
@@ -265,6 +300,10 @@ async def search(
 
     items = []
     for row, matching_row in page_rows:
+        activity_at = (
+            logical_activity_by_document.get(row["id"])
+            or row["activity_at"]
+        )
         snippet = normalized_snippets.get(
             matching_row["id"],
             content_snippets.get(matching_row["id"], ""),
@@ -289,6 +328,7 @@ async def search(
                 "title": row["title"],
                 "snippet": snippet,
                 "file_size_bytes": row["file_size_bytes"],
+                "activity_at": activity_at.isoformat() if activity_at else None,
                 "synced_at": row["synced_at"].isoformat(),
                 "subagent_count": hierarchy.subagent_counts.get(row["id"], 0),
                 "is_subagent_orphan": (

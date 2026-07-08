@@ -81,10 +81,13 @@ _ESSENTIAL_METADATA_KEYS = {
     "agent_nickname",
     "agent_path",
     "cascade_id",
+    "codex_title_revision",
+    "codex_title_revisions",
     "cwd",
     "first_user_message",
     "forked_from_id",
     "model",
+    "memento_title_source",
     "parent_thread_id",
     "project_hash",
     "project_path",
@@ -94,16 +97,48 @@ _ESSENTIAL_METADATA_KEYS = {
     "thread_id",
     "thread_source",
     "title",
+    "title_is_manual",
+    "title_source",
 }
+
+_EMBEDDING_CATEGORIES = {"conversation", "memory", "learning", "plan", "identity"}
+_PROTECTED_DOCUMENT_METADATA_KEYS = {
+    "codex_title_revision",
+    "codex_title_revisions",
+    "memento_title_source",
+    "title_is_manual",
+    "title_source",
+}
+
+
+def _logical_document_file_size(
+    *,
+    mode: str,
+    payload_size: int,
+    offset: int,
+    existing_size: int = 0,
+) -> int:
+    """Return total source size rather than a DELTA payload's tail size."""
+    safe_payload = max(0, int(payload_size))
+    if mode != "delta":
+        return safe_payload
+    # Collector DELTA offsets are the cumulative source end position. Preserve
+    # the existing total as a fallback for legacy senders with a zero offset.
+    return max(safe_payload, max(0, int(offset)), max(0, int(existing_size)))
 
 
 async def _invalidate_embeddings_for_revision(
     db: AsyncSession,
     doc: Document,
-    incoming_hash: str,
+    previous_embedding_content_hash: str,
+    incoming_embedding_content_hash: str,
 ) -> bool:
-    """Invalidate vectors and retry state when document content changes."""
-    if doc.content_hash == incoming_hash:
+    """Reconcile vectors against the exact bounded model input identity."""
+    persisted_hash = doc.embedding_content_hash
+    doc.embedding_content_hash = incoming_embedding_content_hash
+    if (
+        persisted_hash or previous_embedding_content_hash
+    ) == incoming_embedding_content_hash:
         return False
     await db.execute(
         delete(DocumentEmbedding).where(DocumentEmbedding.document_id == doc.id)
@@ -373,6 +408,34 @@ async def _apply_friendly_conversation_title(
 ) -> str | None:
     """Replace opaque transcript identifiers with the first real user prompt."""
     metadata = doc.metadata_ or {}
+    title_source = str(metadata.get("memento_title_source") or "").strip().lower()
+    legacy_title_source = str(metadata.get("title_source") or "").strip().lower()
+    try:
+        title_revision = int(metadata.get("codex_title_revision") or 0)
+    except (TypeError, ValueError):
+        title_revision = 0
+    title_revisions = metadata.get("codex_title_revisions")
+    has_source_revision = title_revision > 0 or (
+        isinstance(title_revisions, dict)
+        and any(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in title_revisions.values()
+        )
+    )
+    if (
+        doc.tool_id == "codex"
+        and (
+            (title_source == "codex_explicit_rename" and has_source_revision)
+            or title_source in {"manual", "memento_manual", "memento_user"}
+            or legacy_title_source in {"manual", "user", "memento_manual"}
+            or metadata.get("title_is_manual") is True
+        )
+        and not _conversation_title_needs_derivation(doc.title, doc.tool_id)
+    ):
+        # The metadata-only rename endpoint is the sole writer of this marker.
+        # Preserve it across later FULL transcript ingests, including subagents
+        # whose agent_path would otherwise overwrite the explicit source title.
+        return doc.title
     if (
         doc.tool_id == "codex"
         and str(metadata.get("thread_source") or "").strip().lower()
@@ -695,6 +758,14 @@ async def ingest_file(
             ).with_for_update()
         )
     ).scalar_one_or_none()
+    is_new_document = doc is None
+    previous_embedding_content_hash: str | None = None
+    logical_file_size = _logical_document_file_size(
+        mode=mode,
+        payload_size=file_size,
+        offset=offset,
+        existing_size=doc.file_size_bytes if doc is not None else 0,
+    )
     same_hash_before_write = doc is not None and doc.content_hash == content_hash
     if (
         sync_row is not None
@@ -867,12 +938,34 @@ async def ingest_file(
             if row:
                 project_id = row
 
+    # These provenance fields are server-owned. A normal file upload must not
+    # be able to impersonate the metadata-only rename endpoint or a future
+    # Memento-side manual title. Existing protected values are merged below.
+    collector_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key not in _PROTECTED_DOCUMENT_METADATA_KEYS
+    }
     stored_metadata, user_history, first_user_message = _prepare_document_metadata(
-        metadata,
+        collector_metadata,
         tool_id=tool_id,
     )
     now = received_at
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
+
+    if doc is not None and category in _EMBEDDING_CATEGORIES:
+        previous_embedding_content_hash = doc.embedding_content_hash
+        if previous_embedding_content_hash is None:
+            # Backward compatibility for rows created before the persisted
+            # input identity existed: derive it while the old content and
+            # messages are still current, before this ingest replaces them.
+            from .embedding_service import document_embedding_input
+
+            _, previous_embedding_content_hash = await document_embedding_input(
+                db,
+                doc,
+            )
+            doc.embedding_content_hash = previous_embedding_content_hash
 
     if doc is None:
         # Very large conversations keep their raw source in object storage.
@@ -888,7 +981,7 @@ async def ingest_file(
             content=content if persist_content else None,
             content_s3_key=content_s3_key,
             content_hash=content_hash,
-            file_size_bytes=file_size,
+            file_size_bytes=logical_file_size,
             metadata_=stored_metadata,
             needs_review=had_sensitive,
             synced_at=now,
@@ -897,11 +990,6 @@ async def ingest_file(
         db.add(doc)
     else:
         # Update existing document
-        await _invalidate_embeddings_for_revision(
-            db,
-            doc,
-            content_hash,
-        )
         preserve_externalized_delta = _is_externalized_delta_update(
             doc,
             mode=mode,
@@ -927,7 +1015,7 @@ async def ingest_file(
         if persist_content and not preserve_externalized_delta:
             doc.content_s3_key = None
         doc.content_hash = content_hash
-        doc.file_size_bytes = file_size
+        doc.file_size_bytes = logical_file_size
         existing_metadata = dict(doc.metadata_ or {})
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
@@ -1016,6 +1104,9 @@ async def ingest_file(
             user_history=user_history,
             first_user_message=first_user_message,
         )
+        from .conversation_activity import refresh_document_activity_at
+
+        await refresh_document_activity_at(db, doc)
         # Build FTS from bounded normalized rows, never from a multi-hundred-
         # megabyte raw transcript. Ordering newest-first ensures a DELTA keeps
         # recent prompts searchable without loading every historical row.
@@ -1039,6 +1130,23 @@ async def ingest_file(
             MAX_SEARCH_TEXT_CHARS,
         )
         title = await _apply_friendly_conversation_title(db, doc) or title
+
+    if category in _EMBEDDING_CATEGORIES:
+        from .embedding_service import document_embedding_input
+
+        _, incoming_embedding_content_hash = await document_embedding_input(db, doc)
+        if is_new_document:
+            doc.embedding_content_hash = incoming_embedding_content_hash
+        else:
+            # Existing rows always have a baseline: either the persisted hash
+            # or the lazily derived pre-update value above.
+            assert previous_embedding_content_hash is not None
+            await _invalidate_embeddings_for_revision(
+                db,
+                doc,
+                previous_embedding_content_hash,
+                incoming_embedding_content_hash,
+            )
 
     # Refresh the content_tsv full-text index after conversation extraction so
     # an opaque source filename can be replaced by its human-readable prompt.
@@ -1105,10 +1213,37 @@ async def ingest_file(
         import asyncio
 
         try:
-            loop = asyncio.get_running_loop()
-            task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
+            # Large direct/multipart uploads must obey the same durable quiet
+            # window as chunked spool ingestion. Small uploads retain the
+            # lightweight in-process path used by development installs that do
+            # not run Celery.
+            from ..tasks.post_ingest import (
+                initial_post_ingest_countdown,
+                process_document_post_ingest,
+            )
+
+            countdown = initial_post_ingest_countdown(
+                category,
+                int(doc.file_size_bytes),
+            )
+            if countdown is not None:
+                process_document_post_ingest.apply_async(
+                    args=[
+                        str(doc.id),
+                        str(doc.tool_id),
+                        category,
+                        str(doc.content_hash),
+                    ],
+                    countdown=countdown,
+                    retry=False,
+                )
+            else:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(
+                    _run_post_ingest(doc.id, doc.tool_id, category)
+                )
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
         except Exception:
             pass
 
@@ -1126,7 +1261,12 @@ async def _run_post_ingest(doc_id, tool_id: str, category: str) -> None:
         await _run_post_ingest_inner(doc_id, tool_id, category)
 
 
-async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
+async def _run_post_ingest_inner(
+    doc_id,
+    tool_id: str,
+    category: str,
+    expected_revision: str | None = None,
+) -> None:
     import logging
 
     logger = logging.getLogger("post_ingest")
@@ -1142,6 +1282,19 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
             ).scalar_one_or_none()
             if not doc:
                 logger.info("Post-ingest: doc %s not found", doc_id)
+                return
+            # A queued task names the exact revision that created it. The
+            # Celery preflight checks this too, but ingestion can commit a new
+            # revision between that check and this independent session. Do not
+            # let the old delivery bypass the new revision's quiet window.
+            # generate_document_embeddings has its own atomic claim/final-write
+            # fence for the smaller race after this reload.
+            if expected_revision and doc.content_hash != expected_revision:
+                logger.info(
+                    "Post-ingest: revision %s superseded for %s",
+                    expected_revision,
+                    doc_id,
+                )
                 return
             # Embedding and graph helpers own short transactions and may
             # commit or roll back internally. A rollback expires ORM state
@@ -1168,6 +1321,13 @@ async def _run_post_ingest_inner(doc_id, tool_id: str, category: str) -> None:
             doc = await db.get(Document, doc_id, populate_existing=True)
             if not doc:
                 logger.info("Post-ingest: doc %s disappeared after embedding", doc_id)
+                return
+            if expected_revision and doc.content_hash != expected_revision:
+                logger.info(
+                    "Post-ingest: revision %s superseded after embedding for %s",
+                    expected_revision,
+                    doc_id,
+                )
                 return
 
             # Knowledge graph extraction

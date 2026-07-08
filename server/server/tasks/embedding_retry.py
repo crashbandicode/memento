@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, or_, select, text
 
@@ -22,6 +22,7 @@ from ..services.embedding_service import (
     generate_document_embeddings,
 )
 from .celery_app import celery_app
+from .post_ingest import LARGE_CONVERSATION_BYTES, POST_INGEST_QUIET_SECONDS
 
 logger = logging.getLogger("embedding_retry")
 
@@ -39,6 +40,9 @@ async def _run_locked() -> dict:
         stale_before = (
             datetime.now(timezone.utc) - EMBEDDING_PROCESSING_STALE_AFTER
         )
+        quiet_before = datetime.now(timezone.utc) - timedelta(
+            seconds=POST_INGEST_QUIET_SECONDS
+        )
         async with async_session_factory() as db:
             statement = (
                 select(Document)
@@ -54,6 +58,16 @@ async def _run_locked() -> dict:
                         ),
                     ),
                     Document.embedding_attempts < MAX_ATTEMPTS,
+                    # Do not let the minute fallback scanner bypass the
+                    # post-ingest debounce for a transcript that is still
+                    # growing. It becomes eligible automatically after the
+                    # same quiet window, preserving eventual recovery.
+                    or_(
+                        Document.category != "conversation",
+                        Document.file_size_bytes < LARGE_CONVERSATION_BYTES,
+                        Document.synced_at.is_(None),
+                        Document.synced_at <= quiet_before,
+                    ),
                 )
                 .order_by(Document.updated_at, Document.id)
                 .limit(1)
@@ -79,7 +93,7 @@ async def _run_locked() -> dict:
 
 
 async def _run() -> dict:
-    # A retry can legitimately run longer than the 15-minute beat interval.
+    # A retry can legitimately run longer than the one-minute beat interval.
     # Hold a PostgreSQL session-level lock (outside a transaction) so later
     # ticks exit instead of materializing stale Documents or racing status.
     async with engine.connect() as lock_connection:
@@ -102,16 +116,16 @@ async def _run() -> dict:
 
 @celery_app.task(
     name="server.tasks.embedding_retry.retry_failed_embeddings",
-    # No autoretry here: the beat schedule already re-fires every 15 min, and
+    # No autoretry here: the beat schedule already re-fires every minute, and
     # autoretry caused asyncio event-loop conflicts when the retry attempt
     # queued before the previous run's engine/connection pool had finished
     # teardown ("Future attached to a different loop" / "another operation
     # is in progress"). The failed docs simply wait for the next beat tick.
     acks_late=True,
-    # One sweep handles exactly one document; align with the 900-second HTTP
-    # deadline plus database cleanup margin instead of inheriting the global
-    # 600-second limit.
-    time_limit=1200,
+    # One sweep handles exactly one document; align with the capped-host
+    # 1200-second HTTP deadline plus database cleanup margin instead of
+    # inheriting the global 600-second limit.
+    time_limit=1500,
 )
 def retry_failed_embeddings() -> dict:
     try:

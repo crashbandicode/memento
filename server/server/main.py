@@ -69,6 +69,35 @@ def _run_migrations(conn) -> None:
     # of silently dropped. Existing rows get 'ok' if they already have any
     # embedding rows, else 'pending' — the periodic retry task picks those up.
     doc_cols = {c["name"] for c in insp.get_columns("documents")}
+    if "activity_at" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN activity_at TIMESTAMPTZ"
+        ))
+        # One-time backfill from normalized transcript time, never from the
+        # collector delivery time.  Tool/system rows are omitted because they
+        # can be synthetic context and should not make a dormant thread look
+        # newly active.  Future ingests maintain this value incrementally.
+        if "conversation_messages" in tables:
+            conn.execute(text(
+                "UPDATE documents AS d SET activity_at = latest.activity_at "
+                "FROM ("
+                "  SELECT document_id, MAX(timestamp) AS activity_at "
+                "  FROM conversation_messages "
+                "  WHERE timestamp IS NOT NULL "
+                "    AND role IN ('user', 'assistant') "
+                "  GROUP BY document_id"
+                ") AS latest "
+                "WHERE d.id = latest.document_id "
+                "  AND d.category = 'conversation'"
+            ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_documents_activity_at "
+        "ON documents (activity_at DESC)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_documents_project_activity "
+        "ON documents (project_id, activity_at DESC)"
+    ))
     if "embedding_status" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN embedding_status VARCHAR(20) "
@@ -103,6 +132,15 @@ def _run_migrations(conn) -> None:
     if "embedding_claimed_at" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN embedding_claimed_at TIMESTAMPTZ"
+        ))
+    if "embedding_content_hash" not in doc_cols:
+        # Leave historical rows NULL. On their first changed ingest the server
+        # derives the old input from the still-current content/messages before
+        # replacing them, so existing vectors can be preserved when the
+        # bounded model input did not actually change. Pending/failed rows also
+        # populate this lazily when an embedding worker claims them.
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN embedding_content_hash VARCHAR(64)"
         ))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_documents_embedding_retry "

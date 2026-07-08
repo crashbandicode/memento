@@ -140,6 +140,56 @@ class ConversationTitleTests(unittest.TestCase):
         self.assertEqual(title, "semantic search dedupe")
         self.assertEqual(doc.title, "semantic search dedupe")
 
+    def test_explicit_subagent_rename_survives_later_full_ingest(self) -> None:
+        doc = SimpleNamespace(
+            tool_id="codex",
+            title="User renamed this investigation",
+            metadata_={
+                "thread_source": "subagent",
+                "agent_path": "/root/semantic_search_dedupe",
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 200_456,
+            },
+        )
+
+        title = asyncio.run(_apply_friendly_conversation_title(None, doc))
+
+        self.assertEqual(title, "User renamed this investigation")
+        self.assertEqual(doc.title, "User renamed this investigation")
+
+    def test_cross_host_rename_map_survives_later_full_ingest(self) -> None:
+        doc = SimpleNamespace(
+            tool_id="codex",
+            title="Rename propagated from another host",
+            metadata_={
+                "thread_source": "subagent",
+                "agent_path": "/root/semantic_search_dedupe",
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revisions": {
+                    "019f144c-82d6-70d0-95e8-e01e7b813e98": 200_456,
+                },
+            },
+        )
+
+        title = asyncio.run(_apply_friendly_conversation_title(None, doc))
+
+        self.assertEqual(title, "Rename propagated from another host")
+
+    def test_manual_memento_title_survives_subagent_derivation(self) -> None:
+        doc = SimpleNamespace(
+            tool_id="codex",
+            title="My manual title",
+            metadata_={
+                "thread_source": "subagent",
+                "agent_path": "/root/semantic_search_dedupe",
+                "title_source": "manual",
+            },
+        )
+
+        title = asyncio.run(_apply_friendly_conversation_title(None, doc))
+
+        self.assertEqual(title, "My manual title")
+
     def test_subagent_nickname_is_used_when_agent_path_is_missing(self) -> None:
         self.assertEqual(
             _friendly_codex_agent_title({"agent_nickname": "Noether"}),

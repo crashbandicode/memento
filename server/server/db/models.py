@@ -133,6 +133,11 @@ class Document(Base):
     embedding_claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    # SHA-256 of the exact bounded chunk list sent to the embedding model.
+    # This is intentionally separate from content_hash: append-only transcripts
+    # often change on disk without changing the first 100 messages / 50 chunks
+    # that Memento embeds.
+    embedding_content_hash: Mapped[str | None] = mapped_column(String(64))
     # Knowledge-graph extraction pipeline status. Same shape as the
     # embedding pair above. Values: pending (just ingested), ok
     # (extracted), failed (LLM errored — retry candidate via
@@ -144,6 +149,10 @@ class Document(Base):
 
     # Timestamps
     source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Latest timestamp carried by a normalized user/assistant message.  This
+    # represents when a conversation actually happened; synced_at remains the
+    # independent collector-delivery timestamp.
+    activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -159,11 +168,13 @@ class Document(Base):
         Index("idx_documents_tool", "tool_id"),
         Index("idx_documents_project", "project_id"),
         Index("idx_documents_category", "category"),
+        Index("idx_documents_activity_at", activity_at.desc()),
         Index("idx_documents_synced_at", synced_at.desc()),
         Index("idx_documents_machine", "machine_id"),
         Index("idx_documents_machine_tool", "machine_id", "tool_id"),
         Index("idx_documents_tool_synced", "tool_id", synced_at.desc()),
         Index("idx_documents_project_synced", "project_id", synced_at.desc()),
+        Index("idx_documents_project_activity", "project_id", activity_at.desc()),
         Index("idx_documents_project_category", "project_id", "category"),
         # Unique per machine+tool+path
         Index("uq_documents_machine_tool_path", "machine_id", "tool_id", "relative_path", unique=True),

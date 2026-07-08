@@ -15,7 +15,9 @@ from ..middleware.auth import get_current_user
 from ..services.conversation_parser import parse_conversation, count_conversation_messages
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_logical_activity_map,
     build_subagent_summaries,
+    effective_conversation_timestamp,
     fold_codex_subagents,
 )
 from ..services.user_filter import user_machine_ids
@@ -52,6 +54,7 @@ async def get_conversation(
 
     subagents: list[dict] = []
     is_subagent_orphan = False
+    logical_activity: dict = {}
     if doc.tool_id == "codex":
         hierarchy_q = (
             select(Document)
@@ -63,6 +66,7 @@ async def get_conversation(
                 Document.relative_path,
                 Document.metadata_,
                 Document.source_modified_at,
+                Document.activity_at,
                 Document.synced_at,
                 Document.file_size_bytes,
             ))
@@ -82,12 +86,17 @@ async def get_conversation(
                 metadata=item.metadata_,
                 title=item.title,
                 source_modified_at=item.source_modified_at,
+                activity_at=item.activity_at,
                 synced_at=item.synced_at,
                 file_size_bytes=item.file_size_bytes,
             )
             for item in hierarchy_docs
         ]
         hierarchy = fold_codex_subagents(hierarchy_refs)
+        logical_activity = build_logical_activity_map(
+            hierarchy,
+            hierarchy_refs,
+        )
         subagents = build_subagent_summaries(
             hierarchy,
             hierarchy_refs,
@@ -127,6 +136,18 @@ async def get_conversation(
                 "synced_at": p.synced_at.isoformat(),
             })
 
+    activity_at = logical_activity.get(doc.id) or effective_conversation_timestamp(
+        ConversationRef(
+            document_id=doc.id,
+            tool_id=doc.tool_id,
+            relative_path=doc.relative_path,
+            metadata=doc.metadata_,
+            source_modified_at=doc.source_modified_at,
+            activity_at=doc.activity_at,
+            synced_at=doc.synced_at,
+        )
+    )
+
     return {
         "id": str(doc.id),
         "tool_id": doc.tool_id,
@@ -137,6 +158,7 @@ async def get_conversation(
         "subagent_count": len(subagents),
         "is_subagent_orphan": is_subagent_orphan,
         "subagents": subagents,
+        "activity_at": activity_at.isoformat() if activity_at else None,
         "synced_at": doc.synced_at.isoformat(),
         "related_plans": related_plans,
     }

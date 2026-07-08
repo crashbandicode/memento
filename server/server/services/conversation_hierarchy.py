@@ -25,6 +25,7 @@ class ConversationRef:
     metadata: Mapping[str, Any] | None
     title: str | None = None
     source_modified_at: datetime | None = None
+    activity_at: datetime | None = None
     synced_at: datetime | None = None
     file_size_bytes: int = 0
 
@@ -196,7 +197,7 @@ def build_subagent_summaries(
             except (KeyError, TypeError, ValueError):
                 agent_depth = None
             parent_thread_id = metadata.get("parent_thread_id")
-            timestamp = child.source_modified_at or child.synced_at
+            timestamp = effective_conversation_timestamp(child)
             children.append({
                 "id": str(child.document_id),
                 "session_id": thread_id,
@@ -214,10 +215,55 @@ def build_subagent_summaries(
                 ),
                 "relative_path": child.relative_path,
                 "timestamp": timestamp.isoformat() if timestamp else None,
+                "activity_at": timestamp.isoformat() if timestamp else None,
+                "synced_at": (
+                    child.synced_at.isoformat() if child.synced_at else None
+                ),
             })
         if children:
             summaries[parent_id] = children
     return summaries
+
+
+def build_logical_activity_map(
+    hierarchy: ConversationHierarchy,
+    conversations: Iterable[ConversationRef],
+) -> dict[Hashable, datetime]:
+    """Return outward effective activity for each visible logical thread.
+
+    Every copy and metadata-linked subagent is already mapped to its visible
+    root by ``canonical_document_ids``.  Persisted ``activity_at`` remains a
+    real user/assistant message time only.  Legacy transcripts without such a
+    timestamp fall back here to source modification time and finally sync time
+    so presentation remains chronological without writing import time into the
+    activity column.
+    """
+    activity: dict[Hashable, datetime] = {}
+    for ref in conversations:
+        effective_activity = effective_conversation_timestamp(ref)
+        if effective_activity is None:
+            continue
+        canonical_id = hierarchy.canonical_document_ids.get(
+            ref.document_id,
+            ref.document_id,
+        )
+        if canonical_id not in hierarchy.visible_document_ids:
+            continue
+        previous = activity.get(canonical_id)
+        if previous is None or effective_activity > previous:
+            activity[canonical_id] = effective_activity
+    return activity
+
+
+def effective_conversation_timestamp(ref: ConversationRef) -> datetime | None:
+    """Prefer transcript activity while retaining legacy ordering fallback."""
+    if ref.activity_at is not None:
+        return ref.activity_at
+    if ref.source_modified_at is not None and ref.synced_at is not None:
+        # A source can carry a future/skewed mtime.  Never present activity as
+        # later than the moment this revision was actually observed.
+        return min(ref.source_modified_at, ref.synced_at)
+    return ref.source_modified_at or ref.synced_at
 
 
 def _orphan_sort_key(ref: ConversationRef) -> tuple[int, float, int, str]:
@@ -228,7 +274,7 @@ def _orphan_sort_key(ref: ConversationRef) -> tuple[int, float, int, str]:
         depth = int(metadata.get("agent_depth", 1))
     except (TypeError, ValueError):
         depth = 1
-    timestamp = ref.source_modified_at or ref.synced_at
+    timestamp = effective_conversation_timestamp(ref)
     epoch = timestamp.timestamp() if timestamp is not None else 0.0
     return depth, -epoch, -(ref.file_size_bytes or 0), str(ref.document_id)
 
@@ -236,6 +282,6 @@ def _orphan_sort_key(ref: ConversationRef) -> tuple[int, float, int, str]:
 def _canonical_root_sort_key(ref: ConversationRef) -> tuple[float, int, str]:
     """Choose the newest, largest root row with a stable document-id tie-breaker."""
 
-    timestamp = ref.source_modified_at or ref.synced_at
+    timestamp = effective_conversation_timestamp(ref)
     epoch = timestamp.timestamp() if timestamp is not None else 0.0
     return epoch, ref.file_size_bytes or 0, str(ref.document_id)

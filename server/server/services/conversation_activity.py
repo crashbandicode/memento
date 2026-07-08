@@ -3,9 +3,62 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from sqlalchemy import func, select
+
+from ..db.models import ConversationMessage
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from ..db.models import Document
 
 
 SHORT_EXCHANGE_CHARACTER_LIMIT = 120
+REAL_ACTIVITY_ROLES = ("user", "assistant")
+
+
+def conversation_activity_at_query(document_id: object):
+    """Select the latest timestamp belonging to a real conversation turn."""
+    return select(func.max(ConversationMessage.timestamp)).where(
+        ConversationMessage.document_id == document_id,
+        ConversationMessage.timestamp.is_not(None),
+        ConversationMessage.role.in_(REAL_ACTIVITY_ROLES),
+    )
+
+
+def historical_conversation_activity_query(
+    document_ids: Iterable[object],
+    as_of: datetime,
+):
+    """Select per-document real activity visible at a snapshot cutoff."""
+    return (
+        select(
+            ConversationMessage.document_id,
+            func.max(ConversationMessage.timestamp),
+        )
+        .where(
+            ConversationMessage.document_id.in_(list(document_ids)),
+            ConversationMessage.timestamp.is_not(None),
+            ConversationMessage.timestamp <= as_of,
+            ConversationMessage.role.in_(REAL_ACTIVITY_ROLES),
+        )
+        .group_by(ConversationMessage.document_id)
+    )
+
+
+async def refresh_document_activity_at(
+    db: "AsyncSession",
+    document: "Document",
+):
+    """Persist conversation time independently from collector sync time."""
+    activity_at = (
+        await db.execute(conversation_activity_at_query(document.id))
+    ).scalar_one_or_none()
+    document.activity_at = activity_at
+    return activity_at
 
 
 def is_low_activity_summary(

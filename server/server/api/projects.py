@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -18,13 +18,16 @@ from ..db.models import (
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
+    historical_conversation_activity_query,
     is_low_activity_messages,
     is_low_activity_summary,
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_logical_activity_map,
     build_subagent_summaries,
     current_thread_id,
+    effective_conversation_timestamp,
     fold_codex_subagents,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
@@ -109,6 +112,7 @@ async def get_project(
             Document.relative_path,
             Document.metadata_,
             Document.source_modified_at,
+            Document.activity_at,
             Document.synced_at,
             Document.file_size_bytes,
             Document.machine_id,
@@ -128,6 +132,7 @@ async def get_project(
             metadata=d.metadata_,
             title=d.title,
             source_modified_at=d.source_modified_at,
+            activity_at=d.activity_at,
             synced_at=d.synced_at,
             file_size_bytes=d.file_size_bytes,
         )
@@ -137,6 +142,23 @@ async def get_project(
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
         conversation_refs,
+    )
+    logical_activity_by_document = build_logical_activity_map(
+        conversation_hierarchy,
+        conversation_refs,
+    )
+
+    # A reply in a folded subagent belongs to the root card's logical thread.
+    # Feed that aggregate into SQL before LIMIT so a recently active root
+    # cannot be omitted merely because its own transcript is older.
+    logical_activity_order = (
+        case(
+            logical_activity_by_document,
+            value=Document.id,
+            else_=None,
+        )
+        if logical_activity_by_document
+        else Document.activity_at
     )
 
     docs_q = (
@@ -148,7 +170,21 @@ async def get_project(
                 Document.id.in_(list(conversation_hierarchy.visible_document_ids)),
             ),
         )
-        .order_by(Document.synced_at.desc(), Document.id.desc())
+        .order_by(
+            case(
+                (
+                    Document.category == "conversation",
+                    func.coalesce(
+                        logical_activity_order,
+                        Document.activity_at,
+                        Document.source_modified_at,
+                        Document.synced_at,
+                    ),
+                ),
+                else_=Document.synced_at,
+            ).desc(),
+            Document.id.desc(),
+        )
         .limit(50)
     )
     docs_q = apply_user_filter(docs_q, mids, Document.machine_id)
@@ -200,6 +236,10 @@ async def get_project(
             if d.ai_summary:
                 row["ai_summary"] = d.ai_summary
         if d.category == "conversation":
+            activity_at = logical_activity_by_document.get(d.id) or d.activity_at
+            row["activity_at"] = (
+                activity_at.isoformat() if activity_at else None
+            )
             message_count, is_low_activity = activity_by_document.get(
                 d.id,
                 (0, True),
@@ -263,12 +303,26 @@ async def get_project_timeline(
         Document.relative_path, Document.title, Document.file_size_bytes,
         Document.ai_summary, Document.metadata_,
         Document.source_modified_at, Document.synced_at, Document.machine_id,
+        Document.activity_at,
     )
     q = (
         select(*meta_cols)
         .where(Document.project_id == project_id)
         .order_by(
-            func.coalesce(Document.source_modified_at, Document.synced_at).desc(),
+            case(
+                (
+                    Document.category == "conversation",
+                    func.coalesce(
+                        Document.activity_at,
+                        Document.source_modified_at,
+                        Document.synced_at,
+                    ),
+                ),
+                else_=func.coalesce(
+                    Document.source_modified_at,
+                    Document.synced_at,
+                ),
+            ).desc(),
             Document.id.desc(),
         )
     )
@@ -285,6 +339,7 @@ async def get_project_timeline(
             metadata=row[8],
             title=row[5],
             source_modified_at=row[9],
+            activity_at=row[12],
             synced_at=row[10],
             file_size_bytes=row[6],
         )
@@ -296,6 +351,10 @@ async def get_project_timeline(
         conversation_hierarchy,
         conversation_refs,
     )
+    logical_activity_by_document = build_logical_activity_map(
+        conversation_hierarchy,
+        conversation_refs,
+    )
 
     # Group by session_id — build sessions (no content yet)
     sessions: dict[str, dict] = {}
@@ -303,7 +362,7 @@ async def get_project_timeline(
 
     for r in all_rows:
         d_id, d_tool_id, d_category, d_ctype, d_path, d_title, d_size, \
-            d_ai_summary, d_meta, d_src_mod, d_synced, _d_mid = r
+            d_ai_summary, d_meta, d_src_mod, d_synced, _d_mid, _d_activity = r
         # Skip noise files
         # `.meta.json` is the Claude Code subagent sidecar (just type +
         # description, no conversation content). `.metadata.json` and
@@ -320,7 +379,13 @@ async def get_project_timeline(
         logical_session_id = str(
             (d_meta or {}).get("root_session_id") or session_id or ""
         )
-        ts = (d_src_mod or d_synced).isoformat()
+        effective_activity = (
+            logical_activity_by_document.get(d_id)
+            if d_category == "conversation"
+            else None
+        )
+        timestamp = effective_activity or d_src_mod or d_synced
+        ts = timestamp.isoformat()
         tool_info = tool_map.get(d_tool_id, {})
 
         if not session_id:
@@ -338,6 +403,8 @@ async def get_project_timeline(
                 "ai_summary": d_ai_summary,
             }
             if d_category == "conversation":
+                event["activity_at"] = ts
+                event["synced_at"] = d_synced.isoformat()
                 event["preview_messages"] = []
                 event["message_count"] = 0
                 event["subagent_count"] = conversation_hierarchy.subagent_counts.get(
@@ -359,6 +426,8 @@ async def get_project_timeline(
                 "tool_id": d_tool_id,
                 "tool_name": tool_info.get("display_name", d_tool_id),
                 "timestamp": ts,
+                "activity_at": None,
+                "synced_at": None,
                 "conversation": None,
                 "artifacts": [],
                 "subagent_count": 0,
@@ -370,12 +439,17 @@ async def get_project_timeline(
 
         if d_category == "conversation":
             session["logical_session_id"] = logical_session_id
+            session["timestamp"] = ts
+            session["activity_at"] = ts
+            session["synced_at"] = d_synced.isoformat()
             session["conversation"] = {
                 "id": str(d_id),
                 "title": d_title or d_path.split("/")[-1],
                 "message_count": 0,
                 "preview_messages": [],
                 "file_size_bytes": d_size,
+                "activity_at": ts,
+                "synced_at": d_synced.isoformat(),
                 "subagent_count": conversation_hierarchy.subagent_counts.get(
                     d_id,
                     0,
@@ -410,6 +484,13 @@ async def get_project_timeline(
                 "content_preview": None,
                 "file_size_bytes": d_size,
             })
+
+    # Artifacts can be synced after their conversation.  A conversation card
+    # remains anchored to effective thread activity; artifact-only sessions
+    # keep their prior latest-document behavior.
+    for session in sessions.values():
+        if session.get("conversation") and session.get("activity_at"):
+            session["timestamp"] = session["activity_at"]
 
     # Merge + sort + paginate BEFORE touching content
     all_events = list(sessions.values()) + standalone
@@ -561,7 +642,7 @@ async def get_project_conversations(
     # traffic doesn't poison the owner-UI cache.
     as_of_key = as_of.isoformat() if as_of else "live"
     cache_key = (
-        f"project:conv:{_user.id}:{project_id}:v4:"
+        f"project:conv:{_user.id}:{project_id}:v5:"
         f"{session_offset}:{session_limit}:{max_messages_per_session}:{order}:{as_of_key}"
     )
     cached = await cache_get(cache_key)
@@ -586,7 +667,8 @@ async def get_project_conversations(
         .options(load_only(
             Document.id, Document.relative_path, Document.machine_id,
             Document.tool_id, Document.title, Document.metadata_,
-            Document.source_modified_at, Document.synced_at,
+            Document.source_modified_at, Document.activity_at,
+            Document.synced_at,
             Document.file_size_bytes,
         ))
         .where(
@@ -595,7 +677,11 @@ async def get_project_conversations(
             Document.content_type.in_(("jsonl", "json")),
         )
         .order_by(
-            func.coalesce(Document.source_modified_at, Document.synced_at).desc(),
+            func.coalesce(
+                Document.activity_at,
+                Document.source_modified_at,
+                Document.synced_at,
+            ).desc(),
             Document.id.desc(),
         )
     )
@@ -603,6 +689,23 @@ async def get_project_conversations(
     if as_of is not None:
         conv_q = conv_q.where(Document.synced_at <= as_of)
     all_convs = (await db.execute(conv_q)).scalars().all()
+
+    activity_at_by_document = {d.id: d.activity_at for d in all_convs}
+    if as_of is not None and all_convs:
+        # Shared snapshots must not inherit a message timestamp added after
+        # the link's cutoff.  Derive the persisted field's historical view in
+        # one bounded GROUP BY, then feed it through normal logical folding.
+        historical_activity_rows = await db.execute(
+            historical_conversation_activity_query(
+                (d.id for d in all_convs),
+                as_of,
+            )
+        )
+        historical_activity = dict(historical_activity_rows.all())
+        activity_at_by_document = {
+            d.id: historical_activity.get(d.id)
+            for d in all_convs
+        }
 
     # Group subagents under their parent conversation.
     # Subagent path: .../parent-id/subagents/agent-xxx.jsonl
@@ -632,6 +735,7 @@ async def get_project_conversations(
             metadata=d.metadata_,
             title=d.title,
             source_modified_at=d.source_modified_at,
+            activity_at=activity_at_by_document.get(d.id),
             synced_at=d.synced_at,
             file_size_bytes=d.file_size_bytes,
         )
@@ -642,28 +746,59 @@ async def get_project_conversations(
         conversation_hierarchy,
         conversation_refs,
     )
+    logical_activity_by_document = build_logical_activity_map(
+        conversation_hierarchy,
+        conversation_refs,
+    )
     main_convs = [
         d
         for d in main_convs
         if d.id in conversation_hierarchy.visible_document_ids
     ]
 
-    # Sort main sessions by first message timestamp — single GROUP BY query
-    conv_ts: dict[str, object] = {}
-    if main_convs:
-        ids = [d.id for d in main_convs]
-        ts_rows = await db.execute(
-            select(ConversationMessage.document_id, func.min(ConversationMessage.timestamp))
-            .where(ConversationMessage.document_id.in_(ids))
-            .group_by(ConversationMessage.document_id)
-        )
-        first_ts_map = {row[0]: row[1] for row in ts_rows.all()}
-        for d in main_convs:
-            conv_ts[str(d.id)] = first_ts_map.get(d.id) or d.source_modified_at or d.synced_at
+    # Legacy ``/subagents/`` children are presented inline rather than folded
+    # by metadata.  Their latest real turn still contributes to the parent
+    # card's logical activity.
+    group_activity_by_document = dict(logical_activity_by_document)
+    for d in main_convs:
+        candidates = [
+            value
+            for value in (
+                group_activity_by_document.get(d.id),
+                *(
+                    effective_conversation_timestamp(
+                        ConversationRef(
+                            document_id=child.id,
+                            tool_id=child.tool_id,
+                            relative_path=child.relative_path,
+                            metadata=child.metadata_,
+                            source_modified_at=child.source_modified_at,
+                            activity_at=activity_at_by_document.get(child.id),
+                            synced_at=child.synced_at,
+                        )
+                    )
+                    for child in subagent_map.get(d.relative_path or "", [])
+                ),
+            )
+            if value is not None
+        ]
+        if candidates:
+            group_activity_by_document[d.id] = max(candidates)
 
     main_convs.sort(
         key=lambda d: (
-            conv_ts.get(str(d.id)) or d.synced_at,
+            group_activity_by_document.get(d.id)
+            or effective_conversation_timestamp(
+                ConversationRef(
+                    document_id=d.id,
+                    tool_id=d.tool_id,
+                    relative_path=d.relative_path,
+                    metadata=d.metadata_,
+                    source_modified_at=d.source_modified_at,
+                    activity_at=activity_at_by_document.get(d.id),
+                    synced_at=d.synced_at,
+                )
+            ),
             str(d.id),
         ),
         reverse=(order != "asc"),
@@ -768,7 +903,22 @@ async def get_project_conversations(
         logical_session_id = str(
             (d.metadata_ or {}).get("root_session_id") or session_id
         )
-        ts = (d.source_modified_at or d.synced_at).isoformat()
+        group_activity_at = group_activity_by_document.get(d.id)
+        effective_timestamp = (
+            group_activity_at
+            or effective_conversation_timestamp(
+                ConversationRef(
+                    document_id=d.id,
+                    tool_id=d.tool_id,
+                    relative_path=d.relative_path,
+                    metadata=d.metadata_,
+                    source_modified_at=d.source_modified_at,
+                    activity_at=activity_at_by_document.get(d.id),
+                    synced_at=d.synced_at,
+                )
+            )
+        )
+        ts = effective_timestamp.isoformat()
 
         # Parse main conversation messages
         messages = list(_parse_doc_messages(d))
@@ -825,6 +975,10 @@ async def get_project_conversations(
             "title": d.title or session_id[:8],
             "conversation_id": str(d.id),
             "timestamp": ts,
+            "activity_at": (
+                group_activity_at.isoformat() if group_activity_at else None
+            ),
+            "synced_at": d.synced_at.isoformat(),
             "message_count": total_msgs,  # true total, not the clipped count
             "is_low_activity": is_low_activity,
             "subagent_count": (

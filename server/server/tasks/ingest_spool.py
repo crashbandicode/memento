@@ -196,11 +196,27 @@ async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
         # normal in-loop background task would be cancelled. Queue one exact
         # document after commit; periodic pending scanners remain a fallback.
         try:
-            from .post_ingest import process_document_post_ingest
+            from .post_ingest import (
+                initial_post_ingest_countdown,
+                process_document_post_ingest,
+            )
+
+            countdown = initial_post_ingest_countdown(
+                str(meta["category"]),
+                int(doc.file_size_bytes),
+            )
+            task_options = {"retry": False}
+            if countdown is not None:
+                task_options["countdown"] = countdown
 
             process_document_post_ingest.apply_async(
-                args=[document_id, str(doc.tool_id), str(meta["category"])],
-                retry=False,
+                args=[
+                    document_id,
+                    str(doc.tool_id),
+                    str(meta["category"]),
+                    str(doc.content_hash),
+                ],
+                **task_options,
             )
         except Exception:
             logger.exception(

@@ -12,9 +12,15 @@ from server.services import embedding_service, graph_service, ingest_service
 
 
 class _DocumentStub:
-    def __init__(self, document_id, relative_path: str) -> None:
+    def __init__(
+        self,
+        document_id,
+        relative_path: str,
+        content_hash: str = "current-revision",
+    ) -> None:
         self.id = document_id
         self._relative_path = relative_path
+        self.content_hash = content_hash
         self.expired = False
 
     @property
@@ -71,6 +77,87 @@ def _install_session(monkeypatch, session) -> None:
         "post_ingest_session_factory",
         lambda: _SessionContext(session),
     )
+
+
+@pytest.mark.asyncio
+async def test_post_ingest_rechecks_expected_revision_in_processing_session(
+    monkeypatch,
+) -> None:
+    document_id = uuid4()
+    current = _DocumentStub(
+        document_id,
+        "sessions/thread.jsonl",
+        content_hash="new-revision",
+    )
+    session = _SessionStub(current, current)
+    _install_session(monkeypatch, session)
+
+    async def _unexpected(*_args) -> int:
+        pytest.fail("superseded task reached an expensive post-ingest helper")
+
+    monkeypatch.setattr(
+        embedding_service,
+        "generate_document_embeddings",
+        _unexpected,
+    )
+    monkeypatch.setattr(
+        graph_service,
+        "extract_knowledge_from_document",
+        _unexpected,
+    )
+
+    await ingest_service._run_post_ingest_inner(
+        document_id,
+        "codex",
+        "conversation",
+        expected_revision="old-revision",
+    )
+
+    assert session.commit_count == 0
+    assert session.rollback_count == 0
+    assert session.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_ingest_does_not_extract_newer_revision_after_embedding(
+    monkeypatch,
+) -> None:
+    document_id = uuid4()
+    initial = _DocumentStub(
+        document_id,
+        "sessions/thread.jsonl",
+        content_hash="old-revision",
+    )
+    refreshed = _DocumentStub(
+        document_id,
+        "sessions/thread.jsonl",
+        content_hash="new-revision",
+    )
+    session = _SessionStub(initial, refreshed)
+    _install_session(monkeypatch, session)
+
+    async def _embed(_db, _doc) -> int:
+        return 0
+
+    async def _unexpected(*_args) -> int:
+        pytest.fail("old task extracted graph data from the newer revision")
+
+    monkeypatch.setattr(embedding_service, "generate_document_embeddings", _embed)
+    monkeypatch.setattr(
+        graph_service,
+        "extract_knowledge_from_document",
+        _unexpected,
+    )
+
+    await ingest_service._run_post_ingest_inner(
+        document_id,
+        "codex",
+        "conversation",
+        expected_revision="old-revision",
+    )
+
+    assert session.get_calls == [(Document, document_id, True)]
+    assert session.commit_count == 0
 
 
 @pytest.mark.asyncio
@@ -140,4 +227,3 @@ async def test_post_ingest_uses_scalar_label_when_embedding_raises_expired(
     assert session.rollback_count == 1
     assert "Embedding skipped for sessions/thread.jsonl" in caplog.text
     assert "greenlet_spawn has not been called" not in caplog.text
-

@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import User
@@ -21,6 +23,7 @@ from ..services.ingest_spool import (
     ChunkValidationError,
     stage_chunk,
 )
+from ..services.thread_metadata_service import apply_codex_thread_title_update
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 logger = logging.getLogger("ingest")
@@ -59,6 +62,87 @@ class IngestResponse(BaseModel):
     message: str = ""
 
 
+class IngestMetadataRequest(BaseModel):
+    metadata_type: Literal["codex_thread_title"]
+    tool: Literal["codex"]
+    thread_id: UUID
+    title: str = Field(min_length=1, max_length=500)
+    revision: int = Field(gt=0, le=2**63 - 1)
+    relative_path: str | None = Field(default=None, max_length=2000)
+
+
+class IngestMetadataResponse(BaseModel):
+    status: Literal["ok", "ignored"]
+    matched: int
+    updated: int
+    ignored: int
+
+
+def _reject_synthetic_metadata_file_upload(
+    *,
+    category: object,
+    mode: object,
+    sync_strategy: object,
+    relative_path: object,
+) -> None:
+    """Keep metadata queue records out of legacy content-ingest endpoints."""
+    category_value = str(category or "").strip().lower()
+    mode_value = str(mode or "").strip().lower()
+    strategy_value = str(sync_strategy or "").strip().lower()
+    path_value = (
+        str(relative_path or "").replace("\\", "/").lstrip("/").casefold()
+    )
+    if (
+        category_value == "metadata"
+        or mode_value == "metadata"
+        or strategy_value == "metadata"
+        or path_value.startswith("__metadata__/")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="metadata updates must use /api/ingest/metadata",
+        )
+
+
+@router.post("/metadata", response_model=IngestMetadataResponse)
+async def ingest_metadata_endpoint(
+    req: IngestMetadataRequest,
+    _collector_user: User = Depends(verify_collector_token),
+    _throttle: None = Depends(throttle_ingest),
+    db: AsyncSession = Depends(get_db),
+    x_device_id: str = Header("unknown"),
+    x_device_name: str = Header("unknown"),
+    x_device_platform: str = Header("unknown"),
+) -> IngestMetadataResponse:
+    """Apply a revisioned source-title change without ingesting file content."""
+    machine = await ensure_device(
+        db,
+        x_device_id,
+        x_device_name,
+        x_device_platform,
+        user_id=_collector_user.id,
+    )
+    result = await apply_codex_thread_title_update(
+        db,
+        machine_id=machine.id,
+        thread_id=req.thread_id,
+        title=req.title,
+        revision=req.revision,
+        relative_path=req.relative_path,
+        user_id=_collector_user.id,
+    )
+    if result.valid and result.matched == 0:
+        # Keep the collector's durable item pending when its transcript upload
+        # is still in flight. The same idempotent update will succeed later.
+        raise HTTPException(status_code=404, detail="Codex thread not ingested yet")
+    return IngestMetadataResponse(
+        status="ok" if result.valid else "ignored",
+        matched=result.matched,
+        updated=result.updated,
+        ignored=result.ignored,
+    )
+
+
 @router.post("/file", response_model=IngestResponse)
 async def ingest_file_endpoint(
     req: IngestFileRequest,
@@ -70,7 +154,14 @@ async def ingest_file_endpoint(
     x_device_platform: str = Header("unknown"),
 ) -> IngestResponse:
     """Ingest a file from the collector (JSON payload, for files < 1MB)."""
+    _reject_synthetic_metadata_file_upload(
+        category=req.category,
+        mode=req.mode,
+        sync_strategy=req.sync_strategy,
+        relative_path=req.relative_path,
+    )
     machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
+    measured_size = len(req.content.encode("utf-8"))
 
     doc = await ingest_file(
         db=db,
@@ -80,7 +171,7 @@ async def ingest_file_endpoint(
         relative_path=req.relative_path,
         content=req.content,
         content_hash=req.hash,
-        file_size=req.file_size or len(req.content.encode("utf-8")),
+        file_size=max(max(0, int(req.file_size or 0)), measured_size),
         mode=req.mode,
         offset=req.offset,
         metadata=req.metadata,
@@ -104,7 +195,15 @@ async def ingest_file_upload(
 ) -> IngestResponse:
     """Ingest a large file via multipart upload."""
     meta = json.loads(metadata)
+    _reject_synthetic_metadata_file_upload(
+        category=meta.get("category"),
+        mode=meta.get("mode"),
+        sync_strategy=meta.get("sync_strategy"),
+        relative_path=meta.get("relative_path"),
+    )
     file_content = (await content.read()).decode("utf-8", errors="replace")
+    measured_size = len(file_content.encode("utf-8"))
+    reported_size = max(0, int(meta.get("file_size") or 0))
     machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
 
     doc = await ingest_file(
@@ -115,7 +214,7 @@ async def ingest_file_upload(
         relative_path=meta["relative_path"],
         content=file_content,
         content_hash=meta["hash"],
-        file_size=meta.get("file_size", len(file_content.encode("utf-8"))),
+        file_size=max(reported_size, measured_size),
         mode=meta.get("mode", "full"),
         offset=meta.get("offset", 0),
         metadata=meta.get("metadata", {}),
@@ -175,6 +274,12 @@ async def ingest_file_chunk(
         raise HTTPException(status_code=400, detail="metadata must be valid JSON") from exc
     if not isinstance(meta, dict):
         raise HTTPException(status_code=400, detail="metadata must be a JSON object")
+    _reject_synthetic_metadata_file_upload(
+        category=meta.get("category"),
+        mode=meta.get("mode"),
+        sync_strategy=meta.get("sync_strategy"),
+        relative_path=meta.get("relative_path"),
+    )
     chunk_data = await content.read(MAX_CHUNK_BYTES + 1)
 
     # Validate device ownership in a short, committed transaction before any
