@@ -31,9 +31,14 @@ class DeviceScopedSelectTests(unittest.TestCase):
         machine_id = str(uuid.uuid4())
         user_id = str(uuid.uuid4())
 
-        compiled = _compile(_scoped_document_select(
-            "codex", "sessions/shared.jsonl", machine_id, user_id,
-        ))
+        compiled = _compile(
+            _scoped_document_select(
+                "codex",
+                "sessions/shared.jsonl",
+                machine_id,
+                user_id,
+            )
+        )
         sql = str(compiled)
 
         self.assertIn("documents.machine_id =", sql)
@@ -45,12 +50,22 @@ class DeviceScopedSelectTests(unittest.TestCase):
         machine_a = str(uuid.uuid4())
         machine_b = str(uuid.uuid4())
 
-        compiled_a = _compile(_scoped_document_select(
-            "codex", "sessions/shared.jsonl", machine_a, None,
-        ))
-        compiled_b = _compile(_scoped_document_select(
-            "codex", "sessions/shared.jsonl", machine_b, None,
-        ))
+        compiled_a = _compile(
+            _scoped_document_select(
+                "codex",
+                "sessions/shared.jsonl",
+                machine_a,
+                None,
+            )
+        )
+        compiled_b = _compile(
+            _scoped_document_select(
+                "codex",
+                "sessions/shared.jsonl",
+                machine_b,
+                None,
+            )
+        )
 
         self.assertIn(machine_a, compiled_a.params.values())
         self.assertNotIn(machine_b, compiled_a.params.values())
@@ -61,9 +76,14 @@ class DeviceScopedSelectTests(unittest.TestCase):
         machine_id = str(uuid.uuid4())
         user_id = str(uuid.uuid4())
 
-        compiled = _compile(_scoped_sync_state_select(
-            "codex", "sessions/shared.jsonl", machine_id, user_id,
-        ))
+        compiled = _compile(
+            _scoped_sync_state_select(
+                "codex",
+                "sessions/shared.jsonl",
+                machine_id,
+                user_id,
+            )
+        )
         sql = str(compiled)
 
         self.assertIn("sync_state.machine_id =", sql)
@@ -97,8 +117,13 @@ class SyncStateUpsertTests(unittest.IsolatedAsyncioTestCase):
         db = _CaptureSession()
 
         await _update_sync_state(
-            db, "codex", "sessions/shared.jsonl", "hash-a", 123,
-            machine_id, user_id,
+            db,
+            "codex",
+            "sessions/shared.jsonl",
+            "hash-a",
+            123,
+            machine_id,
+            user_id,
         )
 
         self.assertEqual(len(db.added), 1)

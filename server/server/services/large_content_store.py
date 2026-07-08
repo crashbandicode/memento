@@ -23,6 +23,12 @@ def _client():
     )
 
 
+def large_content_key(*, user_id: str, device_id: str, job_id: str) -> str:
+    """Return the immutable private object key for one durable upload."""
+    device_key = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
+    return f"raw/{user_id}/{device_key}/{job_id}.txt"
+
+
 def store_large_content(
     payload_path: Path,
     *,
@@ -34,8 +40,7 @@ def store_large_content(
     """Stream one immutable raw payload to MinIO and verify its byte length."""
     client = s3_client or _client()
     bucket = settings.s3_bucket
-    device_key = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
-    key = f"raw/{user_id}/{device_key}/{job_id}.txt"
+    key = large_content_key(user_id=user_id, device_id=device_id, job_id=job_id)
     try:
         client.head_bucket(Bucket=bucket)
     except ClientError as exc:

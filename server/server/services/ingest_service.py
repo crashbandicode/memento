@@ -8,7 +8,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -20,6 +20,7 @@ from ..db.models import (
     SyncState,
     Tool,
 )
+from .ingest_revision import committed_full_supersedes, normalized_source_timestamp
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
@@ -461,6 +462,49 @@ def _scoped_sync_state_select(
     return statement
 
 
+def _source_lock_id(
+    machine_id: str | None,
+    user_id: str | None,
+    tool_id: str,
+    relative_path: str,
+) -> int:
+    """Return a stable signed 64-bit advisory-lock key for one source."""
+    owner = (
+        f"machine:{machine_id}"
+        if machine_id is not None
+        else f"user:{user_id or 'legacy'}"
+    )
+    identity = json.dumps(
+        [owner, tool_id, relative_path],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(b"memento:ingest-source:v1\0" + identity).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+async def _lock_ingest_source(
+    db: AsyncSession,
+    *,
+    machine_id: str | None,
+    user_id: str | None,
+    tool_id: str,
+    relative_path: str,
+) -> None:
+    """Serialize all direct and spooled writers until their transaction ends."""
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:lock_id AS bigint))"),
+        {
+            "lock_id": _source_lock_id(
+                machine_id,
+                user_id,
+                tool_id,
+                relative_path,
+            )
+        },
+    )
+
+
 async def ingest_file(
     db: AsyncSession,
     tool_id: str,
@@ -484,6 +528,15 @@ async def ingest_file(
 ) -> Document:
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
+    received_at = datetime.now(timezone.utc)
+    source_modified_at = normalized_source_timestamp(timestamp) or received_at
+    await _lock_ingest_source(
+        db,
+        machine_id=machine_id,
+        user_id=user_id,
+        tool_id=tool_id,
+        relative_path=relative_path,
+    )
     # Fast-path dedup: if this exact (tool_id, relative_path, content_hash,
     # offset) was already ingested, skip everything. Common in multi-collector
     # setups where pip + Tauri sidecar both watch the same .jsonl and resend
@@ -502,34 +555,92 @@ async def ingest_file(
             )
         )
     ).scalar_one_or_none()
+    doc = (
+        await db.execute(
+            _scoped_document_select(
+                tool_id,
+                relative_path,
+                machine_id,
+                user_id,
+            ).with_for_update()
+        )
+    ).scalar_one_or_none()
+    same_hash_before_write = doc is not None and doc.content_hash == content_hash
     if (
         sync_row is not None
+        and doc is not None
+        and doc.content_hash == content_hash
         and sync_row.last_hash == content_hash
-        and (mode != "delta" or sync_row.last_offset == offset)
+        and sync_row.last_offset == offset
     ):
         # Touch last_synced_at so dashboards know we still see this file,
         # but skip all the actual ingestion work + the post-ingest task.
-        sync_row.last_synced_at = datetime.now(timezone.utc)
-        existing_doc = (
-            await db.execute(
-                _scoped_document_select(
-                    tool_id,
-                    relative_path,
-                    machine_id,
-                    user_id,
-                )
-            )
-        ).scalar_one_or_none()
+        sync_row.last_synced_at = received_at
         pointer_is_current = (
             persist_content
             or not content_s3_key
-            or (
-                existing_doc is not None
-                and existing_doc.content_s3_key == content_s3_key
-            )
+            or (doc is not None and doc.content_s3_key == content_s3_key)
         )
-        if existing_doc is not None and pointer_is_current:
-            return existing_doc
+        if pointer_is_current:
+            doc.source_modified_at = max(
+                filter(None, (doc.source_modified_at, source_modified_at))
+            )
+            setattr(doc, "_memento_ingest_disposition", "idempotent")
+            return doc
+
+    if mode == "full" and doc is not None and doc.content_hash == content_hash:
+        pointer_is_current = (
+            persist_content
+            or not content_s3_key
+            or doc.content_s3_key == content_s3_key
+        )
+        if pointer_is_current:
+            if (
+                doc.source_modified_at is None
+                or source_modified_at > doc.source_modified_at
+            ):
+                doc.source_modified_at = source_modified_at
+            await _update_sync_state(
+                db,
+                tool_id,
+                relative_path,
+                content_hash,
+                offset,
+                machine_id,
+                user_id,
+                mode=mode,
+                monotonic_offset=True,
+            )
+            setattr(doc, "_memento_ingest_disposition", "idempotent")
+            return doc
+
+    if mode == "full" and doc is not None and doc.content_hash != content_hash:
+        existing_offset = 0
+        if sync_row is not None and sync_row.last_hash == doc.content_hash:
+            existing_offset = int(sync_row.last_offset or 0)
+        if committed_full_supersedes(
+            existing_hash=doc.content_hash,
+            existing_timestamp=doc.source_modified_at,
+            existing_offset=existing_offset,
+            existing_size=doc.file_size_bytes,
+            incoming_hash=content_hash,
+            incoming_timestamp=source_modified_at,
+            incoming_offset=offset,
+            incoming_size=file_size,
+        ):
+            setattr(doc, "_memento_ingest_disposition", "superseded")
+            return doc
+
+    if (
+        mode == "delta"
+        and doc is not None
+        and sync_row is not None
+        and sync_row.last_hash == doc.content_hash
+        and int(sync_row.last_offset or 0) >= offset
+    ):
+        sync_row.last_synced_at = received_at
+        setattr(doc, "_memento_ingest_disposition", "stale_delta")
+        return doc
 
     # Re-sanitize
     content = content.replace("\x00", "")  # PostgreSQL TEXT rejects null bytes
@@ -618,21 +729,10 @@ async def ingest_file(
             if row:
                 project_id = row
 
-    # Find existing document
-    result = await db.execute(
-        _scoped_document_select(
-            tool_id,
-            relative_path,
-            machine_id,
-            user_id,
-        )
-    )
-    doc = result.scalar_one_or_none()
-
     stored_metadata, user_history, first_user_message = _prepare_document_metadata(
         metadata
     )
-    now = datetime.now(timezone.utc)
+    now = received_at
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
 
     if doc is None:
@@ -653,9 +753,7 @@ async def ingest_file(
             metadata_=stored_metadata,
             needs_review=had_sensitive,
             synced_at=now,
-            source_modified_at=datetime.fromtimestamp(timestamp, tz=timezone.utc)
-            if timestamp
-            else now,
+            source_modified_at=source_modified_at,
         )
         db.add(doc)
     else:
@@ -695,6 +793,11 @@ async def ingest_file(
         doc.metadata_ = merged_metadata
         doc.needs_review = doc.needs_review or had_sensitive
         doc.synced_at = now
+        if (
+            doc.source_modified_at is None
+            or source_modified_at > doc.source_modified_at
+        ):
+            doc.source_modified_at = source_modified_at
         if machine_id and not doc.machine_id:
             doc.machine_id = machine_id
         doc.title = title
@@ -812,6 +915,8 @@ async def ingest_file(
         offset,
         machine_id,
         user_id,
+        mode=mode,
+        monotonic_offset=same_hash_before_write,
     )
 
     # Trigger AI summary generation (async via Celery)
@@ -1209,6 +1314,9 @@ async def _update_sync_state(
     offset: int,
     machine_id: str | None,
     user_id: str | None = None,
+    *,
+    mode: str = "full",
+    monotonic_offset: bool = False,
 ) -> None:
     """Update server-side sync state."""
     result = await db.execute(
@@ -1234,5 +1342,9 @@ async def _update_sync_state(
         db.add(state)
     else:
         state.last_hash = content_hash
-        state.last_offset = offset
+        state.last_offset = (
+            max(int(state.last_offset or 0), offset)
+            if mode == "delta" or monotonic_offset
+            else offset
+        )
         state.last_synced_at = now

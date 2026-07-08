@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,17 +18,31 @@ from server.services.ingest_spool import (  # noqa: E402
     MAX_UPLOAD_BYTES,
     ChunkValidationError,
     assemble_job,
+    blocked_job_ids,
     cleanup_completion_receipts,
     cleanup_stale_incomplete_jobs,
+    complete_and_remove_job,
     failed_job_ids,
     mark_job_complete,
+    mark_job_blocked,
     mark_job_failed,
+    ready_job_ids_in_recovery_order,
+    ready_manifest,
+    ready_manifest_metadata,
     ready_job_ids,
     record_job_attempt,
     remove_job,
+    select_ready_source_head,
+    source_identity,
+    spool_source_lock,
     stage_chunk,
+    superseding_ready_full_job_id,
 )
 import server.services.ingest_spool as ingest_spool  # noqa: E402
+from server.tasks.ingest_spool import (  # noqa: E402
+    _existing_full_supersedes,
+    _preflight_full_supersedes,
+)
 
 
 class IngestSpoolTests(unittest.TestCase):
@@ -56,12 +71,19 @@ class IngestSpoolTests(unittest.TestCase):
         meta.update(overrides)
         return meta
 
-    def _stage(self, meta: dict, data: bytes) -> tuple[str, bool]:
+    def _stage(
+        self,
+        meta: dict,
+        data: bytes,
+        *,
+        user_id: str = "11111111-1111-1111-1111-111111111111",
+        device_id: str = "device-1",
+    ) -> tuple[str, bool]:
         return stage_chunk(
             meta=meta,
             chunk_data=data,
-            user_id="11111111-1111-1111-1111-111111111111",
-            device_id="device-1",
+            user_id=user_id,
+            device_id=device_id,
             device_name="Yoga",
             device_platform="Windows",
             root=self.root,
@@ -73,14 +95,16 @@ class IngestSpoolTests(unittest.TestCase):
         self.assertEqual(ready_job_ids(self.root), [])
 
         second_job_id, complete = self._stage(
-            self._meta(0, 3, file_size=16), b"first",
+            self._meta(0, 3, file_size=16),
+            b"first",
         )
         self.assertEqual(second_job_id, job_id)
         self.assertFalse(complete)
         self.assertEqual(ready_job_ids(self.root), [])
 
         third_job_id, complete = self._stage(
-            self._meta(1, 3, file_size=16), b"second",
+            self._meta(1, 3, file_size=16),
+            b"second",
         )
         self.assertEqual(third_job_id, job_id)
         self.assertTrue(complete)
@@ -94,7 +118,8 @@ class IngestSpoolTests(unittest.TestCase):
         self.assertFalse(complete)
 
         duplicate_job_id, duplicate_complete = self._stage(
-            self._meta(0, 2, file_size=11), b"first",
+            self._meta(0, 2, file_size=11),
+            b"first",
         )
         self.assertEqual(duplicate_job_id, job_id)
         self.assertFalse(duplicate_complete)
@@ -110,7 +135,8 @@ class IngestSpoolTests(unittest.TestCase):
         )
 
         _job_id, complete = self._stage(
-            self._meta(1, 2, file_size=11), b"second",
+            self._meta(1, 2, file_size=11),
+            b"second",
         )
         self.assertTrue(complete)
         self.assertEqual(
@@ -120,14 +146,16 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_conflicting_metadata_is_rejected_without_mutating_job(self) -> None:
         job_id, _complete = self._stage(
-            self._meta(0, 2, file_size=11), b"first",
+            self._meta(0, 2, file_size=11),
+            b"first",
         )
         manifest_path = self.root / job_id / "manifest.json"
         original_manifest = manifest_path.read_bytes()
 
         with self.assertRaisesRegex(ChunkValidationError, "conflicts"):
             self._stage(
-                self._meta(1, 2, tool="claude_code", file_size=11), b"second",
+                self._meta(1, 2, tool="claude_code", file_size=11),
+                b"second",
             )
         with self.assertRaisesRegex(ChunkValidationError, "conflicts"):
             self._stage(self._meta(1, 3, file_size=11), b"second")
@@ -164,10 +192,12 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_assembly_preserves_manifest_and_is_repeatable(self) -> None:
         job_id, _complete = self._stage(
-            self._meta(0, 2, file_size=11), b"alpha\n",
+            self._meta(0, 2, file_size=11),
+            b"alpha\n",
         )
         _job_id, complete = self._stage(
-            self._meta(1, 2, file_size=11), b"beta\n",
+            self._meta(1, 2, file_size=11),
+            b"beta\n",
         )
         self.assertTrue(complete)
 
@@ -186,11 +216,13 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_ready_discovery_and_safe_removal(self) -> None:
         first_job, complete = self._stage(
-            self._meta(0, 1, upload_id="upload-a"), b"a",
+            self._meta(0, 1, upload_id="upload-a"),
+            b"a",
         )
         self.assertTrue(complete)
         second_job, complete = self._stage(
-            self._meta(0, 1, upload_id="upload-b"), b"b",
+            self._meta(0, 1, upload_id="upload-b"),
+            b"b",
         )
         self.assertTrue(complete)
         incomplete_job, complete = self._stage(
@@ -203,7 +235,8 @@ class IngestSpoolTests(unittest.TestCase):
         invalid_dir.mkdir()
         (invalid_dir / "ready").write_text("ready\n", encoding="utf-8")
         (invalid_dir / "manifest.json").write_text(
-            json.dumps({"total_chunks": 1}), encoding="utf-8",
+            json.dumps({"total_chunks": 1}),
+            encoding="utf-8",
         )
         no_manifest = self.root / ("f" * 64)
         no_manifest.mkdir()
@@ -225,17 +258,587 @@ class IngestSpoolTests(unittest.TestCase):
             remove_job("../outside-sentinel", self.root)
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
+    def test_only_newer_full_snapshot_supersedes_same_owned_path(self) -> None:
+        older, complete = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="older",
+                hash="older-hash",
+                timestamp=100.0,
+            ),
+            b"a",
+        )
+        self.assertTrue(complete)
+        newer, complete = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="newer",
+                hash="newer-hash",
+                timestamp=200.0,
+            ),
+            b"b",
+        )
+        self.assertTrue(complete)
+
+        head, cohort = select_ready_source_head(older, self.root)
+        self.assertEqual(head, newer)
+        self.assertEqual(cohort, (older,))
+        self.assertEqual(
+            superseding_ready_full_job_id(older, self.root),
+            newer,
+        )
+
+        delta, complete = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta",
+                hash="delta-hash",
+                mode="delta",
+                timestamp=300.0,
+            ),
+            b"c",
+        )
+        self.assertTrue(complete)
+
+        head, cohort = select_ready_source_head(older, self.root)
+        self.assertEqual(head, older)
+        self.assertEqual(cohort, ())
+        self.assertIsNone(superseding_ready_full_job_id(older, self.root))
+        self.assertIsNone(superseding_ready_full_job_id(newer, self.root))
+        self.assertIsNone(superseding_ready_full_job_id(delta, self.root))
+
+        mark_job_failed(delta, error_type="test", attempts=1, root=self.root)
+        mark_job_failed(newer, error_type="test", attempts=1, root=self.root)
+        self.assertIsNone(superseding_ready_full_job_id(older, self.root))
+
+    def test_committed_full_supersedes_only_same_or_strictly_older_source(self) -> None:
+        now = datetime.now(timezone.utc)
+        common = {
+            "existing_hash": "existing",
+            "existing_timestamp": now,
+            "existing_offset": 100,
+            "existing_size": 200,
+            "incoming_hash": "incoming",
+            "incoming_timestamp": now,
+            "incoming_offset": 100,
+            "incoming_size": 200,
+        }
+
+        self.assertFalse(_existing_full_supersedes(**common))
+        self.assertTrue(
+            _existing_full_supersedes(**{**common, "incoming_hash": "existing"})
+        )
+        self.assertTrue(
+            _existing_full_supersedes(
+                **{**common, "incoming_timestamp": now - timedelta(seconds=1)}
+            )
+        )
+        self.assertTrue(_existing_full_supersedes(**{**common, "incoming_size": 199}))
+        self.assertTrue(_existing_full_supersedes(**{**common, "incoming_offset": 99}))
+        self.assertFalse(
+            _existing_full_supersedes(
+                **{**common, "incoming_timestamp": now + timedelta(seconds=1)}
+            )
+        )
+
+    def test_equal_full_revisions_use_hash_as_persisted_tie_breaker(self) -> None:
+        older, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="hash-a",
+                hash="aaa",
+                timestamp=100.0,
+                offset=10,
+            ),
+            b"a",
+        )
+        newer, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="hash-z",
+                hash="zzz",
+                timestamp=100.0,
+                offset=10,
+            ),
+            b"z",
+        )
+
+        head, cohort = select_ready_source_head(older, self.root)
+        self.assertEqual(head, newer)
+        self.assertEqual(cohort, (older,))
+
+        now = datetime.fromtimestamp(100.0, tz=timezone.utc)
+        self.assertTrue(
+            _existing_full_supersedes(
+                existing_hash="zzz",
+                existing_timestamp=now,
+                existing_offset=10,
+                existing_size=1,
+                incoming_hash="aaa",
+                incoming_timestamp=now,
+                incoming_offset=10,
+                incoming_size=1,
+            )
+        )
+
+    def test_same_hash_full_always_reaches_locked_pointer_and_timestamp_path(
+        self,
+    ) -> None:
+        self.assertFalse(
+            _preflight_full_supersedes(
+                existing_hash="same",
+                existing_timestamp=datetime.fromtimestamp(100, tz=timezone.utc),
+                existing_offset=100,
+                existing_size=100,
+                incoming_hash="same",
+                incoming_timestamp=300.0,
+                incoming_offset=300,
+                incoming_size=300,
+            )
+        )
+        self.assertTrue(
+            _preflight_full_supersedes(
+                existing_hash="newer",
+                existing_timestamp=datetime.fromtimestamp(300, tz=timezone.utc),
+                existing_offset=300,
+                existing_size=300,
+                incoming_hash="older",
+                incoming_timestamp=100.0,
+                incoming_offset=100,
+                incoming_size=100,
+            )
+        )
+
+    def test_source_grouping_never_crosses_user_device_tool_or_path(self) -> None:
+        target, _ = self._stage(
+            self._meta(0, 1, upload_id="target", hash="target", timestamp=1.0),
+            b"a",
+        )
+        variants = (
+            (
+                self._meta(
+                    0,
+                    1,
+                    upload_id="other-device",
+                    hash="other-device",
+                    timestamp=9.0,
+                ),
+                {"device_id": "device-2"},
+            ),
+            (
+                self._meta(
+                    0,
+                    1,
+                    upload_id="other-user",
+                    hash="other-user",
+                    timestamp=9.0,
+                ),
+                {"user_id": "22222222-2222-2222-2222-222222222222"},
+            ),
+            (
+                self._meta(
+                    0,
+                    1,
+                    upload_id="other-tool",
+                    hash="other-tool",
+                    tool="claude_code",
+                    timestamp=9.0,
+                ),
+                {},
+            ),
+            (
+                self._meta(
+                    0,
+                    1,
+                    upload_id="other-path",
+                    hash="other-path",
+                    relative_path="sessions/other.jsonl",
+                    timestamp=9.0,
+                ),
+                {},
+            ),
+        )
+        for meta, stage_kwargs in variants:
+            self._stage(meta, b"b", **stage_kwargs)
+
+        head, cohort = select_ready_source_head(target, self.root)
+        self.assertEqual(head, target)
+        self.assertEqual(cohort, ())
+
+    def test_reverse_queued_full_and_deltas_keep_every_step_in_order(self) -> None:
+        delta_two, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-two",
+                hash="delta-two",
+                mode="delta",
+                timestamp=3.0,
+                offset=300,
+            ),
+            b"c",
+        )
+        delta_one, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-one",
+                hash="delta-one",
+                mode="delta",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"b",
+        )
+        full, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="full",
+                hash="full",
+                timestamp=1.0,
+                offset=100,
+            ),
+            b"a",
+        )
+
+        head, cohort = select_ready_source_head(delta_two, self.root)
+        self.assertEqual(head, full)
+        self.assertEqual(cohort, ())
+        complete_and_remove_job(full, document_id="document-id", root=self.root)
+        self.assertEqual(select_ready_source_head(delta_two, self.root)[0], delta_one)
+        complete_and_remove_job(
+            delta_one,
+            document_id="document-id",
+            root=self.root,
+        )
+        self.assertEqual(select_ready_source_head(delta_two, self.root)[0], delta_two)
+
+    def test_failed_newest_full_leaves_older_snapshot_as_fallback(self) -> None:
+        older, _ = self._stage(
+            self._meta(0, 1, upload_id="older", hash="older", timestamp=1.0),
+            b"a",
+        )
+        newer, _ = self._stage(
+            self._meta(0, 1, upload_id="newer", hash="newer", timestamp=2.0),
+            b"b",
+        )
+        mark_job_failed(newer, error_type="test", attempts=1, root=self.root)
+
+        self.assertEqual(select_ready_source_head(older, self.root), (older, ()))
+
+    def test_failed_delta_blocks_later_delta_until_full_rebase(self) -> None:
+        full, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="base",
+                hash="base",
+                timestamp=1.0,
+                offset=100,
+            ),
+            b"a",
+        )
+        delta_one, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-one",
+                hash="delta-one",
+                mode="delta",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"b",
+        )
+        delta_two, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-two",
+                hash="delta-two",
+                mode="delta",
+                timestamp=3.0,
+                offset=300,
+            ),
+            b"c",
+        )
+        mark_job_failed(delta_one, error_type="test", attempts=1, root=self.root)
+
+        self.assertEqual(select_ready_source_head(delta_two, self.root), (full, ()))
+        complete_and_remove_job(full, document_id="document-id", root=self.root)
+        self.assertEqual(select_ready_source_head(delta_two, self.root), (None, ()))
+        self.assertNotIn(delta_two, ready_job_ids_in_recovery_order(self.root))
+
+        rebase, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="rebase",
+                hash="rebase",
+                timestamp=4.0,
+                offset=400,
+            ),
+            b"d",
+        )
+        head, superseded = select_ready_source_head(delta_two, self.root)
+        self.assertEqual(head, rebase)
+        self.assertEqual(set(superseded), {delta_one, delta_two})
+        for job_id in superseded:
+            mark_job_blocked(
+                job_id,
+                superseding_job_id=rebase,
+                document_id="document-id",
+                root=self.root,
+            )
+        self.assertEqual(set(blocked_job_ids(self.root)), {delta_one, delta_two})
+        self.assertTrue((self.root / delta_one / "failed.json").is_file())
+        self.assertTrue((self.root / delta_one).is_dir())
+        self.assertTrue((self.root / delta_two).is_dir())
+        self.assertEqual(select_ready_source_head(rebase, self.root), (rebase, ()))
+
+    def test_failed_base_full_blocks_delta_without_a_later_full(self) -> None:
+        base, _ = self._stage(
+            self._meta(0, 1, upload_id="base", hash="base", timestamp=1.0),
+            b"a",
+        )
+        delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta",
+                hash="delta",
+                mode="delta",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"b",
+        )
+        mark_job_failed(base, error_type="test", attempts=1, root=self.root)
+
+        self.assertEqual(select_ready_source_head(delta, self.root), (None, ()))
+        self.assertNotIn(delta, ready_job_ids_in_recovery_order(self.root))
+
+    def test_corrupt_delta_is_ordered_then_becomes_a_failed_barrier(self) -> None:
+        base, _ = self._stage(
+            self._meta(0, 1, upload_id="base", hash="base", timestamp=1.0),
+            b"a",
+        )
+        corrupt_delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="corrupt-delta",
+                hash="corrupt-delta",
+                mode="delta",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"b",
+        )
+        later_delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="later-delta",
+                hash="later-delta",
+                mode="delta",
+                timestamp=3.0,
+                offset=300,
+            ),
+            b"c",
+        )
+        (self.root / corrupt_delta / "chunk-000000.bin").unlink()
+
+        self.assertEqual(
+            ready_manifest_metadata(corrupt_delta, self.root)["job_id"], corrupt_delta
+        )
+        with self.assertRaises(ChunkValidationError):
+            ready_manifest(corrupt_delta, self.root)
+        complete_and_remove_job(base, document_id="document-id", root=self.root)
+        self.assertEqual(
+            ready_job_ids_in_recovery_order(self.root),
+            [corrupt_delta],
+        )
+        self.assertEqual(
+            select_ready_source_head(later_delta, self.root)[0],
+            corrupt_delta,
+        )
+
+        mark_job_failed(
+            corrupt_delta,
+            error_type="ChunkValidationError",
+            attempts=1,
+            root=self.root,
+        )
+        self.assertEqual(select_ready_source_head(later_delta, self.root), (None, ()))
+
+    def test_corrupt_base_full_blocks_delta_after_quarantine(self) -> None:
+        corrupt_base, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="corrupt-base",
+                hash="corrupt-base",
+                timestamp=1.0,
+            ),
+            b"a",
+        )
+        delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta",
+                hash="delta",
+                mode="delta",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"b",
+        )
+        (self.root / corrupt_base / "chunk-000000.bin").write_bytes(b"too-long")
+
+        self.assertEqual(select_ready_source_head(delta, self.root)[0], corrupt_base)
+        mark_job_failed(
+            corrupt_base,
+            error_type="ChunkValidationError",
+            attempts=1,
+            root=self.root,
+        )
+        self.assertEqual(select_ready_source_head(delta, self.root), (None, ()))
+
+    def test_newer_full_rebase_unblocks_delta_after_failed_full(self) -> None:
+        failed_full, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="failed-full",
+                hash="failed-full",
+                timestamp=2.0,
+                offset=200,
+            ),
+            b"a",
+        )
+        rebase, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="rebase",
+                hash="rebase",
+                timestamp=3.0,
+                offset=300,
+            ),
+            b"b",
+        )
+        mark_job_failed(
+            failed_full,
+            error_type="test",
+            attempts=1,
+            root=self.root,
+        )
+
+        self.assertEqual(
+            select_ready_source_head(rebase, self.root),
+            (rebase, (failed_full,)),
+        )
+        mark_job_blocked(
+            failed_full,
+            superseding_job_id=rebase,
+            document_id="document-id",
+            root=self.root,
+        )
+        complete_and_remove_job(rebase, document_id="document-id", root=self.root)
+
+        delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta",
+                hash="delta",
+                mode="delta",
+                timestamp=4.0,
+                offset=400,
+            ),
+            b"c",
+        )
+        self.assertEqual(select_ready_source_head(delta, self.root), (delta, ()))
+
+    def test_recovery_queues_one_head_per_source_and_malformed_jobs(self) -> None:
+        older, _ = self._stage(
+            self._meta(0, 1, upload_id="old", hash="old", timestamp=1.0),
+            b"a",
+        )
+        newer, _ = self._stage(
+            self._meta(0, 1, upload_id="new", hash="new", timestamp=2.0),
+            b"b",
+        )
+        malformed, _ = self._stage(
+            self._meta(0, 1, upload_id="bad", hash="bad", timestamp=3.0),
+            b"c",
+        )
+        (self.root / malformed / "manifest.json").write_text("{}", encoding="utf-8")
+
+        self.assertEqual(
+            ready_job_ids_in_recovery_order(self.root),
+            [malformed, newer],
+        )
+        self.assertIn(older, ready_job_ids(self.root))
+
+    def test_source_lock_is_shared_by_every_job_for_one_path(self) -> None:
+        job_id, _ = self._stage(
+            self._meta(0, 1, upload_id="lock", hash="lock", timestamp=1.0),
+            b"a",
+        )
+        identity = source_identity(ready_manifest(job_id, self.root))
+
+        with spool_source_lock(identity, root=self.root):
+            with spool_source_lock(
+                identity,
+                root=self.root,
+                blocking=False,
+            ) as acquired:
+                self.assertFalse(acquired)
+
+    def test_completed_full_cohort_receives_receipts_before_removal(self) -> None:
+        first, _ = self._stage(
+            self._meta(0, 1, upload_id="first", hash="first", timestamp=1.0),
+            b"a",
+        )
+        second, _ = self._stage(
+            self._meta(0, 1, upload_id="second", hash="second", timestamp=2.0),
+            b"b",
+        )
+
+        self.assertTrue(
+            complete_and_remove_job(
+                first,
+                document_id="document-id",
+                root=self.root,
+            )
+        )
+        self.assertFalse((self.root / first).exists())
+        self.assertTrue((self.root / "completed" / f"{first}.json").is_file())
+        self.assertTrue((self.root / second).is_dir())
+
     def test_stale_cleanup_removes_only_incomplete_expired_jobs(self) -> None:
         stale_job, complete = self._stage(
-            self._meta(0, 2, upload_id="stale", file_size=10), b"first",
+            self._meta(0, 2, upload_id="stale", file_size=10),
+            b"first",
         )
         self.assertFalse(complete)
         fresh_job, complete = self._stage(
-            self._meta(0, 2, upload_id="fresh", file_size=10), b"first",
+            self._meta(0, 2, upload_id="fresh", file_size=10),
+            b"first",
         )
         self.assertFalse(complete)
         ready_job, complete = self._stage(
-            self._meta(0, 1, upload_id="ready", file_size=5), b"ready",
+            self._meta(0, 1, upload_id="ready", file_size=5),
+            b"ready",
         )
         self.assertTrue(complete)
 
@@ -259,13 +862,15 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_exact_size_is_required_before_ready(self) -> None:
         job_id, complete = self._stage(
-            self._meta(0, 2, upload_id="short", file_size=3), b"a",
+            self._meta(0, 2, upload_id="short", file_size=3),
+            b"a",
         )
         self.assertFalse(complete)
 
         with self.assertRaisesRegex(ChunkValidationError, "declared file_size"):
             self._stage(
-                self._meta(1, 2, upload_id="short", file_size=3), b"b",
+                self._meta(1, 2, upload_id="short", file_size=3),
+                b"b",
             )
 
         self.assertFalse((self.root / job_id / "ready").exists())
@@ -300,11 +905,13 @@ class IngestSpoolTests(unittest.TestCase):
             self.assertRaisesRegex(ChunkValidationError, "capacity"),
         ):
             self._stage(
-                self._meta(0, 1, upload_id="quota", file_size=4), b"data",
+                self._meta(0, 1, upload_id="quota", file_size=4),
+                b"data",
             )
 
         job_dirs = [
-            path for path in self.root.iterdir()
+            path
+            for path in self.root.iterdir()
             if path.is_dir() and path.name != "completed"
         ]
         self.assertEqual(len(job_dirs), 1)
@@ -312,7 +919,8 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_failed_job_is_quarantined_from_recovery(self) -> None:
         job_id, complete = self._stage(
-            self._meta(0, 1, upload_id="poison", file_size=4), b"data",
+            self._meta(0, 1, upload_id="poison", file_size=4),
+            b"data",
         )
         self.assertTrue(complete)
 
@@ -333,7 +941,8 @@ class IngestSpoolTests(unittest.TestCase):
 
     def test_attempt_counter_survives_worker_restarts(self) -> None:
         job_id, complete = self._stage(
-            self._meta(0, 1, upload_id="attempts", file_size=4), b"data",
+            self._meta(0, 1, upload_id="attempts", file_size=4),
+            b"data",
         )
         self.assertTrue(complete)
 
