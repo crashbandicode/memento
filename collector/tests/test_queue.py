@@ -220,6 +220,147 @@ class SyncQueueTests(unittest.TestCase):
 
         self.assertEqual(self._status_rows()[0][2], "pending")
 
+    def test_metadata_transition_is_durable_and_acknowledged_separately(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        first = {
+            thread_id: {
+                "metadata_type": "codex_thread_title",
+                "tool": "codex",
+                "thread_id": thread_id,
+                "title": "Original title",
+                "revision": 1000,
+            }
+        }
+        self.assertEqual(self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex", records=first,
+        ), 1)
+        self.assertEqual(self.queue.pending_count(), 1)
+        first_item = self.queue.claim_batch()[0]
+        self.assertEqual(first_item.metadata["title"], "Original title")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            first_state = connection.execute(
+                """SELECT observed_value, synced_value FROM metadata_state
+                   WHERE namespace='codex_thread_titles' AND item_key=?""",
+                (thread_id,),
+            ).fetchone()
+        self.assertEqual(first_state, ("Original title", ""))
+        self.assertTrue(self.queue.mark_synced(first_item))
+
+        renamed = {thread_id: {**first[thread_id], "title": "Renamed", "revision": 2000}}
+        self.assertEqual(self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex", records=renamed,
+        ), 1)
+        item = self.queue.claim_batch()[0]
+        self.assertEqual(item.sync_strategy, "metadata")
+        self.assertEqual(item.payload_bytes, 0)
+        self.assertEqual(item.metadata["title"], "Renamed")
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            before = connection.execute(
+                """SELECT observed_value, synced_value FROM metadata_state
+                   WHERE namespace='codex_thread_titles' AND item_key=?""",
+                (thread_id,),
+            ).fetchone()
+        self.assertEqual(before, ("Renamed", "Original title"))
+        self.assertTrue(self.queue.mark_synced(item))
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            after = connection.execute(
+                """SELECT observed_value, synced_value FROM metadata_state
+                   WHERE namespace='codex_thread_titles' AND item_key=?""",
+                (thread_id,),
+            ).fetchone()
+        self.assertEqual(after, ("Renamed", "Renamed"))
+
+    def test_metadata_pending_update_coalesces_and_revert_cancels_it(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+
+        def record(title: str, revision: int) -> dict[str, dict]:
+            return {thread_id: {
+                "metadata_type": "codex_thread_title",
+                "tool": "codex",
+                "thread_id": thread_id,
+                "title": title,
+                "revision": revision,
+            }}
+
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("A", 1),
+        )
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("B", 2),
+        )
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("C", 3),
+        )
+        self.assertEqual(self.queue.pending_count(), 1)
+        self.assertEqual(self.queue.claim_batch()[0].metadata["title"], "C")
+
+        # Use a second thread for the no-in-flight revert case.
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e99"
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("A", 1),
+        )
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("B", 2),
+        )
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex",
+            records=record("A", 3),
+        )
+        self.assertEqual(self.queue.pending_count(), 2)
+        self.assertEqual(self.queue.claim_batch()[0].metadata["title"], "A")
+
+    def test_force_resync_requeues_unacknowledged_metadata(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        baseline = {thread_id: {
+            "metadata_type": "codex_thread_title",
+            "tool": "codex",
+            "thread_id": thread_id,
+            "title": "A",
+            "revision": 1,
+        }}
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex", records=baseline,
+        )
+        changed = {thread_id: {**baseline[thread_id], "title": "B", "revision": 2}}
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex", records=changed,
+        )
+        self.queue.clear_all_state()
+        self.assertEqual(self.queue.pending_count(), 0)
+
+        self.assertEqual(self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles", tool_name="codex", records=changed,
+        ), 1)
+        self.assertEqual(self.queue.claim_batch()[0].metadata["title"], "B")
+
+    def test_recreated_queue_reconciles_first_observation_again(self) -> None:
+        thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
+        record = {thread_id: {
+            "metadata_type": "codex_thread_title",
+            "tool": "codex",
+            "thread_id": thread_id,
+            "title": "Already renamed before install",
+            "revision": 123_456,
+        }}
+        rebuilt = SyncQueue(self.root / "rebuilt.db")
+        try:
+            self.assertEqual(rebuilt.enqueue_metadata_changes(
+                namespace="codex_thread_titles",
+                tool_name="codex",
+                records=record,
+            ), 1)
+            item = rebuilt.claim_batch()[0]
+            self.assertEqual(item.metadata["title"], "Already renamed before install")
+            self.assertEqual(item.metadata["revision"], 123_456)
+        finally:
+            rebuilt.close()
+
 
 class SyncQueueMigrationTests(unittest.TestCase):
     def test_v1_migration_preserves_deltas_and_deduplicates_pending_full(self) -> None:

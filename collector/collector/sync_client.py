@@ -177,6 +177,11 @@ class SyncClient:
         }
 
         try:
+            if item.sync_strategy == "metadata":
+                # Roll out the server endpoint before this collector. Legacy
+                # content endpoints intentionally reject synthetic metadata
+                # rows so an older client cannot create bogus Documents.
+                return self._upload_metadata(item)
             size = item.payload_bytes
             if size <= self._config.large_file_threshold:
                 payload["content"] = self._queue.read_payload_text(item)
@@ -198,6 +203,22 @@ class SyncClient:
         except Exception:
             logger.exception("Upload error for %s/%s", item.tool_name, item.relative_path)
             return False
+
+    def _upload_metadata(self, item: QueueItem) -> bool:
+        """Send a durable metadata-only update without reading file content."""
+        payload = {
+            key: value
+            for key, value in item.metadata.items()
+            if not key.startswith("_queue_")
+        }
+        resp = self._client.post("/api/ingest/metadata", json=payload)
+        if resp.status_code in (200, 201):
+            return True
+        logger.warning(
+            "Server %s for metadata %s/%s: %s",
+            resp.status_code, item.tool_name, item.relative_path, resp.text[:200],
+        )
+        return False
 
     def _upload_json(self, payload: dict) -> bool:
         resp = self._client.post("/api/ingest/file", json=payload)

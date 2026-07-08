@@ -51,6 +51,7 @@ class _FakeQueue:
 class _Response:
     def __init__(self, status_code: int = 200) -> None:
         self.status_code = status_code
+        self.text = "response"
 
 
 class _FakeHttpClient:
@@ -61,6 +62,18 @@ class _FakeHttpClient:
         del data
         self.chunk_sizes.append(len(files["content"][1]))
         return _Response()
+
+
+class _MetadataHttpClient:
+    def __init__(self, status_code: int = 200) -> None:
+        self.path = ""
+        self.payload: dict = {}
+        self.status_code = status_code
+
+    def post(self, path: str, json: dict) -> _Response:
+        self.path = path
+        self.payload = json
+        return _Response(self.status_code)
 
 
 class _ScriptedHttpClient:
@@ -216,6 +229,46 @@ class SyncClientStreamingTests(unittest.TestCase):
 
         self.assertFalse(client._upload_chunked(self._payload(), self._item(total_size)))
         self.assertEqual(len(http_client.calls), 1)
+
+    def test_metadata_upload_is_lightweight_and_hides_queue_state(self) -> None:
+        queue = _FakeQueue(0)
+        http_client = _MetadataHttpClient()
+        client = self._client(queue, http_client)
+        item = self._item(0)
+        item.sync_strategy = "metadata"
+        item.metadata = {
+            "metadata_type": "codex_thread_title",
+            "tool": "codex",
+            "thread_id": "019f144c-82d6-70d0-95e8-e01e7b813e98",
+            "title": "Renamed",
+            "revision": 200,
+            "_queue_state_namespace": "codex_thread_titles",
+            "_queue_state_key": "private-key",
+            "_queue_state_value": "Renamed",
+        }
+
+        self.assertTrue(client._upload(item))
+        self.assertEqual(http_client.path, "/api/ingest/metadata")
+        self.assertEqual(http_client.payload["title"], "Renamed")
+        self.assertFalse(any(
+            key.startswith("_queue_") for key in http_client.payload
+        ))
+        self.assertEqual(queue.stream.largest_read, 0)
+
+    def test_missing_transcript_metadata_response_remains_retryable(self) -> None:
+        queue = _FakeQueue(0)
+        client = self._client(queue, _MetadataHttpClient(status_code=404))
+        item = self._item(0)
+        item.sync_strategy = "metadata"
+        item.metadata = {
+            "metadata_type": "codex_thread_title",
+            "tool": "codex",
+            "thread_id": "019f144c-82d6-70d0-95e8-e01e7b813e98",
+            "title": "Rename before transcript arrives",
+            "revision": 200,
+        }
+
+        self.assertFalse(client._upload(item))
 
 
 if __name__ == "__main__":

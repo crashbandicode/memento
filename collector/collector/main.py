@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 from .config import CollectorConfig, SYSTEM, _default_data_dir
 from .queue import SyncQueue
@@ -327,6 +328,40 @@ def _check_and_update(logger: logging.Logger) -> None:
 
 
 _ag_export_lock = threading.Lock()
+_codex_metadata_poll_lock = threading.Lock()
+
+
+def _poll_codex_thread_titles(
+    tool: CodexTool,
+    queue: SyncQueue,
+    logger: logging.Logger,
+) -> None:
+    """Queue explicit Codex title transitions as tiny durable updates."""
+    if not _codex_metadata_poll_lock.acquire(blocking=False):
+        return
+    try:
+        records = tool.thread_title_records()
+        valid_records: dict[str, dict] = {}
+        for thread_id, record in records.items():
+            try:
+                parsed_thread_id = uuid.UUID(thread_id)
+                revision = int(record.get("revision") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if str(parsed_thread_id) != thread_id.lower() or revision <= 0:
+                continue
+            valid_records[thread_id] = record
+        queued = queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=valid_records,
+        )
+        if queued:
+            logger.info("Queued %d Codex thread title update(s)", queued)
+    except Exception:
+        logger.exception("Codex thread title poll failed")
+    finally:
+        _codex_metadata_poll_lock.release()
 
 
 def _run_antigravity_export(queue: SyncQueue, logger: logging.Logger) -> None:
@@ -439,8 +474,9 @@ def main() -> None:
     _check_windows_task_health(logger)
 
     # Initialize tools
+    codex_tool = CodexTool()
     tools = [
-        ClaudeCodeTool(), OpenClawTool(), CodexTool(),
+        ClaudeCodeTool(), OpenClawTool(), codex_tool,
         AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path), CursorTool(),
         HermesTool(),
     ]
@@ -479,6 +515,16 @@ def main() -> None:
     # 2. Initial scan (non-blocking)
     threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
 
+    # Establish the durable state_5.sqlite title baseline without uploading the
+    # database or any transcript. Future title transitions become tiny queue
+    # items and survive collector/server restarts.
+    if codex_tool in available:
+        threading.Thread(
+            target=_poll_codex_thread_titles,
+            args=(codex_tool, queue, logger),
+            daemon=True,
+        ).start()
+
     # 3. Start file watcher + sync client
     watcher.start()
     sync_client.start()
@@ -500,6 +546,7 @@ def main() -> None:
     last_heartbeat = time.time()
     last_command_poll = time.time()
     last_update_check = time.time()
+    last_codex_metadata_poll = time.time()
 
     try:
         while not shutdown:
@@ -525,6 +572,17 @@ def main() -> None:
             if config.auto_update_enabled and now - last_update_check > AUTO_UPDATE_INTERVAL:
                 last_update_check = now
                 threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+
+            if (
+                codex_tool in available
+                and now - last_codex_metadata_poll > config.sqlite_poll_interval
+            ):
+                last_codex_metadata_poll = now
+                threading.Thread(
+                    target=_poll_codex_thread_titles,
+                    args=(codex_tool, queue, logger),
+                    daemon=True,
+                ).start()
 
     except KeyboardInterrupt:
         pass

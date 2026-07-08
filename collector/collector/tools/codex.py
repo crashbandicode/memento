@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+import threading
 from pathlib import Path
 
 from ..config import TOOL_PATHS
@@ -16,6 +18,8 @@ _SKIP_DIRS = {"users", "user", "home", "desktop", "dev", "documents",
 
 # Cache: thread_id → {title, first_user_message}
 _thread_info_cache: dict[str, dict] | None = None
+_thread_info_cache_signature: tuple[object, ...] | None = None
+_thread_info_lock = threading.RLock()
 
 
 _history_cache: dict[str, list[dict]] | None = None
@@ -51,36 +55,95 @@ def _load_history(codex_home: Path) -> dict[str, list[dict]]:
     return result
 
 
-def _load_threads_from_sqlite(codex_home: Path) -> dict[str, dict]:
+def _state_db_signature(state_db: Path) -> tuple[object, ...]:
+    """Include SQLite's WAL because title writes may not touch the main file."""
+    parts: list[object] = [str(state_db.resolve())]
+    for path in (state_db, Path(f"{state_db}-wal")):
+        try:
+            stat = path.stat()
+            parts.extend((stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            parts.extend((None, None))
+    return tuple(parts)
+
+
+def _load_threads_from_sqlite(
+    codex_home: Path,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, dict]:
     """Read thread titles and first_user_message from state_5.sqlite."""
-    global _thread_info_cache
-    if _thread_info_cache is not None:
-        return _thread_info_cache
+    global _thread_info_cache, _thread_info_cache_signature
 
     state_db = codex_home / "state_5.sqlite"
     if not state_db.exists():
-        _thread_info_cache = {}
-        return _thread_info_cache
+        return {}
 
-    import sqlite3
+    signature = _state_db_signature(state_db)
+    with _thread_info_lock:
+        if (
+            not force_refresh
+            and _thread_info_cache is not None
+            and _thread_info_cache_signature == signature
+        ):
+            return _thread_info_cache
+
     result: dict[str, dict] = {}
     try:
         conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=5)
-        cursor = conn.execute(
-            "SELECT id, title, first_user_message FROM threads"
-        )
-        for row in cursor.fetchall():
-            tid, title, first_msg = row
-            if tid:
-                result[str(tid)] = {
-                    "title": title or "",
-                    "first_user_message": first_msg or "",
-                }
-        conn.close()
-    except Exception:
-        pass
-    _thread_info_cache = result
-    return _thread_info_cache
+        try:
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")
+            }
+            first_message = (
+                "first_user_message" if "first_user_message" in columns else "''"
+            )
+            if "updated_at_ms" in columns:
+                revision = (
+                    "COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000, 0)"
+                )
+            elif "updated_at" in columns:
+                revision = "COALESCE(updated_at * 1000, 0)"
+            else:
+                revision = "0"
+            rollout_path = "rollout_path" if "rollout_path" in columns else "''"
+            thread_source = "thread_source" if "thread_source" in columns else "''"
+            agent_path = "agent_path" if "agent_path" in columns else "''"
+            cursor = conn.execute(
+                f"SELECT id, title, {first_message}, {revision}, {rollout_path}, "
+                f"{thread_source}, {agent_path} "
+                "FROM threads"
+            )
+            for row in cursor.fetchall():
+                (
+                    tid,
+                    title,
+                    first_msg,
+                    source_revision,
+                    source_path,
+                    source_kind,
+                    source_agent_path,
+                ) = row
+                if tid:
+                    result[str(tid)] = {
+                        "title": title or "",
+                        "first_user_message": first_msg or "",
+                        "revision": max(0, int(source_revision or 0)),
+                        "rollout_path": source_path or "",
+                        "thread_source": source_kind or "",
+                        "agent_path": source_agent_path or "",
+                    }
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        # A concurrent Codex checkpoint can briefly make the read fail. Keep
+        # the previous complete snapshot instead of treating every row as gone.
+        with _thread_info_lock:
+            return _thread_info_cache or {}
+    with _thread_info_lock:
+        _thread_info_cache = result
+        _thread_info_cache_signature = _state_db_signature(state_db)
+        return _thread_info_cache
 
 
 class CodexTool(BaseTool):
@@ -322,6 +385,49 @@ class CodexTool(BaseTool):
         user_inputs = history.get(thread_id, [])
         if user_inputs:
             meta["user_history"] = user_inputs
+
+    def thread_title_records(self) -> dict[str, dict]:
+        """Return a fresh, compact state snapshot for explicit-rename polling."""
+        threads = _load_threads_from_sqlite(self.root_path, force_refresh=True)
+        records: dict[str, dict] = {}
+        for thread_id, info in threads.items():
+            thread_source = str(info.get("thread_source") or "").strip().lower()
+            if thread_source not in {"", "root", "user"}:
+                continue
+            if not thread_source and str(info.get("agent_path") or "").strip():
+                continue
+            title = str(info.get("title") or "").strip()[:500]
+            if not title:
+                continue
+            record = {
+                "metadata_type": "codex_thread_title",
+                "tool": self.name,
+                "thread_id": thread_id,
+                "title": title,
+                "revision": max(0, int(info.get("revision") or 0)),
+            }
+            relative_path = self._state_rollout_relative_path(
+                str(info.get("rollout_path") or "")
+            )
+            if relative_path and len(relative_path) <= 2000:
+                record["relative_path"] = relative_path
+            records[thread_id] = record
+        return records
+
+    def _state_rollout_relative_path(self, rollout_path: str) -> str:
+        """Normalize the state DB rollout path to the collector document key."""
+        normalized = rollout_path.replace("\\", "/").strip()
+        if not normalized:
+            return ""
+        root = str(self.root_path).replace("\\", "/").rstrip("/")
+        prefix = f"{root}/"
+        if normalized.casefold().startswith(prefix.casefold()):
+            return normalized[len(prefix):]
+        for marker in ("/archived_sessions/", "/sessions/"):
+            index = normalized.casefold().find(marker)
+            if index >= 0:
+                return normalized[index + 1:]
+        return ""
 
     @staticmethod
     def _read_initial_session_meta(abs_path: Path) -> dict:

@@ -8,6 +8,7 @@ remain ordered and immutable.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -62,7 +63,7 @@ class QueueItem:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
         self._db_path = db_path
@@ -116,6 +117,14 @@ class SyncQueue:
                 synced_offset INTEGER NOT NULL DEFAULT 0,
                 synced_at REAL,
                 PRIMARY KEY (tool_name, relative_path)
+            );
+            CREATE TABLE IF NOT EXISTS metadata_state (
+                namespace TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                observed_value TEXT NOT NULL,
+                synced_value TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (namespace, item_key)
             );
         """)
 
@@ -194,6 +203,134 @@ class SyncQueue:
         )
         self._conn.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self._conn.commit()
+
+    @_rollback_on_error
+    def enqueue_metadata_changes(
+        self,
+        *,
+        namespace: str,
+        tool_name: str,
+        records: dict[str, dict[str, Any]],
+    ) -> int:
+        """Durably coalesce changed lightweight metadata into the upload queue.
+
+        The first observation is intentionally unsynced and therefore queued.
+        Codex polling excludes subagents, while the server rejects injected
+        wrapper titles, so this safe catch-up also repairs renames made before
+        the collector was installed or while its queue database was absent.
+        ``synced_value`` advances only after server acknowledgement, so restarts
+        and force-resync cannot lose an update.
+        """
+        now = time.time()
+        queued = 0
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for item_key, record in records.items():
+                current_value = str(record.get("title") or "").strip()
+                if not current_value:
+                    continue
+
+                state_row = self._conn.execute(
+                    """SELECT observed_value, synced_value
+                       FROM metadata_state
+                       WHERE namespace=? AND item_key=?""",
+                    (namespace, item_key),
+                ).fetchone()
+                if state_row is None:
+                    self._conn.execute(
+                        """INSERT INTO metadata_state (
+                               namespace, item_key, observed_value,
+                               synced_value, updated_at
+                           ) VALUES (?,?,?,?,?)""",
+                        (namespace, item_key, current_value, "", now),
+                    )
+                    observed_value, synced_value = current_value, ""
+                else:
+                    observed_value, synced_value = (
+                        str(state_row[0]),
+                        str(state_row[1]),
+                    )
+                if state_row is not None and observed_value != current_value:
+                    self._conn.execute(
+                        """UPDATE metadata_state
+                           SET observed_value=?, updated_at=?
+                           WHERE namespace=? AND item_key=?""",
+                        (current_value, now, namespace, item_key),
+                    )
+
+                path_key = hashlib.sha256(item_key.encode("utf-8")).hexdigest()
+                relative_path = f"__metadata__/{namespace}/{path_key}"
+                active = self._conn.execute(
+                    """SELECT 1 FROM queue
+                       WHERE tool_name=? AND relative_path=?
+                         AND status='uploading' LIMIT 1""",
+                    (tool_name, relative_path),
+                ).fetchone() is not None
+                pending = self._conn.execute(
+                    """SELECT id, metadata FROM queue
+                       WHERE tool_name=? AND relative_path=?
+                         AND status='pending'
+                       ORDER BY id DESC LIMIT 1""",
+                    (tool_name, relative_path),
+                ).fetchone()
+
+                # A change back to the last acknowledged value can cancel a
+                # pending update. If an older value is already in flight, queue
+                # the restoration so the server still converges correctly.
+                needs_upload = current_value != synced_value or active
+                if not needs_upload:
+                    if pending:
+                        self._conn.execute(
+                            "UPDATE queue SET status='superseded' WHERE id=?",
+                            (int(pending[0]),),
+                        )
+                    continue
+
+                if pending:
+                    try:
+                        pending_metadata = json.loads(str(pending[1]))
+                    except (TypeError, json.JSONDecodeError):
+                        pending_metadata = {}
+                    if pending_metadata.get("_queue_state_value") == current_value:
+                        continue
+
+                payload = dict(record)
+                payload.update({
+                    "_queue_state_namespace": namespace,
+                    "_queue_state_key": item_key,
+                    "_queue_state_value": current_value,
+                })
+                metadata_json = json.dumps(payload, default=str)
+                content_hash = hashlib.sha256(
+                    metadata_json.encode("utf-8")
+                ).hexdigest()
+
+                if pending:
+                    self._conn.execute(
+                        """UPDATE queue SET metadata=?, content_hash=?,
+                                  created_at=?, retry_count=0, available_at=0,
+                                  last_attempt_at=NULL, last_error=NULL
+                           WHERE id=? AND status='pending'""",
+                        (metadata_json, content_hash, now, int(pending[0])),
+                    )
+                else:
+                    self._conn.execute(
+                        """INSERT INTO queue (
+                               tool_name, category, content_type, relative_path,
+                               content, content_hash, file_size, sync_strategy,
+                               is_partial, offset, metadata, created_at,
+                               payload_bytes, available_at
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                        (
+                            tool_name, "metadata", "json", relative_path, "",
+                            content_hash, 0, "metadata", 0, 0, metadata_json,
+                            now, 0,
+                        ),
+                    )
+                queued += 1
+
+            self._conn.commit()
+        return queued
 
     def _column_names(self, table: str) -> set[str]:
         return {str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")}
@@ -545,7 +682,8 @@ class SyncQueue:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute(
-                """SELECT tool_name, relative_path, content_hash, offset, payload_path
+                """SELECT tool_name, relative_path, content_hash, offset,
+                          payload_path, metadata
                    FROM queue WHERE id=? AND status='uploading' AND lease_token=?""",
                 (item.id, item.lease_token),
             ).fetchone()
@@ -573,6 +711,22 @@ class SyncQueue:
                 (row[0], row[1], row[2], int(row[3]), now,
                  row[2], int(row[3]), now, row[2], int(row[3]), now),
             )
+            try:
+                item_metadata = json.loads(str(row[5]))
+            except (TypeError, json.JSONDecodeError):
+                item_metadata = {}
+            state_namespace = item_metadata.get("_queue_state_namespace")
+            state_key = item_metadata.get("_queue_state_key")
+            state_value = item_metadata.get("_queue_state_value")
+            if all(isinstance(value, str) for value in (
+                state_namespace, state_key, state_value,
+            )):
+                self._conn.execute(
+                    """UPDATE metadata_state
+                       SET synced_value=?, updated_at=?
+                       WHERE namespace=? AND item_key=?""",
+                    (state_value, now, state_namespace, state_key),
+                )
             self._conn.commit()
         self._discard_payload(payload_path)
         return True
