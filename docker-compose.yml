@@ -167,7 +167,15 @@ services:
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
-    command: celery -A server.tasks.celery_app worker --loglevel=info
+    # Embedding admission is serialized and most background work is I/O-bound;
+    # a large prefork pool only multiplies Python heaps and busy retries. Two
+    # workers preserve useful overlap while keeping workstation memory stable.
+    command: >
+      celery -A server.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=${MEMENTO_CELERY_CONCURRENCY:-2}
+      --prefetch-multiplier=1
+      --max-tasks-per-child=25
     environment:
       MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
       MEMENTO_REDIS_URL: redis://redis:6379/0

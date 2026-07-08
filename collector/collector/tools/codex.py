@@ -214,13 +214,20 @@ class CodexTool(BaseTool):
 
         # Active sessions
         if parts[0] == "sessions" and abs_path.suffix == ".jsonl":
-            project_name, project_path = self._extract_cwd_from_session(abs_path)
+            session_meta = self._read_initial_session_meta(abs_path)
+            project_name, project_path = self._extract_cwd_from_meta(session_meta)
             meta: dict = {"session_name": abs_path.stem}
             if project_name:
                 meta["project_hash"] = project_name
             if project_path:
                 meta["project_path"] = project_path
-            self._enrich_with_thread_info(abs_path, meta)
+            identity = self._extract_session_identity(abs_path, session_meta)
+            meta.update(identity)
+            self._enrich_with_thread_info(
+                abs_path,
+                meta,
+                thread_id=identity.get("thread_id"),
+            )
             return FileClassification(
                 tool_name=self.name,
                 category=Category.CONVERSATION,
@@ -232,13 +239,20 @@ class CodexTool(BaseTool):
 
         # Archived sessions
         if parts[0] == "archived_sessions" and abs_path.suffix == ".jsonl":
-            project_name, project_path = self._extract_cwd_from_session(abs_path)
+            session_meta = self._read_initial_session_meta(abs_path)
+            project_name, project_path = self._extract_cwd_from_meta(session_meta)
             meta = {"session_name": abs_path.stem, "archived": True}
             if project_name:
                 meta["project_hash"] = project_name
             if project_path:
                 meta["project_path"] = project_path
-            self._enrich_with_thread_info(abs_path, meta)
+            identity = self._extract_session_identity(abs_path, session_meta)
+            meta.update(identity)
+            self._enrich_with_thread_info(
+                abs_path,
+                meta,
+                thread_id=identity.get("thread_id"),
+            )
             return FileClassification(
                 tool_name=self.name,
                 category=Category.CONVERSATION,
@@ -284,9 +298,15 @@ class CodexTool(BaseTool):
 
         return None
 
-    def _enrich_with_thread_info(self, abs_path: Path, meta: dict) -> None:
+    def _enrich_with_thread_info(
+        self,
+        abs_path: Path,
+        meta: dict,
+        *,
+        thread_id: str | None = None,
+    ) -> None:
         """Add title, first_user_message, and history from sqlite + history.jsonl."""
-        thread_id = self._extract_thread_id(abs_path)
+        thread_id = thread_id or self._extract_thread_id(abs_path)
         if not thread_id:
             return
         # Thread info from sqlite (title + first prompt)
@@ -304,9 +324,13 @@ class CodexTool(BaseTool):
             meta["user_history"] = user_inputs
 
     @staticmethod
-    def _extract_thread_id(abs_path: Path) -> str:
-        """Extract thread UUID from session JSONL (from session_meta or filename)."""
-        # Try reading session_meta first
+    def _read_initial_session_meta(abs_path: Path) -> dict:
+        """Read payload from the first nonblank record when it is session_meta.
+
+        Codex subagent rollouts include inherited session_meta records later in
+        the file.  Those describe ancestors and must never replace the rollout's
+        own identity from the initial record.
+        """
         try:
             with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -314,41 +338,127 @@ class CodexTool(BaseTool):
                     if not line:
                         continue
                     obj = json.loads(line)
-                    if obj.get("type") == "session_meta":
-                        tid = obj.get("payload", {}).get("id", "")
-                        if tid:
-                            return tid
-                    break
+                    if obj.get("type") != "session_meta":
+                        return {}
+                    payload = obj.get("payload")
+                    return payload if isinstance(payload, dict) else {}
         except Exception:
             pass
-        # Fallback: extract from filename (rollout-YYYY-MM-DDTHH-MM-SS-UUID.jsonl)
+        return {}
+
+    @staticmethod
+    def _filename_thread_id(abs_path: Path) -> str:
+        """Extract a thread UUID from a rollout filename."""
         name = abs_path.stem
-        import re
-        match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", name, re.I)
+        match = re.search(
+            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12})",
+            name,
+            re.I,
+        )
         return match.group(1) if match else ""
 
     @staticmethod
-    def _extract_cwd_from_session(abs_path: Path) -> tuple[str | None, str | None]:
-        """Extract (project_name, full_cwd) from session_meta cwd field."""
-        try:
-            with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    if obj.get("type") == "session_meta":
-                        cwd = obj.get("payload", {}).get("cwd", "")
-                        if cwd:
-                            parts = cwd.replace("\\", "/").rstrip("/").split("/")
-                            meaningful = [p for p in parts
-                                          if p.lower() not in _SKIP_DIRS and len(p) > 1]
-                            name = meaningful[-1] if meaningful else None
-                            return name, cwd
-                    break
-        except Exception:
-            pass
+    def _metadata_string(metadata: dict, key: str) -> str:
+        value = metadata.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    @classmethod
+    def _extract_session_identity(
+        cls,
+        abs_path: Path,
+        session_meta: dict,
+    ) -> dict:
+        """Normalize initial Codex lineage fields into collector metadata."""
+        thread_id = (
+            cls._metadata_string(session_meta, "id")
+            or cls._filename_thread_id(abs_path)
+        )
+        if not thread_id:
+            return {}
+
+        # Collector session_id remains the current rollout/thread identity.
+        # Raw Codex payload.session_id is the root session for subagent forks.
+        root_session_id = (
+            cls._metadata_string(session_meta, "session_id") or thread_id
+        )
+        result: dict = {
+            "session_id": thread_id,
+            "thread_id": thread_id,
+            "root_session_id": root_session_id,
+        }
+
+        source = session_meta.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = (
+            subagent.get("thread_spawn")
+            if isinstance(subagent, dict)
+            else None
+        )
+        spawn = spawn if isinstance(spawn, dict) else {}
+
+        string_fields = {
+            "thread_source": cls._metadata_string(session_meta, "thread_source"),
+            "parent_thread_id": (
+                cls._metadata_string(session_meta, "parent_thread_id")
+                or cls._metadata_string(spawn, "parent_thread_id")
+            ),
+            "forked_from_id": cls._metadata_string(
+                session_meta,
+                "forked_from_id",
+            ),
+            "agent_path": (
+                cls._metadata_string(session_meta, "agent_path")
+                or cls._metadata_string(spawn, "agent_path")
+            ),
+            "agent_nickname": (
+                cls._metadata_string(session_meta, "agent_nickname")
+                or cls._metadata_string(spawn, "agent_nickname")
+            ),
+        }
+        result.update({key: value for key, value in string_fields.items() if value})
+
+        depth = spawn.get("depth")
+        if isinstance(depth, int) and not isinstance(depth, bool):
+            result["agent_depth"] = depth
+        elif isinstance(depth, str) and depth.isdigit():
+            result["agent_depth"] = int(depth)
+        return result
+
+    @classmethod
+    def _extract_thread_id(cls, abs_path: Path) -> str:
+        """Extract current thread UUID from initial session_meta or filename."""
+        session_meta = cls._read_initial_session_meta(abs_path)
+        return (
+            cls._metadata_string(session_meta, "id")
+            or cls._filename_thread_id(abs_path)
+        )
+
+    @classmethod
+    def _extract_cwd_from_meta(
+        cls,
+        session_meta: dict,
+    ) -> tuple[str | None, str | None]:
+        """Extract (project_name, full_cwd) from an initial session_meta payload."""
+        cwd = cls._metadata_string(session_meta, "cwd")
+        if cwd:
+            parts = cwd.replace("\\", "/").rstrip("/").split("/")
+            meaningful = [
+                part
+                for part in parts
+                if part.lower() not in _SKIP_DIRS and len(part) > 1
+            ]
+            name = meaningful[-1] if meaningful else None
+            return name, cwd
         return None, None
+
+    @classmethod
+    def _extract_cwd_from_session(
+        cls,
+        abs_path: Path,
+    ) -> tuple[str | None, str | None]:
+        """Back-compatible path-based cwd extraction helper."""
+        return cls._extract_cwd_from_meta(cls._read_initial_session_meta(abs_path))
 
     @property
     def excluded_paths(self) -> list[str]:

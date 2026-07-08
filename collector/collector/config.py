@@ -164,9 +164,12 @@ class CollectorConfig(BaseSettings):
     batch_size: int = 20
     sync_interval: float = 0.5  # seconds between sync cycles when queue empty
     queue_spool_threshold: int = 4 * 1024 * 1024
-    queue_high_water_bytes: int = 512 * 1024 * 1024
-    max_in_flight_bytes: int = 128 * 1024 * 1024
-    max_concurrent_uploads: int = 4
+    # Keep initial discovery and upload concurrency bounded on developer
+    # workstations. Uploads stream from spool files, so two concurrent slots
+    # retain network throughput without multiplying sanitizer/request buffers.
+    queue_high_water_bytes: int = 256 * 1024 * 1024
+    max_in_flight_bytes: int = 64 * 1024 * 1024
+    max_concurrent_uploads: int = 2
     queue_lease_seconds: int = 300
     auto_update_enabled: bool = True
 
