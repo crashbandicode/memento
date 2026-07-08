@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -277,6 +278,113 @@ async def test_semantic_search_filters_non_current_embedding_status(monkeypatch)
     assert len(db.statements) == 1
     query_sql = str(db.statements[0].compile())
     assert "documents.embedding_status" in query_sql
+    assert "row_number" in query_sql.lower()
+    assert "chunk_rank" in query_sql
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_pages_documents_past_large_subagent_group(
+    monkeypatch,
+) -> None:
+    root_id = uuid4()
+    child_ids = [uuid4() for _ in range(283)]
+    note_id = uuid4()
+    now = datetime.now(timezone.utc)
+
+    child_rows = [
+        (
+            f"matching child chunk {index}",
+            child_id,
+            "codex",
+            "Inherited root prompt",
+            f"sessions/{child_id}.jsonl",
+            "conversation",
+            now,
+            now,
+            {
+                "session_id": str(child_id),
+                "root_session_id": str(root_id),
+                "thread_source": "subagent",
+                "agent_path": f"/root/worker_{index}",
+            },
+            100,
+            0.1 + index / 10_000,
+        )
+        for index, child_id in enumerate(child_ids)
+    ]
+    note_row = (
+        "matching independent note",
+        note_id,
+        "obsidian",
+        "Independent note",
+        "notes/independent.md",
+        "note",
+        now,
+        now,
+        {},
+        100,
+        0.5,
+    )
+    root_companion = (
+        root_id,
+        "codex",
+        "Root conversation",
+        f"sessions/{root_id}.jsonl",
+        "conversation",
+        now,
+        now,
+        {"session_id": str(root_id), "thread_source": "root"},
+        500,
+    )
+
+    class _Rows:
+        def __init__(self, rows: list) -> None:
+            self._rows = rows
+
+        def all(self) -> list:
+            return self._rows
+
+    class _DB:
+        def __init__(self) -> None:
+            self.statements: list = []
+
+        async def execute(self, statement) -> _Rows:
+            self.statements.append(statement)
+            call = len(self.statements)
+            if call == 1:
+                return _Rows(child_rows[:100])
+            if call == 2:
+                return _Rows(child_rows[100:200])
+            if call == 3:
+                return _Rows(child_rows[200:] + [note_row])
+            return _Rows([root_companion])
+
+    async def _machines(*_args, **_kwargs):
+        return None
+
+    async def _embed(*_args, **_kwargs):
+        return [[0.0] * embedding_service.EMBEDDING_DIM]
+
+    monkeypatch.setattr(memory, "user_machine_ids", _machines)
+    monkeypatch.setattr(embedding_service, "_call_embedding_server", _embed)
+    db = _DB()
+
+    result = await memory.semantic_search(
+        q="query",
+        limit=2,
+        tool_filter=None,
+        days=None,
+        db=db,
+        _user=SimpleNamespace(id=uuid4()),
+    )
+
+    assert len(db.statements) == 4
+    assert [item["id"] for item in result["results"]] == [
+        str(root_id),
+        str(note_id),
+    ]
+    assert result["results"][0]["matched_subagent_id"] == str(child_ids[0])
+    assert result["results"][0]["subagent_count"] == 283
 
 
 def test_post_ingest_limit_exceeds_background_embedding_deadline() -> None:

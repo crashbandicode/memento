@@ -33,10 +33,37 @@ CHUNK_OVERLAP = 200
 _server_available: bool | None = None  # None = not checked yet
 _last_check_time: float = 0  # Retry every 60s after failure
 EMBEDDING_PROCESSING_STALE_AFTER = timedelta(minutes=25)
+CONVERSATION_EMBEDDING_MESSAGE_LIMIT = 100
+CONVERSATION_EMBEDDING_MESSAGE_CHARS = 4_000
+CONVERSATION_EMBEDDING_TOTAL_CHARS = 100_000
 
 
 class EmbeddingServerBusy(RuntimeError):
     """The healthy embedding server is already processing another request."""
+
+
+def conversation_embedding_content(
+    message_contents: list[str | None],
+) -> str:
+    """Build the exact normalized-message fallback used for conversations.
+
+    Callers must supply user/assistant messages in transcript order. Keeping
+    this transformation shared lets repair jobs determine whether changing
+    stored presentation rows actually changes the model input.
+    """
+    parts: list[str] = []
+    used = 0
+    for message in message_contents[:CONVERSATION_EMBEDDING_MESSAGE_LIMIT]:
+        fragment = (message or "")[:CONVERSATION_EMBEDDING_MESSAGE_CHARS].strip()
+        if not fragment:
+            continue
+        remaining = CONVERSATION_EMBEDDING_TOTAL_CHARS - used
+        if remaining <= 0:
+            break
+        fragment = fragment[:remaining]
+        parts.append(fragment)
+        used += len(fragment)
+    return "\n\n".join(parts)
 
 
 def _chunk_text(
@@ -202,31 +229,25 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         rows = (
             (
                 await db.execute(
-                    select(func.left(ConversationMessage.content, 4_000))
+                    select(func.left(
+                        ConversationMessage.content,
+                        CONVERSATION_EMBEDDING_MESSAGE_CHARS,
+                    ))
                     .where(
                         ConversationMessage.document_id == doc.id,
                         ConversationMessage.role.in_(("user", "assistant")),
                     )
-                    .order_by(ConversationMessage.line_number)
-                    .limit(100)
+                    .order_by(
+                        ConversationMessage.line_number,
+                        ConversationMessage.id,
+                    )
+                    .limit(CONVERSATION_EMBEDDING_MESSAGE_LIMIT)
                 )
             )
             .scalars()
             .all()
         )
-        parts: list[str] = []
-        used = 0
-        for message in rows:
-            fragment = (message or "").strip()
-            if not fragment:
-                continue
-            remaining = 100_000 - used
-            if remaining <= 0:
-                break
-            fragment = fragment[:remaining]
-            parts.append(fragment)
-            used += len(fragment)
-        embedding_content = "\n\n".join(parts)
+        embedding_content = conversation_embedding_content(list(rows))
 
     if len(embedding_content) < 100:
         await _set_status("skipped", bump_attempts=True)

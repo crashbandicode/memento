@@ -1,25 +1,41 @@
-"""Clean stored transcript data after parser and presentation normalization changes.
+"""Idempotently normalize stored conversation presentation data.
 
-This migration is intentionally idempotent: it converts useful Claude Code slash
-commands into compact tool rows, removes only their repetitive caveat notices,
-and replaces opaque generated document titles with a compact version of the
-first meaningful user prompt.
+The repair is deliberately batched: updating ``content_tsv`` touches large GIN
+indexes and a single transaction over every transcript can exceed the normal
+interactive statement timeout.  Applied runs commit each batch; dry runs use
+the same work and roll each batch back while retaining accurate counts.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import defaultdict
+from dataclasses import dataclass, fields
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy.orm import load_only
 
-from server.db.models import ConversationMessage, Document
+from server.db.models import ConversationMessage, Document, DocumentEmbedding
 from server.db.session import async_session_factory, engine
-from server.services.ingest_service import (
-    _friendly_conversation_title,
-    _has_generated_conversation_title,
+from server.services.conversation_parser import (
+    _extract_local_command,
+    extract_codex_session_metadata,
+    normalize_codex_user_payload,
 )
-from server.services.conversation_parser import _extract_local_command
+from server.services.ingest_service import (
+    MAX_SEARCH_TEXT_CHARS,
+    _bounded_message_text,
+    _conversation_title_needs_derivation,
+    _friendly_codex_agent_title,
+    _friendly_conversation_title,
+)
+from server.services.embedding_service import (
+    CONVERSATION_EMBEDDING_MESSAGE_CHARS,
+    CONVERSATION_EMBEDDING_MESSAGE_LIMIT,
+    conversation_embedding_content,
+)
+from server.services.large_content_store import read_large_content_prefix
 
 
 LOCAL_COMMAND_PREFIXES = (
@@ -30,91 +46,431 @@ LOCAL_COMMAND_PREFIXES = (
     "<local-command-stdout",
     "<local-command-stderr",
 )
+DEFAULT_BATCH_SIZE = 25
+SESSION_META_PREFIX_CHARS = 1024 * 1024
+CODEX_MIRROR_MESSAGE_TYPES = frozenset({"response_item", "user_message"})
 
 
-async def backfill(dry_run: bool) -> tuple[int, int, int]:
-    async with async_session_factory() as db:
-        claude_document_ids = select(Document.id).where(
-            Document.tool_id == "claude_code"
+@dataclass
+class BackfillStats:
+    converted_local_commands: int = 0
+    removed_local_command_caveats: int = 0
+    normalized_codex_prompts: int = 0
+    reclassified_codex_context: int = 0
+    deduplicated_codex_prompts: int = 0
+    renamed_conversations: int = 0
+    backfilled_thread_metadata: int = 0
+    refreshed_search_documents: int = 0
+    invalidated_embedding_documents: int = 0
+
+    def add(self, other: "BackfillStats") -> None:
+        for field in fields(self):
+            setattr(self, field.name, getattr(self, field.name) + getattr(other, field.name))
+
+
+def _normalize_codex_stored_message(message) -> tuple[bool, bool]:
+    """Normalize one stored user row; return ``(changed, became_context)``."""
+    role, content = normalize_codex_user_payload(message.content or "")
+    changed = message.role != role or message.content != content
+    became_context = role == "system"
+    if changed:
+        message.role = role
+        message.content = content
+    if became_context and message.message_type != "codex_context":
+        message.message_type = "codex_context"
+        changed = True
+    return changed, became_context
+
+
+def _is_codex_mirror_pair(first, second) -> bool:
+    """Return whether two rows are the two known Codex copies of one prompt."""
+    if first.role != "user" or second.role != "user":
+        return False
+    if {first.message_type, second.message_type} != CODEX_MIRROR_MESSAGE_TYPES:
+        return False
+    if first.timestamp is None or second.timestamp is None:
+        return False
+    if abs(first.line_number - second.line_number) > 1:
+        return False
+    return (
+        first.timestamp.isoformat()[:19] == second.timestamp.isoformat()[:19]
+        and first.content == second.content
+    )
+
+
+def _codex_title_from_messages(
+    current_title: str | None,
+    relative_path: str,
+    messages: list,
+    metadata: dict | None = None,
+) -> str | None:
+    """Return a repaired title while preserving legitimate/manual titles."""
+    values = metadata or {}
+    if (
+        str(values.get("thread_source") or "").strip().lower() == "subagent"
+    ):
+        # Subagent transcripts inherit the root's opening prompts, so those
+        # messages cannot identify the fork. The collector's task-oriented
+        # agent path/nickname is the stable presentation contract instead.
+        agent_title = _friendly_codex_agent_title(values)
+        if agent_title:
+            return agent_title
+    if not _conversation_title_needs_derivation(current_title, "codex"):
+        return current_title
+    for message in sorted(messages, key=lambda item: item.line_number):
+        if message.role != "user":
+            continue
+        title = _friendly_conversation_title(
+            message.content or "",
+            tool_id="codex",
         )
-        local_messages = await db.execute(
-            select(ConversationMessage).where(
-                ConversationMessage.document_id.in_(claude_document_ids),
-                ConversationMessage.role == "user",
-                or_(*(
-                    func.lower(func.ltrim(ConversationMessage.content)).like(f"{prefix}%")
-                    for prefix in LOCAL_COMMAND_PREFIXES
-                )),
-            )
+        if title:
+            return title
+    agent_title = _friendly_codex_agent_title(metadata)
+    if agent_title:
+        return agent_title
+    return relative_path.rsplit("/", 1)[-1] or current_title
+
+
+def _embedding_input_changed(
+    *,
+    has_inline_content: bool,
+    previous_message_content: str,
+    current_message_content: str,
+) -> bool:
+    """Return whether presentation repair changes this document's model input."""
+    if has_inline_content:
+        return False
+    return previous_message_content != current_message_content
+
+
+def _conversation_embedding_rows_query(document_ids: set):
+    """Select only the bounded, deterministic fallback rows for each document."""
+    ranked = select(
+        ConversationMessage.document_id.label("document_id"),
+        func.left(
+            ConversationMessage.content,
+            CONVERSATION_EMBEDDING_MESSAGE_CHARS,
+        ).label("content"),
+        func.row_number().over(
+            partition_by=ConversationMessage.document_id,
+            order_by=(
+                ConversationMessage.line_number,
+                ConversationMessage.id,
+            ),
+        ).label("row_number"),
+    ).where(
+        ConversationMessage.document_id.in_(document_ids),
+        ConversationMessage.role.in_(("user", "assistant")),
+    ).subquery()
+    return (
+        select(ranked.c.document_id, ranked.c.content)
+        .where(ranked.c.row_number <= CONVERSATION_EMBEDDING_MESSAGE_LIMIT)
+        .order_by(ranked.c.document_id, ranked.c.row_number)
+    )
+
+
+async def _conversation_embedding_content_by_document(
+    db,
+    document_ids: set,
+) -> dict:
+    """Load at most the runtime embedding limit for every requested document."""
+    contents: dict = {document_id: [] for document_id in document_ids}
+    if not document_ids:
+        return {}
+    rows = await db.execute(_conversation_embedding_rows_query(document_ids))
+    for document_id, content in rows.all():
+        contents[document_id].append(content)
+    return {
+        document_id: conversation_embedding_content(message_contents)
+        for document_id, message_contents in contents.items()
+    }
+
+
+async def _invalidate_changed_embeddings(db, document_ids: set) -> None:
+    """Discard vectors only when their actual model input changed."""
+    if not document_ids:
+        return
+    await db.execute(
+        delete(DocumentEmbedding).where(
+            DocumentEmbedding.document_id.in_(document_ids)
         )
-        converted_commands = 0
-        removed_caveats = 0
-        for message in local_messages.scalars():
-            command = _extract_local_command(message.content or "")
-            if command is None:
-                await db.execute(
-                    delete(ConversationMessage).where(
-                        ConversationMessage.id == message.id
-                    )
-                )
-                removed_caveats += 1
-                continue
-
-            tool_name, tool_input, output = command
-            message.role = "tool"
-            message.message_type = "local_command"
-            message.content = output or f"[{tool_name}]"
-            message.metadata_ = {
-                **(message.metadata_ or {}),
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-            }
-            converted_commands += 1
-
-        documents = await db.execute(
-            select(Document.id, Document.title)
-            .where(Document.category == "conversation")
-            .order_by(Document.created_at.asc())
+    )
+    await db.execute(
+        update(Document)
+        .where(Document.id.in_(document_ids))
+        .values(
+            embedding_status="pending",
+            embedding_attempts=0,
+            embedding_claim_token=None,
+            embedding_claimed_at=None,
         )
-        renamed_documents = 0
-        for document_id, current_title in documents:
-            if not _has_generated_conversation_title(current_title):
-                continue
+    )
 
-            messages = await db.execute(
-                select(ConversationMessage.content)
-                .where(
-                    ConversationMessage.document_id == document_id,
-                    ConversationMessage.role == "user",
-                )
-                .order_by(ConversationMessage.line_number.asc())
-                .limit(25)
-            )
-            friendly_title = next(
-                (
-                    title
-                    for content in messages.scalars()
-                    if (title := _friendly_conversation_title(content or ""))
-                ),
-                None,
-            )
-            if not friendly_title:
-                continue
 
+async def _refresh_document_search(db, document: Document) -> None:
+    rows = (
+        (
             await db.execute(
-                update(Document)
-                .where(Document.id == document_id)
-                .values(title=friendly_title)
+                select(func.left(ConversationMessage.content, 2_048))
+                .where(
+                    ConversationMessage.document_id == document.id,
+                    ConversationMessage.role.in_(("user", "assistant")),
+                )
+                .order_by(ConversationMessage.line_number.desc())
+                .limit(200)
             )
-            renamed_documents += 1
+        )
+        .scalars()
+        .all()
+    )
+    search_text = _bounded_message_text(
+        "\n".join(row for row in reversed(rows) if row),
+        MAX_SEARCH_TEXT_CHARS,
+    )
+    from server.services.tokenize import tokenize_for_index
 
+    tsv_input = tokenize_for_index(f"{document.title or ''} {search_text}")
+    await db.execute(
+        update(Document)
+        .where(Document.id == document.id)
+        .values(content_tsv=func.to_tsvector("simple", tsv_input))
+    )
+
+
+async def _repair_claude_commands(db) -> BackfillStats:
+    stats = BackfillStats()
+    claude_document_ids = select(Document.id).where(Document.tool_id == "claude_code")
+    local_messages = await db.execute(
+        select(ConversationMessage).where(
+            ConversationMessage.document_id.in_(claude_document_ids),
+            ConversationMessage.role == "user",
+            or_(*(
+                func.lower(func.ltrim(ConversationMessage.content)).like(f"{prefix}%")
+                for prefix in LOCAL_COMMAND_PREFIXES
+            )),
+        )
+    )
+    for message in local_messages.scalars():
+        command = _extract_local_command(message.content or "")
+        if command is None:
+            await db.execute(
+                delete(ConversationMessage).where(ConversationMessage.id == message.id)
+            )
+            stats.removed_local_command_caveats += 1
+            continue
+
+        tool_name, tool_input, output = command
+        message.role = "tool"
+        message.message_type = "local_command"
+        message.content = output or f"[{tool_name}]"
+        message.metadata_ = {
+            **(message.metadata_ or {}),
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }
+        stats.converted_local_commands += 1
+    return stats
+
+
+async def _externalized_prefix(key: str) -> str:
+    try:
+        return await asyncio.to_thread(
+            read_large_content_prefix,
+            key,
+            max_bytes=SESSION_META_PREFIX_CHARS,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to range-read externalized transcript prefix: {key}"
+        ) from exc
+
+
+async def _set_batch_timeouts(db) -> None:
+    await db.execute(text("SET LOCAL statement_timeout = '25min'"))
+    await db.execute(
+        text("SET LOCAL idle_in_transaction_session_timeout = '25min'")
+    )
+
+
+async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
+    stats = BackfillStats()
+    rows = await db.execute(
+        select(
+            Document,
+            func.left(Document.content, SESSION_META_PREFIX_CHARS).label("content_prefix"),
+            (
+                func.coalesce(func.length(Document.content), 0) > 0
+            ).label("has_inline_embedding_content"),
+        )
+        .options(load_only(
+            Document.id,
+            Document.tool_id,
+            Document.category,
+            Document.relative_path,
+            Document.title,
+            Document.metadata_,
+            Document.content_s3_key,
+        ))
+        .where(Document.id.in_(document_ids))
+    )
+    documents: dict = {}
+    content_prefixes: dict = {}
+    inline_embedding_documents: set = set()
+    for document, content_prefix, has_inline_embedding_content in rows.all():
+        documents[document.id] = document
+        content_prefixes[document.id] = content_prefix or ""
+        if has_inline_embedding_content:
+            inline_embedding_documents.add(document.id)
+
+    message_rows = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.document_id.in_(document_ids),
+            ConversationMessage.role == "user",
+        )
+        .order_by(
+            ConversationMessage.document_id,
+            ConversationMessage.line_number,
+        )
+    )
+    messages_by_document: dict = defaultdict(list)
+    for message in message_rows.scalars():
+        messages_by_document[message.document_id].append(message)
+
+    # Inline transcripts are embedded directly from Document.content, which
+    # this presentation repair never changes. For externalized/empty
+    # conversations, read only the same first 100 bounded rows used at runtime.
+    fallback_embedding_documents = set(documents) - inline_embedding_documents
+    embedding_content_before = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+
+    changed_documents: set = set()
+    for document_id, messages in messages_by_document.items():
+        mirror_candidates: dict[tuple[str, str], object] = {}
+        retained_messages = []
+        for message in messages:
+            if message.role == "user":
+                changed, became_context = _normalize_codex_stored_message(message)
+                if changed:
+                    changed_documents.add(document_id)
+                    if became_context:
+                        stats.reclassified_codex_context += 1
+                    else:
+                        stats.normalized_codex_prompts += 1
+
+            if message.role == "user":
+                dedupe_key = None
+                if (
+                    message.message_type in CODEX_MIRROR_MESSAGE_TYPES
+                    and message.timestamp is not None
+                ):
+                    dedupe_key = (
+                        message.timestamp.isoformat()[:19],
+                        message.content,
+                    )
+                previous = mirror_candidates.get(dedupe_key) if dedupe_key else None
+                if previous is not None and _is_codex_mirror_pair(previous, message):
+                    await db.delete(message)
+                    changed_documents.add(document_id)
+                    stats.deduplicated_codex_prompts += 1
+                    continue
+                if dedupe_key is not None:
+                    mirror_candidates[dedupe_key] = message
+            retained_messages.append(message)
+        messages_by_document[document_id] = retained_messages
+
+    await db.flush()
+
+    for document_id, document in documents.items():
+        messages = messages_by_document.get(document_id, [])
+        prefix = content_prefixes.get(document_id, "")
+        if not prefix and document.content_s3_key:
+            prefix = await _externalized_prefix(document.content_s3_key)
+        identity = extract_codex_session_metadata(prefix)
+        existing_metadata = dict(document.metadata_ or {})
+        if identity:
+            merged_metadata = {**existing_metadata, **identity}
+            if merged_metadata != existing_metadata:
+                document.metadata_ = merged_metadata
+                existing_metadata = merged_metadata
+                stats.backfilled_thread_metadata += 1
+
+        repaired_title = _codex_title_from_messages(
+            document.title,
+            document.relative_path,
+            messages,
+            existing_metadata,
+        )
+        if repaired_title and repaired_title != document.title:
+            document.title = repaired_title
+            changed_documents.add(document_id)
+            stats.renamed_conversations += 1
+
+    await db.flush()
+    for document_id in changed_documents:
+        document = documents.get(document_id)
+        if document is None:
+            continue
+        await _refresh_document_search(db, document)
+        stats.refreshed_search_documents += 1
+
+    embedding_content_after = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+    embedding_changed_documents = {
+        document_id
+        for document_id in documents
+        if _embedding_input_changed(
+            has_inline_content=document_id in inline_embedding_documents,
+            previous_message_content=embedding_content_before.get(document_id, ""),
+            current_message_content=embedding_content_after.get(document_id, ""),
+        )
+    }
+    await _invalidate_changed_embeddings(db, embedding_changed_documents)
+    stats.invalidated_embedding_documents += len(embedding_changed_documents)
+    return stats
+
+
+async def backfill(
+    dry_run: bool,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> BackfillStats:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    stats = BackfillStats()
+    async with async_session_factory() as db:
+        await _set_batch_timeouts(db)
+        stats.add(await _repair_claude_commands(db))
         if dry_run:
             await db.rollback()
         else:
             await db.commit()
 
+        document_ids = list((await db.execute(
+            select(Document.id)
+            .where(
+                Document.tool_id == "codex",
+                Document.category == "conversation",
+            )
+            .order_by(Document.id)
+        )).scalars())
+
+        for offset in range(0, len(document_ids), batch_size):
+            await _set_batch_timeouts(db)
+            batch = document_ids[offset:offset + batch_size]
+            stats.add(await _repair_codex_batch(db, batch))
+            if dry_run:
+                await db.rollback()
+            else:
+                await db.commit()
+
     await engine.dispose()
-    return converted_commands, removed_caveats, renamed_documents
+    return stats
 
 
 def main() -> None:
@@ -122,17 +478,23 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="calculate changes and roll the transaction back",
+        help="calculate changes and roll each repair batch back",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="documents per transaction (default: 25)",
     )
     args = parser.parse_args()
 
-    converted, removed, renamed = asyncio.run(backfill(args.dry_run))
+    stats = asyncio.run(backfill(args.dry_run, batch_size=args.batch_size))
     mode = "dry-run" if args.dry_run else "applied"
-    print(
-        f"{mode}: converted_local_commands={converted} "
-        f"removed_local_command_caveats={removed} "
-        f"renamed_conversations={renamed}"
+    values = " ".join(
+        f"{field.name}={getattr(stats, field.name)}"
+        for field in fields(stats)
     )
+    print(f"{mode}: {values}")
 
 
 if __name__ == "__main__":

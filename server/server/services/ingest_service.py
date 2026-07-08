@@ -76,15 +76,23 @@ MAX_USER_HISTORY_ENTRIES = 2_000
 MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
 
 _ESSENTIAL_METADATA_KEYS = {
+    "agent_depth",
     "agent_id",
+    "agent_nickname",
+    "agent_path",
     "cascade_id",
     "cwd",
     "first_user_message",
+    "forked_from_id",
     "model",
+    "parent_thread_id",
     "project_hash",
     "project_path",
+    "root_session_id",
     "session_id",
     "source",
+    "thread_id",
+    "thread_source",
     "title",
 }
 
@@ -133,11 +141,28 @@ def _json_size(value: object) -> int:
 
 def _prepare_document_metadata(
     metadata: dict,
+    *,
+    tool_id: str | None = None,
 ) -> tuple[dict, list[dict], str]:
     """Separate transient prompt history and bound JSON stored on Document."""
     candidate = dict(metadata or {})
     raw_history = candidate.pop("user_history", [])
     first_user_message = str(candidate.pop("first_user_message", "") or "")
+    normalizer = None
+    if tool_id == "codex":
+        from .conversation_parser import normalize_codex_user_payload
+
+        normalizer = normalize_codex_user_payload
+        first_role, first_user_message = normalizer(first_user_message)
+        if first_role != "user":
+            first_user_message = ""
+        raw_title = candidate.get("title")
+        if isinstance(raw_title, str):
+            title_role, normalized_title = normalizer(raw_title)
+            if title_role == "user" and normalized_title:
+                candidate["title"] = normalized_title
+            else:
+                candidate.pop("title", None)
     first_user_message = _bounded_message_text(
         first_user_message,
         MAX_STORED_MESSAGE_CHARS,
@@ -149,10 +174,12 @@ def _prepare_document_metadata(
         for entry in raw_history[:MAX_USER_HISTORY_ENTRIES]:
             if not isinstance(entry, dict):
                 continue
-            text = _bounded_message_text(
-                str(entry.get("text", "") or ""),
-                MAX_STORED_MESSAGE_CHARS,
-            )
+            text = str(entry.get("text", "") or "")
+            if normalizer is not None:
+                history_role, text = normalizer(text)
+                if history_role != "user":
+                    continue
+            text = _bounded_message_text(text, MAX_STORED_MESSAGE_CHARS)
             entry_size = len(text.encode("utf-8")) + 64
             if history_bytes + entry_size > MAX_USER_HISTORY_BYTES:
                 break
@@ -258,9 +285,39 @@ def _has_generated_conversation_title(title: str | None) -> bool:
     return bool(_GENERATED_CONVERSATION_TITLE_RE.fullmatch(candidate))
 
 
-def _friendly_conversation_title(content: str, max_length: int = 96) -> str | None:
+def _conversation_title_needs_derivation(
+    title: str | None,
+    tool_id: str | None = None,
+) -> bool:
+    """Return whether a source title is opaque or injected Codex context."""
+    if _has_generated_conversation_title(title):
+        return True
+    candidate = (title or "").strip()
+    if not candidate:
+        return True
+    if tool_id != "codex":
+        return False
+
+    from .conversation_parser import normalize_codex_user_payload
+
+    role, normalized = normalize_codex_user_payload(candidate)
+    return role != "user" or normalized != candidate
+
+
+def _friendly_conversation_title(
+    content: str,
+    max_length: int = 96,
+    *,
+    tool_id: str | None = None,
+) -> str | None:
     """Build a compact thread name from the first meaningful human prompt."""
     text = (content or "").strip()
+    if tool_id == "codex":
+        from .conversation_parser import normalize_codex_user_payload
+
+        role, text = normalize_codex_user_payload(text)
+        if role != "user":
+            return None
     if not text or text.lower().startswith(_CLAUDE_LOCAL_COMMAND_PREFIXES):
         return None
 
@@ -277,12 +334,58 @@ def _friendly_conversation_title(content: str, max_length: int = 96) -> str | No
     return shortened.rstrip(".,;:-") + "…"
 
 
+def _friendly_codex_agent_title(
+    metadata: dict | None,
+    max_length: int = 96,
+) -> str | None:
+    """Build a readable task-oriented title from subagent metadata."""
+    values = metadata or {}
+    agent_path = str(values.get("agent_path") or "").strip()
+    if agent_path:
+        label = agent_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    else:
+        label = str(values.get("agent_nickname") or "").strip()
+    readable = re.sub(r"[_-]+", " ", label).strip()
+    return readable[:max_length] or None
+
+
+def _select_updated_document_title(
+    existing_title: str | None,
+    incoming_title: str,
+    *,
+    category: str,
+    tool_id: str,
+) -> str:
+    """Keep a legitimate existing Codex title across collector syncs."""
+    if (
+        tool_id == "codex"
+        and category == "conversation"
+        and existing_title
+        and not _conversation_title_needs_derivation(existing_title, tool_id)
+    ):
+        return existing_title
+    return incoming_title
+
+
 async def _apply_friendly_conversation_title(
     db: AsyncSession,
     doc: Document,
 ) -> str | None:
     """Replace opaque transcript identifiers with the first real user prompt."""
-    if not _has_generated_conversation_title(doc.title):
+    metadata = doc.metadata_ or {}
+    if (
+        doc.tool_id == "codex"
+        and str(metadata.get("thread_source") or "").strip().lower()
+        == "subagent"
+    ):
+        # A subagent starts with a cloned copy of its root transcript. Its first
+        # user row therefore describes the parent task, not this fork. Prefer
+        # the task-oriented agent path (or nickname fallback) unconditionally.
+        agent_title = _friendly_codex_agent_title(metadata)
+        if agent_title:
+            doc.title = agent_title
+            return agent_title
+    if not _conversation_title_needs_derivation(doc.title, doc.tool_id):
         return doc.title
 
     result = await db.execute(
@@ -295,10 +398,18 @@ async def _apply_friendly_conversation_title(
         .limit(25)
     )
     for content in result.scalars():
-        friendly = _friendly_conversation_title(content or "")
+        friendly = _friendly_conversation_title(
+            content or "",
+            tool_id=doc.tool_id,
+        )
         if friendly:
             doc.title = friendly
             return friendly
+    if doc.tool_id == "codex":
+        agent_title = _friendly_codex_agent_title(doc.metadata_)
+        if agent_title:
+            doc.title = agent_title
+            return agent_title
     return doc.title
 
 
@@ -668,6 +779,14 @@ async def ingest_file(
     else:
         content, had_sensitive = _resanitize(content)
 
+    # Collector metadata is advisory and older clients omitted Codex thread
+    # identity entirely.  The first session_meta object is authoritative and
+    # cheap to parse even for an externalized multi-hundred-megabyte FULL.
+    if tool_id == "codex" and category == "conversation" and content:
+        from .conversation_parser import extract_codex_session_metadata
+
+        metadata.update(extract_codex_session_metadata(content))
+
     # Ensure tool exists
     tool = await ensure_tool(db, tool_id)
 
@@ -749,7 +868,8 @@ async def ingest_file(
                 project_id = row
 
     stored_metadata, user_history, first_user_message = _prepare_document_metadata(
-        metadata
+        metadata,
+        tool_id=tool_id,
     )
     now = received_at
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
@@ -812,7 +932,8 @@ async def ingest_file(
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
         merged_metadata, _, _ = _prepare_document_metadata(
-            {**existing_metadata, **stored_metadata}
+            {**existing_metadata, **stored_metadata},
+            tool_id=tool_id,
         )
         doc.metadata_ = merged_metadata
         doc.needs_review = doc.needs_review or had_sensitive
@@ -824,7 +945,12 @@ async def ingest_file(
             doc.source_modified_at = source_modified_at
         if machine_id and not doc.machine_id:
             doc.machine_id = machine_id
-        doc.title = title
+        doc.title = _select_updated_document_title(
+            doc.title,
+            title,
+            category=category,
+            tool_id=tool_id,
+        )
         # Backfill project_id when newly resolved (was NULL, or changed).
         # Don't overwrite an existing link with NULL — keep last good value.
         if project_id and doc.project_id != project_id:
@@ -1259,6 +1385,11 @@ async def _extract_messages(
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.
     if user_history and isinstance(user_history, list):
+        codex_normalizer = None
+        if tool_id == "codex":
+            from .conversation_parser import normalize_codex_user_payload
+
+            codex_normalizer = normalize_codex_user_payload
         # Inject history entries that aren't already in DB (by content dedup)
         existing = await db.execute(
             select(ConversationMessage.content).where(
@@ -1270,6 +1401,10 @@ async def _extract_messages(
         injected = 0
         for entry in user_history:
             text = entry.get("text", "").strip()
+            if codex_normalizer is not None:
+                history_role, text = codex_normalizer(text)
+                if history_role != "user":
+                    continue
             ts_epoch = entry.get("ts", 0)
             if not text or text in existing_texts:
                 continue
@@ -1299,6 +1434,14 @@ async def _extract_messages(
     elif not user_history:
         # Fallback: first_user_message from state_5.sqlite
         first_user_msg = (first_user_message or "").strip()
+        if tool_id == "codex" and first_user_msg:
+            from .conversation_parser import normalize_codex_user_payload
+
+            first_role, first_user_msg = normalize_codex_user_payload(
+                first_user_msg
+            )
+            if first_role != "user":
+                first_user_msg = ""
         if first_user_msg:
             existing_user = await db.execute(
                 select(ConversationMessage.id)

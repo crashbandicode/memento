@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import sys
 import tempfile
 import unittest
@@ -22,7 +23,10 @@ from server.services.ingest_service import (  # noqa: E402
     _is_externalized_delta_update,
     _prepare_document_metadata,
 )
-from server.services.large_content_store import store_large_content  # noqa: E402
+from server.services.large_content_store import (  # noqa: E402
+    read_large_content_prefix,
+    store_large_content,
+)
 
 
 class _FakeS3:
@@ -57,7 +61,32 @@ class _FakeS3:
         self.deleted.append((Bucket, Key))
 
 
+class _PrefixS3:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.calls = []
+
+    def get_object(self, *, Bucket, Key, Range):
+        self.calls.append((Bucket, Key, Range))
+        return {"Body": io.BytesIO(self.payload)}
+
+
 class LargeContentStoreTests(unittest.TestCase):
+    def test_prefix_read_uses_a_bounded_s3_range(self) -> None:
+        client = _PrefixS3(b"abcdef")
+
+        prefix = read_large_content_prefix(
+            "raw/thread.txt",
+            max_bytes=5,
+            s3_client=client,
+        )
+
+        self.assertEqual(prefix, "abcde")
+        self.assertEqual(
+            client.calls,
+            [(settings.s3_bucket, "raw/thread.txt", "bytes=0-4")],
+        )
+
     def test_raw_payload_is_streamed_to_deterministic_private_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             payload = Path(temporary) / "payload.bin"

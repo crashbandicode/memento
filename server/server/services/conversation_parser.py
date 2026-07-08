@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from uuid import UUID
 
 
 @dataclass
@@ -33,6 +34,169 @@ _ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
     r"|\x9B[0-?]*[ -/]*[@-~]"
 )
+
+_CODEX_REQUEST_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*##[ \t]+My request for Codex:[ \t]*$"
+)
+_CODEX_SYSTEM_CONTEXT_RE = re.compile(
+    r"^(?:"
+    r"#\s*AGENTS\.md instructions(?:\s+for\b|\s*<INSTRUCTIONS>|\s*$)"
+    r"|AGENTS\.md instructions(?:\s+for\b|\s*<INSTRUCTIONS>|\s*$)"
+    r"|#\s*Context from my IDE setup\s*:"
+    r"|Context from my IDE setup\s*:"
+    r"|#\s*Files mentioned by the user\s*:"
+    r"|Files mentioned by the user\s*:"
+    r"|<(?:environment_context|turn_aborted|app-context|collaboration_mode"
+    r"|skills_instructions|plugins_instructions|multi_agent_mode|INSTRUCTIONS)\b"
+    r"|<permissions instructions>"
+    r")",
+    re.IGNORECASE,
+)
+_CODEX_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def normalize_codex_user_payload(content: str) -> tuple[str, str]:
+    """Return ``(role, text)`` for a Codex payload labelled as user input.
+
+    Codex Desktop and older IDE integrations serialize injected workspace
+    context as ``role=user``.  Those envelopes are valuable provenance but
+    are not human prompts.  Older wrappers also embed the actual prompt after
+    a stable ``## My request for Codex:`` marker; retain only that suffix.
+    """
+    text = (content or "").strip()
+    if not text:
+        return "system", ""
+
+    marker = _CODEX_REQUEST_MARKER_RE.search(text)
+    if marker is not None:
+        prefix = text[:marker.start()].strip()
+        if not prefix or _CODEX_SYSTEM_CONTEXT_RE.match(prefix):
+            request = text[marker.end():].strip()
+            if request:
+                return "user", request
+            return "system", text
+
+    if _CODEX_SYSTEM_CONTEXT_RE.match(text):
+        return "system", text
+    return "user", text
+
+
+def _codex_uuid(value: object) -> str | None:
+    candidate = str(value or "").strip()
+    if not _CODEX_UUID_RE.fullmatch(candidate):
+        return None
+    try:
+        return str(UUID(candidate))
+    except ValueError:
+        return None
+
+
+def _codex_session_metadata_from_payload(payload: dict) -> dict:
+    source = payload.get("source")
+    subagent: dict = {}
+    if isinstance(source, dict):
+        nested = source.get("subagent")
+        if isinstance(nested, dict):
+            spawn = nested.get("thread_spawn")
+            if isinstance(spawn, dict):
+                subagent = spawn
+
+    current_id = _codex_uuid(
+        payload.get("id") or payload.get("thread_id") or payload.get("session_id")
+    )
+    if current_id is None:
+        return {}
+    root_id = _codex_uuid(
+        payload.get("root_session_id") or payload.get("session_id") or current_id
+    ) or current_id
+
+    result: dict[str, object] = {
+        "session_id": current_id,
+        "thread_id": current_id,
+        "root_session_id": root_id,
+    }
+    for key, value in (
+        ("parent_thread_id", payload.get("parent_thread_id") or subagent.get("parent_thread_id")),
+        ("forked_from_id", payload.get("forked_from_id")),
+    ):
+        normalized = _codex_uuid(value)
+        if normalized:
+            result[key] = normalized
+
+    thread_source = payload.get("thread_source")
+    if isinstance(thread_source, str) and thread_source.strip():
+        result["thread_source"] = thread_source.strip()[:64]
+    for key, value in (
+        ("agent_path", payload.get("agent_path") or subagent.get("agent_path")),
+        ("agent_nickname", payload.get("agent_nickname") or subagent.get("agent_nickname")),
+    ):
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()[:1024]
+
+    depth = payload.get("agent_depth")
+    if depth is None:
+        depth = subagent.get("depth")
+    if isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0:
+        result["agent_depth"] = depth
+    return result
+
+
+def extract_codex_session_metadata(raw_content: str) -> dict:
+    """Extract bounded thread identity from the first Codex session_meta row."""
+    if not raw_content:
+        return {}
+    first = next(iter(_iter_json_objects(raw_content)), None)
+    if first is not None:
+        try:
+            obj = json.loads(first)
+        except (json.JSONDecodeError, TypeError):
+            obj = None
+        if isinstance(obj, dict) and obj.get("type") == "session_meta":
+            payload = obj.get("payload")
+            if isinstance(payload, dict):
+                return _codex_session_metadata_from_payload(payload)
+
+    # A range-read prefix can end inside a very large base_instructions value.
+    # The identity fields precede it, so recover only those early scalar keys
+    # without ever accepting a non-session_meta object.
+    prefix = raw_content.lstrip()[: 1024 * 1024]
+    if not re.search(r'"type"\s*:\s*"session_meta"', prefix[:4096]):
+        return {}
+
+    def string_value(key: str) -> str | None:
+        match = re.search(
+            rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"',
+            prefix,
+        )
+        if match is None:
+            return None
+        try:
+            return json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            return None
+
+    payload = {
+        key: value
+        for key in (
+            "id",
+            "thread_id",
+            "session_id",
+            "root_session_id",
+            "parent_thread_id",
+            "forked_from_id",
+            "thread_source",
+            "agent_path",
+            "agent_nickname",
+        )
+        if (value := string_value(key)) is not None
+    }
+    depth_match = re.search(r'"(?:agent_depth|depth)"\s*:\s*(\d+)', prefix)
+    if depth_match is not None:
+        payload["agent_depth"] = int(depth_match.group(1))
+    return _codex_session_metadata_from_payload(payload)
 
 
 def strip_terminal_sequences(text: str) -> str:
@@ -147,12 +311,19 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                 content = _extract_codex_content(payload.get("content", []))
                 if not content.strip():
                     return None
-                # Skip Codex system context injections (not real user text)
-                if content.lstrip().startswith("<environment_context>"):
+                normalized_role, content = normalize_codex_user_payload(content)
+                if not content:
                     return None
-                if content.lstrip().startswith("<turn_aborted>"):
-                    return None
-                return NormalizedMessage(role="user", content=content, timestamp=timestamp, raw_type=msg_type)
+                return NormalizedMessage(
+                    role=normalized_role,
+                    content=content,
+                    timestamp=timestamp,
+                    raw_type=(
+                        "codex_context"
+                        if normalized_role == "system"
+                        else msg_type
+                    ),
+                )
             return None
 
         if msg_type == "event_msg":
@@ -163,7 +334,17 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             if event_type == "user_message":
                 text = payload.get("message", "")
                 if text.strip():
-                    return NormalizedMessage(role="user", content=text, timestamp=timestamp, raw_type="user_message")
+                    normalized_role, text = normalize_codex_user_payload(text)
+                    return NormalizedMessage(
+                        role=normalized_role,
+                        content=text,
+                        timestamp=timestamp,
+                        raw_type=(
+                            "codex_context"
+                            if normalized_role == "system"
+                            else "user_message"
+                        ),
+                    )
                 return None
             # Agent message — intermediate commentary in new Codex, sole reply in old Codex.
             # Kept as assistant message; if task_complete also exists, ingest dedup handles it.

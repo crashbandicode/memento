@@ -9,12 +9,160 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_parser import (  # noqa: E402
+    extract_codex_session_metadata,
+    normalize_codex_user_payload,
     parse_conversation_line,
     strip_terminal_sequences,
 )
 
 
 class ConversationParserTests(unittest.TestCase):
+    def test_codex_request_wrapper_keeps_only_the_human_request(self) -> None:
+        wrapped = (
+            "# Context from my IDE setup:\n\n"
+            "## Open tabs:\n- REPORT.md\n\n"
+            "## My request for Codex:\n"
+            "Explain the drift and propose a fix."
+        )
+        raw = json.dumps({
+            "type": "response_item",
+            "timestamp": "2026-07-08T10:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": wrapped}],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "codex")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "user")
+        self.assertEqual(msg.content, "Explain the drift and propose a fix.")
+
+    def test_codex_files_wrapper_is_normalized_for_event_messages(self) -> None:
+        wrapped = (
+            "# Files mentioned by the user:\n\n"
+            "## report.png\n\n"
+            "## My request for Codex:\nRepair the card title."
+        )
+        raw = json.dumps({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": wrapped},
+        })
+
+        msg = parse_conversation_line(raw, "codex")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "user")
+        self.assertEqual(msg.content, "Repair the card title.")
+
+    def test_codex_agents_envelope_is_system_context_not_a_prompt(self) -> None:
+        content = (
+            "# AGENTS.md instructions for C:\\repo\n\n"
+            "<INSTRUCTIONS>Use PowerShell.</INSTRUCTIONS>"
+        )
+        raw = json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": content}],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "codex")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "system")
+        self.assertEqual(msg.raw_type, "codex_context")
+        self.assertEqual(msg.content, content)
+
+    def test_codex_environment_context_is_preserved_as_system_context(self) -> None:
+        role, content = normalize_codex_user_payload(
+            "<environment_context><cwd>C:\\repo</cwd></environment_context>"
+        )
+
+        self.assertEqual(role, "system")
+        self.assertIn("environment_context", content)
+
+    def test_codex_plain_prompt_is_not_over_normalized(self) -> None:
+        role, content = normalize_codex_user_payload(
+            "Please explain how AGENTS.md instructions are loaded."
+        )
+
+        self.assertEqual(role, "user")
+        self.assertEqual(
+            content,
+            "Please explain how AGENTS.md instructions are loaded.",
+        )
+
+    def test_codex_plain_prompt_quoting_request_marker_is_not_truncated(self) -> None:
+        prompt = (
+            "Please preserve this template exactly:\n\n"
+            "## My request for Codex:\nplaceholder"
+        )
+
+        role, content = normalize_codex_user_payload(prompt)
+
+        self.assertEqual(role, "user")
+        self.assertEqual(content, prompt)
+
+    def test_codex_session_metadata_uses_current_thread_and_root_ids(self) -> None:
+        root_id = "11111111-1111-4111-8111-111111111111"
+        current_id = "22222222-2222-4222-8222-222222222222"
+        raw = json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "session_id": root_id,
+                "id": current_id,
+                "forked_from_id": root_id,
+                "parent_thread_id": root_id,
+                "thread_source": "subagent",
+                "agent_path": "/root/reviewer",
+                "agent_nickname": "Noether",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": root_id,
+                            "depth": 1,
+                            "agent_path": "/root/reviewer",
+                            "agent_nickname": "Noether",
+                        }
+                    }
+                },
+            },
+        })
+
+        metadata = extract_codex_session_metadata(raw)
+
+        self.assertEqual(metadata["session_id"], current_id)
+        self.assertEqual(metadata["thread_id"], current_id)
+        self.assertEqual(metadata["root_session_id"], root_id)
+        self.assertEqual(metadata["parent_thread_id"], root_id)
+        self.assertEqual(metadata["forked_from_id"], root_id)
+        self.assertEqual(metadata["thread_source"], "subagent")
+        self.assertEqual(metadata["agent_path"], "/root/reviewer")
+        self.assertEqual(metadata["agent_nickname"], "Noether")
+        self.assertEqual(metadata["agent_depth"], 1)
+
+    def test_codex_session_metadata_survives_a_truncated_range_prefix(self) -> None:
+        current_id = "33333333-3333-4333-8333-333333333333"
+        raw = (
+            '{"type":"session_meta","payload":{'
+            f'"session_id":"{current_id}","id":"{current_id}",'
+            '"thread_source":"user","base_instructions":"unfinished'
+        )
+
+        metadata = extract_codex_session_metadata(raw)
+
+        self.assertEqual(metadata["session_id"], current_id)
+        self.assertEqual(metadata["root_session_id"], current_id)
+        self.assertEqual(metadata["thread_source"], "user")
+
     def test_claude_tool_result_is_not_classified_as_user(self) -> None:
         raw = json.dumps({
             "type": "user",

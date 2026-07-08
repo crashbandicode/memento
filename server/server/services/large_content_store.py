@@ -64,3 +64,28 @@ def store_large_content(
             pass
         raise OSError("raw transcript object size verification failed")
     return key
+
+
+def read_large_content_prefix(
+    key: str,
+    *,
+    max_bytes: int = 1024 * 1024,
+    s3_client=None,
+) -> str:
+    """Range-read a bounded UTF-8 prefix from one private transcript."""
+    if max_bytes <= 0:
+        return ""
+    client = s3_client or _client()
+    response = client.get_object(
+        Bucket=settings.s3_bucket,
+        Key=key,
+        Range=f"bytes=0-{max_bytes - 1}",
+    )
+    body = response["Body"]
+    try:
+        payload = body.read(max_bytes)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+    return payload.decode("utf-8", errors="replace")
