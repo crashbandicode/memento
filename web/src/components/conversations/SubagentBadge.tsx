@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Icon } from "@/components/aurora/Icon";
 import type { ConversationSubagentSummary } from "@/lib/api-client";
+import styles from "./SubagentBadge.module.css";
 
 export default function SubagentBadge({
   count,
@@ -58,14 +59,10 @@ export default function SubagentBadge({
         {pill}
       </summary>
       <div
+        className={styles.panel}
         style={{
           display: "grid",
           gap: 5,
-          minWidth: 220,
-          width: "min(420px, calc(100vw - 48px))",
-          maxHeight: 360,
-          overflowY: "auto",
-          overscrollBehavior: "contain",
           marginTop: 6,
           padding: 7,
           border: "1px solid var(--aurora-border)",

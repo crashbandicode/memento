@@ -28,11 +28,20 @@ function detectInitialLocale(): Locale {
 }
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
-  // Lazy init: first saved choice, else browser pref, else zh-CN. Avoids
-  // setState-in-effect cascading render.
-  const [locale, setLocale] = useState<Locale>(detectInitialLocale);
+  // The server and the browser's first render must use the same locale or
+  // translated text cannot hydrate. Restore the saved/browser preference only
+  // after hydration; requestAnimationFrame keeps the update out of the effect
+  // body and avoids a cascading synchronous render.
+  const [locale, setLocale] = useState<Locale>("zh-CN");
   const t = locales[locale].translations;
   const pathname = usePathname();
+
+  useEffect(() => {
+    const initialLocale = detectInitialLocale();
+    if (initialLocale === "zh-CN") return;
+    const frame = requestAnimationFrame(() => setLocale(initialLocale));
+    return () => cancelAnimationFrame(frame);
+  }, []);
 
   const handleSetLocale = (l: Locale) => {
     setLocale(l);
