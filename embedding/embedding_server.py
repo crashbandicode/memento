@@ -41,11 +41,12 @@ logger = logging.getLogger("embedding_server")
 _model = None
 _encode_lock = threading.Lock()
 _embed_slots = threading.BoundedSemaphore(
-    int(os.environ.get("MEMENTO_EMBEDDING_MAX_QUEUED_REQUESTS", "8"))
+    int(os.environ.get("MEMENTO_EMBEDDING_MAX_INFLIGHT_REQUESTS", "1"))
 )
 _max_request_bytes = int(
     os.environ.get("MEMENTO_EMBEDDING_MAX_REQUEST_BYTES", str(8 * 1024 * 1024))
 )
+_model_batch_size = int(os.environ.get("MEMENTO_EMBEDDING_MODEL_BATCH_SIZE", "10"))
 
 
 def _load_model(model_name: str):
@@ -67,7 +68,11 @@ class Handler(BaseHTTPRequestHandler):
             self._safe_error(404)
             return
         if not _embed_slots.acquire(blocking=False):
-            self._safe_error(503, "embedding queue is full")
+            # Do not queue behind a multi-minute CPU inference. HTTP clients
+            # can time out while waiting, leaving the server to perform stale
+            # work after nobody is listening. Callers persist a failed status
+            # and retry later, so an immediate 503 is both cheaper and safer.
+            self._safe_error(503, "embedding server is busy")
             return
         try:
             try:
@@ -93,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
             with _encode_lock:
                 embeddings = _model.encode(
                     texts,
+                    batch_size=_model_batch_size,
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )

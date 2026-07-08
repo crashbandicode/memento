@@ -8,12 +8,13 @@ import json
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
     ConversationMessage,
     Document,
+    DocumentEmbedding,
     DocumentVersion,
     Machine,
     Project,
@@ -86,6 +87,24 @@ _ESSENTIAL_METADATA_KEYS = {
     "source",
     "title",
 }
+
+
+async def _invalidate_embeddings_for_revision(
+    db: AsyncSession,
+    doc: Document,
+    incoming_hash: str,
+) -> bool:
+    """Invalidate vectors and retry state when document content changes."""
+    if doc.content_hash == incoming_hash:
+        return False
+    await db.execute(
+        delete(DocumentEmbedding).where(DocumentEmbedding.document_id == doc.id)
+    )
+    doc.embedding_status = "pending"
+    doc.embedding_attempts = 0
+    doc.embedding_claim_token = None
+    doc.embedding_claimed_at = None
+    return True
 
 
 def _bounded_message_text(value: str, limit: int) -> str:
@@ -758,6 +777,11 @@ async def ingest_file(
         db.add(doc)
     else:
         # Update existing document
+        await _invalidate_embeddings_for_revision(
+            db,
+            doc,
+            content_hash,
+        )
         preserve_externalized_delta = _is_externalized_delta_update(
             doc,
             mode=mode,

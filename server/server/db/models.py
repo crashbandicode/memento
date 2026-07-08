@@ -124,10 +124,15 @@ class Document(Base):
     visibility: Mapped[str] = mapped_column(String(20), default="private")
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
     # Tracks the outcome of the embedding pipeline so failures don't silently
-    # drop documents. Values: pending (just ingested), ok (embedded), failed
-    # (call errored — retry candidate), skipped (too short / binary — intentional).
+    # drop documents. Values: pending (just ingested), processing (claimed),
+    # ok (embedded), failed (call errored — retry candidate), skipped (too
+    # short / binary — intentional). The token/timestamp fence stale workers.
     embedding_status: Mapped[str] = mapped_column(String(20), default="pending")
     embedding_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    embedding_claim_token: Mapped[str | None] = mapped_column(String(36))
+    embedding_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     # Knowledge-graph extraction pipeline status. Same shape as the
     # embedding pair above. Values: pending (just ingested), ok
     # (extracted), failed (LLM errored — retry candidate via

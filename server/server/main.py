@@ -96,6 +96,18 @@ def _run_migrations(conn) -> None:
             "ALTER TABLE documents ADD COLUMN embedding_attempts INTEGER "
             "NOT NULL DEFAULT 0"
         ))
+    if "embedding_claim_token" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN embedding_claim_token VARCHAR(36)"
+        ))
+    if "embedding_claimed_at" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN embedding_claimed_at TIMESTAMPTZ"
+        ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_documents_embedding_retry "
+        "ON documents (embedding_status, embedding_attempts, embedding_claimed_at)"
+    ))
 
     # knowledge_status / knowledge_attempts: same pattern as the embedding
     # pair, added later to give a way to retry LLM extraction. Existing rows

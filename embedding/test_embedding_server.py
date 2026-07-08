@@ -34,6 +34,7 @@ class _SerializingModel:
         self.calls = 0
         self.active = 0
         self.max_active = 0
+        self.batch_sizes: list[int | None] = []
 
     def encode(self, texts, **_kwargs):
         with self._guard:
@@ -41,6 +42,7 @@ class _SerializingModel:
             call = self.calls
             self.active += 1
             self.max_active = max(self.max_active, self.active)
+            self.batch_sizes.append(_kwargs.get("batch_size"))
         if call == 1:
             self.first_started.set()
             if not self.release_first.wait(timeout=3):
@@ -110,7 +112,7 @@ class EmbeddingServerTests(unittest.TestCase):
 
         self.assertEqual(post_result, [200])
 
-    def test_concurrent_embeddings_are_serialized(self) -> None:
+    def test_concurrent_embedding_is_rejected_instead_of_queued(self) -> None:
         model = _SerializingModel()
         server, previous_model = self._start_server(model)
         port = server.server_address[1]
@@ -127,7 +129,9 @@ class EmbeddingServerTests(unittest.TestCase):
             first.start()
             self.assertTrue(model.first_started.wait(timeout=1))
             second.start()
-            time.sleep(0.1)
+            second.join(timeout=1)
+            self.assertFalse(second.is_alive())
+            self.assertEqual(results, [503])
             self.assertEqual(model.calls, 1)
             self.assertEqual(model.max_active, 1)
         finally:
@@ -138,9 +142,10 @@ class EmbeddingServerTests(unittest.TestCase):
             server.server_close()
             embedding_server._model = previous_model
 
-        self.assertEqual(sorted(results), [200, 200])
-        self.assertEqual(model.calls, 2)
+        self.assertEqual(sorted(results), [200, 503])
+        self.assertEqual(model.calls, 1)
         self.assertEqual(model.max_active, 1)
+        self.assertEqual(model.batch_sizes, [embedding_server._model_batch_size])
 
     def test_oversized_request_is_rejected_before_reading_body(self) -> None:
         model = _BlockingModel()

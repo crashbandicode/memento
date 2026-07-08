@@ -421,6 +421,7 @@ async def semantic_search(
             dist_col,
         )
         .join(Document, DocumentEmbedding.document_id == Document.id)
+        .where(Document.embedding_status == "ok")
         .order_by(dist_col.asc())
         .limit(limit * 4)  # Overfetch: multiple chunks per doc; we'll dedup
     )

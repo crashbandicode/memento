@@ -102,14 +102,15 @@ celery_app.conf.beat_schedule = {
         # i.e. re-bake the day that just ended.
         "kwargs": {"offset_days": -1},
     },
-    # Every 15 min: reattempt documents whose embedding pipeline errored
-    # (e.g. the host-side BGE-M3 server was briefly unreachable).
+    # Every minute: recover one pending/failed embedding revision. The task is
+    # PostgreSQL-singleton and handles one document, so ticks that overlap a
+    # long CPU inference exit immediately while short jobs keep the queue
+    # moving instead of leaving the model idle for up to 15 minutes.
     "embedding-retry": {
         "task": "server.tasks.embedding_retry.retry_failed_embeddings",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute="*"),
     },
-    # Same cadence (offset by 2 min so the two retry beats don't hammer
-    # the DB / LLM provider at the same instant). Picks up docs whose
+    # Every 15 minutes, offset by 2: pick up docs whose
     # knowledge-graph extract failed at ingest time — typically because
     # the LLM provider was rate-limited or the API key expired.
     "knowledge-retry": {

@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, DocumentEmbedding
@@ -30,6 +32,11 @@ CHUNK_OVERLAP = 200
 
 _server_available: bool | None = None  # None = not checked yet
 _last_check_time: float = 0  # Retry every 60s after failure
+EMBEDDING_PROCESSING_STALE_AFTER = timedelta(minutes=25)
+
+
+class EmbeddingServerBusy(RuntimeError):
+    """The healthy embedding server is already processing another request."""
 
 
 def _chunk_text(
@@ -55,16 +62,18 @@ def _chunk_text(
 
 
 async def _call_embedding_server(
-    texts: list[str], timeout: float = 120.0
+    texts: list[str],
+    timeout: float = 900.0,
+    *,
+    raise_on_busy: bool = False,
 ) -> list[list[float]] | None:
     """Call the external embedding HTTP server.
 
-    timeout: total request timeout per batch. Default 120s is for the
-    ingest/retry path which tolerates long model loads; the interactive
-    query path (``/api/memory/semantic``) should pass a small value (e.g.
-    8s) so a stuck BGE-M3 server doesn't stall the MCP client past its
-    own 30s ceiling, which surfaces as an empty-string ReadTimeout in
-    the user's UI.
+    timeout: request timeout. Default 900s covers the complete background
+    document (up to 50 chunks); real CPU-only BGE-M3 batches can exceed two
+    minutes. Interactive callers pass 30s instead. When ``raise_on_busy`` is
+    true, an admission 503 is surfaced separately so durable background work
+    can remain pending without consuming its finite failure budget.
     """
     global _server_available, _last_check_time
     import time
@@ -75,22 +84,27 @@ async def _call_embedding_server(
     try:
         import httpx
 
-        all_embeddings: list[list[float]] = []
-        batch_size = 10
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                resp = await client.post(
-                    f"{EMBEDDING_SERVER_URL}/embed",
-                    json={"texts": batch},
-                )
-                if resp.status_code != 200:
-                    logger.warning("Embedding server returned %d", resp.status_code)
-                    return None
-                data = resp.json()
-                all_embeddings.extend(data.get("embeddings", []))
+            # One request reserves server admission for the whole document.
+            # The server still encodes in bounded model batches, but another
+            # caller cannot interleave and force us to discard partial work.
+            resp = await client.post(
+                f"{EMBEDDING_SERVER_URL}/embed",
+                json={"texts": texts},
+            )
+            if resp.status_code == 503:
+                _server_available = True
+                if raise_on_busy:
+                    raise EmbeddingServerBusy("embedding server is busy")
+                return None
+            if resp.status_code != 200:
+                logger.warning("Embedding server returned %d", resp.status_code)
+                return None
+            data = resp.json()
         _server_available = True
-        return all_embeddings
+        return data.get("embeddings", [])
+    except EmbeddingServerBusy:
+        raise
     except Exception as e:
         import time
 
@@ -113,9 +127,39 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     SQLAlchemy's stale-row detection — under load every collector resend used
     to roll back the whole transaction and lose the embeddings.
     """
-    from sqlalchemy import update as _update
+    revision_hash = doc.content_hash
+    claim_token = str(uuid4())
 
-    async def _set_status(status: str, *, bump_attempts: bool = False) -> None:
+    async def _claim_revision() -> bool:
+        """Claim one exact revision, including abandoned processing work."""
+        stale_before = datetime.now(timezone.utc) - EMBEDDING_PROCESSING_STALE_AFTER
+        result = await db.execute(
+            update(Document)
+            .where(
+                Document.id == doc.id,
+                Document.content_hash == revision_hash,
+                or_(
+                    Document.embedding_status.in_(("pending", "failed")),
+                    and_(
+                        Document.embedding_status == "processing",
+                        or_(
+                            Document.embedding_claimed_at.is_(None),
+                            Document.embedding_claimed_at < stale_before,
+                        ),
+                    ),
+                ),
+            )
+            .values(
+                embedding_status="processing",
+                embedding_claim_token=claim_token,
+                embedding_claimed_at=func.now(),
+                updated_at=func.now(),
+            )
+        )
+        await db.commit()
+        return result.rowcount == 1
+
+    async def _set_status(status: str, *, bump_attempts: bool = False) -> bool:
         """Update embedding_status in its own short transaction.
 
         Critical: commits IMMEDIATELY so the documents-row write lock is
@@ -123,18 +167,34 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         Without this, the doc row stays locked the whole time, heartbeat /
         ingest contention piles up and the connection pool dies.
         """
-        values: dict = {"embedding_status": status}
+        values: dict = {
+            "embedding_status": status,
+            "embedding_claim_token": None,
+            "embedding_claimed_at": None,
+            "updated_at": func.now(),
+        }
         if bump_attempts:
-            values["embedding_attempts"] = (doc.embedding_attempts or 0) + 1
-        await db.execute(
-            _update(Document).where(Document.id == doc.id).values(**values)
+            values["embedding_attempts"] = (
+                func.coalesce(Document.embedding_attempts, 0) + 1
+            )
+        result = await db.execute(
+            update(Document)
+            .where(
+                Document.id == doc.id,
+                Document.content_hash == revision_hash,
+                Document.embedding_status == "processing",
+                Document.embedding_claim_token == claim_token,
+            )
+            .values(**values)
         )
         await db.commit()
+        return result.rowcount == 1
 
-    await _set_status(doc.embedding_status or "pending", bump_attempts=True)
+    if not await _claim_revision():
+        return 0
 
     if doc.content_type in ("sqlite", "sqlite_export", "binary"):
-        await _set_status("skipped")
+        await _set_status("skipped", bump_attempts=True)
         return 0
 
     embedding_content = doc.content or ""
@@ -169,12 +229,12 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
         embedding_content = "\n\n".join(parts)
 
     if len(embedding_content) < 100:
-        await _set_status("skipped")
+        await _set_status("skipped", bump_attempts=True)
         return 0
 
     chunks = _chunk_text(embedding_content)
     if not chunks:
-        await _set_status("skipped")
+        await _set_status("skipped", bump_attempts=True)
         return 0
 
     # Cap at 50 chunks per document (~100KB) to avoid overloading embedding server
@@ -185,9 +245,18 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     # connection under idle_in_transaction_session_timeout.
     await db.commit()
     logger.info("Embedding %d chunks for %s", len(chunks), doc.relative_path)
-    embeddings = await _call_embedding_server(chunks)
+    try:
+        embeddings = await _call_embedding_server(chunks, raise_on_busy=True)
+    except EmbeddingServerBusy:
+        # Healthy but occupied is admission control, not a failed attempt.
+        # Keep the durable document retry-eligible for the next scanner pass.
+        await _set_status("pending")
+        return 0
     if embeddings is None:
-        await _set_status("failed")
+        await _set_status("failed", bump_attempts=True)
+        return 0
+    if not embeddings:
+        await _set_status("failed", bump_attempts=True)
         return 0
 
     if len(embeddings[0]) != EMBEDDING_DIM:
@@ -196,7 +265,34 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
             len(embeddings[0]),
             EMBEDDING_DIM,
         )
-        await _set_status("failed")
+        await _set_status("failed", bump_attempts=True)
+        return 0
+
+    if len(embeddings) != len(chunks):
+        logger.warning(
+            "Embedding count mismatch: got %d, expected %d",
+            len(embeddings),
+            len(chunks),
+        )
+        await _set_status("failed", bump_attempts=True)
+        return 0
+
+    # Lock and re-check the exact revision immediately before writing vectors.
+    # A concurrent ingest either wins this row lock and changes content_hash
+    # first (making this return no row), or waits until our vectors/status are
+    # committed and then resets the newer revision to pending.
+    current_revision = await db.execute(
+        select(Document.id)
+        .where(
+            Document.id == doc.id,
+            Document.content_hash == revision_hash,
+            Document.embedding_status == "processing",
+            Document.embedding_claim_token == claim_token,
+        )
+        .with_for_update()
+    )
+    if current_revision.scalar_one_or_none() is None:
+        await db.rollback()
         return 0
 
     # Upsert each chunk. Two concurrent post-ingest tasks on the same doc
@@ -238,7 +334,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
     )
 
     await db.flush()
-    await _set_status("ok")
+    await _set_status("ok", bump_attempts=True)
     logger.info(
         "Generated %d embeddings for %s/%s", len(chunks), doc.tool_id, doc.relative_path
     )

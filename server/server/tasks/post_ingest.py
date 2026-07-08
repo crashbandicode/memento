@@ -18,7 +18,10 @@ logger = logging.getLogger("post_ingest_task")
     # scanners recover it. Early acknowledgement avoids duplicate graph work
     # if a worker dies after completing the DB writes but before ACKing.
     acks_late=False,
-    time_limit=600,
+    # A whole-document BGE-M3 request may legitimately take up to 15 minutes
+    # on CPU. Keep a margin beyond its 900-second client deadline for database
+    # writes and knowledge extraction, while still bounding a wedged task.
+    time_limit=1200,
 )
 def process_document_post_ingest(
     document_id: str,
