@@ -5,22 +5,28 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, cast, Date
+from sqlalchemy import Date, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
-from ..services.conversation_activity import is_low_activity_summary
+from ..services.conversation_activity import (
+    effective_conversation_activity_expression,
+    is_low_activity_summary,
+)
 from ..services.conversation_hierarchy import (
     ConversationRef,
     build_logical_activity_map,
     build_subagent_summaries,
+    current_thread_id,
     fold_codex_subagents,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
 
 
 def _apply_device_filter(query, device_id: str | None):
@@ -84,9 +90,15 @@ async def get_dashboard(
             "conversation_count": categories.get("conversation", 0),
         })
 
-    # Fetch lightweight metadata for the complete visible conversation set so
-    # a root that falls outside the newest 20 rows can still absorb its newer
-    # Codex subagents.  Transcript content is never loaded here.
+    # Fetch a bounded, activity-ordered candidate set instead of folding every
+    # visible conversation on each dashboard refresh.  If a candidate is a
+    # Codex subagent, pull its logical companions so the visible root still
+    # absorbs the child in dashboard presentation.
+    activity_expr = effective_conversation_activity_expression(
+        Document.activity_at,
+        Document.source_modified_at,
+        Document.synced_at,
+    )
     recent_convos_q = (
         select(Document.id, Document.tool_id, Document.title,
                Document.synced_at, Document.project_id, Document.file_size_bytes,
@@ -95,11 +107,54 @@ async def get_dashboard(
                Document.activity_at)
         .outerjoin(Project, Document.project_id == Project.id)
         .where(Document.category == "conversation")
-        .order_by(Document.synced_at.desc(), Document.id.desc())
+        .order_by(activity_expr.desc(), Document.id.desc())
+        .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
     recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
-    all_convo_rows = list((await db.execute(recent_convos_q)).all())
+    candidate_rows = list((await db.execute(recent_convos_q)).all())
+
+    root_thread_ids: set[str] = set()
+    for row in candidate_rows:
+        if row[1] != "codex":
+            continue
+        metadata = row[8] or {}
+        if (
+            str(metadata.get("thread_source") or "").strip().lower() == "subagent"
+            and metadata.get("root_session_id")
+        ):
+            root_thread_ids.add(str(metadata["root_session_id"]))
+        else:
+            thread_id = current_thread_id(metadata)
+            if thread_id:
+                root_thread_ids.add(thread_id)
+
+    all_convo_rows_by_id = {row[0]: row for row in candidate_rows}
+    if root_thread_ids:
+        root_ids = list(root_thread_ids)
+        companions_q = (
+            select(Document.id, Document.tool_id, Document.title,
+                   Document.synced_at, Document.project_id, Document.file_size_bytes,
+                   Project.title.label("project_title"), Document.relative_path,
+                   Document.metadata_, Document.source_modified_at,
+                   Document.activity_at)
+            .outerjoin(Project, Document.project_id == Project.id)
+            .where(
+                Document.category == "conversation",
+                Document.tool_id == "codex",
+                or_(
+                    Document.metadata_["session_id"].astext.in_(root_ids),
+                    Document.metadata_["thread_id"].astext.in_(root_ids),
+                    Document.metadata_["root_session_id"].astext.in_(root_ids),
+                ),
+            )
+        )
+        companions_q = _apply_device_filter(companions_q, device_id)
+        companions_q = apply_user_filter(companions_q, mids, Document.machine_id)
+        for row in (await db.execute(companions_q)).all():
+            all_convo_rows_by_id[row[0]] = row
+
+    all_convo_rows = list(all_convo_rows_by_id.values())
     conversation_refs = [
         ConversationRef(
             document_id=row[0],

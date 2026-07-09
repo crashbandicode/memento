@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..db.models import Document, Machine, Tool, User
 from ..db.session import get_db
@@ -182,7 +183,25 @@ async def list_tool_files(
 ) -> list[DocumentSummary]:
     mids = await user_machine_ids(db, _user)
 
-    query = select(Document).where(Document.tool_id == tool_id)
+    query = (
+        select(Document)
+        .options(
+            load_only(
+                Document.id,
+                Document.relative_path,
+                Document.category,
+                Document.content_type,
+                Document.title,
+                Document.file_size_bytes,
+                Document.activity_at,
+                Document.source_modified_at,
+                Document.synced_at,
+                Document.ai_summary,
+                Document.machine_id,
+            )
+        )
+        .where(Document.tool_id == tool_id)
+    )
     if category:
         query = query.where(Document.category == category)
     query = _device_filter(query, device_id)
@@ -205,7 +224,9 @@ async def list_tool_files(
     machine_names: dict[str, str] = {}
     machine_ids = {d.machine_id for d in docs if d.machine_id}
     if machine_ids:
-        m_result = await db.execute(select(Machine).where(Machine.id.in_(machine_ids)))
-        machine_names = {str(m.id): m.name for m in m_result.scalars().all()}
+        m_result = await db.execute(
+            select(Machine.id, Machine.name).where(Machine.id.in_(machine_ids))
+        )
+        machine_names = {str(mid): name for mid, name in m_result.all()}
 
     return [_document_summary(d, machine_names) for d in docs]

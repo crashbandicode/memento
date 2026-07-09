@@ -183,7 +183,7 @@ export default function DeviceToolProjectPage() {
         }
         right={
           project && (
-            <Link href={`/projects/${project.id}/timeline`} style={{ textDecoration: "none" }}>
+            <Link href={`/projects/${project.id}/timeline`} prefetch={false} style={{ textDecoration: "none" }}>
               <Btn size="sm" icon="target">{t.timeline.title}</Btn>
             </Link>
           )
@@ -227,6 +227,7 @@ export default function DeviceToolProjectPage() {
                 <Link
                   key={f.id}
                   href={href}
+                  prefetch={false}
                   style={{
                     display: "flex",
                     alignItems: "center",

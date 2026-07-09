@@ -48,14 +48,21 @@ export default function DailyDetailPage() {
   const { t, locale } = useI18n();
 
   useEffect(() => {
+    const controller = new AbortController();
     const tz = new Date().getTimezoneOffset();
-    authFetch(`${getApiBase()}/api/daily/${dateStr}?tz_offset=${tz}`).then((r) => r.json()).then((d: DailyDetail) => {
+    authFetch(`${getApiBase()}/api/daily/${dateStr}?tz_offset=${tz}`, { signal: controller.signal }).then((r) => r.json()).then((d: DailyDetail) => {
+      if (controller.signal.aborted) return;
       setData(d);
       // summary title is produced server-side by the AI summary pipeline; match any title that
       // contains a known marker. The English pipeline emits "AI Daily Summary", Chinese "AI 日报".
       const existing = d.summaries?.find((s) => !!s.title && /AI\s*(?:\u65e5\u62a5|Daily)/i.test(s.title));
       if (existing?.summary) setAiSummary(existing.summary);
-    }).catch(console.error);
+    }).catch((error: unknown) => {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        console.error(error);
+      }
+    });
+    return () => controller.abort();
   }, [dateStr]);
 
   const handleGenerate = async () => {
@@ -156,6 +163,7 @@ export default function DailyDetailPage() {
             )}
             {conversations.slice(0, 30).map((c: { id: string; tool_id: string; content_type: string; title: string; user_messages: number; assistant_messages: number }) => (
               <Link key={c.id} href={c.content_type === "jsonl" ? `/conversations/${c.id}` : `/documents/${c.id}`}
+                prefetch={false}
                 style={{
                   display: "flex", alignItems: "center", gap: 10,
                   padding: "6px 8px", borderRadius: 10,
@@ -185,6 +193,7 @@ export default function DailyDetailPage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
             {keyChanges.slice(0, 20).map((c: { id: string; category: string; title: string }) => (
               <Link key={c.id} href={`/documents/${c.id}`}
+                prefetch={false}
                 style={{
                   display: "flex", alignItems: "center", gap: 8, padding: "6px 8px",
                   borderRadius: 8, textDecoration: "none",

@@ -1,4 +1,6 @@
 export function getApiBase(): string {
+  const configuredBase = process.env.NEXT_PUBLIC_MEMENTO_API_BASE;
+  if (configuredBase) return configuredBase.replace(/\/$/, "");
   if (typeof window !== "undefined") {
     const { protocol, hostname, port } = window.location;
     // If accessed via standard ports (80/443) — likely behind reverse proxy, API at same origin
@@ -51,10 +53,31 @@ const _inflight = new Map<string, Promise<unknown>>();
 // Short-lived response cache for idempotent GETs (60s), lives for the tab session.
 const _cache = new Map<string, { ts: number; data: unknown }>();
 const CACHE_TTL_MS = 60_000;
+const CACHE_MAX_ENTRIES = 200;
 
 export function invalidateApiCache(prefix?: string) {
   if (!prefix) { _cache.clear(); return; }
   for (const k of _cache.keys()) if (k.startsWith(prefix)) _cache.delete(k);
+}
+
+function getCached<T>(cacheKey: string): T | null {
+  const hit = _cache.get(cacheKey);
+  if (!hit) return null;
+  if (Date.now() - hit.ts >= CACHE_TTL_MS) {
+    _cache.delete(cacheKey);
+    return null;
+  }
+  return hit.data as T;
+}
+
+function setCached(cacheKey: string, data: unknown) {
+  _cache.set(cacheKey, { ts: Date.now(), data });
+  for (const [key, entry] of _cache) {
+    if (_cache.size <= CACHE_MAX_ENTRIES && Date.now() - entry.ts < CACHE_TTL_MS) break;
+    if (_cache.size > CACHE_MAX_ENTRIES || Date.now() - entry.ts >= CACHE_TTL_MS) {
+      _cache.delete(key);
+    }
+  }
 }
 
 async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
@@ -79,8 +102,8 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
   const cacheKey = method === "GET" ? `${base}${path}` : null;
 
   if (cacheKey) {
-    const hit = _cache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data as T;
+    const hit = getCached<T>(cacheKey);
+    if (hit) return hit;
     const pending = _inflight.get(cacheKey) as Promise<T> | undefined;
     if (pending) return pending;
   }
@@ -99,7 +122,7 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
       throw new Error(`API ${res.status}: ${text}`);
     }
     const data = (await res.json()) as T;
-    if (cacheKey) _cache.set(cacheKey, { ts: Date.now(), data });
+    if (cacheKey) setCached(cacheKey, data);
     return data;
   })();
 
@@ -259,6 +282,18 @@ export interface DailyDate {
   tools?: string[];
 }
 
+export interface DeviceSummary {
+  id: string;
+  name: string;
+  device_id: string;
+  last_heartbeat: string | null;
+  created_at?: string;
+  collector_version?: string | null;
+  document_count?: number;
+  total_files?: number;
+  tools?: string[];
+}
+
 export interface DailyDetail {
   date: string;
   total_documents: number;
@@ -396,14 +431,15 @@ export const api = {
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
   getPrompts: (id: string) =>
     apiFetch<ConversationPromptsResponse>(`/api/conversations/${id}/prompts`),
-  getDailyDates: (days = 30) => {
+  getDailyDates: (days = 30, signal?: AbortSignal) => {
     const tz = new Date().getTimezoneOffset();
-    return apiFetch<DailyDate[]>(`/api/daily?days=${days}&tz_offset=${tz}`);
+    return apiFetch<DailyDate[]>(`/api/daily?days=${days}&tz_offset=${tz}`, { signal });
   },
-  getDaily: (date: string) => {
+  getDaily: (date: string, signal?: AbortSignal) => {
     const tz = new Date().getTimezoneOffset();
-    return apiFetch<DailyDetail>(`/api/daily/${date}?tz_offset=${tz}`);
+    return apiFetch<DailyDetail>(`/api/daily/${date}?tz_offset=${tz}`, { signal });
   },
+  getDevices: () => apiFetch<DeviceSummary[]>("/api/devices"),
   search: (q: string, tool?: string, offset = 0, limit = 20) => {
     const params = new URLSearchParams({ q, offset: String(offset), limit: String(limit) });
     if (tool) params.set("tool", tool);

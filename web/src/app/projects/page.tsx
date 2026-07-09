@@ -124,6 +124,7 @@ export default function ProjectsPage() {
                     href={selectedDeviceId
                       ? `/devices/${selectedDeviceId}/tools/${p.tool_id}/projects/${p.id}`
                       : `/projects/${p.id}`}
+                    prefetch={false}
                     style={{ textDecoration: "none" }}
                   >
                     <div
@@ -157,6 +158,7 @@ export default function ProjectsPage() {
                     <Chip>{p.document_count} {t.files}</Chip>
                     <Link
                       href={`/projects/${p.id}/timeline`}
+                      prefetch={false}
                       style={{
                         fontSize: 11,
                         color: "var(--aurora-accent)",

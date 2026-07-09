@@ -60,11 +60,17 @@ export default function Dashboard() {
   const [lastEvent, setLastEvent] = useState("");
   const requestRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
+  const pendingRefreshRef = useRef(false);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const maxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { t } = useI18n();
   const now = useNow();
 
   const fetchData = useCallback(() => {
-    abortRef.current?.abort();
+    if (abortRef.current && !abortRef.current.signal.aborted) {
+      pendingRefreshRef.current = true;
+      return;
+    }
     const requestId = ++requestRef.current;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -82,17 +88,62 @@ export default function Dashboard() {
         }
       })
       .finally(() => {
+        if (abortRef.current === controller) abortRef.current = null;
         if (requestId === requestRef.current) setLoading(false);
+        if (pendingRefreshRef.current && document.visibilityState !== "hidden") {
+          pendingRefreshRef.current = false;
+          debounceTimerRef.current = setTimeout(fetchData, 250);
+        }
       });
   }, []);
 
+  const clearScheduledRefresh = useCallback(() => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    if (maxWaitTimerRef.current) clearTimeout(maxWaitTimerRef.current);
+    debounceTimerRef.current = null;
+    maxWaitTimerRef.current = null;
+  }, []);
+
+  const scheduleRefresh = useCallback(() => {
+    pendingRefreshRef.current = true;
+    if (document.visibilityState === "hidden") {
+      clearScheduledRefresh();
+      return;
+    }
+
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    debounceTimerRef.current = setTimeout(() => {
+      clearScheduledRefresh();
+      pendingRefreshRef.current = false;
+      fetchData();
+    }, 1_500);
+
+    maxWaitTimerRef.current ??= setTimeout(() => {
+      clearScheduledRefresh();
+      pendingRefreshRef.current = false;
+      fetchData();
+    }, 10_000);
+  }, [clearScheduledRefresh, fetchData]);
+
   useEffect(() => {
     fetchData();
-    return () => abortRef.current?.abort();
-  }, [fetchData]);
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        clearScheduledRefresh();
+        return;
+      }
+      if (pendingRefreshRef.current) scheduleRefresh();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      clearScheduledRefresh();
+      abortRef.current?.abort();
+    };
+  }, [clearScheduledRefresh, fetchData, scheduleRefresh]);
   useSSE((event) => {
     setLastEvent(`${event.data.tool_id}: ${event.data.title || event.data.relative_path}`);
-    fetchData();
+    scheduleRefresh();
   });
 
   if (loading) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
@@ -220,7 +271,7 @@ export default function Dashboard() {
                 const trend = toolDaily.map((d) => d.count);
                 const maxT = Math.max(...trend, 1);
                 return (
-                  <Link key={tool.id} href={`/tools/${tool.id}`} style={{ textDecoration: "none" }}>
+                  <Link key={tool.id} href={`/tools/${tool.id}`} prefetch={false} style={{ textDecoration: "none" }}>
                     <Glass hover padding={18} radius={18} accent={`hsla(${tg.h},80%,55%,0.25)`}>
                       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
                         <ToolGlyph id={tool.id} size={36} />
@@ -463,6 +514,7 @@ function RecentRow({
   return (
     <Link
       href={href}
+      prefetch={false}
       onMouseEnter={() => setH(true)}
       onMouseLeave={() => setH(false)}
       style={{

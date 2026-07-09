@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import { useNow } from "@/lib/use-now";
-import { getApiBase, authFetch } from "@/lib/api-client";
+import { api, getApiBase, authFetch } from "@/lib/api-client";
 import { ToolGlyph, PlatformGlyph, Icon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar } from "@/components/aurora/primitives";
 
@@ -39,18 +39,29 @@ export default function DevicesPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
-    authFetch(`${getApiBase()}/api/devices`)
-      .then((r) => r.json())
-      .then((devs: Device[]) => {
-        setDevices(devs);
-        for (const d of devs) {
-          authFetch(`${getApiBase()}/api/devices/${d.id}/discovery`)
-            .then((r) => r.json())
-            .then((disc) => setDiscoveries((prev) => ({ ...prev, [d.id]: disc.tools || {} })))
-            .catch(() => {});
-        }
+    let cancelled = false;
+    api.getDevices()
+      .then((devs) => {
+        if (cancelled) return;
+        const nextDevices = devs as Device[];
+        setDevices(nextDevices);
+        return Promise.all(
+          nextDevices.map((d) =>
+            authFetch(`${getApiBase()}/api/devices/${d.id}/discovery`)
+              .then((r) => r.json())
+              .then((disc) => [d.id, disc.tools || {}] as const)
+              .catch(() => [d.id, {}] as const),
+          ),
+        );
       })
-      .catch(console.error);
+      .then((entries) => {
+        if (!entries || cancelled) return;
+        setDiscoveries(Object.fromEntries(entries));
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) console.error(error);
+      });
+    return () => { cancelled = true; };
   }, []);
 
   // Delete a device and ALL its data — irreversible. Used both for

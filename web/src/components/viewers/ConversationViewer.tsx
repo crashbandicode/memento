@@ -147,13 +147,14 @@ export default function ConversationViewer({
   artifacts,
 }: {
   documentId: string;
-  toolId: string;
-  totalMessages: number;
+  toolId?: string;
+  totalMessages?: number;
   artifacts?: Artifact[];
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
+  const [knownTotal, setKnownTotal] = useState(totalMessages);
   const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
   const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
@@ -169,6 +170,7 @@ export default function ConversationViewer({
     setLoading(true);
     try {
       const res = await api.getMessages(documentId, offsetRef.current, 50);
+      setKnownTotal(res.total);
       if (res.messages.length > 0) {
         setMessages((prev) => {
           const existingIds = new Set(prev.map((m) => m.id));
@@ -191,6 +193,7 @@ export default function ConversationViewer({
     offsetRef.current = 0;
     loadingRef.current = false;
     setHasMore(true);
+    setKnownTotal(totalMessages);
     setPrompts([]);
     setActivePromptLine(null);
     setPendingPromptLine(null);
@@ -203,6 +206,10 @@ export default function ConversationViewer({
       })
       .catch((error) => console.error("Failed to load prompt outline:", error));
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (typeof totalMessages === "number") setKnownTotal(totalMessages);
+  }, [totalMessages]);
 
   useEffect(() => {
     if (pendingPromptLine === null) return;
@@ -256,7 +263,7 @@ export default function ConversationViewer({
       setLoading(true);
       try {
         const collected: ConversationMessage[] = [];
-        let total = totalMessages;
+        let total = knownTotal ?? totalMessages ?? offsetRef.current;
         while (offsetRef.current < prompt.line_number) {
           const remaining = prompt.line_number - offsetRef.current;
           const response = await api.getMessages(
@@ -265,6 +272,7 @@ export default function ConversationViewer({
             Math.min(200, Math.max(50, remaining)),
           );
           total = response.total;
+          setKnownTotal(response.total);
           if (response.messages.length === 0) break;
           collected.push(...response.messages);
           offsetRef.current += response.messages.length;
@@ -301,7 +309,7 @@ export default function ConversationViewer({
         className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
       >
         <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 16, textAlign: "center" }}>
-          {fmt(t.conversation.messagesTotal, { total: totalMessages, loaded: messages.length })}
+          {fmt(t.conversation.messagesTotal, { total: knownTotal ?? "…", loaded: messages.length })}
         </div>
 
         <div className="space-y-3 max-w-4xl mx-auto pb-24 xl:pb-8">

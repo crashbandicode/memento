@@ -216,6 +216,7 @@ export default function ToolDetailPage() {
                   href={selectedDeviceId
                     ? `/devices/${selectedDeviceId}/tools/${toolId}/projects/${p.id}`
                     : `/projects/${p.id}`}
+                  prefetch={false}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -267,6 +268,7 @@ export default function ToolDetailPage() {
                   <Link
                     key={f.id}
                     href={href}
+                    prefetch={false}
                     style={{
                       display: "flex",
                       alignItems: "center",

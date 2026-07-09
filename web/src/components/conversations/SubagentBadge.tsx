@@ -90,6 +90,7 @@ export default function SubagentBadge({
         {matchedSubagentId && (
           <Link
             href={`/conversations/${matchedSubagentId}`}
+            prefetch={false}
             style={{
               display: "flex",
               alignItems: "center",
@@ -114,6 +115,7 @@ export default function SubagentBadge({
           <Link
             key={subagent.session_id || subagent.id}
             href={`/conversations/${subagent.id}`}
+            prefetch={false}
             style={{
               display: "flex",
               alignItems: "center",

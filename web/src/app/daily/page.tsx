@@ -66,13 +66,19 @@ export default function DailyPage() {
   const { t, locale } = useI18n();
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     api
-      .getDailyDates(days)
-      .then((d) => { if (!cancelled) setAllDates(d); })
-      .catch(console.error)
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+      .getDailyDates(days, controller.signal)
+      .then((d) => setAllDates(d))
+      .catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          console.error(error);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
   }, [days]);
 
   // Map: YYYY-MM-DD → {count, tools}
@@ -255,6 +261,7 @@ function DayCell({
   return (
     <Link
       href={`/daily/${cell.date}`}
+      prefetch={false}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       className="min-h-[54px] sm:min-h-[88px] p-1 sm:p-2.5 flex flex-col"

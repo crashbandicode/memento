@@ -113,10 +113,10 @@ export default function ProjectDetailPage() {
             >
               {t.projects_page.exportMd}
             </Btn>
-            <Link href={`/projects/${projectId}/conversations`} style={{ textDecoration: "none" }}>
+            <Link href={`/projects/${projectId}/conversations`} prefetch={false} style={{ textDecoration: "none" }}>
               <Btn variant="glass" size="sm" icon="message">{t.conversations}</Btn>
             </Link>
-            <Link href={`/projects/${projectId}/timeline`} style={{ textDecoration: "none" }}>
+            <Link href={`/projects/${projectId}/timeline`} prefetch={false} style={{ textDecoration: "none" }}>
               <Btn size="sm" icon="target">{t.timeline.title}</Btn>
             </Link>
           </>
@@ -201,6 +201,7 @@ function DocRow({
   return (
     <Link
       href={href}
+      prefetch={false}
       onMouseEnter={() => setH(true)}
       onMouseLeave={() => setH(false)}
       style={{

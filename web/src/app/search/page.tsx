@@ -73,6 +73,7 @@ export default function SearchPage() {
             <Glass key={r.id} hover padding={18} radius={18}>
               <Link
                 href={r.category === "conversation" ? `/conversations/${r.id}` : `/documents/${r.id}`}
+                prefetch={false}
                 style={{ display: "block", textDecoration: "none" }}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>

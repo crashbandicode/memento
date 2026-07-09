@@ -30,44 +30,59 @@ export default function ConversationPage() {
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
   const { t, locale } = useI18n();
 
-  useEffect(() => { api.getConversation(docId).then(setMeta).catch(console.error); }, [docId]);
+  useEffect(() => {
+    let cancelled = false;
+    api.getConversation(docId)
+      .then((nextMeta) => {
+        if (!cancelled) setMeta(nextMeta);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) console.error(error);
+      });
+    return () => { cancelled = true; };
+  }, [docId]);
 
-  if (!meta) return <div className="text-gray-400 mt-20 text-center">{t.loading}</div>;
-
-  const plans = meta.related_plans || [];
-  const diagnostics = (meta.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
-  const hasDiagnostics = meta.tool_id === "antigravity" && diagnostics && Object.keys(diagnostics).length > 0;
-  const activityTimestamp = new Date(meta.activity_at || meta.synced_at).toLocaleString(locale, {
+  const currentMeta = meta?.id === docId ? meta : null;
+  const plans = currentMeta?.related_plans || [];
+  const diagnostics = (currentMeta?.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
+  const hasDiagnostics = currentMeta?.tool_id === "antigravity" && diagnostics && Object.keys(diagnostics).length > 0;
+  const activityTimestamp = currentMeta ? new Date(currentMeta.activity_at || currentMeta.synced_at).toLocaleString(locale, {
     year: "numeric",
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  });
+  }) : "";
 
   return (
     <div className="max-w-4xl mx-auto">
       <div style={{ marginBottom: 18 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
-          <ToolGlyph id={meta.tool_id} size={32} />
-          <h2 style={{ margin: 0, fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
-            {meta.title || meta.relative_path}
-          </h2>
-        </div>
-        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
-          <Chip>{meta.tool_id}</Chip>
-          <span>{meta.message_count} {t.conversation.messages}</span>
-          <SubagentBadge
-            count={meta.subagent_count}
-            orphan={meta.is_subagent_orphan}
-            subagents={meta.subagents}
-          />
-          {plans.length > 0 && <Chip tone="warn">{plans.length} artifacts</Chip>}
-          {hasDiagnostics && diagnostics.step_fetch_failed && <Chip tone="danger">{t.conversation.stepFetchFailed}</Chip>}
-          <span className="basis-full pt-0.5 sm:basis-auto sm:pt-0">
-            {t.conversation.lastActivity}: {activityTimestamp}
-          </span>
-        </div>
+        {!currentMeta ? (
+          <div className="text-gray-400 text-center">{t.loading}</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
+              <ToolGlyph id={currentMeta.tool_id} size={32} />
+              <h2 style={{ margin: 0, fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
+                {currentMeta.title || currentMeta.relative_path}
+              </h2>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
+              <Chip>{currentMeta.tool_id}</Chip>
+              <span>{currentMeta.message_count} {t.conversation.messages}</span>
+              <SubagentBadge
+                count={currentMeta.subagent_count}
+                orphan={currentMeta.is_subagent_orphan}
+                subagents={currentMeta.subagents}
+              />
+              {plans.length > 0 && <Chip tone="warn">{plans.length} artifacts</Chip>}
+              {hasDiagnostics && diagnostics.step_fetch_failed && <Chip tone="danger">{t.conversation.stepFetchFailed}</Chip>}
+              <span className="basis-full pt-0.5 sm:basis-auto sm:pt-0">
+                {t.conversation.lastActivity}: {activityTimestamp}
+              </span>
+            </div>
+          </>
+        )}
       </div>
       {hasDiagnostics && diagnostics && (
         <div style={{ marginBottom: 18, borderRadius: 16, border: "1px solid rgba(251,191,36,0.25)", background: "rgba(251,191,36,0.08)", padding: 14 }}>
@@ -137,8 +152,8 @@ export default function ConversationPage() {
       )}
       <ConversationViewer
         documentId={docId}
-        toolId={meta.tool_id}
-        totalMessages={meta.message_count}
+        toolId={currentMeta?.tool_id}
+        totalMessages={currentMeta?.message_count}
         artifacts={plans}
       />
     </div>

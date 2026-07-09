@@ -1,14 +1,9 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
-import { getApiBase, authFetch } from "./api-client";
+import { api, DeviceSummary } from "./api-client";
 
-interface Device {
-  id: string;
-  name: string;
-  device_id: string;
-  last_heartbeat: string | null;
-}
+type Device = DeviceSummary;
 
 interface DeviceState {
   devices: Device[];
@@ -37,12 +32,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     // Only fetch if logged in
     const token = localStorage.getItem("dr_token");
     if (token) {
-      authFetch(`${getApiBase()}/api/devices`)
-        .then((response) => {
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          return response.json();
-        })
-        .then((nextDevices: Device[]) => {
+      api.getDevices()
+        .then((nextDevices) => {
           setDevices(nextDevices);
           setSelectedDeviceId((current) => {
             if (current && !nextDevices.some((device) => device.device_id === current)) {

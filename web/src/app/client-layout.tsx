@@ -70,8 +70,8 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
 }
 
 /** Renders Sidebar+Header only inside the authenticated app. Public entry,
- *  splash, and share pages are always plain; unauthenticated pages are gated
- *  below as well. */
+ *  splash, auth, and share pages are always plain; protected children are not
+ *  mounted until auth has resolved, which avoids duplicate route effects. */
 function AppShell({ children }: { children: React.ReactNode }) {
   const { token, loading } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -82,9 +82,20 @@ function AppShell({ children }: { children: React.ReactNode }) {
   // Public share pages are read-only and shouldn't show the app sidebar
   // (visitors have no account; the sidebar wouldn't work anyway).
   const isSharePage = pathname.startsWith("/s/") || pathname === "/s";
+  const isAuthPage = pathname.startsWith("/auth/");
 
-  if (isPublicEntry || isSharePage || loading || !token) {
+  if (isPublicEntry || isSharePage || isAuthPage) {
     return <main className="min-h-screen">{children}</main>;
+  }
+
+  if (loading || !token) {
+    return (
+      <main className="min-h-screen">
+        <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>
+          Loading...
+        </div>
+      </main>
+    );
   }
 
   return (

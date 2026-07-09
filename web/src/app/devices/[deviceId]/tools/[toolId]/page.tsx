@@ -121,6 +121,7 @@ export default function DeviceToolPage() {
                 <Link
                   key={p.id}
                   href={`/devices/${deviceId}/tools/${toolId}/projects/${p.id}`}
+                  prefetch={false}
                   style={{
                     display: "flex",
                     justifyContent: "space-between",
@@ -159,6 +160,7 @@ export default function DeviceToolPage() {
                   <Link
                     key={f.id}
                     href={href}
+                    prefetch={false}
                     style={{
                       display: "flex",
                       alignItems: "center",
