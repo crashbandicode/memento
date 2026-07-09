@@ -157,6 +157,37 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(doc.source_modified_at, before)
         self.assertLessEqual(doc.source_modified_at, after)
 
+    async def test_preexisting_future_source_time_no_longer_blocks_full(self) -> None:
+        doc = _document(
+            content_hash="poisoned-hash",
+            timestamp=4_102_444_800.0,
+            offset=100,
+        )
+        doc.synced_at = datetime.fromtimestamp(150.0, tz=timezone.utc)
+        sync = _sync_state(doc, offset=100)
+        db = _OrderedSession(None, sync, doc)
+
+        with patch(
+            "server.services.ingest_service.ensure_tool",
+            new=AsyncMock(side_effect=RuntimeError("newer full accepted")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "newer full accepted"):
+                await ingest_file(
+                    db,
+                    **_ingest_kwargs(
+                        doc,
+                        content_hash="valid-newer-hash",
+                        file_size=200,
+                        offset=200,
+                        timestamp=200.0,
+                    ),
+                )
+
+        self.assertEqual(
+            doc.source_modified_at,
+            datetime.fromtimestamp(150.0, tz=timezone.utc),
+        )
+
     async def test_stale_same_hash_full_cannot_downgrade_offset_or_source_time(
         self,
     ) -> None:

@@ -758,6 +758,15 @@ async def ingest_file(
             ).with_for_update()
         )
     ).scalar_one_or_none()
+    # Repair timestamps accepted before source-clock bounding was introduced.
+    # Leaving a future value in place would make later valid FULL snapshots
+    # look stale indefinitely, even though new incoming times are bounded.
+    if doc is not None and doc.source_modified_at is not None:
+        observed_at = doc.synced_at or received_at
+        doc.source_modified_at = bounded_source_timestamp(
+            doc.source_modified_at,
+            observed_at,
+        )
     is_new_document = doc is None
     previous_embedding_content_hash: str | None = None
     logical_file_size = _logical_document_file_size(
