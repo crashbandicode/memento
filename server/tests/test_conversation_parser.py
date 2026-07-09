@@ -499,6 +499,31 @@ class ConversationParserTests(unittest.TestCase):
         )
         self.assertNotIn("[Tool:", msg.content)
 
+    def test_cursor_removes_redacted_transport_line_appended_to_prose(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Running the next check.\n[REDACTED]",
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Shell",
+                        "input": {"command": "ls -la"},
+                    },
+                ],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Running the next check.")
+        self.assertEqual(msg.tool_calls[0]["name"], "Shell")
+
     def test_cursor_call_only_assistant_message_is_retained(self) -> None:
         raw = json.dumps({
             "role": "assistant",

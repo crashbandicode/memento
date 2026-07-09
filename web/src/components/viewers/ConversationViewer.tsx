@@ -42,15 +42,19 @@ type AssistantContentSegment =
 const STANDALONE_REDACTED_LINE_RE = /(^|\r?\n)[ \t]*\[REDACTED\][ \t]*(?=\r?\n|$)/gi;
 const FLATTENED_TOOL_MARKER_RE = /(^|\r?\n)\[Tool:\s*([^\]\r\n]{1,120})\][ \t]*(?:\r?\n|$)/g;
 
+function stripCursorTransportRedaction(value: string): string {
+  const beginsWithTransportLine = /^[ \t]*\[REDACTED\][ \t]*(?:\r?\n|$)/i.test(value);
+  const cleaned = value.replace(STANDALONE_REDACTED_LINE_RE, "$1");
+  return beginsWithTransportLine ? cleaned.replace(/^\r?\n/, "") : cleaned;
+}
+
 /**
  * Cursor serializes structured assistant tool calls into the stored display
  * text. Recover that structure for presentation without altering the source
  * transcript or hiding ordinary mentions of `[Tool: ...]` in prose.
  */
 export function splitAssistantContent(value: string): AssistantContentSegment[] {
-  const withoutTransportRedaction = value
-    .replace(STANDALONE_REDACTED_LINE_RE, "$1")
-    .replace(/^\r?\n/, "");
+  const withoutTransportRedaction = stripCursorTransportRedaction(value);
   const originalMarker = new RegExp(FLATTENED_TOOL_MARKER_RE.source, "g");
   if (!originalMarker.test(withoutTransportRedaction)) {
     return withoutTransportRedaction.trim()
@@ -802,14 +806,17 @@ export const ChatBubble = memo(function ChatBubble({
   // without competing with the stronger accent used for human prompts.
   if (role === "assistant") {
     const structuredToolCalls = msg.tool_calls || [];
+    const assistantContent = toolId === "cursor"
+      ? stripCursorTransportRedaction(content)
+      : content;
     const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
-      ? content.trim() && content.trim() !== "[REDACTED]"
-        ? [{ type: "text", content }]
+      ? assistantContent.trim()
+        ? [{ type: "text", content: assistantContent }]
         : []
       : toolId === "cursor"
         ? splitAssistantContent(content)
-        : content
-          ? [{ type: "text", content }]
+        : assistantContent
+          ? [{ type: "text", content: assistantContent }]
           : [];
     const narrative = legacySegments
       .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")

@@ -80,6 +80,10 @@ _MAX_STRUCTURED_TOOL_NAME_BYTES = 256
 _MAX_STRUCTURED_TOOL_INPUT_BYTES = 64 * 1024
 _MAX_STRUCTURED_TOOL_CALL_BYTES = 128 * 1024
 _TOOL_INPUT_TRUNCATION_MARKER = "\n\n[... tool input truncated by Memento ...]"
+_CURSOR_REDACTED_TRANSPORT_LINE_RE = re.compile(
+    r"(^|\n)[ \t]*\[REDACTED\][ \t]*(?=\n|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def normalize_codex_user_payload(content: str) -> tuple[str, str]:
@@ -830,16 +834,21 @@ def _extract_cursor_assistant_content(
 ) -> tuple[str, list[dict[str, str]]]:
     """Separate Cursor prose from structured assistant tool invocations."""
     if not isinstance(content, list):
-        prose = _extract_content(content)
-        if prose.strip() == "[REDACTED]":
-            prose = ""
+        prose = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
+            r"\1",
+            _extract_content(content),
+        ).strip("\r\n")
         return prose, []
 
     prose_parts: list[str] = []
     raw_calls: list[dict] = []
     for item in content:
         if isinstance(item, str):
-            if item.strip() != "[REDACTED]":
+            item = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
+                r"\1",
+                item,
+            ).strip("\r\n")
+            if item:
                 prose_parts.append(item)
             continue
         if not isinstance(item, dict):
@@ -849,15 +858,22 @@ def _extract_cursor_assistant_content(
         if item_type == "text":
             text = item.get("text", "")
             text = text if isinstance(text, str) else str(text)
-            # Cursor emits this exact text block when assistant prose is not
-            # available. It is transport state, not part of the conversation.
-            if text.strip() != "[REDACTED]":
+            # Cursor can append the transport placeholder to real prose in the
+            # same text block, so remove only exact standalone lines.
+            text = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
+                r"\1",
+                text,
+            ).strip("\r\n")
+            if text:
                 prose_parts.append(text)
         elif item_type in ("tool_use", "toolCall"):
             if len(raw_calls) < _MAX_STRUCTURED_TOOL_CALLS:
                 raw_calls.append(item)
 
-    prose = _strip_system_tags("\n".join(prose_parts))
+    prose = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
+        r"\1",
+        _strip_system_tags("\n".join(prose_parts)),
+    ).strip("\r\n")
     return prose, normalize_tool_calls(raw_calls)
 
 
