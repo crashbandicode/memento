@@ -201,6 +201,20 @@ class ConversationBrowseActivityTests(unittest.TestCase):
             ai_summary=None,
         )
 
+    def _device_row(self, category: str) -> tuple:
+        document = self._document(category)
+        return (
+            document.id,
+            document.title,
+            document.relative_path,
+            document.category,
+            document.content_type,
+            document.file_size_bytes,
+            document.activity_at,
+            document.source_modified_at,
+            document.synced_at,
+        )
+
     def test_tool_file_summary_exposes_effective_conversation_activity(self) -> None:
         summary = _document_summary(
             self._document("conversation"),
@@ -212,7 +226,7 @@ class ConversationBrowseActivityTests(unittest.TestCase):
         self.assertEqual(summary.device_name, "dreamland-yoga (Linux)")
 
     def test_device_file_row_exposes_effective_conversation_activity(self) -> None:
-        row = _device_file_row(self._document("conversation"))
+        row = _device_file_row(self._device_row("conversation"))
 
         self.assertEqual(row["activity_at"], self.activity.isoformat())
         self.assertEqual(row["synced_at"], self.synced.isoformat())
@@ -230,14 +244,24 @@ class ConversationBrowseActivityTests(unittest.TestCase):
         )
 
         summary = _document_summary(document, {})
-        row = _device_file_row(document)
+        row = _device_file_row((
+            document.id,
+            document.title,
+            document.relative_path,
+            document.category,
+            document.content_type,
+            document.file_size_bytes,
+            document.activity_at,
+            document.source_modified_at,
+            document.synced_at,
+        ))
 
         self.assertEqual(summary.activity_at, document.source_modified_at.isoformat())
         self.assertEqual(row["activity_at"], document.source_modified_at.isoformat())
 
     def test_non_conversation_rows_do_not_claim_conversation_activity(self) -> None:
         summary = _document_summary(self._document("memory"), {})
-        row = _device_file_row(self._document("memory"))
+        row = _device_file_row(self._device_row("memory"))
 
         self.assertIsNone(summary.activity_at)
         self.assertIsNone(row["activity_at"])

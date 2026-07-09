@@ -1,15 +1,57 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useI18n } from "@/lib/i18n";
+import { fmt, useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
+import { mergeProjectFiles } from "@/lib/project-files";
 import { Icon, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
 
 interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; }
-interface ProjectInfo { id: string; slug: string; title: string; tool_id: string; source_path: string; }
+interface ProjectInfo { id: string; slug: string; title: string; tool_id: string; source_path: string | null; }
+interface HierarchyFilesResponse { total: number; files: FileItem[]; project: ProjectInfo | null; }
+
+type LoadState = "loading" | "success" | "error";
+
+const PAGE_SIZE = 100;
+
+async function fetchProjectFiles(
+  deviceId: string,
+  toolId: string,
+  projectId: string,
+  offset: number,
+  signal: AbortSignal,
+): Promise<HierarchyFilesResponse> {
+  const query = new URLSearchParams({
+    project_id: projectId,
+    offset: String(offset),
+    limit: String(PAGE_SIZE),
+  });
+  const response = await authFetch(
+    `${getApiBase()}/api/hierarchy/devices/${deviceId}/tools/${toolId}/files?${query}`,
+    { signal },
+  );
+
+  if (!response.ok) {
+    const status = response.statusText
+      ? `${response.status} ${response.statusText}`
+      : String(response.status);
+    throw new Error(`HTTP ${status}`);
+  }
+
+  const data = (await response.json()) as Partial<HierarchyFilesResponse>;
+  if (!Number.isFinite(data.total) || (data.total ?? -1) < 0 || !Array.isArray(data.files)) {
+    throw new Error("Invalid project files response");
+  }
+
+  return {
+    total: data.total as number,
+    files: data.files,
+    project: data.project ?? null,
+  };
+}
 
 export default function DeviceToolProjectPage() {
   const params = useParams();
@@ -20,15 +62,96 @@ export default function DeviceToolProjectPage() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [total, setTotal] = useState(0);
   const [project, setProject] = useState<ProjectInfo | null>(null);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [nextOffset, setNextOffset] = useState(0);
+  const [retryToken, setRetryToken] = useState(0);
+  const generationRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const loadingMoreRef = useRef(false);
 
   useEffect(() => {
-    authFetch(`${getApiBase()}/api/hierarchy/devices/${deviceId}/tools/${toolId}/files?project_id=${projectId}&limit=100`)
-      .then((r) => r.json()).then((d) => { setFiles(d.files); setTotal(d.total); }).catch(() => {});
-    if (projectId !== "none") {
-      authFetch(`${getApiBase()}/api/projects/${projectId}`)
-        .then((r) => r.json()).then(setProject).catch(() => {});
+    const generation = ++generationRef.current;
+    activeControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    loadingMoreRef.current = false;
+
+    setFiles([]);
+    setTotal(0);
+    setProject(null);
+    setNextOffset(0);
+    setLoadState("loading");
+    setLoadError(null);
+    setLoadingMore(false);
+    setLoadMoreError(null);
+
+    void (async () => {
+      try {
+        const data = await fetchProjectFiles(deviceId, toolId, projectId, 0, controller.signal);
+        if (controller.signal.aborted || generation !== generationRef.current) return;
+        if (data.total > 0 && data.files.length === 0) {
+          throw new Error("Project files response was unexpectedly empty");
+        }
+
+        setFiles(mergeProjectFiles([], data.files));
+        setTotal(data.total);
+        setProject(data.project);
+        setNextOffset(data.files.length);
+        setLoadState("success");
+      } catch (error) {
+        if (controller.signal.aborted || generation !== generationRef.current) return;
+        setLoadError(error instanceof Error ? error.message : "Unknown error");
+        setLoadState("error");
+      } finally {
+        if (generation === generationRef.current && activeControllerRef.current === controller) {
+          activeControllerRef.current = null;
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
+      if (activeControllerRef.current === controller) activeControllerRef.current = null;
+    };
+  }, [deviceId, toolId, projectId, retryToken]);
+
+  const loadMore = useCallback(async () => {
+    if (loadState !== "success" || loadingMoreRef.current || nextOffset >= total) return;
+
+    const generation = generationRef.current;
+    const offset = nextOffset;
+    activeControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setLoadMoreError(null);
+
+    try {
+      const data = await fetchProjectFiles(deviceId, toolId, projectId, offset, controller.signal);
+      if (controller.signal.aborted || generation !== generationRef.current) return;
+      if (data.files.length === 0 && offset < data.total) {
+        throw new Error("Project files pagination did not advance");
+      }
+
+      setFiles((current) => mergeProjectFiles(current, data.files));
+      setTotal(data.total);
+      setProject(data.project);
+      setNextOffset(offset + data.files.length);
+    } catch (error) {
+      if (controller.signal.aborted || generation !== generationRef.current) return;
+      setLoadMoreError(error instanceof Error ? error.message : "Unknown error");
+    } finally {
+      if (generation === generationRef.current) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
+      if (activeControllerRef.current === controller) activeControllerRef.current = null;
     }
-  }, [deviceId, toolId, projectId]);
+  }, [deviceId, loadState, nextOffset, projectId, toolId, total]);
 
   const byCategory: Record<string, FileItem[]> = {};
   for (const f of files) (byCategory[f.category] ??= []).push(f);
@@ -50,9 +173,13 @@ export default function DeviceToolProjectPage() {
       <TopBar
         title={project?.title || (projectId === "none" ? "(No Project)" : projectId.slice(0, 8))}
         subtitle={
-          project?.source_path
-            ? `${project.source_path} · ${total} ${t.files}`
-            : `${total} ${t.files}`
+          loadState === "loading"
+            ? t.loading
+            : loadState === "error"
+              ? t.projectPage.loadFailed
+              : project?.source_path
+                ? `${project.source_path} · ${total} ${t.files}`
+                : `${total} ${t.files}`
         }
         right={
           project && (
@@ -63,7 +190,29 @@ export default function DeviceToolProjectPage() {
         }
       />
 
-      {Object.entries(byCategory).map(([cat, catFiles]) => (
+      {loadState === "loading" && (
+        <Glass padding={40} radius={20} style={{ textAlign: "center" }}>
+          <div role="status" aria-live="polite" style={{ color: "var(--aurora-fg3)", fontSize: 13 }}>
+            {t.loading}
+          </div>
+        </Glass>
+      )}
+
+      {loadState === "error" && (
+        <Glass padding={40} radius={20} style={{ textAlign: "center" }}>
+          <div role="alert">
+            <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 4px" }}>{t.projectPage.loadFailed}</p>
+            {loadError && (
+              <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: "0 0 16px" }}>{loadError}</p>
+            )}
+          </div>
+          <Btn size="sm" variant="glass" icon="refresh" onClick={() => setRetryToken((token) => token + 1)}>
+            {t.projectPage.retry}
+          </Btn>
+        </Glass>
+      )}
+
+      {loadState === "success" && Object.entries(byCategory).map(([cat, catFiles]) => (
         <div key={cat} style={{ marginBottom: 24 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "8px 4px 12px" }}>
             <CategoryIcon category={cat} size={14} />
@@ -119,10 +268,35 @@ export default function DeviceToolProjectPage() {
         </div>
       ))}
 
-      {files.length === 0 && (
+      {loadState === "success" && total === 0 && (
         <Glass padding={40} radius={20} style={{ textAlign: "center" }}>
           <p style={{ color: "var(--aurora-fg4)", fontSize: 13 }}>{t.noData}</p>
         </Glass>
+      )}
+
+      {loadState === "success" && (nextOffset < total || loadMoreError) && (
+        <div style={{ textAlign: "center", padding: "0 0 24px" }}>
+          {loadMoreError && (
+            <div role="alert" style={{ marginBottom: 10 }}>
+              <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 2px" }}>{t.projectPage.loadFailed}</p>
+              <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: 0 }}>{loadMoreError}</p>
+            </div>
+          )}
+          <Btn
+            size="sm"
+            variant="glass"
+            icon={loadMoreError ? "refresh" : "chevron_down"}
+            onClick={() => void loadMore()}
+            disabled={loadingMore}
+            aria-busy={loadingMore}
+          >
+            {loadingMore
+              ? t.projectPage.loadingMore
+              : loadMoreError
+                ? t.projectPage.retry
+                : fmt(t.projectPage.loadMore, { loaded: files.length, total })}
+          </Btn>
+        </div>
       )}
     </div>
   );

@@ -120,6 +120,8 @@ const enUS: Translations = {
     categories: "Categories",
     projectsInTool: "Projects",
     fileList: "Files",
+    fileLoadFailed: "Couldn't load this tool's files.",
+    toolLoadFailed: "Couldn't load this tool.",
   },
 
   projectPage: {
@@ -128,6 +130,11 @@ const enUS: Translations = {
     docsCount: "{count} files",
     recentFiles: "Recent Files",
     from: "from",
+    listLoadFailed: "Couldn't load projects.",
+    loadFailed: "Couldn't load this project's files.",
+    retry: "Retry",
+    loadMore: "Load more ({loaded}/{total})",
+    loadingMore: "Loading more files...",
   },
 
   document: {

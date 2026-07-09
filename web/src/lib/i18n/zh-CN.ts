@@ -123,6 +123,8 @@ const zhCN = {
     categories: "文件分类",
     projectsInTool: "相关项目",
     fileList: "文件列表",
+    fileLoadFailed: "无法加载此工具的文件。",
+    toolLoadFailed: "无法加载此工具。",
   },
 
   // Projects
@@ -132,6 +134,11 @@ const zhCN = {
     docsCount: "{count} 个文件",
     recentFiles: "最近文件",
     from: "来自",
+    listLoadFailed: "无法加载项目。",
+    loadFailed: "无法加载此项目的文件。",
+    retry: "重试",
+    loadMore: "加载更多（{loaded}/{total}）",
+    loadingMore: "正在加载更多文件…",
   },
 
   // Documents

@@ -7,10 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import HTTPException
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.hierarchy import list_device_tool_files  # noqa: E402
+from server.api.projects import get_project  # noqa: E402
 from server.api.tools import list_tool_files  # noqa: E402
 
 
@@ -35,6 +38,9 @@ class _Result:
 
     def all(self):
         return self._rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
 
 
 class _Db:
@@ -88,10 +94,21 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_device_files_return_and_order_by_effective_activity(self) -> None:
         machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
         self.document.machine_id = machine.id
+        device_row = (
+            self.document.id,
+            self.document.title,
+            self.document.relative_path,
+            self.document.category,
+            self.document.content_type,
+            self.document.file_size_bytes,
+            self.document.activity_at,
+            self.document.source_modified_at,
+            self.document.synced_at,
+        )
         db = _Db([
             _Result(scalar_value=machine),
             _Result(scalar_value=1),
-            _Result(rows=[self.document]),
+            _Result(rows=[device_row]),
         ])
 
         payload = await list_device_tool_files(
@@ -109,9 +126,277 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
             payload["files"][0]["activity_at"],
             self.activity.isoformat(),
         )
+        self.assertIsNone(payload["project"])
         sql = str(db.statements[2].compile())
         self.assertIn("ORDER BY CASE WHEN", sql)
         self.assertIn("coalesce(documents.activity_at", sql)
+
+    async def test_device_files_project_summary_pagination_and_lean_queries(self) -> None:
+        machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
+        project_id = uuid.uuid4()
+        first_id = uuid.uuid4()
+        second_id = uuid.uuid4()
+        project_row = (
+            project_id,
+            "lean-project",
+            "Lean project",
+            "codex",
+            "C:/src/lean-project",
+        )
+        rows = [
+            (
+                first_id,
+                "First",
+                "sessions/first.jsonl",
+                "conversation",
+                "jsonl",
+                101,
+                self.activity,
+                self.source_modified,
+                self.synced,
+            ),
+            (
+                second_id,
+                "Second",
+                "sessions/second.jsonl",
+                "conversation",
+                "jsonl",
+                99,
+                None,
+                self.source_modified,
+                self.synced,
+            ),
+        ]
+        db = _Db([
+            _Result(scalar_value=machine),
+            _Result(rows=[project_row]),
+            _Result(scalar_value=341),
+            _Result(rows=rows),
+        ])
+
+        payload = await list_device_tool_files(
+            "device-token",
+            "codex",
+            project_id=str(project_id),
+            category="conversation",
+            offset=100,
+            limit=2,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["total"], 341)
+        self.assertEqual(
+            payload["project"],
+            {
+                "id": str(project_id),
+                "slug": "lean-project",
+                "title": "Lean project",
+                "tool_id": "codex",
+                "source_path": "C:/src/lean-project",
+            },
+        )
+        self.assertEqual([row["id"] for row in payload["files"]], [
+            str(first_id),
+            str(second_id),
+        ])
+
+        project_sql = str(db.statements[1].compile())
+        self.assertIn("documents.machine_id", project_sql)
+        self.assertIn("documents.tool_id", project_sql)
+
+        count_sql = str(db.statements[2].compile())
+        self.assertNotIn("FROM (SELECT", count_sql)
+        self.assertIn("count(documents.id)", count_sql)
+
+        files_statement = db.statements[3]
+        selected_keys = {column.key for column in files_statement.selected_columns}
+        self.assertEqual(
+            selected_keys,
+            {
+                "id",
+                "title",
+                "relative_path",
+                "category",
+                "content_type",
+                "file_size_bytes",
+                "activity_at",
+                "source_modified_at",
+                "synced_at",
+            },
+        )
+        self.assertNotIn("content", selected_keys)
+        self.assertNotIn("rendered_html", selected_keys)
+        self.assertEqual(files_statement._offset_clause.value, 100)
+        self.assertEqual(files_statement._limit_clause.value, 2)
+        files_sql = str(files_statement.compile())
+        self.assertIn("ORDER BY CASE WHEN", files_sql)
+        self.assertIn("documents.category =", files_sql)
+
+    async def test_device_files_no_project_summary_and_null_filter(self) -> None:
+        machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
+        db = _Db([
+            _Result(scalar_value=machine),
+            _Result(scalar_value=0),
+            _Result(rows=[]),
+        ])
+
+        payload = await list_device_tool_files(
+            "device-token",
+            "codex",
+            project_id="none",
+            category=None,
+            offset=0,
+            limit=50,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            payload["project"],
+            {
+                "id": "none",
+                "slug": "",
+                "title": "(No Project)",
+                "tool_id": "codex",
+                "source_path": None,
+            },
+        )
+        self.assertIn("documents.project_id IS NULL", str(db.statements[1].compile()))
+
+    async def test_device_files_reject_malformed_project_id(self) -> None:
+        machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
+        db = _Db([_Result(scalar_value=machine)])
+
+        with self.assertRaises(HTTPException) as raised:
+            await list_device_tool_files(
+                "device-token",
+                "codex",
+                project_id="not-a-uuid",
+                category=None,
+                offset=0,
+                limit=50,
+                db=db,
+                _user=self.owner,
+            )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(len(db.statements), 1)
+
+    async def test_device_files_reject_unknown_device_for_project_detail(self) -> None:
+        db = _Db([_Result(scalar_value=None), _Result(scalar_value=None)])
+
+        with self.assertRaises(HTTPException) as raised:
+            await list_device_tool_files(
+                "unknown-device",
+                "codex",
+                project_id=str(uuid.uuid4()),
+                category=None,
+                offset=0,
+                limit=50,
+                db=db,
+                _user=self.owner,
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+
+    async def test_device_files_reject_project_outside_device_scope(self) -> None:
+        machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
+        db = _Db([
+            _Result(scalar_value=machine),
+            _Result(rows=[]),
+        ])
+
+        with self.assertRaises(HTTPException) as raised:
+            await list_device_tool_files(
+                "device-token",
+                "codex",
+                project_id=str(uuid.uuid4()),
+                category=None,
+                offset=0,
+                limit=50,
+                db=db,
+                _user=self.owner,
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(len(db.statements), 2)
+
+    async def test_default_project_detail_does_not_select_document_payloads(self) -> None:
+        project = SimpleNamespace(
+            id=uuid.uuid4(),
+            slug="lean-project",
+            title="Lean project",
+            tool_id="codex",
+            source_path="C:/src/lean-project",
+            visibility="private",
+        )
+        db = _Db([
+            _Result(scalar_value=project),
+            _Result(rows=[]),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_project(
+            project.id,
+            include_content=False,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["documents"], [])
+        docs_sql = str(db.statements[2].compile())
+        self.assertNotIn("documents.content,", docs_sql)
+        self.assertNotIn("documents.rendered_html", docs_sql)
+        self.assertNotIn("documents.ai_summary", docs_sql)
+        self.assertIn("documents.relative_path", docs_sql)
+
+    async def test_project_detail_include_content_keeps_payload_columns(self) -> None:
+        project = SimpleNamespace(
+            id=uuid.uuid4(),
+            slug="full-project",
+            title="Full project",
+            tool_id="codex",
+            source_path="C:/src/full-project",
+            visibility="private",
+        )
+        db = _Db([
+            _Result(scalar_value=project),
+            _Result(rows=[]),
+            _Result(rows=[]),
+        ])
+
+        await get_project(
+            project.id,
+            include_content=True,
+            db=db,
+            _user=self.owner,
+        )
+
+        docs_sql = str(db.statements[2].compile())
+        self.assertIn("documents.content,", docs_sql)
+        self.assertIn("documents.rendered_html", docs_sql)
+
+    async def test_project_detail_requires_a_document_visible_to_the_user(self) -> None:
+        machine_id = uuid.uuid4()
+        viewer = SimpleNamespace(id=uuid.uuid4(), role="viewer")
+        db = _Db([
+            _Result(rows=[(machine_id,)]),
+            _Result(scalar_value=None),
+        ])
+
+        with self.assertRaises(HTTPException) as raised:
+            await get_project(
+                uuid.uuid4(),
+                include_content=False,
+                db=db,
+                _user=viewer,
+            )
+
+        self.assertEqual(raised.exception.status_code, 404)
+        project_sql = str(db.statements[1].compile())
+        self.assertIn("JOIN documents", project_sql)
+        self.assertIn("documents.machine_id IN", project_sql)
 
 
 if __name__ == "__main__":

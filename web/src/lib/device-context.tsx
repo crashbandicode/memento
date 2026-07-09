@@ -38,8 +38,20 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const token = localStorage.getItem("dr_token");
     if (token) {
       authFetch(`${getApiBase()}/api/devices`)
-        .then((r) => r.json())
-        .then(setDevices)
+        .then((response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        })
+        .then((nextDevices: Device[]) => {
+          setDevices(nextDevices);
+          setSelectedDeviceId((current) => {
+            if (current && !nextDevices.some((device) => device.device_id === current)) {
+              localStorage.setItem("dr_device_id", "all");
+              return null;
+            }
+            return current;
+          });
+        })
         .catch(() => {});
     }
   }, []);

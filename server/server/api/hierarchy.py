@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,26 +19,61 @@ from ..services.conversation_activity import (
 router = APIRouter(prefix="/api/hierarchy", tags=["hierarchy"])
 
 
-def _device_file_row(document: Document) -> dict:
+_DEVICE_FILE_COLUMNS = (
+    Document.id,
+    Document.title,
+    Document.relative_path,
+    Document.category,
+    Document.content_type,
+    Document.file_size_bytes,
+    Document.activity_at,
+    Document.source_modified_at,
+    Document.synced_at,
+)
+
+
+def _device_file_row(row) -> dict:
+    (
+        document_id,
+        title,
+        relative_path,
+        category,
+        content_type,
+        file_size_bytes,
+        raw_activity_at,
+        source_modified_at,
+        synced_at,
+    ) = row
     activity_at = None
-    if document.category == "conversation":
+    if category == "conversation":
         effective_timestamp = effective_conversation_activity(
-            document.activity_at,
-            document.source_modified_at,
-            document.synced_at,
+            raw_activity_at,
+            source_modified_at,
+            synced_at,
         )
         activity_at = (
             effective_timestamp.isoformat() if effective_timestamp else None
         )
     return {
-        "id": str(document.id),
-        "title": document.title,
-        "relative_path": document.relative_path,
-        "category": document.category,
-        "content_type": document.content_type,
-        "file_size_bytes": document.file_size_bytes,
+        "id": str(document_id),
+        "title": title,
+        "relative_path": relative_path,
+        "category": category,
+        "content_type": content_type,
+        "file_size_bytes": file_size_bytes,
         "activity_at": activity_at,
-        "synced_at": document.synced_at.isoformat(),
+        "synced_at": synced_at.isoformat(),
+    }
+
+
+def _project_summary(row) -> dict:
+    project_id, slug, title, tool_id, source_path = row
+    return {
+        "id": str(project_id),
+        "slug": slug,
+        "title": title,
+        "tool_id": tool_id,
+        "source_path": source_path,
     }
 
 
@@ -196,17 +231,60 @@ async def list_device_tool_files(
     """Level 4: Files (conversations/docs) for a device+tool, with optional project/category filter."""
     m = _check_machine_access(await _find_machine(db, device_id), _user)
     if not m:
-        return {"total": 0, "files": []}
+        if project_id is not None:
+            raise HTTPException(status_code=404, detail="Device not found")
+        return {"total": 0, "files": [], "project": None}
 
-    query = select(Document).where(Document.machine_id == m.id, Document.tool_id == tool_id)
+    criteria = [Document.machine_id == m.id, Document.tool_id == tool_id]
+    project = None
     if project_id and project_id != "none":
-        query = query.where(Document.project_id == uuid.UUID(project_id))
-    elif project_id == "none":
-        query = query.where(Document.project_id.is_(None))
-    if category:
-        query = query.where(Document.category == category)
+        try:
+            resolved_project_id = uuid.UUID(project_id)
+        except (AttributeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid project_id") from exc
+        criteria.append(Document.project_id == resolved_project_id)
 
-    count_q = select(func.count()).select_from(query.subquery())
+        # Only expose project metadata when the project is represented on the
+        # already-authorized device+tool pair.  Looking the project up by UUID
+        # alone would leak another user's project title/path to a caller who
+        # can guess its identifier.
+        project_result = await db.execute(
+            select(
+                Project.id,
+                Project.slug,
+                Project.title,
+                Project.tool_id,
+                Project.source_path,
+            )
+            .join(Document, Document.project_id == Project.id)
+            .where(
+                Project.id == resolved_project_id,
+                Document.machine_id == m.id,
+                Document.tool_id == tool_id,
+            )
+            .limit(1)
+        )
+        project_row = project_result.first()
+        if not project_row:
+            raise HTTPException(status_code=404, detail="Project not found on this device")
+        project = _project_summary(project_row)
+    elif project_id == "none":
+        criteria.append(Document.project_id.is_(None))
+        project = {
+            "id": "none",
+            "slug": "",
+            "title": "(No Project)",
+            "tool_id": tool_id,
+            "source_path": None,
+        }
+    if category:
+        criteria.append(Document.category == category)
+
+    # Count directly against the filtered table.  Counting a subquery based
+    # on ``select(Document)`` made PostgreSQL plan a projection containing the
+    # multi-megabyte content/rendered payload columns even though the caller
+    # only needed a row count.
+    count_q = select(func.count(Document.id)).where(*criteria)
     total = (await db.execute(count_q)).scalar() or 0
 
     display_timestamp = conversation_list_timestamp_expression(
@@ -216,13 +294,16 @@ async def list_device_tool_files(
         Document.synced_at,
     )
     result = await db.execute(
-        query.order_by(display_timestamp.desc(), Document.id.desc())
+        select(*_DEVICE_FILE_COLUMNS)
+        .where(*criteria)
+        .order_by(display_timestamp.desc(), Document.id.desc())
         .offset(offset)
         .limit(limit)
     )
-    docs = result.scalars().all()
+    rows = result.all()
 
     return {
         "total": total,
-        "files": [_device_file_row(d) for d in docs],
+        "files": [_device_file_row(row) for row in rows],
+        "project": project,
     }

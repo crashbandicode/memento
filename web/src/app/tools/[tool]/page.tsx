@@ -7,7 +7,9 @@ import { ToolDetail, DocumentSummary, getApiBase, authFetch } from "@/lib/api-cl
 import { useI18n, fmt } from "@/lib/i18n";
 import { useDevice } from "@/lib/device-context";
 import { ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
-import { Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+
+type LoadState = "loading" | "success" | "error";
 
 export default function ToolDetailPage() {
   const params = useParams();
@@ -15,26 +17,140 @@ export default function ToolDetailPage() {
   const [tool, setTool] = useState<ToolDetail | null>(null);
   const [files, setFiles] = useState<DocumentSummary[]>([]);
   const [projects, setProjects] = useState<{ id: string; title: string; document_count: number }[]>([]);
-  const [activeCategory, setActiveCategory] = useState<string | undefined>();
+  const [categorySelection, setCategorySelection] = useState<{ scope: string; value?: string }>({ scope: "" });
+  const [toolLoadState, setToolLoadState] = useState<LoadState>("loading");
+  const [toolLoadError, setToolLoadError] = useState<string | null>(null);
+  const [loadedToolKey, setLoadedToolKey] = useState<string | null>(null);
+  const [toolRetryToken, setToolRetryToken] = useState(0);
+  const [projectLoadState, setProjectLoadState] = useState<LoadState>("loading");
+  const [projectLoadError, setProjectLoadError] = useState<string | null>(null);
+  const [loadedProjectKey, setLoadedProjectKey] = useState<string | null>(null);
+  const [projectRetryToken, setProjectRetryToken] = useState(0);
+  const [fileLoadState, setFileLoadState] = useState<LoadState>("loading");
+  const [fileLoadError, setFileLoadError] = useState<string | null>(null);
+  const [loadedFileKey, setLoadedFileKey] = useState<string | null>(null);
+  const [fileRetryToken, setFileRetryToken] = useState(0);
   const { t, locale } = useI18n();
   const { selectedDeviceId } = useDevice();
   const dateFmt = locale === "zh-CN" ? "zh-CN" : "en-US";
   const dq = selectedDeviceId ? `&device_id=${selectedDeviceId}` : "";
+  const projectRequestKey = `${toolId}:${selectedDeviceId ?? "all"}`;
+  const activeCategory = categorySelection.scope === projectRequestKey ? categorySelection.value : undefined;
+  const fileRequestKey = `${projectRequestKey}:${activeCategory ?? "all"}`;
 
   useEffect(() => {
-    authFetch(`${getApiBase()}/api/tools/${toolId}?_=1${dq}`).then((r) => r.json()).then(setTool).catch(() => {
-      setTool({ id: toolId, display_name: toolId, icon: null, total_files: 0, total_size_bytes: 0, last_sync_at: null, categories: {} });
-    });
-    authFetch(`${getApiBase()}/api/projects?tool_id=${toolId}`).then((r) => r.json()).then(setProjects).catch(() => {});
-  }, [toolId, dq]);
+    const controller = new AbortController();
+    setTool(null);
+    setToolLoadState("loading");
+    setToolLoadError(null);
+
+    void (async () => {
+      try {
+        const response = await authFetch(`${getApiBase()}/api/tools/${toolId}?_=1${dq}`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (controller.signal.aborted) return;
+        setTool(data as ToolDetail);
+        setLoadedToolKey(projectRequestKey);
+        setToolLoadState("success");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setToolLoadError(error instanceof Error ? error.message : "Unknown error");
+        setLoadedToolKey(projectRequestKey);
+        setToolLoadState("error");
+      }
+    })();
+
+    return () => controller.abort();
+  }, [dq, projectRequestKey, toolId, toolRetryToken]);
 
   useEffect(() => {
+    const controller = new AbortController();
+    const projectQuery = new URLSearchParams({ tool_id: toolId });
+    if (selectedDeviceId) projectQuery.set("device_id", selectedDeviceId);
+
+    setProjects([]);
+    setProjectLoadState("loading");
+    setProjectLoadError(null);
+
+    void (async () => {
+      try {
+        const response = await authFetch(`${getApiBase()}/api/projects?${projectQuery}`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data)) throw new Error("Invalid projects response");
+        if (controller.signal.aborted) return;
+        setProjects(data);
+        setLoadedProjectKey(projectRequestKey);
+        setProjectLoadState("success");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setProjectLoadError(error instanceof Error ? error.message : "Unknown error");
+        setLoadedProjectKey(projectRequestKey);
+        setProjectLoadState("error");
+      }
+    })();
+
+    return () => controller.abort();
+  }, [projectRequestKey, projectRetryToken, selectedDeviceId, toolId]);
+
+  useEffect(() => {
+    const controller = new AbortController();
     const catParam = activeCategory ? `&category=${activeCategory}` : "";
-    authFetch(`${getApiBase()}/api/tools/${toolId}/files?offset=0&limit=50${catParam}${dq}`)
-      .then((r) => r.json()).then(setFiles).catch(() => setFiles([]));
-  }, [toolId, activeCategory, dq]);
+    setFiles([]);
+    setFileLoadState("loading");
+    setFileLoadError(null);
 
-  if (!tool) return <div style={{ color: "var(--aurora-fg4)", marginTop: 80, textAlign: "center" }}>{t.loading}</div>;
+    void (async () => {
+      try {
+        const response = await authFetch(
+          `${getApiBase()}/api/tools/${toolId}/files?offset=0&limit=50${catParam}${dq}`,
+          { signal: controller.signal },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data)) throw new Error("Invalid files response");
+        if (controller.signal.aborted) return;
+        setFiles(data);
+        setLoadedFileKey(fileRequestKey);
+        setFileLoadState("success");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setFileLoadError(error instanceof Error ? error.message : "Unknown error");
+        setLoadedFileKey(fileRequestKey);
+        setFileLoadState("error");
+      }
+    })();
+
+    return () => controller.abort();
+  }, [activeCategory, dq, fileRequestKey, fileRetryToken, toolId]);
+
+  const visibleProjectState: LoadState = loadedProjectKey === projectRequestKey ? projectLoadState : "loading";
+  const visibleProjects = visibleProjectState === "success" ? projects : [];
+  const visibleFileState: LoadState = loadedFileKey === fileRequestKey ? fileLoadState : "loading";
+  const visibleFiles = visibleFileState === "success" ? files : [];
+  const visibleToolState: LoadState = loadedToolKey === projectRequestKey ? toolLoadState : "loading";
+
+  if (visibleToolState === "loading") {
+    return <div role="status" aria-live="polite" style={{ color: "var(--aurora-fg4)", marginTop: 80, textAlign: "center" }}>{t.loading}</div>;
+  }
+  if (visibleToolState === "error" || !tool) {
+    return (
+      <Glass padding={40} radius={20} style={{ maxWidth: 560, margin: "80px auto 0", textAlign: "center" }}>
+        <div role="alert" style={{ marginBottom: 16 }}>
+          <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 4px" }}>{t.tools.toolLoadFailed}</p>
+          {toolLoadError && <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: 0 }}>{toolLoadError}</p>}
+        </div>
+        <Btn size="sm" variant="glass" icon="refresh" onClick={() => setToolRetryToken((token) => token + 1)}>
+          {t.projectPage.retry}
+        </Btn>
+      </Glass>
+    );
+  }
 
   const categories = Object.entries(tool.categories);
 
@@ -56,7 +172,7 @@ export default function ToolDetailPage() {
             <div style={{ padding: "8px 12px" }}>
               <SectionLabel style={{ margin: 0 }}>{t.tools.categories}</SectionLabel>
             </div>
-            <CatRow label={t.all} count={tool.total_files} active={!activeCategory} onClick={() => setActiveCategory(undefined)} />
+            <CatRow label={t.all} count={tool.total_files} active={!activeCategory} onClick={() => setCategorySelection({ scope: projectRequestKey })} />
             {categories.map(([cat, count]) => (
               <CatRow
                 key={cat}
@@ -64,18 +180,42 @@ export default function ToolDetailPage() {
                 label={(t.category as Record<string, string>)[cat] || cat}
                 count={count}
                 active={activeCategory === cat}
-                onClick={() => setActiveCategory(cat)}
+                onClick={() => setCategorySelection({ scope: projectRequestKey, value: cat })}
               />
             ))}
           </Glass>
 
-          {projects.length > 0 && (
+          {visibleProjectState === "loading" && (
+            <Glass padding={18} radius={18}>
+              <div role="status" aria-live="polite" style={{ color: "var(--aurora-fg3)", fontSize: 12 }}>
+                {t.loading}
+              </div>
+            </Glass>
+          )}
+
+          {visibleProjectState === "error" && (
+            <Glass padding={18} radius={18}>
+              <div role="alert" style={{ marginBottom: 10 }}>
+                <p style={{ color: "var(--aurora-fg2)", fontSize: 12, margin: "0 0 2px" }}>{t.projectPage.listLoadFailed}</p>
+                {projectLoadError && <p style={{ color: "var(--aurora-fg4)", fontSize: 10, margin: 0 }}>{projectLoadError}</p>}
+              </div>
+              <Btn size="sm" variant="glass" icon="refresh" onClick={() => setProjectRetryToken((token) => token + 1)}>
+                {t.projectPage.retry}
+              </Btn>
+            </Glass>
+          )}
+
+          {visibleProjectState === "success" && visibleProjects.length > 0 && (
             <Glass padding={6} radius={18}>
               <div style={{ padding: "8px 12px" }}>
                 <SectionLabel style={{ margin: 0 }}>{t.tools.projectsInTool}</SectionLabel>
               </div>
-              {projects.map((p) => (
-                <Link key={p.id} href={`/projects/${p.id}`}
+              {visibleProjects.map((p) => (
+                <Link
+                  key={p.id}
+                  href={selectedDeviceId
+                    ? `/devices/${selectedDeviceId}/tools/${toolId}/projects/${p.id}`
+                    : `/projects/${p.id}`}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -98,15 +238,29 @@ export default function ToolDetailPage() {
           <Glass padding={6} radius={18}>
             <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--aurora-border)" }}>
               <SectionLabel style={{ margin: 0 }}>
-                {t.tools.fileList} ({files.length})
+                {t.tools.fileList} ({visibleFiles.length})
               </SectionLabel>
             </div>
-            {files.length === 0 ? (
+            {visibleFileState === "loading" ? (
+              <div role="status" aria-live="polite" style={{ textAlign: "center", color: "var(--aurora-fg3)", padding: 48, fontSize: 13 }}>
+                {t.loading}
+              </div>
+            ) : visibleFileState === "error" ? (
+              <div style={{ textAlign: "center", padding: 40 }}>
+                <div role="alert" style={{ marginBottom: 12 }}>
+                  <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 3px" }}>{t.tools.fileLoadFailed}</p>
+                  {fileLoadError && <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: 0 }}>{fileLoadError}</p>}
+                </div>
+                <Btn size="sm" variant="glass" icon="refresh" onClick={() => setFileRetryToken((token) => token + 1)}>
+                  {t.projectPage.retry}
+                </Btn>
+              </div>
+            ) : visibleFiles.length === 0 ? (
               <div style={{ textAlign: "center", color: "var(--aurora-fg4)", padding: 48, fontSize: 13 }}>
                 {t.tools.noFiles}
               </div>
             ) : (
-              files.map((f) => {
+              visibleFiles.map((f) => {
                 const href = f.content_type === "jsonl" && f.category === "conversation"
                   ? `/conversations/${f.id}` : `/documents/${f.id}`;
                 return (

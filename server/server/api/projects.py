@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 
 from ..db.models import (
     ConversationMessage, Document, KnowledgeEntity, KnowledgeObservation,
-    KnowledgeRelation, Project, Tool, User,
+    KnowledgeRelation, Machine, Project, Tool, User,
 )
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
@@ -35,18 +35,78 @@ from ..services.user_filter import user_machine_ids, apply_user_filter
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
+async def _resolve_project_device_id(
+    db: AsyncSession,
+    user: User,
+    device_id: str,
+) -> uuid.UUID:
+    """Resolve a public collector device ID, with a database UUID fallback.
+
+    The device selector exposes ``Machine.collector_token_hash`` as
+    ``device_id``.  Older callers can still send the database UUID.  Resolve
+    the public ID first so a UUID-shaped collector ID cannot accidentally
+    select a different machine through the fallback.
+    """
+    machine = (
+        await db.execute(
+            select(Machine)
+            .options(load_only(Machine.id, Machine.user_id))
+            .where(Machine.collector_token_hash == device_id)
+        )
+    ).scalar_one_or_none()
+
+    if machine is None:
+        try:
+            machine_uuid = uuid.UUID(device_id)
+        except ValueError:
+            machine_uuid = None
+        if machine_uuid is not None:
+            machine = (
+                await db.execute(
+                    select(Machine)
+                    .options(load_only(Machine.id, Machine.user_id))
+                    .where(Machine.id == machine_uuid)
+                )
+            ).scalar_one_or_none()
+
+    if (
+        machine is None
+        or (
+            user.role not in ("admin", "owner")
+            and machine.user_id != user.id
+        )
+    ):
+        # Do not disclose whether an inaccessible device exists.
+        raise HTTPException(status_code=404, detail="Device not found")
+    return machine.id
+
+
 @router.get("")
 async def list_projects(
     tool_id: str | None = None,
+    device_id: str | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
-    mids = await user_machine_ids(db, _user)
+    selected_machine_id = (
+        await _resolve_project_device_id(db, _user, device_id)
+        if device_id
+        else None
+    )
+    # A selected machine was already ownership-checked above.  Preserve the
+    # existing all-device user filter when no explicit device is selected.
+    mids = (
+        None
+        if selected_machine_id is not None
+        else await user_machine_ids(db, _user)
+    )
 
     # Single query: projects LEFT JOIN documents, GROUP BY, count documents
     doc_count_col = func.count(Document.id).label("doc_count")
     join_cond = Document.project_id == Project.id
-    if mids is not None:
+    if selected_machine_id is not None:
+        join_cond = join_cond & (Document.machine_id == selected_machine_id)
+    elif mids is not None:
         join_cond = join_cond & Document.machine_id.in_(mids)
 
     query = (
@@ -57,8 +117,8 @@ async def list_projects(
     )
     if tool_id:
         query = query.where(Project.tool_id == tool_id)
-    if mids is not None:
-        # Exclude projects with zero visible docs for non-admin users
+    if selected_machine_id is not None or mids is not None:
+        # Exclude projects with zero visible docs for the selected scope.
         query = query.having(doc_count_col > 0)
 
     result = await db.execute(query)
@@ -94,7 +154,18 @@ async def get_project(
 ) -> dict:
     mids = await user_machine_ids(db, _user)
 
-    result = await db.execute(select(Project).where(Project.id == project_id))
+    project_q = select(Project).where(Project.id == project_id)
+    if mids is not None:
+        # Project rows are shared metadata and do not carry user_id.  Require
+        # at least one document on a machine visible to this user so a guessed
+        # UUID cannot disclose another user's title or source path.
+        project_q = (
+            project_q
+            .join(Document, Document.project_id == Project.id)
+            .where(Document.machine_id.in_(mids))
+            .distinct()
+        )
+    result = await db.execute(project_q)
     project = result.scalar_one_or_none()
     if not project:
         raise HTTPException(status_code=404)
@@ -187,6 +258,20 @@ async def get_project(
         )
         .limit(50)
     )
+    if not include_content:
+        # The default endpoint is a metadata view.  Document.content and
+        # rendered_html can each be megabytes, and selecting the ORM entity
+        # without load_only hydrated those payloads only to discard them in
+        # _doc_row below.
+        docs_q = docs_q.options(load_only(
+            Document.id,
+            Document.relative_path,
+            Document.category,
+            Document.title,
+            Document.file_size_bytes,
+            Document.activity_at,
+            Document.synced_at,
+        ))
     docs_q = apply_user_filter(docs_q, mids, Document.machine_id)
     docs_result = await db.execute(docs_q)
     docs = docs_result.scalars().all()
