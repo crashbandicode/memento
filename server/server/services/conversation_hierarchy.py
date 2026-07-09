@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Hashable, Iterable, Mapping
 
+from .conversation_activity import effective_conversation_activity
+
 
 @dataclass(frozen=True, slots=True)
 class ConversationRef:
@@ -257,13 +259,11 @@ def build_logical_activity_map(
 
 def effective_conversation_timestamp(ref: ConversationRef) -> datetime | None:
     """Prefer transcript activity while retaining legacy ordering fallback."""
-    if ref.activity_at is not None:
-        return ref.activity_at
-    if ref.source_modified_at is not None and ref.synced_at is not None:
-        # A source can carry a future/skewed mtime.  Never present activity as
-        # later than the moment this revision was actually observed.
-        return min(ref.source_modified_at, ref.synced_at)
-    return ref.source_modified_at or ref.synced_at
+    return effective_conversation_activity(
+        ref.activity_at,
+        ref.source_modified_at,
+        ref.synced_at,
+    )
 
 
 def _orphan_sort_key(ref: ConversationRef) -> tuple[int, float, int, str]:

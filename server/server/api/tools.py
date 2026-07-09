@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import uuid
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import Document, Machine, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..services.conversation_activity import (
+    conversation_list_timestamp_expression,
+    effective_conversation_activity,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
@@ -33,9 +35,42 @@ class DocumentSummary(BaseModel):
     content_type: str
     title: str | None
     file_size_bytes: int
+    activity_at: str | None = None
     synced_at: str
     ai_summary: str | None = None
     device_name: str | None = None
+
+
+def _document_summary(
+    document: Document,
+    machine_names: dict[str, str],
+) -> DocumentSummary:
+    activity_at = None
+    if document.category == "conversation":
+        effective_timestamp = effective_conversation_activity(
+            document.activity_at,
+            document.source_modified_at,
+            document.synced_at,
+        )
+        activity_at = (
+            effective_timestamp.isoformat() if effective_timestamp else None
+        )
+    return DocumentSummary(
+        id=str(document.id),
+        relative_path=document.relative_path,
+        category=document.category,
+        content_type=document.content_type,
+        title=document.title,
+        file_size_bytes=document.file_size_bytes,
+        activity_at=activity_at,
+        synced_at=document.synced_at.isoformat(),
+        ai_summary=document.ai_summary,
+        device_name=(
+            machine_names.get(str(document.machine_id))
+            if document.machine_id
+            else None
+        ),
+    )
 
 
 def _device_filter(query, device_id: str | None):
@@ -152,7 +187,16 @@ async def list_tool_files(
         query = query.where(Document.category == category)
     query = _device_filter(query, device_id)
     query = apply_user_filter(query, mids, Document.machine_id)
-    query = query.order_by(Document.synced_at.desc()).offset(offset).limit(limit)
+    display_timestamp = conversation_list_timestamp_expression(
+        Document.category,
+        Document.activity_at,
+        Document.source_modified_at,
+        Document.synced_at,
+    )
+    query = query.order_by(
+        display_timestamp.desc(),
+        Document.id.desc(),
+    ).offset(offset).limit(limit)
 
     result = await db.execute(query)
     docs = result.scalars().all()
@@ -164,12 +208,4 @@ async def list_tool_files(
         m_result = await db.execute(select(Machine).where(Machine.id.in_(machine_ids)))
         machine_names = {str(m.id): m.name for m in m_result.scalars().all()}
 
-    return [
-        DocumentSummary(
-            id=str(d.id), relative_path=d.relative_path, category=d.category,
-            content_type=d.content_type, title=d.title,
-            file_size_bytes=d.file_size_bytes, synced_at=d.synced_at.isoformat(),
-            ai_summary=d.ai_summary,
-            device_name=machine_names.get(str(d.machine_id)) if d.machine_id else None,
-        ) for d in docs
-    ]
+    return [_document_summary(d, machine_names) for d in docs]

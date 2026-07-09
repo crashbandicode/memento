@@ -11,9 +11,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import Document, Machine, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
-from ..services.user_filter import user_machine_ids
+from ..services.conversation_activity import (
+    conversation_list_timestamp_expression,
+    effective_conversation_activity,
+)
 
 router = APIRouter(prefix="/api/hierarchy", tags=["hierarchy"])
+
+
+def _device_file_row(document: Document) -> dict:
+    activity_at = None
+    if document.category == "conversation":
+        effective_timestamp = effective_conversation_activity(
+            document.activity_at,
+            document.source_modified_at,
+            document.synced_at,
+        )
+        activity_at = (
+            effective_timestamp.isoformat() if effective_timestamp else None
+        )
+    return {
+        "id": str(document.id),
+        "title": document.title,
+        "relative_path": document.relative_path,
+        "category": document.category,
+        "content_type": document.content_type,
+        "file_size_bytes": document.file_size_bytes,
+        "activity_at": activity_at,
+        "synced_at": document.synced_at.isoformat(),
+    }
 
 
 def _check_machine_access(machine: Machine | None, user: User) -> Machine | None:
@@ -183,21 +209,20 @@ async def list_device_tool_files(
     count_q = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_q)).scalar() or 0
 
-    result = await db.execute(query.order_by(Document.synced_at.desc()).offset(offset).limit(limit))
+    display_timestamp = conversation_list_timestamp_expression(
+        Document.category,
+        Document.activity_at,
+        Document.source_modified_at,
+        Document.synced_at,
+    )
+    result = await db.execute(
+        query.order_by(display_timestamp.desc(), Document.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     docs = result.scalars().all()
 
     return {
         "total": total,
-        "files": [
-            {
-                "id": str(d.id),
-                "title": d.title,
-                "relative_path": d.relative_path,
-                "category": d.category,
-                "content_type": d.content_type,
-                "file_size_bytes": d.file_size_bytes,
-                "synced_at": d.synced_at.isoformat(),
-            }
-            for d in docs
-        ],
+        "files": [_device_file_row(d) for d in docs],
     }

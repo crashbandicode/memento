@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from ..db.models import ConversationMessage
 
@@ -18,6 +18,59 @@ if TYPE_CHECKING:
 
 SHORT_EXCHANGE_CHARACTER_LIMIT = 120
 REAL_ACTIVITY_ROLES = ("user", "assistant")
+
+
+def effective_conversation_activity(
+    activity_at: datetime | None,
+    source_modified_at: datetime | None,
+    synced_at: datetime | None,
+) -> datetime | None:
+    """Return the outward timestamp for a conversation revision.
+
+    Persisted activity is always a real user/assistant turn. Legacy sources
+    without such a timestamp fall back to their source mtime, bounded by the
+    moment the revision was observed so a skewed future mtime cannot surface.
+    """
+    if activity_at is not None:
+        return activity_at
+    if source_modified_at is not None and synced_at is not None:
+        return min(source_modified_at, synced_at)
+    return source_modified_at or synced_at
+
+
+def effective_conversation_activity_expression(
+    activity_at,
+    source_modified_at,
+    synced_at,
+):
+    """SQL expression matching :func:`effective_conversation_activity`."""
+    bounded_source_timestamp = case(
+        (source_modified_at.is_(None), synced_at),
+        (synced_at.is_(None), source_modified_at),
+        (source_modified_at <= synced_at, source_modified_at),
+        else_=synced_at,
+    )
+    return func.coalesce(activity_at, bounded_source_timestamp)
+
+
+def conversation_list_timestamp_expression(
+    category,
+    activity_at,
+    source_modified_at,
+    synced_at,
+):
+    """Order conversations by activity and other documents by sync time."""
+    return case(
+        (
+            category == "conversation",
+            effective_conversation_activity_expression(
+                activity_at,
+                source_modified_at,
+                synced_at,
+            ),
+        ),
+        else_=synced_at,
+    )
 
 
 def conversation_activity_at_query(document_id: object):

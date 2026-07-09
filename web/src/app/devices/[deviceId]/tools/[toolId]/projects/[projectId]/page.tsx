@@ -8,7 +8,7 @@ import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
 
-interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; synced_at: string; }
+interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; }
 interface ProjectInfo { id: string; slug: string; title: string; tool_id: string; source_path: string; }
 
 export default function DeviceToolProjectPage() {
@@ -106,7 +106,11 @@ export default function DeviceToolProjectPage() {
                   </div>
                   <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
                   <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                    {new Date(f.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                    {new Date(
+                      f.category === "conversation" && f.activity_at
+                        ? f.activity_at
+                        : f.synced_at,
+                    ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                   </span>
                 </Link>
               );

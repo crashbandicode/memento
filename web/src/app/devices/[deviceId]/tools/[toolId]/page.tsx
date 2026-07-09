@@ -9,7 +9,7 @@ import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
 
 interface ProjectItem { id: string; title: string; slug: string; file_count: number; last_sync: string | null; }
-interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; synced_at: string; }
+interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; }
 
 export default function DeviceToolPage() {
   const params = useParams();
@@ -187,7 +187,11 @@ export default function DeviceToolPage() {
                     </div>
                     <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
                     <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                      {new Date(f.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      {new Date(
+                        f.category === "conversation" && f.activity_at
+                          ? f.activity_at
+                          : f.synced_at,
+                      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                     </span>
                   </Link>
                 );

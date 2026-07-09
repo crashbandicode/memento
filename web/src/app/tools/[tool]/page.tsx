@@ -141,7 +141,11 @@ export default function ToolDetailPage() {
                     </div>
                     <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
                     <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                      {new Date(f.synced_at).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                      {new Date(
+                        f.category === "conversation" && f.activity_at
+                          ? f.activity_at
+                          : f.synced_at,
+                      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                     </span>
                   </Link>
                 );

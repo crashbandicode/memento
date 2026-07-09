@@ -6,19 +6,120 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+    select,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_activity import (  # noqa: E402
+    conversation_list_timestamp_expression,
     conversation_activity_at_query,
+    effective_conversation_activity,
     historical_conversation_activity_query,
     is_low_activity_messages,
     is_low_activity_summary,
     refresh_document_activity_at,
 )
+from server.api.hierarchy import _device_file_row  # noqa: E402
+from server.api.tools import _document_summary  # noqa: E402
+from server.db.models import Document  # noqa: E402
 
 
 class ConversationActivityTests(unittest.TestCase):
+    def test_effective_activity_prefers_real_turn_timestamp(self) -> None:
+        activity = datetime(2026, 5, 15, 12, tzinfo=timezone.utc)
+        source_modified = datetime(2026, 7, 7, 12, tzinfo=timezone.utc)
+        synced = datetime(2026, 7, 8, 12, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            effective_conversation_activity(activity, source_modified, synced),
+            activity,
+        )
+
+    def test_effective_activity_bounds_future_source_mtime(self) -> None:
+        source_modified = datetime(2026, 7, 10, 12, tzinfo=timezone.utc)
+        synced = datetime(2026, 7, 8, 12, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            effective_conversation_activity(None, source_modified, synced),
+            synced,
+        )
+
+    def test_list_timestamp_expression_distinguishes_conversations(self) -> None:
+        expression = conversation_list_timestamp_expression(
+            Document.category,
+            Document.activity_at,
+            Document.source_modified_at,
+            Document.synced_at,
+        )
+        sql = str(select(expression).compile())
+
+        self.assertIn("documents.category =", sql)
+        self.assertIn("coalesce(documents.activity_at", sql)
+        self.assertIn("ELSE documents.synced_at", sql)
+
+    def test_list_timestamp_expression_orders_effective_activity(self) -> None:
+        metadata = MetaData()
+        rows = Table(
+            "activity_rows",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("category", String, nullable=False),
+            Column("activity_at", DateTime),
+            Column("source_modified_at", DateTime),
+            Column("synced_at", DateTime, nullable=False),
+        )
+        engine = create_engine("sqlite://")
+        metadata.create_all(engine)
+        may = datetime(2026, 5, 15, 12)
+        june = datetime(2026, 6, 24, 12)
+        july = datetime(2026, 7, 7, 12)
+        with engine.begin() as connection:
+            connection.execute(insert(rows), [
+                {
+                    "id": 1,
+                    "category": "conversation",
+                    "activity_at": None,
+                    "source_modified_at": may,
+                    "synced_at": july,
+                },
+                {
+                    "id": 2,
+                    "category": "conversation",
+                    "activity_at": june,
+                    "source_modified_at": may,
+                    "synced_at": july,
+                },
+                {
+                    "id": 3,
+                    "category": "memory",
+                    "activity_at": None,
+                    "source_modified_at": may,
+                    "synced_at": july,
+                },
+            ])
+            display_timestamp = conversation_list_timestamp_expression(
+                rows.c.category,
+                rows.c.activity_at,
+                rows.c.source_modified_at,
+                rows.c.synced_at,
+            )
+            ordered_ids = connection.execute(
+                select(rows.c.id).order_by(display_timestamp.desc(), rows.c.id.desc())
+            ).scalars().all()
+
+        self.assertEqual(ordered_ids, [3, 2, 1])
+
     def test_tool_only_and_one_sided_threads_are_low_activity(self) -> None:
         self.assertTrue(is_low_activity_summary(0, 0, 0))
         self.assertTrue(is_low_activity_summary(1, 0, 500))
@@ -77,6 +178,69 @@ class RefreshDocumentActivityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(actual, expected)
         self.assertEqual(document.activity_at, expected)
+
+
+class ConversationBrowseActivityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.activity = datetime(2026, 5, 15, 12, tzinfo=timezone.utc)
+        self.source_modified = datetime(2026, 7, 7, 12, tzinfo=timezone.utc)
+        self.synced = datetime(2026, 7, 8, 12, tzinfo=timezone.utc)
+
+    def _document(self, category: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id="document-id",
+            machine_id="machine-id",
+            relative_path="sessions/thread.jsonl",
+            category=category,
+            content_type="jsonl",
+            title="Historical thread",
+            file_size_bytes=123,
+            activity_at=self.activity,
+            source_modified_at=self.source_modified,
+            synced_at=self.synced,
+            ai_summary=None,
+        )
+
+    def test_tool_file_summary_exposes_effective_conversation_activity(self) -> None:
+        summary = _document_summary(
+            self._document("conversation"),
+            {"machine-id": "dreamland-yoga (Linux)"},
+        )
+
+        self.assertEqual(summary.activity_at, self.activity.isoformat())
+        self.assertEqual(summary.synced_at, self.synced.isoformat())
+        self.assertEqual(summary.device_name, "dreamland-yoga (Linux)")
+
+    def test_device_file_row_exposes_effective_conversation_activity(self) -> None:
+        row = _device_file_row(self._document("conversation"))
+
+        self.assertEqual(row["activity_at"], self.activity.isoformat())
+        self.assertEqual(row["synced_at"], self.synced.isoformat())
+
+    def test_yoga_timestamp_less_thread_uses_historical_source_mtime(self) -> None:
+        document = self._document("conversation")
+        document.activity_at = None
+        document.source_modified_at = datetime(
+            2026,
+            6,
+            24,
+            15,
+            8,
+            tzinfo=timezone.utc,
+        )
+
+        summary = _document_summary(document, {})
+        row = _device_file_row(document)
+
+        self.assertEqual(summary.activity_at, document.source_modified_at.isoformat())
+        self.assertEqual(row["activity_at"], document.source_modified_at.isoformat())
+
+    def test_non_conversation_rows_do_not_claim_conversation_activity(self) -> None:
+        summary = _document_summary(self._document("memory"), {})
+        row = _device_file_row(self._document("memory"))
+
+        self.assertIsNone(summary.activity_at)
+        self.assertIsNone(row["activity_at"])
 
 
 if __name__ == "__main__":
