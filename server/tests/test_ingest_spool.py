@@ -391,6 +391,39 @@ class IngestSpoolTests(unittest.TestCase):
             )
         )
 
+    def test_future_source_mtime_is_bounded_by_ready_observation(self) -> None:
+        first, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="future-first",
+                hash="zzz",
+                timestamp=4_102_444_800.0,
+                file_size=2,
+            ),
+            b"aa",
+        )
+        second, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="future-second",
+                hash="aaa",
+                timestamp=4_102_444_800.0,
+            ),
+            b"b",
+        )
+
+        first_ready = self.root / first / "ready"
+        second_ready = self.root / second / "ready"
+        os.utime(first_ready, ns=(100_000_000_000, 100_000_000_000))
+        os.utime(second_ready, ns=(200_000_000_000, 200_000_000_000))
+
+        head, cohort = select_ready_source_head(first, self.root)
+
+        self.assertEqual(head, second)
+        self.assertEqual(cohort, (first,))
+
     def test_same_hash_full_always_reaches_locked_pointer_and_timestamp_path(
         self,
     ) -> None:

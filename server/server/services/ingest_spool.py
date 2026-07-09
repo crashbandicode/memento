@@ -21,7 +21,11 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import UUID
 
-from .ingest_revision import full_snapshot_revision, normalized_source_timestamp
+from .ingest_revision import (
+    bounded_source_timestamp,
+    full_snapshot_revision,
+    normalized_source_timestamp,
+)
 
 DEFAULT_SPOOL_ROOT = Path(
     os.environ.get("MEMENTO_INGEST_SPOOL_DIR", "/data/ingest-spool")
@@ -540,9 +544,12 @@ def _source_sequence_rank(
     """Order mixed FULL/DELTA work without discarding any incremental update."""
     meta = manifest["meta"]
     ready_mtime_ns = _ready_mtime_ns(job_id, root)
-    timestamp = normalized_source_timestamp(meta.get("timestamp"))
+    ready_timestamp = normalized_source_timestamp(
+        ready_mtime_ns / 1_000_000_000,
+    )
+    timestamp = bounded_source_timestamp(meta.get("timestamp"), ready_timestamp)
     if timestamp is None:
-        timestamp = normalized_source_timestamp(ready_mtime_ns / 1_000_000_000)
+        timestamp = ready_timestamp
     return (
         timestamp,
         0 if meta.get("mode", "full") == "full" else 1,
@@ -555,11 +562,15 @@ def _source_sequence_rank(
 def _full_snapshot_rank(
     job_id: str,
     manifest: dict[str, Any],
+    root: Path,
 ) -> tuple[object, int, int, str, str] | None:
     """Use only revision fields that are persisted in PostgreSQL."""
     meta = manifest["meta"]
+    ready_timestamp = normalized_source_timestamp(
+        _ready_mtime_ns(job_id, root) / 1_000_000_000,
+    )
     revision = full_snapshot_revision(
-        timestamp=meta.get("timestamp"),
+        timestamp=bounded_source_timestamp(meta.get("timestamp"), ready_timestamp),
         offset=meta.get("offset", 0),
         file_size=meta.get("file_size", 0),
         content_hash=meta.get("hash", ""),
@@ -607,7 +618,7 @@ def select_ready_source_head(
         manifest["meta"].get("mode", "full") == "full" for _, manifest in all_jobs
     )
     full_ranks = {
-        candidate_id: _full_snapshot_rank(candidate_id, manifest)
+        candidate_id: _full_snapshot_rank(candidate_id, manifest, root)
         for candidate_id, manifest in all_jobs
     }
     if all_full and all(rank is not None for rank in full_ranks.values()):

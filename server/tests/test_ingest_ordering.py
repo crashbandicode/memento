@@ -135,6 +135,28 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(getattr(doc, "_memento_ingest_disposition"), "idempotent")
 
+    async def test_future_source_time_is_bounded_by_server_receipt(self) -> None:
+        doc = _document(content_hash="same-hash", timestamp=100.0)
+        sync = _sync_state(doc, offset=0)
+        db = _OrderedSession(None, sync, doc, sync)
+        before = datetime.now(timezone.utc)
+
+        result = await ingest_file(
+            db,
+            **_ingest_kwargs(
+                doc,
+                content_hash="same-hash",
+                file_size=300,
+                offset=300,
+                timestamp=4_102_444_800.0,
+            ),
+        )
+        after = datetime.now(timezone.utc)
+
+        self.assertIs(result, doc)
+        self.assertGreaterEqual(doc.source_modified_at, before)
+        self.assertLessEqual(doc.source_modified_at, after)
+
     async def test_stale_same_hash_full_cannot_downgrade_offset_or_source_time(
         self,
     ) -> None:

@@ -21,6 +21,25 @@ def normalized_source_timestamp(
         return None
 
 
+def bounded_source_timestamp(
+    value: datetime | float | int | None,
+    observed_at: datetime | float | int | None,
+) -> datetime | None:
+    """Normalize source time without allowing it beyond server observation.
+
+    Filesystem clocks are collector-controlled and can be skewed into the
+    future.  Since source time is also a FULL-snapshot revision key, persisting
+    an unbounded value could make every later valid revision look stale.
+    """
+    source_timestamp = normalized_source_timestamp(value)
+    observation_timestamp = normalized_source_timestamp(observed_at)
+    if source_timestamp is None:
+        return observation_timestamp
+    if observation_timestamp is None:
+        return source_timestamp
+    return min(source_timestamp, observation_timestamp)
+
+
 def full_snapshot_revision(
     *,
     timestamp: datetime | float | int | None,

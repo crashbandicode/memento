@@ -21,7 +21,7 @@ from ..db.models import (
     SyncState,
     Tool,
 )
-from .ingest_revision import committed_full_supersedes, normalized_source_timestamp
+from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
@@ -722,7 +722,7 @@ async def ingest_file(
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
     received_at = datetime.now(timezone.utc)
-    source_modified_at = normalized_source_timestamp(timestamp) or received_at
+    source_modified_at = bounded_source_timestamp(timestamp, received_at) or received_at
     await _lock_ingest_source(
         db,
         machine_id=machine_id,
