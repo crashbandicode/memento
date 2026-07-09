@@ -220,6 +220,10 @@ export interface ConversationMessage {
   thinking?: string | null;
   tool_name?: string;
   tool_input?: string;
+  tool_calls?: Array<{
+    name: string;
+    input: string;
+  }>;
   raw_type?: string;
   metadata?: Record<string, unknown>;
   timestamp: string | null;

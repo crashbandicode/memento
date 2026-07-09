@@ -37,6 +37,13 @@ export default function ConversationPage() {
   const plans = meta.related_plans || [];
   const diagnostics = (meta.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
   const hasDiagnostics = meta.tool_id === "antigravity" && diagnostics && Object.keys(diagnostics).length > 0;
+  const activityTimestamp = new Date(meta.activity_at || meta.synced_at).toLocaleString(locale, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -57,10 +64,8 @@ export default function ConversationPage() {
           />
           {plans.length > 0 && <Chip tone="warn">{plans.length} artifacts</Chip>}
           {hasDiagnostics && diagnostics.step_fetch_failed && <Chip tone="danger">{t.conversation.stepFetchFailed}</Chip>}
-          <span>
-            {t.conversation.lastActivity}: {new Date(
-              meta.activity_at || meta.synced_at,
-            ).toLocaleString(locale)}
+          <span className="basis-full pt-0.5 sm:basis-auto sm:pt-0">
+            {t.conversation.lastActivity}: {activityTimestamp}
           </span>
         </div>
       </div>
@@ -130,7 +135,12 @@ export default function ConversationPage() {
           </div>
         </div>
       )}
-      <ConversationViewer documentId={docId} totalMessages={meta.message_count} artifacts={plans} />
+      <ConversationViewer
+        documentId={docId}
+        toolId={meta.tool_id}
+        totalMessages={meta.message_count}
+        artifacts={plans}
+      />
     </div>
   );
 }

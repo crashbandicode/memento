@@ -35,12 +35,106 @@ function formatToolText(value: string): string {
   }
 }
 
+type AssistantContentSegment =
+  | { type: "text"; content: string }
+  | { type: "tool"; name: string; input: string };
+
+const STANDALONE_REDACTED_LINE_RE = /(^|\r?\n)[ \t]*\[REDACTED\][ \t]*(?=\r?\n|$)/gi;
+const FLATTENED_TOOL_MARKER_RE = /(^|\r?\n)\[Tool:\s*([^\]\r\n]{1,120})\][ \t]*(?:\r?\n|$)/g;
+
+/**
+ * Cursor serializes structured assistant tool calls into the stored display
+ * text. Recover that structure for presentation without altering the source
+ * transcript or hiding ordinary mentions of `[Tool: ...]` in prose.
+ */
+export function splitAssistantContent(value: string): AssistantContentSegment[] {
+  const originalMarker = new RegExp(FLATTENED_TOOL_MARKER_RE.source, "g");
+  if (!originalMarker.test(value)) {
+    return value ? [{ type: "text", content: value }] : [];
+  }
+
+  const content = value
+    .replace(STANDALONE_REDACTED_LINE_RE, "$1")
+    .replace(/^\r?\n/, "")
+    .trimEnd();
+  const marker = new RegExp(FLATTENED_TOOL_MARKER_RE.source, "g");
+  const matches = Array.from(content.matchAll(marker));
+
+  if (matches.length === 0) {
+    return [{ type: "text", content: value }];
+  }
+
+  const segments: AssistantContentSegment[] = [];
+  const leadingText = content
+    .slice(0, matches[0].index ?? 0)
+    .replace(/\r?\n$/, "");
+  if (leadingText.trim()) segments.push({ type: "text", content: leadingText });
+
+  for (const [index, match] of matches.entries()) {
+    const start = (match.index ?? 0) + match[0].length;
+    const end = matches[index + 1]?.index ?? content.length;
+    const input = content.slice(start, end).trim();
+    // Parser-generated Cursor tool inputs are serialized JSON. If a legacy
+    // payload is ambiguous (for example prose follows a raw string input),
+    // leave the complete assistant message untouched instead of hiding or
+    // reordering user-visible text inside a collapsed row.
+    if (input) {
+      try {
+        JSON.parse(input);
+      } catch {
+        return [{ type: "text", content: value }];
+      }
+    }
+    segments.push({
+      type: "tool",
+      name: match[2].trim(),
+      input,
+    });
+  }
+  return segments;
+}
+
+function toolPreview(toolName: string, input: string, output: string): string {
+  const fallback = (input || output).replace(/\s+/g, " ").trim().slice(0, 240);
+  if (!input.trim().startsWith("{")) return fallback;
+
+  try {
+    const parsed = JSON.parse(input) as Record<string, unknown>;
+    const normalizedName = toolName.toLowerCase();
+    if (normalizedName === "todowrite" && Array.isArray(parsed.todos)) {
+      const counts = new Map<string, number>();
+      parsed.todos.forEach((todo) => {
+        if (!todo || typeof todo !== "object") return;
+        const status = String((todo as Record<string, unknown>).status || "task");
+        counts.set(status, (counts.get(status) || 0) + 1);
+      });
+      const statusSummary = Array.from(counts)
+        .map(([status, count]) => `${count} ${status.replaceAll("_", " ")}`)
+        .join(" · ");
+      return `${parsed.todos.length} tasks${statusSummary ? ` · ${statusSummary}` : ""}`.slice(0, 240);
+    }
+
+    const preferredKeys = normalizedName === "shell"
+      ? ["description", "command"]
+      : ["path", "file_path", "query", "pattern", "description", "command", "url"];
+    for (const key of preferredKeys) {
+      const candidate = parsed[key];
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 240);
+    }
+  } catch {
+    // Keep the compact raw fallback when a legacy payload is not valid JSON.
+  }
+  return fallback;
+}
+
 export default function ConversationViewer({
   documentId,
+  toolId,
   totalMessages,
   artifacts,
 }: {
   documentId: string;
+  toolId: string;
   totalMessages: number;
   artifacts?: Artifact[];
 }) {
@@ -208,7 +302,7 @@ export default function ConversationViewer({
                 data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
                 style={{ scrollMarginTop: 16 }}
               >
-                <ChatBubble msg={msg} locale={locale} t={t} />
+                <ChatBubble msg={msg} toolId={toolId} locale={locale} t={t} />
               </div>
             );
           })}
@@ -432,12 +526,125 @@ function PromptNavigator({
   );
 }
 
+function ConversationToolCard({
+  name,
+  input = "",
+  output = "",
+}: {
+  name: string;
+  input?: string;
+  output?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const toolLabel = name || "Tool result";
+  const cleanedOutput = cleanToolOutput(output);
+  const visibleOutput = cleanedOutput === `[${toolLabel}]` ? "" : cleanedOutput;
+  const preview = toolPreview(toolLabel, input, visibleOutput);
+  const hasDetails = Boolean(input.trim() || visibleOutput);
+  const formattedInput = expanded ? formatToolText(input) : "";
+  const formattedOutput = expanded ? formatToolText(visibleOutput) : "";
+
+  return (
+    <div className="mx-0.5 flex min-w-0 justify-start sm:mx-1">
+      <div
+        className={expanded ? "w-full min-w-0" : "w-full min-w-0 sm:w-fit sm:min-w-60"}
+        style={{
+          background: "var(--aurora-surface-solid)",
+          border: "1px solid var(--aurora-border)",
+          borderRadius: 10,
+          color: "var(--aurora-fg1)",
+          maxWidth: "100%",
+          overflow: "hidden",
+          boxShadow: "0 1px 2px rgba(15,23,42,0.03)",
+        }}
+      >
+        <button
+          type="button"
+          data-conversation-tool={toolLabel}
+          aria-label={`${toolLabel} tool call`}
+          aria-expanded={expanded}
+          disabled={!hasDetails}
+          onClick={() => hasDetails && setExpanded((value) => !value)}
+          style={{
+            width: "100%",
+            minHeight: 44,
+            display: "flex",
+            alignItems: "center",
+            gap: 9,
+            padding: "9px 12px",
+            border: 0,
+            background: "transparent",
+            color: "inherit",
+            cursor: hasDetails ? "pointer" : "default",
+            textAlign: "left",
+          }}
+        >
+          <Icon name="terminal" size={13} style={{ color: "#F97316", flex: "0 0 auto" }} />
+          <span
+            title={toolLabel}
+            style={{
+              maxWidth: "min(42%, 220px)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              fontWeight: 600,
+              fontSize: 12,
+              whiteSpace: "nowrap",
+              flex: "0 1 auto",
+            }}
+          >
+            {toolLabel}
+          </span>
+          {!expanded && preview && (
+            <span
+              title={preview}
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                color: "var(--aurora-fg4)",
+                fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
+                fontSize: 10.5,
+              }}
+            >
+              {preview}
+            </span>
+          )}
+          {hasDetails && (
+            <span style={{ marginLeft: "auto", display: "inline-flex", color: "var(--aurora-fg4)", flex: "0 0 auto" }}>
+              <Icon
+                name="chevron_down"
+                size={13}
+                style={{
+                  transform: expanded ? "rotate(180deg)" : "none",
+                  transition: "transform .15s ease",
+                }}
+              />
+            </span>
+          )}
+        </button>
+
+        {expanded && hasDetails && (
+          <div style={{ borderTop: "1px solid var(--aurora-border)", padding: "11px 12px 12px" }}>
+            {formattedInput && <ToolCodeBlock label="Input" value={formattedInput} />}
+            {formattedOutput && (
+              <ToolCodeBlock label="Output" value={formattedOutput} topSpacing={Boolean(formattedInput)} />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export const ChatBubble = memo(function ChatBubble({
   msg,
+  toolId = "",
   locale,
   t,
 }: {
   msg: ConversationMessage;
+  toolId?: string;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
 }) {
@@ -592,91 +799,144 @@ export const ChatBubble = memo(function ChatBubble({
   // Assistant — a quiet neutral surface keeps each response visually bounded
   // without competing with the stronger accent used for human prompts.
   if (role === "assistant") {
-    const isLong = content.length > 500;
-    const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
-    const hasSeparateThinking = Boolean(thinking && thinking !== content.trim());
+    const structuredToolCalls = msg.tool_calls || [];
+    const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
+      ? content.trim() && content.trim() !== "[REDACTED]"
+        ? [{ type: "text", content }]
+        : []
+      : toolId === "cursor"
+        ? splitAssistantContent(content)
+        : content
+          ? [{ type: "text", content }]
+          : [];
+    const narrative = legacySegments
+      .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")
+      .map((segment) => segment.content)
+      .join("\n\n")
+      .trim();
+    const toolCalls = structuredToolCalls.length > 0
+      ? structuredToolCalls.map((call) => ({
+          name: call.name,
+          input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
+        }))
+      : legacySegments
+          .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
+          .map((segment) => ({ name: segment.name, input: segment.input }));
+    const isLong = narrative.length > 500;
+    const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
+    const hasSeparateThinking = Boolean(thinking && thinking !== narrative);
+    const hasNarrative = Boolean(narrative || hasSeparateThinking);
 
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
-        <div style={{ width: "100%", minWidth: 0, padding: "3px 4px 8px" }}>
-          <div style={{ display: "flex", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
-            <span
-              aria-hidden="true"
-              style={{
-                width: 18,
-                height: 18,
-                borderRadius: 999,
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: "color-mix(in srgb, #10B981 13%, transparent)",
-                color: "#059669",
-                fontSize: 9,
-                fontWeight: 700,
-              }}
-            >
-              A
-            </span>
-            <span style={{ fontSize: 10.5, fontWeight: 600, color: "#10B981" }}>Assistant</span>
-            {msg.timestamp && (
-              <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
-                {new Date(msg.timestamp).toLocaleString(locale)}
-              </span>
-            )}
-          </div>
-          <div
-            style={{
-              padding: "12px 16px",
-              color: "var(--aurora-fg1)",
-              fontSize: 13.5,
-              lineHeight: 1.55,
-              letterSpacing: "-0.005em",
-              background: "color-mix(in srgb, var(--aurora-chip) 34%, var(--aurora-surface-solid))",
-              border: "1px solid var(--aurora-border)",
-              borderRadius: 12,
-              boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
-            }}
-          >
-            <div className="prose prose-sm max-w-none">
-              <MarkdownViewer content={displayContent} />
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
-              {isLong && (
-                <button
-                  onClick={() => setExpanded(!expanded)}
-                  style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
-                >
-                  {expanded ? t.conversation.collapse : t.conversation.expandAll}
-                </button>
-              )}
-              {hasSeparateThinking && (
-                <button
-                  onClick={() => setShowThinking((v) => !v)}
-                  style={{ fontSize: 11, color: "#D97706", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
-                >
-                  {showThinking ? t.conversation.hideThinking : t.conversation.showThinking}
-                </button>
-              )}
-            </div>
-            {showThinking && hasSeparateThinking && (
+        <div style={{ width: "100%", minWidth: 0, padding: hasNarrative ? "3px 2px 8px" : "0 0 4px" }}>
+          {hasNarrative && (
+            <>
               <div
                 style={{
-                  marginTop: 12,
-                  borderRadius: 12,
-                  border: "1px solid var(--aurora-border)",
-                  background: "rgba(251,191,36,0.08)",
-                  padding: "10px 12px",
+                  display: "flex",
+                  gap: 8,
+                  marginBottom: 5,
+                  alignItems: "center",
+                  padding: "0 4px",
                 }}
               >
-                <div style={{ marginBottom: 6, fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "#D97706" }}>
-                  {t.conversation.thinking}
-                </div>
-                <div className="prose prose-sm max-w-none" style={{ color: "#78350F" }}>
-                  <MarkdownViewer content={thinking} />
-                </div>
+                <span
+                  aria-hidden="true"
+                  style={{
+                    width: 18,
+                    height: 18,
+                    borderRadius: 999,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "color-mix(in srgb, #10B981 13%, transparent)",
+                    color: "#059669",
+                    fontSize: 9,
+                    fontWeight: 700,
+                  }}
+                >
+                  A
+                </span>
+                <span style={{ fontSize: 10.5, fontWeight: 600, color: "#10B981" }}>Assistant</span>
+                {msg.timestamp && (
+                  <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
+                    {new Date(msg.timestamp).toLocaleString(locale)}
+                  </span>
+                )}
               </div>
-            )}
-          </div>
+              <div
+                className="px-3 py-3 sm:px-4"
+                style={{
+                  color: "var(--aurora-fg1)",
+                  fontSize: 13.5,
+                  lineHeight: 1.55,
+                  letterSpacing: "-0.005em",
+                  background: "color-mix(in srgb, var(--aurora-chip) 34%, var(--aurora-surface-solid))",
+                  border: "1px solid var(--aurora-border)",
+                  borderRadius: 12,
+                  boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
+                }}
+              >
+                {displayContent && (
+                  <div className="prose prose-sm max-w-none">
+                    <MarkdownViewer content={displayContent} />
+                  </div>
+                )}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: displayContent ? 8 : 0 }}>
+                  {isLong && (
+                    <button
+                      onClick={() => setExpanded(!expanded)}
+                      style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
+                    >
+                      {expanded ? t.conversation.collapse : t.conversation.expandAll}
+                    </button>
+                  )}
+                  {hasSeparateThinking && (
+                    <button
+                      onClick={() => setShowThinking((value) => !value)}
+                      style={{ fontSize: 11, color: "#D97706", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
+                    >
+                      {showThinking ? t.conversation.hideThinking : t.conversation.showThinking}
+                    </button>
+                  )}
+                </div>
+                {showThinking && hasSeparateThinking && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      borderRadius: 12,
+                      border: "1px solid var(--aurora-border)",
+                      background: "rgba(251,191,36,0.08)",
+                      padding: "10px 12px",
+                    }}
+                  >
+                    <div style={{ marginBottom: 6, fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "#D97706" }}>
+                      {t.conversation.thinking}
+                    </div>
+                    <div className="prose prose-sm max-w-none" style={{ color: "#78350F" }}>
+                      <MarkdownViewer content={thinking} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          {toolCalls.length > 0 && (
+            <div
+              role="group"
+              aria-label="Assistant tool calls"
+              style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
+            >
+              {toolCalls.map((call, index) => (
+                <ConversationToolCard
+                  key={`${call.name}-${index}`}
+                  name={call.name}
+                  input={call.input}
+                />
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -686,97 +946,7 @@ export const ChatBubble = memo(function ChatBubble({
   // output stay collapsed until requested, keeping long agent sessions easy
   // to scan while retaining every detail.
   if (role === "tool") {
-    const toolLabel = toolName || "Tool result";
-    const cleanedOutput = cleanToolOutput(content);
-    // Parser placeholders identify a standalone invocation but contain no
-    // actual output. Keep those as quiet one-line context rather than opening
-    // an accordion whose only content repeats the tool name.
-    const output = cleanedOutput === `[${toolLabel}]` ? "" : cleanedOutput;
-    const formattedInput = formatToolText(toolInput);
-    const formattedOutput = formatToolText(output);
-    const previewSource = formattedInput || formattedOutput;
-    const preview = previewSource.replace(/\s+/g, " ").trim();
-    const hasDetails = Boolean(formattedInput || formattedOutput);
-
-    return (
-      <div style={{ display: "flex", justifyContent: "flex-start", margin: "2px 4px" }}>
-        <div
-          style={{
-            width: expanded ? "100%" : "fit-content",
-            minWidth: expanded ? 0 : 240,
-            background: "var(--aurora-surface-solid)",
-            border: "1px solid var(--aurora-border)",
-            borderRadius: 10,
-            color: "var(--aurora-fg1)",
-            maxWidth: "100%",
-            overflow: "hidden",
-            boxShadow: "0 1px 2px rgba(15,23,42,0.03)",
-          }}
-        >
-          <button
-            type="button"
-            data-conversation-tool={toolLabel}
-            aria-expanded={expanded}
-            onClick={() => hasDetails && setExpanded(!expanded)}
-            style={{
-              width: "100%",
-              minHeight: 38,
-              display: "flex",
-              alignItems: "center",
-              gap: 9,
-              padding: "8px 12px",
-              border: 0,
-              background: "transparent",
-              color: "inherit",
-              cursor: hasDetails ? "pointer" : "default",
-              textAlign: "left",
-            }}
-          >
-            <Icon name="terminal" size={13} style={{ color: "#F97316", flex: "0 0 auto" }} />
-            <span style={{ fontWeight: 600, fontSize: 12, whiteSpace: "nowrap" }}>{toolLabel}</span>
-            {!expanded && preview && (
-              <span
-                title={preview}
-                style={{
-                  minWidth: 0,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  color: "var(--aurora-fg4)",
-                  fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
-                  fontSize: 10.5,
-                }}
-              >
-                {preview}
-              </span>
-            )}
-            {hasDetails && (
-              <span style={{ marginLeft: "auto", display: "inline-flex", color: "var(--aurora-fg4)" }}>
-                <Icon
-                  name="chevron_down"
-                  size={13}
-                  style={{
-                    transform: expanded ? "rotate(180deg)" : "none",
-                    transition: "transform .15s ease",
-                  }}
-                />
-              </span>
-            )}
-          </button>
-
-          {expanded && hasDetails && (
-            <div style={{ borderTop: "1px solid var(--aurora-border)", padding: "11px 12px 12px" }}>
-              {formattedInput && (
-                <ToolCodeBlock label="Input" value={formattedInput} />
-              )}
-              {formattedOutput && (
-                <ToolCodeBlock label="Output" value={formattedOutput} topSpacing={Boolean(formattedInput)} />
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
+    return <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />;
   }
 
   // System — centered amber
@@ -824,12 +994,14 @@ function ToolCodeBlock({
         {label}
       </div>
       <pre
+        className="whitespace-pre-wrap break-words sm:whitespace-pre"
         style={{
           margin: 0,
           padding: "10px 11px",
+          maxWidth: "100%",
           maxHeight: 320,
           overflow: "auto",
-          whiteSpace: "pre",
+          overscrollBehaviorX: "contain",
           background: "color-mix(in srgb, var(--aurora-chip) 58%, var(--aurora-surface-solid))",
           border: "1px solid var(--aurora-border)",
           borderRadius: 8,
