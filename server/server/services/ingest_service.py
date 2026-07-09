@@ -170,6 +170,32 @@ def _bounded_message_text(value: str, limit: int) -> str:
     return head + marker + tail
 
 
+def _conversation_message_metadata(normalized) -> dict:
+    """Build the bounded metadata persisted beside normalized text."""
+    from .conversation_parser import normalize_tool_calls, strip_terminal_sequences
+
+    meta: dict = {}
+    if normalized.thinking:
+        meta["thinking"] = _bounded_message_text(
+            strip_terminal_sequences(normalized.thinking).replace("\x00", ""),
+            MAX_STORED_AUXILIARY_CHARS,
+        )
+    if normalized.tool_name:
+        meta["tool_name"] = _bounded_message_text(
+            normalized.tool_name,
+            MAX_STORED_TOOL_NAME_CHARS,
+        )
+    if normalized.tool_input:
+        meta["tool_input"] = _bounded_message_text(
+            strip_terminal_sequences(normalized.tool_input).replace("\x00", ""),
+            MAX_STORED_AUXILIARY_CHARS,
+        )
+    tool_calls = normalize_tool_calls(normalized.tool_calls)
+    if tool_calls:
+        meta["tool_calls"] = tool_calls
+    return meta
+
+
 def _json_size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
 
@@ -1417,10 +1443,7 @@ async def _extract_messages(
                 (m.content or "").replace("\x00", ""),
                 MAX_STORED_MESSAGE_CHARS,
             )
-            tool_name = _bounded_message_text(
-                m.tool_name or "",
-                MAX_STORED_TOOL_NAME_CHARS,
-            )
+            meta = _conversation_message_metadata(m)
             batch.append(
                 ConversationMessage(
                     document_id=doc.id,
@@ -1428,14 +1451,14 @@ async def _extract_messages(
                     message_type=_bounded_message_text(m.role, 50),
                     role=m.role,
                     content=clean_content,
-                    metadata_={"tool_name": tool_name} if tool_name else {},
+                    metadata_=meta,
                     timestamp=ts,
                 )
             )
             add_search_text(m.role, clean_content)
             batch_bytes += (
                 len(clean_content.encode("utf-8"))
-                + len(tool_name.encode("utf-8"))
+                + sum(len(str(value).encode("utf-8")) for value in meta.values())
                 + 256
             )
             if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
@@ -1490,7 +1513,7 @@ async def _extract_messages(
             full_clean_content = strip_terminal_sequences(normalized.content).replace(
                 "\x00", ""
             )
-            if not full_clean_content.strip():
+            if not full_clean_content.strip() and not normalized.tool_calls:
                 continue
             clean_content = _bounded_message_text(
                 full_clean_content,
@@ -1503,6 +1526,13 @@ async def _extract_messages(
             dedupe_hash = hashlib.md5()
             dedupe_hash.update(f"{normalized.role}:{ts_bucket}:".encode())
             dedupe_hash.update(clean_content.encode("utf-8"))
+            dedupe_hash.update(
+                json.dumps(
+                    normalized.tool_calls,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
             dedupe_key = dedupe_hash.hexdigest()
             if dedupe_key in seen_contents:
                 continue
@@ -1516,22 +1546,7 @@ async def _extract_messages(
                 except (ValueError, AttributeError):
                     pass
 
-            meta = {}
-            if normalized.thinking:
-                meta["thinking"] = _bounded_message_text(
-                    strip_terminal_sequences(normalized.thinking).replace("\x00", ""),
-                    MAX_STORED_AUXILIARY_CHARS,
-                )
-            if normalized.tool_name:
-                meta["tool_name"] = _bounded_message_text(
-                    normalized.tool_name,
-                    MAX_STORED_TOOL_NAME_CHARS,
-                )
-            if normalized.tool_input:
-                meta["tool_input"] = _bounded_message_text(
-                    strip_terminal_sequences(normalized.tool_input).replace("\x00", ""),
-                    MAX_STORED_AUXILIARY_CHARS,
-                )
+            meta = _conversation_message_metadata(normalized)
             batch.append(
                 ConversationMessage(
                     document_id=doc.id,

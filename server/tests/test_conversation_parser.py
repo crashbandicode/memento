@@ -9,8 +9,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_parser import (  # noqa: E402
+    count_conversation_messages,
     extract_codex_session_metadata,
     normalize_codex_user_payload,
+    normalize_cursor_user_payload,
+    parse_conversation,
     parse_conversation_line,
     strip_terminal_sequences,
 )
@@ -254,6 +257,323 @@ class ConversationParserTests(unittest.TestCase):
         })
 
         self.assertIsNone(parse_conversation_line(raw, "claude_code"))
+
+    def test_cursor_timestamp_envelope_is_removed_and_parsed(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+                        "(UTC-4)</timestamp>\n"
+                        "<user_query>\nMove this workspace to Windows.\n"
+                        "</user_query>"
+                    ),
+                }],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "user")
+        self.assertEqual(msg.content, "Move this workspace to Windows.")
+        self.assertEqual(msg.timestamp, "2026-06-24T09:08:00-04:00")
+
+    def test_cursor_utc_timestamp_envelope_uses_explicit_utc(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "message": {
+                "content": (
+                    "<timestamp>Monday, Jun 15, 2026, 7:51 PM "
+                    "(UTC)</timestamp>\n"
+                    "<user_query>Continue the investigation.</user_query>"
+                ),
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Continue the investigation.")
+        self.assertEqual(msg.timestamp, "2026-06-15T19:51:00+00:00")
+
+    def test_cursor_positive_fractional_utc_offset_is_parsed(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "message": {
+                "content": (
+                    "<timestamp>Friday, Jun 12, 2026, 8:42 AM "
+                    "(UTC+5:30)</timestamp>\n"
+                    "<user_query>Check the deployment.</user_query>"
+                ),
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Check the deployment.")
+        self.assertEqual(msg.timestamp, "2026-06-12T08:42:00+05:30")
+
+    def test_cursor_native_timestamp_wins_over_envelope_timestamp(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "timestamp": "2026-06-24T13:09:00Z",
+            "message": {
+                "content": (
+                    "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+                    "(UTC-4)</timestamp>\n"
+                    "<user_query>Use the native timestamp.</user_query>"
+                ),
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Use the native timestamp.")
+        self.assertEqual(msg.timestamp, "2026-06-24T13:09:00Z")
+
+    def test_cursor_legacy_user_query_wrapper_without_timestamp_is_removed(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "message": {
+                "content": "<user_query>Plain wrapped prompt.</user_query>",
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Plain wrapped prompt.")
+        self.assertEqual(msg.timestamp, "")
+
+    def test_cursor_normalizer_is_noop_without_valid_timestamp_envelope(self) -> None:
+        content = "<user_query>Backfill must not alter this.</user_query>"
+
+        normalized, timestamp = normalize_cursor_user_payload(content)
+
+        self.assertEqual(normalized, content)
+        self.assertEqual(timestamp, "")
+
+    def test_cursor_normalizer_handles_stored_prompt_without_query_wrapper(self) -> None:
+        content = (
+            "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+            "(UTC-4)</timestamp>\nAlready-normalized stored prompt."
+        )
+
+        normalized, timestamp = normalize_cursor_user_payload(content)
+
+        self.assertEqual(normalized, "Already-normalized stored prompt.")
+        self.assertEqual(timestamp, "2026-06-24T09:08:00-04:00")
+
+    def test_cursor_impossible_utc_offset_is_preserved(self) -> None:
+        content = (
+            "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+            "(UTC+14:30)</timestamp>\n"
+            "<user_query>Keep impossible metadata literal.</user_query>"
+        )
+
+        normalized, timestamp = normalize_cursor_user_payload(content)
+
+        self.assertEqual(normalized, content)
+        self.assertEqual(timestamp, "")
+
+    def test_cursor_mid_prompt_literal_tags_are_preserved(self) -> None:
+        content = (
+            "Explain why <timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+            "(UTC-4)</timestamp> and <user_query> are shown."
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, content)
+        self.assertEqual(msg.timestamp, "")
+
+    def test_cursor_malformed_leading_timestamp_is_preserved(self) -> None:
+        content = (
+            "<timestamp>not a Cursor timestamp</timestamp>\n"
+            "<user_query>Keep this literal example.</user_query>"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, content)
+        self.assertEqual(msg.timestamp, "")
+
+    def test_cursor_assistant_markup_is_not_normalized(self) -> None:
+        content = (
+            "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+            "(UTC-4)</timestamp>\n"
+            "<user_query>This is assistant-authored markup.</user_query>"
+        )
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, content)
+        self.assertEqual(msg.timestamp, "")
+
+    def test_cursor_redacted_transport_text_becomes_structured_tool_call(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "[REDACTED]"},
+                    {
+                        "type": "tool_use",
+                        "name": "TodoWrite",
+                        "input": {
+                            "merge": False,
+                            "todos": [{"id": "1", "status": "in_progress"}],
+                        },
+                    },
+                ],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "assistant")
+        self.assertEqual(msg.content, "")
+        self.assertEqual(msg.tool_calls[0]["name"], "TodoWrite")
+        self.assertEqual(
+            json.loads(msg.tool_calls[0]["input"])["merge"],
+            False,
+        )
+
+    def test_cursor_keeps_prose_separate_from_multiple_tool_calls(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "I will inspect both files."},
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"path": "/tmp/one.py"},
+                    },
+                    {
+                        "type": "toolCall",
+                        "name": "Shell",
+                        "arguments": {"command": "ls -la /tmp"},
+                    },
+                ],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "I will inspect both files.")
+        self.assertEqual(
+            [call["name"] for call in msg.tool_calls],
+            ["Read", "Shell"],
+        )
+        self.assertNotIn("[Tool:", msg.content)
+
+    def test_cursor_call_only_assistant_message_is_retained(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Read",
+                    "input": {"path": "/tmp/results.jsonl"},
+                }],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "")
+        self.assertEqual(len(msg.tool_calls), 1)
+
+    def test_cursor_call_only_rows_keep_count_and_pagination_in_lockstep(self) -> None:
+        rows = [
+            {
+                "role": "user",
+                "message": {"content": "Inspect the file."},
+            },
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"path": "/tmp/results.jsonl"},
+                    }],
+                },
+            },
+            {
+                "role": "assistant",
+                "message": {"content": "The file is valid."},
+            },
+        ]
+        raw_content = "\n".join(json.dumps(row) for row in rows)
+
+        total = count_conversation_messages(raw_content, "cursor")
+        page = parse_conversation(
+            raw_content,
+            "cursor",
+            offset=1,
+            limit=1,
+        )
+
+        self.assertEqual(total, 3)
+        self.assertEqual(len(page), 1)
+        self.assertEqual(page[0].content, "")
+        self.assertEqual(page[0].tool_calls[0]["name"], "Read")
+
+    def test_cursor_malformed_tool_fields_are_safe_and_calls_are_bounded(self) -> None:
+        calls = [
+            {"type": "tool_use", "name": ["not", "a", "name"], "input": None},
+            "not a content block",
+        ]
+        calls.extend(
+            {"type": "tool_use", "name": f"Tool{i}", "input": {"n": i}}
+            for i in range(40)
+        )
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {"content": calls},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(len(msg.tool_calls), 32)
+        self.assertEqual(msg.tool_calls[0], {"name": "Tool", "input": "null"})
 
     def test_antigravity_message_preserves_separate_thinking(self) -> None:
         raw = json.dumps({

@@ -12,8 +12,9 @@ import argparse
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass, fields
+from datetime import datetime
 
-from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy import delete, exists, func, or_, select, text, update
 from sqlalchemy.orm import load_only
 
 from server.db.models import ConversationMessage, Document, DocumentEmbedding
@@ -22,6 +23,7 @@ from server.services.conversation_parser import (
     _extract_local_command,
     extract_codex_session_metadata,
     normalize_codex_user_payload,
+    normalize_cursor_user_payload,
 )
 from server.services.ingest_service import (
     MAX_SEARCH_TEXT_CHARS,
@@ -33,9 +35,13 @@ from server.services.ingest_service import (
 from server.services.embedding_service import (
     CONVERSATION_EMBEDDING_MESSAGE_CHARS,
     CONVERSATION_EMBEDDING_MESSAGE_LIMIT,
+    _chunk_text,
     conversation_embedding_content,
+    embedding_input_hash,
 )
+from server.services.conversation_activity import refresh_document_activity_at
 from server.services.large_content_store import read_large_content_prefix
+from server.services.thread_metadata_service import _has_manual_title
 
 
 LOCAL_COMMAND_PREFIXES = (
@@ -62,6 +68,16 @@ class BackfillStats:
     backfilled_thread_metadata: int = 0
     refreshed_search_documents: int = 0
     invalidated_embedding_documents: int = 0
+    cursor_candidate_documents: int = 0
+    normalized_cursor_prompts: int = 0
+    removed_cursor_envelope_only_messages: int = 0
+    backfilled_cursor_message_timestamps: int = 0
+    preserved_cursor_message_timestamps: int = 0
+    invalid_cursor_envelopes: int = 0
+    rederived_cursor_titles: int = 0
+    preserved_manual_cursor_titles: int = 0
+    refreshed_activity_documents: int = 0
+    updated_activity_documents: int = 0
 
     def add(self, other: "BackfillStats") -> None:
         for field in fields(self):
@@ -80,6 +96,74 @@ def _normalize_codex_stored_message(message) -> tuple[bool, bool]:
         message.message_type = "codex_context"
         changed = True
     return changed, became_context
+
+
+def _has_leading_cursor_timestamp(value: str | None) -> bool:
+    """Return whether text looks like a Cursor timestamp-envelope candidate."""
+    return (value or "").lstrip().lower().startswith("<timestamp>")
+
+
+def _normalize_cursor_stored_message(message) -> tuple[bool, bool, bool]:
+    """Normalize one stored Cursor row.
+
+    Returns ``(content_changed, timestamp_backfilled, timestamp_preserved)``.
+    A valid envelope is the authority only when the historical row has no
+    structured timestamp. Existing structured timestamps are never replaced.
+    Invalid or user-authored ``<timestamp>`` text is an exact no-op.
+    """
+    content = message.content or ""
+    normalized, envelope_timestamp = normalize_cursor_user_payload(content)
+    if not envelope_timestamp:
+        return False, False, False
+
+    content_changed = normalized != content
+    if content_changed:
+        message.content = normalized
+
+    if message.timestamp is not None:
+        return content_changed, False, True
+
+    try:
+        message.timestamp = datetime.fromisoformat(envelope_timestamp)
+    except (TypeError, ValueError):
+        # The shared parser helper promises ISO output. Keep this guard so a
+        # future parser regression cannot partially mutate production rows.
+        if content_changed:
+            message.content = content
+        return False, False, False
+    return content_changed, True, False
+
+
+def _cursor_title_from_messages(
+    current_title: str | None,
+    messages: list,
+    metadata: dict | None = None,
+) -> tuple[str | None, bool]:
+    """Return ``(title, manual_title_preserved)`` for an affected Cursor row."""
+    normalized_title, envelope_timestamp = normalize_cursor_user_payload(
+        current_title or ""
+    )
+    if not envelope_timestamp:
+        return current_title, False
+
+    if _has_manual_title(metadata or {}):
+        return current_title, True
+
+    for message in sorted(messages, key=lambda item: item.line_number):
+        if message.role != "user":
+            continue
+        title = _friendly_conversation_title(
+            message.content or "",
+            tool_id="cursor",
+        )
+        if title:
+            return title, False
+
+    fallback = _friendly_conversation_title(
+        normalized_title,
+        tool_id="cursor",
+    )
+    return fallback or current_title, False
 
 
 def _is_codex_mirror_pair(first, second) -> bool:
@@ -141,7 +225,16 @@ def _embedding_input_changed(
     """Return whether presentation repair changes this document's model input."""
     if has_inline_content:
         return False
-    return previous_message_content != current_message_content
+
+    def model_input_hash(content: str) -> str:
+        chunks = []
+        if len(content) >= 100:
+            chunks = _chunk_text(content, max_chunks=50)
+        return embedding_input_hash(chunks)
+
+    return model_input_hash(previous_message_content) != model_input_hash(
+        current_message_content
+    )
 
 
 def _conversation_embedding_rows_query(document_ids: set):
@@ -435,35 +528,229 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
     return stats
 
 
+def _cursor_repair_document_ids_query():
+    """Select only Cursor conversations with a leading envelope candidate."""
+    message_candidate = exists(
+        select(1)
+        .select_from(ConversationMessage)
+        .where(
+            ConversationMessage.document_id == Document.id,
+            ConversationMessage.role == "user",
+            ConversationMessage.content.op("~*")(r"^\s*<timestamp>"),
+        )
+        .correlate(Document)
+    )
+    return (
+        select(Document.id)
+        .where(
+            Document.tool_id == "cursor",
+            Document.category == "conversation",
+            or_(
+                Document.title.op("~*")(r"^\s*<timestamp>"),
+                message_candidate,
+            ),
+        )
+        .order_by(Document.id)
+    )
+
+
+async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
+    """Normalize one guarded batch of historical Cursor conversations.
+
+    Apply mode requires ingestion and embedding workers to be quiesced. Row
+    locks protect the document/message repair itself, but an embedding worker
+    must not publish vectors between the before/after input snapshots.
+    """
+    stats = BackfillStats(cursor_candidate_documents=len(document_ids))
+    rows = await db.execute(
+        select(
+            Document,
+            (
+                func.coalesce(func.length(Document.content), 0) > 0
+            ).label("has_inline_embedding_content"),
+        )
+        .options(load_only(
+            Document.id,
+            Document.tool_id,
+            Document.category,
+            Document.title,
+            Document.metadata_,
+            Document.activity_at,
+        ))
+        .where(Document.id.in_(document_ids))
+        .with_for_update(of=Document)
+    )
+    documents: dict = {}
+    inline_embedding_documents: set = set()
+    for document, has_inline_embedding_content in rows.all():
+        documents[document.id] = document
+        if has_inline_embedding_content:
+            inline_embedding_documents.add(document.id)
+
+    message_rows = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.document_id.in_(document_ids),
+            ConversationMessage.role == "user",
+        )
+        .order_by(
+            ConversationMessage.document_id,
+            ConversationMessage.line_number,
+            ConversationMessage.id,
+        )
+        .with_for_update(of=ConversationMessage)
+    )
+    messages_by_document: dict = defaultdict(list)
+    for message in message_rows.scalars():
+        messages_by_document[message.document_id].append(message)
+
+    fallback_embedding_documents = set(documents) - inline_embedding_documents
+    embedding_content_before = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+
+    search_changed_documents: set = set()
+    activity_refresh_documents: set = set()
+    for document_id, messages in messages_by_document.items():
+        retained_messages = []
+        for message in messages:
+            if not _has_leading_cursor_timestamp(message.content):
+                retained_messages.append(message)
+                continue
+
+            content_changed, timestamp_backfilled, timestamp_preserved = (
+                _normalize_cursor_stored_message(message)
+            )
+            if not (content_changed or timestamp_backfilled or timestamp_preserved):
+                stats.invalid_cursor_envelopes += 1
+                retained_messages.append(message)
+                continue
+
+            activity_refresh_documents.add(document_id)
+            if content_changed:
+                search_changed_documents.add(document_id)
+                stats.normalized_cursor_prompts += 1
+            if not (message.content or "").strip():
+                await db.delete(message)
+                search_changed_documents.add(document_id)
+                stats.removed_cursor_envelope_only_messages += 1
+                continue
+            if timestamp_backfilled:
+                stats.backfilled_cursor_message_timestamps += 1
+            elif timestamp_preserved:
+                stats.preserved_cursor_message_timestamps += 1
+            retained_messages.append(message)
+        messages_by_document[document_id] = retained_messages
+
+    await db.flush()
+
+    for document_id, document in documents.items():
+        if _has_leading_cursor_timestamp(document.title):
+            normalized_title, envelope_timestamp = normalize_cursor_user_payload(
+                document.title or ""
+            )
+            if not envelope_timestamp:
+                stats.invalid_cursor_envelopes += 1
+            else:
+                activity_refresh_documents.add(document_id)
+                repaired_title, manual_preserved = _cursor_title_from_messages(
+                    document.title,
+                    messages_by_document.get(document_id, []),
+                    document.metadata_,
+                )
+                if manual_preserved:
+                    stats.preserved_manual_cursor_titles += 1
+                elif repaired_title and repaired_title != document.title:
+                    document.title = repaired_title
+                    search_changed_documents.add(document_id)
+                    stats.renamed_conversations += 1
+                    stats.rederived_cursor_titles += 1
+                elif normalized_title != document.title:
+                    # This should only be reachable for an empty normalized
+                    # title. Report it as invalid rather than blanking a row.
+                    stats.invalid_cursor_envelopes += 1
+
+    await db.flush()
+
+    for document_id in sorted(activity_refresh_documents, key=str):
+        document = documents.get(document_id)
+        if document is None:
+            continue
+        previous_activity = document.activity_at
+        current_activity = await refresh_document_activity_at(db, document)
+        stats.refreshed_activity_documents += 1
+        if current_activity != previous_activity:
+            stats.updated_activity_documents += 1
+
+    for document_id in sorted(search_changed_documents, key=str):
+        document = documents.get(document_id)
+        if document is None:
+            continue
+        await _refresh_document_search(db, document)
+        stats.refreshed_search_documents += 1
+
+    embedding_content_after = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+    embedding_changed_documents = {
+        document_id
+        for document_id in fallback_embedding_documents
+        if _embedding_input_changed(
+            has_inline_content=False,
+            previous_message_content=embedding_content_before.get(document_id, ""),
+            current_message_content=embedding_content_after.get(document_id, ""),
+        )
+    }
+    await _invalidate_changed_embeddings(db, embedding_changed_documents)
+    stats.invalidated_embedding_documents += len(embedding_changed_documents)
+    return stats
+
+
 async def backfill(
     dry_run: bool,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    cursor_only: bool = False,
 ) -> BackfillStats:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     stats = BackfillStats()
     async with async_session_factory() as db:
-        await _set_batch_timeouts(db)
-        stats.add(await _repair_claude_commands(db))
-        if dry_run:
-            await db.rollback()
-        else:
-            await db.commit()
-
-        document_ids = list((await db.execute(
-            select(Document.id)
-            .where(
-                Document.tool_id == "codex",
-                Document.category == "conversation",
-            )
-            .order_by(Document.id)
-        )).scalars())
-
-        for offset in range(0, len(document_ids), batch_size):
+        if not cursor_only:
             await _set_batch_timeouts(db)
-            batch = document_ids[offset:offset + batch_size]
-            stats.add(await _repair_codex_batch(db, batch))
+            stats.add(await _repair_claude_commands(db))
+            if dry_run:
+                await db.rollback()
+            else:
+                await db.commit()
+
+            document_ids = list((await db.execute(
+                select(Document.id)
+                .where(
+                    Document.tool_id == "codex",
+                    Document.category == "conversation",
+                )
+                .order_by(Document.id)
+            )).scalars())
+
+            for offset in range(0, len(document_ids), batch_size):
+                await _set_batch_timeouts(db)
+                batch = document_ids[offset:offset + batch_size]
+                stats.add(await _repair_codex_batch(db, batch))
+                if dry_run:
+                    await db.rollback()
+                else:
+                    await db.commit()
+
+        cursor_document_ids = list((await db.execute(
+            _cursor_repair_document_ids_query()
+        )).scalars())
+        for offset in range(0, len(cursor_document_ids), batch_size):
+            await _set_batch_timeouts(db)
+            batch = cursor_document_ids[offset:offset + batch_size]
+            stats.add(await _repair_cursor_batch(db, batch))
             if dry_run:
                 await db.rollback()
             else:
@@ -475,10 +762,19 @@ async def backfill(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--dry-run",
         action="store_true",
         help="calculate changes and roll each repair batch back",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "commit each guarded repair batch; ingestion and embedding "
+            "workers must be quiesced"
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -486,9 +782,18 @@ def main() -> None:
         default=DEFAULT_BATCH_SIZE,
         help="documents per transaction (default: 25)",
     )
+    parser.add_argument(
+        "--cursor-only",
+        action="store_true",
+        help="skip the older Claude/Codex repairs and process Cursor only",
+    )
     args = parser.parse_args()
 
-    stats = asyncio.run(backfill(args.dry_run, batch_size=args.batch_size))
+    stats = asyncio.run(backfill(
+        args.dry_run,
+        batch_size=args.batch_size,
+        cursor_only=args.cursor_only,
+    ))
     mode = "dry-run" if args.dry_run else "applied"
     values = " ".join(
         f"{field.name}={getattr(stats, field.name)}"

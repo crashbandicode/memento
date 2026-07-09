@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 
@@ -22,6 +23,9 @@ class NormalizedMessage:
     tool_name: str = "" # If role=="tool", the tool that was used
     tool_input: str = ""  # Tool input/command
     thinking: str = ""  # Optional thinking/reasoning text kept separate from final response
+    tool_calls: list[dict[str, str]] = field(default_factory=list)
+    # Structured assistant tool calls. Each item has bounded ``name`` and
+    # serialized ``input`` strings while the message itself remains one row.
     timestamp: str = ""
     raw_type: str = ""  # Original message type
 
@@ -56,6 +60,26 @@ _CODEX_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_CURSOR_TIMESTAMP_ENVELOPE_RE = re.compile(
+    r"\A\s*<timestamp>(?P<value>[^<\r\n]+)</timestamp>\s*",
+    re.IGNORECASE,
+)
+_CURSOR_TIMESTAMP_VALUE_RE = re.compile(
+    r"\A(?P<date>"
+    r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"[A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2} (?:AM|PM)"
+    r") \(UTC(?P<offset>[+-]\d{1,2}(?::\d{2})?)?\)\Z"
+)
+_CURSOR_USER_QUERY_ENVELOPE_RE = re.compile(
+    r"\A\s*<user_query>\s*(?P<content>[\s\S]*?)\s*</user_query>\s*\Z",
+    re.IGNORECASE,
+)
+
+_MAX_STRUCTURED_TOOL_CALLS = 32
+_MAX_STRUCTURED_TOOL_NAME_BYTES = 256
+_MAX_STRUCTURED_TOOL_INPUT_BYTES = 64 * 1024
+_MAX_STRUCTURED_TOOL_CALL_BYTES = 128 * 1024
+_TOOL_INPUT_TRUNCATION_MARKER = "\n\n[... tool input truncated by Memento ...]"
 
 
 def normalize_codex_user_payload(content: str) -> tuple[str, str]:
@@ -82,6 +106,60 @@ def normalize_codex_user_payload(content: str) -> tuple[str, str]:
     if _CODEX_SYSTEM_CONTEXT_RE.match(text):
         return "system", text
     return "user", text
+
+
+def _parse_cursor_envelope_timestamp(value: str) -> str | None:
+    """Return an ISO timestamp for Cursor's human-readable UTC envelope."""
+    match = _CURSOR_TIMESTAMP_VALUE_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+
+    try:
+        parsed = datetime.strptime(
+            match.group("date"),
+            "%A, %b %d, %Y, %I:%M %p",
+        )
+        raw_offset = match.group("offset")
+        if raw_offset is None:
+            tz = timezone.utc
+        else:
+            sign = -1 if raw_offset.startswith("-") else 1
+            offset_parts = raw_offset[1:].split(":", 1)
+            hours = int(offset_parts[0])
+            minutes = int(offset_parts[1]) if len(offset_parts) == 2 else 0
+            if hours > 14 or minutes > 59 or (hours == 14 and minutes != 0):
+                return None
+            tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=tz).isoformat()
+
+
+def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
+    """Remove only Cursor's leading metadata envelope from a user prompt.
+
+    Recent Cursor transcripts place a human-readable timestamp immediately
+    before an optional ``<user_query>`` wrapper. Literal tags elsewhere in a
+    prompt are user-authored content and must remain untouched.
+    """
+    text = content or ""
+    timestamp_match = _CURSOR_TIMESTAMP_ENVELOPE_RE.match(text)
+    if timestamp_match is None:
+        return text, ""
+
+    parsed_timestamp = _parse_cursor_envelope_timestamp(
+        timestamp_match.group("value")
+    )
+    # Treat the tag as Cursor metadata only when its value has the exact
+    # shape emitted by Cursor. A malformed leading tag may be user text.
+    if parsed_timestamp is None:
+        return text, ""
+    text = text[timestamp_match.end():]
+
+    query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(text)
+    if query_match is not None:
+        text = query_match.group("content")
+    return text.strip(), parsed_timestamp
 
 
 def _codex_uuid(value: object) -> str | None:
@@ -505,17 +583,33 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
         else:
             raw_content = message
         thinking = _extract_thinking_parts(raw_content)
-        content = _extract_content(raw_content)
-        # Strip <user_query> tags
-        if content:
-            content = content.replace("<user_query>", "").replace("</user_query>", "").strip()
-        if role in ("user", "assistant") and content.strip():
+        tool_calls: list[dict[str, str]] = []
+        if role == "assistant":
+            content, tool_calls = _extract_cursor_assistant_content(raw_content)
+        else:
+            content = _extract_content(raw_content)
+        if role == "user":
+            content, envelope_timestamp = normalize_cursor_user_payload(content)
+            if not envelope_timestamp:
+                # Older Cursor records can carry only the outer query wrapper.
+                # Match the whole payload so literal tags within a prompt are
+                # not treated as transport metadata.
+                query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(content)
+                if query_match is not None:
+                    content = query_match.group("content").strip()
+            # Preserve a native machine timestamp if a future Cursor version
+            # adds one; current transcripts carry it only in the envelope.
+            timestamp = timestamp or envelope_timestamp
+        if role in ("user", "assistant") and (content.strip() or tool_calls):
             # Skip tool_result/tool_use noise
-            if content.startswith("[Tool:") or content.startswith("[Result]"):
+            if not tool_calls and (
+                content.startswith("[Tool:") or content.startswith("[Result]")
+            ):
                 return None
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
-                timestamp=timestamp, raw_type=msg_type or role,
+                tool_calls=tool_calls, timestamp=timestamp,
+                raw_type=msg_type or role,
             )
         return None
 
@@ -663,6 +757,108 @@ def _extract_thinking_parts(content) -> str:
             if data:
                 parts.append(f"[redacted thinking: {len(data)} bytes]")
     return "\n\n".join(parts)
+
+
+def _bounded_tool_text(value: str, limit: int) -> str:
+    """Bound structured tool metadata by UTF-8 bytes."""
+    clean = strip_terminal_sequences(value).replace("\x00", "")
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= limit:
+        return clean
+
+    marker = _TOOL_INPUT_TRUNCATION_MARKER.encode("utf-8")
+    if len(marker) >= limit:
+        return marker[:limit].decode("utf-8", "ignore")
+    prefix = encoded[: limit - len(marker)].decode("utf-8", "ignore")
+    return prefix + marker.decode("utf-8")
+
+
+def _serialize_tool_input(value: object) -> str:
+    if isinstance(value, str):
+        serialized = value
+    else:
+        try:
+            serialized = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError, OverflowError):
+            serialized = str(value)
+    return _bounded_tool_text(serialized, _MAX_STRUCTURED_TOOL_INPUT_BYTES)
+
+
+def normalize_tool_calls(value: object) -> list[dict[str, str]]:
+    """Return the safe, bounded public representation of assistant tools.
+
+    This accepts both raw Cursor ``tool_use`` blocks and the ``name``/``input``
+    dictionaries persisted in ConversationMessage metadata. Keeping one
+    normalizer for both paths prevents raw-content and DB-fallback responses
+    from drifting apart.
+    """
+    if not isinstance(value, list):
+        return []
+
+    calls: list[dict[str, str]] = []
+    total_bytes = 0
+    for raw_call in value:
+        if len(calls) >= _MAX_STRUCTURED_TOOL_CALLS:
+            break
+        if not isinstance(raw_call, dict):
+            continue
+
+        raw_name = raw_call.get("name")
+        name = raw_name if isinstance(raw_name, str) else "Tool"
+        name = _bounded_tool_text(
+            name.strip() or "Tool",
+            _MAX_STRUCTURED_TOOL_NAME_BYTES,
+        )
+        if "input" in raw_call:
+            raw_input = raw_call.get("input")
+        else:
+            raw_input = raw_call.get("arguments", {})
+        serialized_input = _serialize_tool_input(raw_input)
+
+        name_bytes = len(name.encode("utf-8"))
+        remaining = _MAX_STRUCTURED_TOOL_CALL_BYTES - total_bytes - name_bytes
+        if remaining <= 0:
+            break
+        serialized_input = _bounded_tool_text(serialized_input, remaining)
+        total_bytes += name_bytes + len(serialized_input.encode("utf-8"))
+        calls.append({"name": name, "input": serialized_input})
+    return calls
+
+
+def _extract_cursor_assistant_content(
+    content: object,
+) -> tuple[str, list[dict[str, str]]]:
+    """Separate Cursor prose from structured assistant tool invocations."""
+    if not isinstance(content, list):
+        prose = _extract_content(content)
+        if prose.strip() == "[REDACTED]":
+            prose = ""
+        return prose, []
+
+    prose_parts: list[str] = []
+    raw_calls: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            if item.strip() != "[REDACTED]":
+                prose_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text", "")
+            text = text if isinstance(text, str) else str(text)
+            # Cursor emits this exact text block when assistant prose is not
+            # available. It is transport state, not part of the conversation.
+            if text.strip() != "[REDACTED]":
+                prose_parts.append(text)
+        elif item_type in ("tool_use", "toolCall"):
+            if len(raw_calls) < _MAX_STRUCTURED_TOOL_CALLS:
+                raw_calls.append(item)
+
+    prose = _strip_system_tags("\n".join(prose_parts))
+    return prose, normalize_tool_calls(raw_calls)
 
 
 def _extract_content(content) -> str:
@@ -897,7 +1093,10 @@ def parse_conversation(raw_content: str, tool_id: str, offset: int = 0, limit: i
             # Deduplicate: same role + content + timestamp (within same second)
             # Prevents event_msg/user_message and response_item/user duplicates
             ts_bucket = (msg.timestamp or "")[:19]
-            dedupe_key = hashlib.md5(f"{msg.role}:{ts_bucket}:{msg.content}".encode()).hexdigest()
+            calls = json.dumps(msg.tool_calls, ensure_ascii=False, separators=(",", ":"))
+            dedupe_key = hashlib.md5(
+                f"{msg.role}:{ts_bucket}:{msg.content}:{calls}".encode()
+            ).hexdigest()
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
@@ -930,7 +1129,10 @@ def count_conversation_messages(raw_content: str, tool_id: str) -> int:
         msg = parse_conversation_line(line.strip(), tool_id)
         if msg and msg.role in ("user", "assistant"):
             ts_bucket = (msg.timestamp or "")[:19]
-            dedupe_key = hashlib.md5(f"{msg.role}:{ts_bucket}:{msg.content}".encode()).hexdigest()
+            calls = json.dumps(msg.tool_calls, ensure_ascii=False, separators=(",", ":"))
+            dedupe_key = hashlib.md5(
+                f"{msg.role}:{ts_bucket}:{msg.content}:{calls}".encode()
+            ).hexdigest()
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)

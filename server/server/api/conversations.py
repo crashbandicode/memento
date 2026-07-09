@@ -12,7 +12,11 @@ from sqlalchemy.orm import load_only
 from ..db.models import ConversationMessage, Document, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
-from ..services.conversation_parser import parse_conversation, count_conversation_messages
+from ..services.conversation_parser import (
+    count_conversation_messages,
+    normalize_tool_calls,
+    parse_conversation,
+)
 from ..services.conversation_hierarchy import (
     ConversationRef,
     build_logical_activity_map,
@@ -23,6 +27,17 @@ from ..services.conversation_hierarchy import (
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+
+def _parsed_tool_calls(message: object) -> list[dict[str, str]]:
+    return normalize_tool_calls(getattr(message, "tool_calls", None))
+
+
+def _stored_tool_calls(metadata: object) -> list[dict[str, str]]:
+    """Read the same bounded tool-call shape used by raw-content parsing."""
+    if not isinstance(metadata, dict):
+        return []
+    return normalize_tool_calls(metadata.get("tool_calls"))
 
 
 @router.get("/{doc_id}")
@@ -199,6 +214,7 @@ async def get_conversation_messages(
                     "thinking": m.thinking or None,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
+                    "tool_calls": _parsed_tool_calls(m),
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
                 }
@@ -235,6 +251,7 @@ async def get_conversation_messages(
                 "thinking": (m.metadata_ or {}).get("thinking") if m.metadata_ else None,
                 "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                 "tool_input": (m.metadata_ or {}).get("tool_input", ""),
+                "tool_calls": _stored_tool_calls(m.metadata_),
                 "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                 "raw_type": m.message_type or "",
             }
