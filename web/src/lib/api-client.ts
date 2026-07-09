@@ -90,7 +90,7 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
     if (!res.ok) {
       if (res.status === 401 && typeof window !== "undefined" && !isPublic) {
         const onAuthPage = window.location.pathname.startsWith("/auth/");
-        const onLanding = window.location.pathname === "/";
+        const onLanding = window.location.pathname === "/" || window.location.pathname === "/splash";
         localStorage.removeItem("dr_token");
         if (!onAuthPage && !onLanding) window.location.href = "/auth/login";
         throw new Error("Unauthorized");
@@ -105,7 +105,13 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
 
   if (cacheKey) {
     _inflight.set(cacheKey, run);
-    run.finally(() => _inflight.delete(cacheKey));
+    // Avoid `.finally()` here: it creates a second rejected promise on HTTP
+    // errors, which surfaces as an unhandled browser `pageerror` even when the
+    // caller correctly catches the original request (for example stale JWT).
+    void run.then(
+      () => _inflight.delete(cacheKey),
+      () => _inflight.delete(cacheKey),
+    );
   }
   return run;
 }

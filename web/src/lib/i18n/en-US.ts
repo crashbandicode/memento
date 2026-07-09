@@ -55,6 +55,8 @@ const enUS: Translations = {
   register: "Register",
   submit: "Submit",
   cancel: "Cancel",
+  back: "Back",
+  forward: "Forward",
   approve: "Approve",
   online: "Online",
   viewAll: "View All",
@@ -264,6 +266,7 @@ const enUS: Translations = {
     continueInBrowser: "Continue in your browser",
     desktopHandoffFailed:
       "Couldn't hand the session back to the desktop app — please sign in again",
+    viewSplash: "About Memento",
   },
 
   // Token display + profile

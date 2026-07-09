@@ -211,7 +211,7 @@ export default function PublicSharePage() {
       {payload.kind === "memory" && <MemoryView data={payload.data} />}
 
       <div style={{ marginTop: 40, textAlign: "center", fontSize: 11, color: "var(--aurora-fg4)" }}>
-        Powered by Memento · <Link href="/" style={{ color: "var(--aurora-accent)" }}>memento</Link>
+        Powered by Memento · <Link href="/splash" style={{ color: "var(--aurora-accent)" }}>memento</Link>
       </div>
     </div>
   );

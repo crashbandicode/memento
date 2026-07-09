@@ -54,8 +54,21 @@ function readInitialSkin(): Skin {
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>(readInitialTheme);
-  const [skin, setSkinState] = useState<Skin>(readInitialSkin);
+  // Stable first render prevents saved browser preferences from disagreeing
+  // with the server-rendered markup during hydration.
+  const [theme, setThemeState] = useState<Theme>("light");
+  const [skin, setSkinState] = useState<Skin>("aurora");
+
+  useEffect(() => {
+    const initialTheme = readInitialTheme();
+    const initialSkin = readInitialSkin();
+    if (initialTheme === "light" && initialSkin === "aurora") return;
+    const frame = requestAnimationFrame(() => {
+      setThemeState(initialTheme);
+      setSkinState(initialSkin);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
 
   // Sync <html data-*> attrs + favicon link on mount and whenever theme/skin change.
   useEffect(() => {

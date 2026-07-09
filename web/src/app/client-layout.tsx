@@ -69,21 +69,21 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   );
 }
 
-/** Renders Sidebar+Header only inside the authenticated app; the public
- *  landing page ("/") and auth pages always use plain layout. */
+/** Renders Sidebar+Header only inside the authenticated app. Public entry,
+ *  splash, and share pages are always plain; unauthenticated pages are gated
+ *  below as well. */
 function AppShell({ children }: { children: React.ReactNode }) {
   const { token, loading } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const pathname = usePathname();
 
-  // Always plain layout for the marketing landing page — its own nav is
-  // rendered by the landing component itself.
-  const isLanding = pathname === "/";
+  // Root is an auth-aware redirect and /splash owns its marketing nav.
+  const isPublicEntry = pathname === "/" || pathname === "/splash";
   // Public share pages are read-only and shouldn't show the app sidebar
   // (visitors have no account; the sidebar wouldn't work anyway).
   const isSharePage = pathname.startsWith("/s/") || pathname === "/s";
 
-  if (isLanding || isSharePage || loading || !token) {
+  if (isPublicEntry || isSharePage || loading || !token) {
     return <main className="min-h-screen">{children}</main>;
   }
 

@@ -17,11 +17,12 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-/** Routes that don't require authentication — landing and auth pages.
+/** Routes that don't require authentication — landing, splash, and auth pages.
  *  /auth/desktop does its own token check (it reads dr_token straight from
  *  localStorage): AuthProvider must not bounce it to /auth/login mid-handoff. */
 const PUBLIC_PATHS = [
   "/",
+  "/splash",
   "/auth/login",
   "/auth/register",
   "/auth/handoff",
@@ -65,11 +66,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (typeof window === "undefined") return null;
     return localStorage.getItem("dr_token");
   });
-  const [loading, setLoading] = useState<boolean>(() => {
-    // If we start with no token, no /me fetch needed → not loading.
-    if (typeof window === "undefined") return true;
-    return !!localStorage.getItem("dr_token");
-  });
+  // Keep the server and browser's hydration render identical. The mount
+  // effect resolves this immediately when no token exists, or after /me when
+  // one does. Auth-sensitive children already use this loading gate.
+  const [loading, setLoading] = useState(true);
   const pathname = usePathname();
   const router = useRouter();
 
@@ -138,8 +138,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Redirect to login if not authenticated and not on a public page.
   // /s/<token> is a share URL — recipient has no account, must stay public.
   useEffect(() => {
+    if (loading) return;
+    if (pathname === "/") {
+      router.replace(token ? "/app" : "/auth/login");
+      return;
+    }
     const isSharePrefix = pathname.startsWith("/s/") || pathname === "/s";
-    if (!loading && !token && !PUBLIC_PATHS.includes(pathname) && !isSharePrefix) {
+    if (!token && !PUBLIC_PATHS.includes(pathname) && !isSharePrefix) {
       router.replace("/auth/login");
     }
   }, [loading, token, pathname, router]);

@@ -44,7 +44,7 @@ export function LandingNav() {
       >
         {/* Brand */}
         <Link
-          href="/"
+          href="/splash"
           style={{
             display: "inline-flex",
             alignItems: "center",

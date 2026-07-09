@@ -128,6 +128,22 @@ export default function LoginPage() {
             {t.register}
           </Link>
         </p>
+        <p style={{ textAlign: "center", fontSize: 12, margin: "10px 0 0" }}>
+          <Link
+            href="/splash"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              color: "var(--aurora-fg3)",
+              fontWeight: 500,
+              textDecoration: "none",
+            }}
+          >
+            <Icon name="sparkles" size={12} />
+            {t.auth.viewSplash}
+          </Link>
+        </p>
       </Glass>
     </div>
   );
