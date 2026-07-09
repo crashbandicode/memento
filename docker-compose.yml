@@ -132,6 +132,14 @@ services:
     restart: unless-stopped
     ports:
       - "8001:8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.memento-api.rule=Host(`memento.babypotatofarm.com`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.memento-api.entrypoints=websecure"
+      - "traefik.http.routers.memento-api.tls.certresolver=cloudflare"
+      - "traefik.http.routers.memento-api.priority=100"
+      - "traefik.http.services.memento-api.loadbalancer.server.port=8000"
     environment:
       MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
       MEMENTO_REDIS_URL: redis://redis:6379/0
@@ -161,6 +169,9 @@ services:
     # Docker Desktop adds this automatically; this entry is a no-op there.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - proxy
     volumes:
       # GeoIP database for share-link visitor location. Host dir is created
       # on-demand by scripts/download_geoip.sh; mount is optional — service
@@ -288,10 +299,26 @@ services:
     restart: unless-stopped
     ports:
       - "3001:3000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.memento-web.rule=Host(`memento.babypotatofarm.com`)"
+      - "traefik.http.routers.memento-web.entrypoints=websecure"
+      - "traefik.http.routers.memento-web.tls.certresolver=cloudflare"
+      - "traefik.http.routers.memento-web.priority=10"
+      - "traefik.http.services.memento-web.loadbalancer.server.port=3000"
     depends_on:
       - api
+    networks:
+      - default
+      - proxy
 
 volumes:
   pgdata:
   miniodata:
   ingest_spool:
+
+networks:
+  default:
+  proxy:
+    external: true
