@@ -173,7 +173,14 @@ class SyncClient:
             "file_size": item.payload_bytes,
             "sync_strategy": item.sync_strategy,
             "metadata": item.metadata,
-            "timestamp": item.created_at,
+            # New queue rows retain the filesystem's source mtime. Rows from
+            # pre-v4 queues have no such value and keep the historical enqueue
+            # time fallback instead of becoming unreadable after migration.
+            "timestamp": (
+                item.source_modified_at
+                if item.source_modified_at is not None
+                else item.created_at
+            ),
         }
 
         try:

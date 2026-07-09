@@ -395,6 +395,7 @@ def _run_antigravity_export(queue: SyncQueue, logger: logging.Logger) -> None:
                 file_size=len(content),
                 sync_strategy="full",
                 metadata=meta,
+                source_modified_at=conv.get("source_modified_at"),
             )
     except Exception:
         logger.exception("Antigravity export error")

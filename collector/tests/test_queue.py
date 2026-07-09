@@ -26,7 +26,8 @@ class SyncQueueTests(unittest.TestCase):
 
     def _enqueue(self, path: str, content: str, content_hash: str,
                  strategy: str = "full", partial: bool = False,
-                 offset: int = 0) -> int:
+                 offset: int = 0,
+                 source_modified_at: float | None = None) -> int:
         return self.queue.enqueue(
             tool_name="codex",
             category="conversation",
@@ -39,6 +40,7 @@ class SyncQueueTests(unittest.TestCase):
             is_partial=partial,
             offset=offset,
             metadata={"title": content_hash},
+            source_modified_at=source_modified_at,
         )
 
     def _status_rows(self) -> list[tuple]:
@@ -99,6 +101,32 @@ class SyncQueueTests(unittest.TestCase):
         self.assertIsNone(item.content)
         self.assertEqual(item.content_hash, "hash-2")
         self.assertEqual(self.queue.read_payload_text(item), second_content)
+
+    def test_source_mtime_survives_spool_coalescing_and_retry(self) -> None:
+        first_id = self._enqueue(
+            "sessions/thread.jsonl",
+            "a" * 70_000,
+            "hash-1",
+            source_modified_at=1_700_000_001.25,
+        )
+        second_id = self._enqueue(
+            "sessions/thread.jsonl",
+            "b" * 75_000,
+            "hash-2",
+            source_modified_at=1_700_000_099.75,
+        )
+
+        self.assertEqual(second_id, first_id)
+        self.queue.close()
+        self.queue = SyncQueue(self.db_path, spool_threshold=64 * 1024)
+        first_claim = self.queue.claim_batch(max_bytes=200_000)[0]
+        self.assertEqual(first_claim.source_modified_at, 1_700_000_099.75)
+        self.assertTrue(self.queue.mark_failed(first_claim, "temporary outage"))
+        self._make_retries_available()
+
+        retry = self.queue.claim_batch(max_bytes=200_000)[0]
+        self.assertEqual(retry.source_modified_at, 1_700_000_099.75)
+        self.assertEqual(self.queue.read_payload_text(retry), "b" * 75_000)
 
     def test_uploading_full_is_immutable_and_newer_snapshot_waits(self) -> None:
         self._enqueue("sessions/thread.jsonl", "old", "hash-1")
@@ -602,11 +630,19 @@ class SyncQueueMigrationTests(unittest.TestCase):
                     state = connection.execute(
                         "SELECT observed_hash, observed_offset, synced_hash FROM file_state"
                     ).fetchone()
+                    source_timestamps = connection.execute(
+                        "SELECT source_modified_at FROM queue ORDER BY id"
+                    ).fetchall()
                     version = connection.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(full_statuses, [("superseded",), ("pending",)])
                 self.assertEqual(delta_statuses, [("pending",), ("pending",)])
                 self.assertEqual(state, ("new", 42, None))
+                self.assertEqual(source_timestamps, [(None,), (None,), (None,), (None,)])
                 self.assertEqual(version, SyncQueue.SCHEMA_VERSION)
+                self.assertTrue(all(
+                    item.source_modified_at is None
+                    for item in queue.claim_batch(batch_size=10)
+                ))
             finally:
                 queue.close()
 

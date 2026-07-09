@@ -301,6 +301,7 @@ class FileWatcher:
                 file_size=len(content),
                 sync_strategy="full",
                 metadata=meta,
+                source_modified_at=conv.get("source_modified_at"),
             )
             logger.info(
                 "Queued antigravity/conversations/%s.jsonl (conversation, jsonl)",
@@ -335,9 +336,11 @@ class FileWatcher:
             return
 
         try:
-            file_size = path.stat().st_size
+            source_stat = path.stat()
+            file_size = source_stat.st_size
         except OSError:
             return
+        source_revision = (source_stat.st_size, source_stat.st_mtime_ns)
 
         # Check if file content actually changed
         current_hash = _file_hash(path)
@@ -355,7 +358,6 @@ class FileWatcher:
         # Determine read offset for delta sync
         read_offset = 0
         if classification.sync_strategy == SyncStrategy.DELTA:
-            file_size = path.stat().st_size
             if file_size < last_offset:
                 # File was truncated, re-sync from beginning
                 read_offset = 0
@@ -395,6 +397,20 @@ class FileWatcher:
             san = sanitize_text(parsed_content)
         parsed_content = san.content
 
+        # Hash, parse, and timestamp must describe one stable source revision.
+        # A concurrent append generates another watcher event; returning here
+        # leaves file_state untouched so that event (or the next scan) retries
+        # the complete newer revision rather than pairing old content with its
+        # new mtime.
+        try:
+            final_stat = path.stat()
+        except OSError:
+            return
+        if (final_stat.st_size, final_stat.st_mtime_ns) != source_revision:
+            logger.debug("Source changed while processing %s; deferring", path)
+            return
+        source_modified_at = source_stat.st_mtime
+
         self._queue.enqueue(
             tool_name=classification.tool_name,
             category=classification.category.value,
@@ -407,6 +423,7 @@ class FileWatcher:
             is_partial=is_partial,
             offset=new_offset,
             metadata=classification.metadata,
+            source_modified_at=source_modified_at,
         )
 
         logger.info(

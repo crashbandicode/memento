@@ -54,6 +54,7 @@ class QueueItem:
     offset: int
     metadata: dict[str, Any]
     created_at: float
+    source_modified_at: float | None = None
     retry_count: int = 0
     payload_path: str | None = None
     payload_bytes: int = 0
@@ -90,7 +91,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
         self._db_path = db_path
@@ -121,6 +122,7 @@ class SyncQueue:
                 offset INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at REAL NOT NULL,
+                source_modified_at REAL,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 payload_path TEXT,
@@ -166,6 +168,9 @@ class SyncQueue:
             "available_at": "REAL NOT NULL DEFAULT 0",
             "last_attempt_at": "REAL",
             "last_error": "TEXT",
+            # Kept nullable for queues created by older collectors. Those rows
+            # retain their original enqueue-time fallback on upload.
+            "source_modified_at": "REAL",
         }
         for name, definition in queue_additions.items():
             if name not in queue_columns:
@@ -509,7 +514,8 @@ class SyncQueue:
     def enqueue(self, tool_name: str, category: str, content_type: str,
                 relative_path: str, content: str, content_hash: str,
                 file_size: int, sync_strategy: str, is_partial: bool = False,
-                offset: int = 0, metadata: dict | None = None) -> int:
+                offset: int = 0, metadata: dict | None = None,
+                source_modified_at: float | None = None) -> int:
         del file_size  # payload byte size is measured after sanitization below
         is_full = sync_strategy == "full" and not is_partial
 
@@ -565,26 +571,28 @@ class SyncQueue:
                     self._conn.execute(
                         """UPDATE queue SET category=?, content_type=?, content=?,
                            content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
-                           offset=?, metadata=?, retry_count=0,
+                           offset=?, metadata=?, source_modified_at=?, retry_count=0,
                            status='pending', payload_path=?, payload_bytes=?,
                            lease_token=NULL, lease_until=NULL, available_at=0,
                            last_attempt_at=NULL, last_error=NULL
                            WHERE id=? AND status='pending'""",
                         (category, content_type, inline_content, content_hash,
                          payload_bytes, sync_strategy, int(is_partial), offset,
-                         metadata_json, payload_path, payload_bytes, item_id),
+                         metadata_json, source_modified_at, payload_path,
+                         payload_bytes, item_id),
                     )
                 else:
                     cursor = self._conn.execute(
                         """INSERT INTO queue (
                            tool_name, category, content_type, relative_path, content,
                            content_hash, file_size, sync_strategy, is_partial, offset,
-                           metadata, created_at, payload_path, payload_bytes, available_at
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                           metadata, created_at, source_modified_at, payload_path,
+                           payload_bytes, available_at
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
                         (tool_name, category, content_type, relative_path,
                          inline_content, content_hash, payload_bytes, sync_strategy,
-                         int(is_partial), offset, metadata_json, now, payload_path,
-                         payload_bytes),
+                         int(is_partial), offset, metadata_json, now,
+                         source_modified_at, payload_path, payload_bytes),
                     )
                     item_id = int(cursor.lastrowid)
 
@@ -639,7 +647,8 @@ class SyncQueue:
                 """SELECT q.id, q.tool_name, q.category, q.content_type,
                           q.relative_path, q.content_hash, q.file_size,
                           q.sync_strategy, q.is_partial, q.offset, q.metadata,
-                          q.created_at, q.retry_count, q.payload_path,
+                          q.created_at, q.source_modified_at, q.retry_count,
+                          q.payload_path,
                           CASE WHEN q.payload_bytes > 0
                                THEN q.payload_bytes ELSE q.file_size END
                    FROM queue AS q
@@ -671,7 +680,7 @@ class SyncQueue:
                 path_key = (str(row[1]), str(row[4]))
                 if path_key in selected_paths:
                     continue
-                size = max(0, int(row[14] or 0))
+                size = max(0, int(row[15] or 0))
                 if len(selected) >= batch_size:
                     break
                 # Metadata-only work has no payload and must remain claimable
@@ -716,8 +725,12 @@ class SyncQueue:
                 content_type=row[3], relative_path=row[4], content=None,
                 content_hash=row[5], file_size=int(row[6]),
                 sync_strategy=row[7], is_partial=bool(row[8]), offset=int(row[9]),
-                metadata=metadata, created_at=float(row[11]), retry_count=int(row[12]),
-                payload_path=row[13], payload_bytes=int(row[14] or row[6]),
+                metadata=metadata, created_at=float(row[11]),
+                source_modified_at=(
+                    float(row[12]) if row[12] is not None else None
+                ),
+                retry_count=int(row[13]), payload_path=row[14],
+                payload_bytes=int(row[15] or row[6]),
                 lease_token=token,
             ))
         return items

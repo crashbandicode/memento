@@ -140,6 +140,19 @@ def export_conversations(pb_files: list[Path] | None = None) -> list[dict]:
 
         # Decrypt + parse the full trajectory
         decoded = decode_pb_conversation(pb_path, base_timestamp=mtime_iso)
+        # Do not publish or cache a decode whose content/hash came from one PB
+        # revision while its timestamp came from another. The periodic export
+        # or next filesystem event will retry the stable revision.
+        try:
+            final_stat = pb_path.stat()
+        except OSError:
+            continue
+        if (
+            final_stat.st_size != stat.st_size
+            or final_stat.st_mtime_ns != stat.st_mtime_ns
+        ):
+            logger.debug("Antigravity source changed during export: %s", pb_path)
+            continue
         messages = decoded.get("messages", [])
         if not messages:
             # Skip conversations we couldn't decode
@@ -211,6 +224,7 @@ def export_conversations(pb_files: list[Path] | None = None) -> list[dict]:
             "content_hash": content_hash,
             "created_time": "",
             "last_modified": mtime_iso,
+            "source_modified_at": stat.st_mtime,
             "metadata": meta,
             "export_diagnostics": meta["export_diagnostics"],
         })

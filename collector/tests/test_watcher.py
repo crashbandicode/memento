@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from watchdog.events import FileModifiedEvent
 
-from collector.watcher import _DebouncedHandler
+from collector.parsers.base import ParseResult
+from collector.tools.base import (
+    Category,
+    ContentType,
+    FileClassification,
+    SyncStrategy,
+)
+from collector.watcher import FileWatcher, _DebouncedHandler
 
 
 def _modified(path: Path) -> FileModifiedEvent:
@@ -168,3 +178,101 @@ def test_stop_waits_for_active_callback_and_drops_rest(
     handler.on_any_event(_modified(second))
     time.sleep(0.05)
     assert callbacks == [first]
+
+
+def test_file_processing_enqueues_source_filesystem_mtime(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"role":"user","message":{"content":"hello"}}\n', encoding="utf-8")
+    expected_mtime = 1_700_000_123.5
+    os.utime(path, (expected_mtime, expected_mtime))
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return None, 0
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = []
+
+    watcher._process_file_changed(path)
+
+    assert len(queue.enqueued) == 1
+    assert queue.enqueued[0]["source_modified_at"] == expected_mtime
+
+
+def test_mutation_during_read_defers_without_advancing_source_revision(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    original = '{"role":"user","message":{"content":"old"}}\n'
+    replacement = '{"role":"user","message":{"content":"new"}}\n'
+    path.write_text(original, encoding="utf-8")
+    original_mtime = 1_700_000_123.5
+    replacement_mtime = 1_700_000_456.75
+    os.utime(path, (original_mtime, original_mtime))
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return None, 0
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    class MutatingParser:
+        def can_parse(self, _path: Path) -> bool:
+            return True
+
+        def parse(self, changed_path: Path, offset: int = 0) -> ParseResult:
+            del offset
+            content = changed_path.read_text(encoding="utf-8")
+            changed_path.write_text(replacement, encoding="utf-8")
+            os.utime(changed_path, (replacement_mtime, replacement_mtime))
+            return ParseResult(content=content, offset=len(content))
+
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [MutatingParser()]
+
+    watcher._process_file_changed(path)
+
+    assert queue.enqueued == []
+
+    # The unstable read did not advance file_state; a later event/scan can
+    # process the complete replacement revision normally.
+    watcher._parsers = []
+    watcher._process_file_changed(path)
+
+    assert len(queue.enqueued) == 1
+    assert json.loads(queue.enqueued[0]["content"])["message"]["content"] == "new"
+    assert queue.enqueued[0]["source_modified_at"] == replacement_mtime

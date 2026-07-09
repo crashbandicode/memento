@@ -47,6 +47,9 @@ class _FakeQueue:
         self.renewals += 1
         return lease_seconds == 300
 
+    def read_payload_text(self, _item: QueueItem) -> str:
+        return "payload"
+
 
 class _Response:
     def __init__(self, status_code: int = 200) -> None:
@@ -101,12 +104,16 @@ class _ScriptedHttpClient:
 
 class SyncClientStreamingTests(unittest.TestCase):
     @staticmethod
-    def _item(total_size: int) -> QueueItem:
+    def _item(
+        total_size: int,
+        source_modified_at: float | None = None,
+    ) -> QueueItem:
         return QueueItem(
             id=1, tool_name="codex", category="conversation",
             content_type="jsonl", relative_path="thread.jsonl", content=None,
             content_hash="hash", file_size=total_size, sync_strategy="full",
             is_partial=False, offset=0, metadata={}, created_at=1.0,
+            source_modified_at=source_modified_at,
             payload_bytes=total_size, lease_token="lease",
         )
 
@@ -120,11 +127,51 @@ class SyncClientStreamingTests(unittest.TestCase):
     def _client(queue: _FakeQueue, http_client) -> SyncClient:
         client = object.__new__(SyncClient)
         client._queue = queue
-        client._config = SimpleNamespace(queue_lease_seconds=300)
+        client._config = SimpleNamespace(
+            queue_lease_seconds=300,
+            large_file_threshold=64 * 1024,
+        )
         client._running = True
         client._pause_requested = threading.Event()
         client._client = http_client
         return client
+
+    def test_all_upload_routes_use_source_mtime_and_legacy_fallback(self) -> None:
+        timestamp_cases = (
+            (1_700_000_123.5, 1_700_000_123.5),
+            (None, 1.0),
+        )
+        size_cases = (
+            (1, "json"),
+            (64 * 1024 + 1, "multipart"),
+            (CHUNK_SIZE + 1, "chunked"),
+        )
+        for source_modified_at, expected in timestamp_cases:
+            for size, expected_route in size_cases:
+                queue = _FakeQueue(size)
+                client = self._client(queue, _FakeHttpClient())
+                payloads: list[tuple[str, dict]] = []
+                client._upload_json = (
+                    lambda payload: payloads.append(("json", payload)) or True
+                )
+                client._upload_multipart = (
+                    lambda payload, _stream:
+                    payloads.append(("multipart", payload)) or True
+                )
+                client._upload_chunked = (
+                    lambda payload, _item:
+                    payloads.append(("chunked", payload)) or True
+                )
+
+                with self.subTest(
+                    source_modified_at=source_modified_at,
+                    route=expected_route,
+                ):
+                    self.assertTrue(client._upload(
+                        self._item(size, source_modified_at=source_modified_at),
+                    ))
+                    self.assertEqual(payloads[0][0], expected_route)
+                    self.assertEqual(payloads[0][1]["timestamp"], expected)
 
     def test_chunked_upload_reads_only_one_chunk_at_a_time(self) -> None:
         total_size = CHUNK_SIZE * 2 + 123
