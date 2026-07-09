@@ -48,15 +48,17 @@ const FLATTENED_TOOL_MARKER_RE = /(^|\r?\n)\[Tool:\s*([^\]\r\n]{1,120})\][ \t]*(
  * transcript or hiding ordinary mentions of `[Tool: ...]` in prose.
  */
 export function splitAssistantContent(value: string): AssistantContentSegment[] {
+  const withoutTransportRedaction = value
+    .replace(STANDALONE_REDACTED_LINE_RE, "$1")
+    .replace(/^\r?\n/, "");
   const originalMarker = new RegExp(FLATTENED_TOOL_MARKER_RE.source, "g");
-  if (!originalMarker.test(value)) {
-    return value ? [{ type: "text", content: value }] : [];
+  if (!originalMarker.test(withoutTransportRedaction)) {
+    return withoutTransportRedaction.trim()
+      ? [{ type: "text", content: withoutTransportRedaction }]
+      : [];
   }
 
-  const content = value
-    .replace(STANDALONE_REDACTED_LINE_RE, "$1")
-    .replace(/^\r?\n/, "")
-    .trimEnd();
+  const content = withoutTransportRedaction.trimEnd();
   const marker = new RegExp(FLATTENED_TOOL_MARKER_RE.source, "g");
   const matches = Array.from(content.matchAll(marker));
 
