@@ -1,6 +1,13 @@
 "use client";
 
-import { memo, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Link from "next/link";
 import { api, ConversationMessage, ConversationPrompt } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
@@ -297,7 +304,7 @@ export default function ConversationViewer({
           {fmt(t.conversation.messagesTotal, { total: totalMessages, loaded: messages.length })}
         </div>
 
-        <div className="space-y-3 max-w-4xl mx-auto pb-8">
+        <div className="space-y-3 max-w-4xl mx-auto pb-24 xl:pb-8">
           {messages.map((msg, idx) => {
             const isHumanPrompt = (msg.role || msg.message_type) === "user"
               && !msg.content.includes("[Subagent Context]");
@@ -349,6 +356,7 @@ export default function ConversationViewer({
       </div>
 
       <PromptNavigator
+        key={documentId}
         prompts={prompts}
         activeLine={activePromptLine}
         loadingLine={navigatingPromptLine}
@@ -382,14 +390,87 @@ function PromptNavigator({
   loadingLine: number | null;
   label: string;
   loadingLabel: string;
-  onSelect: (prompt: ConversationPrompt) => void;
+  onSelect: (prompt: ConversationPrompt) => void | Promise<void>;
 }) {
+  const { t: translations } = useI18n();
   const [expanded, setExpanded] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
+  const promptItems = useMemo(
+    () => prompts.map((prompt, index) => ({
+      prompt,
+      index,
+      snippet: promptSnippet(prompt.content) || fmt(
+        translations.conversation.promptFallback,
+        { number: index + 1 },
+      ),
+    })),
+    [prompts, translations.conversation.promptFallback],
+  );
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredPromptItems = normalizedQuery
+    ? promptItems.filter(({ snippet }) => snippet.toLocaleLowerCase().includes(normalizedQuery))
+    : promptItems;
+  const activeIndex = prompts.findIndex((prompt) => prompt.line_number === activeLine);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const animationFrame = window.requestAnimationFrame(() => searchRef.current?.focus());
+    const desktopBreakpoint = window.matchMedia("(min-width: 1280px)");
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setMobileOpen(false);
+      setQuery("");
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    };
+    const handleDesktopBreakpoint = (event: MediaQueryListEvent) => {
+      if (!event.matches) return;
+      setMobileOpen(false);
+      setQuery("");
+    };
+    window.addEventListener("keydown", handleEscape);
+    desktopBreakpoint.addEventListener("change", handleDesktopBreakpoint);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("keydown", handleEscape);
+      desktopBreakpoint.removeEventListener("change", handleDesktopBreakpoint);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [mobileOpen]);
+
+  const closeMobileSheet = () => {
+    setMobileOpen(false);
+    setQuery("");
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
+  const handleMobileDialogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab") return;
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable?.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   if (prompts.length === 0) return null;
 
   return (
-    <aside
+    <>
+      <aside
       data-prompt-navigator
       aria-label={label}
       className="hidden xl:flex"
@@ -446,8 +527,7 @@ function PromptNavigator({
           padding: expanded ? "6px" : "8px 7px",
         }}
       >
-        {prompts.map((prompt, index) => {
-          const snippet = promptSnippet(prompt.content) || `Prompt ${index + 1}`;
+        {promptItems.map(({ prompt, index, snippet }) => {
           const active = prompt.line_number === activeLine;
           const isLoading = prompt.line_number === loadingLine;
           return (
@@ -527,8 +607,347 @@ function PromptNavigator({
             </button>
           );
         })}
-      </div>
-    </aside>
+        </div>
+      </aside>
+
+      <button
+        ref={triggerRef}
+        type="button"
+        data-mobile-prompt-trigger
+        className={`${mobileOpen ? "hidden" : "inline-flex"} xl:hidden`}
+        aria-haspopup="dialog"
+        aria-expanded={mobileOpen}
+        aria-controls="mobile-prompt-navigator"
+        aria-busy={loadingLine !== null}
+        disabled={loadingLine !== null}
+        onClick={() => setMobileOpen(true)}
+        style={{
+          position: "fixed",
+          right: 16,
+          bottom: "calc(14px + env(safe-area-inset-bottom))",
+          zIndex: 24,
+          minHeight: 46,
+          maxWidth: "calc(100vw - 32px)",
+          alignItems: "center",
+          gap: 9,
+          padding: "9px 12px",
+          border: "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))",
+          borderRadius: 999,
+          background: "color-mix(in srgb, var(--aurora-surface-solid) 94%, transparent)",
+          color: "var(--aurora-fg1)",
+          boxShadow: "0 12px 32px -12px rgba(15,23,42,0.38)",
+          backdropFilter: "blur(18px)",
+          cursor: loadingLine !== null ? "wait" : "pointer",
+        }}
+      >
+        <span
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 999,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flex: "0 0 auto",
+            background: "var(--aurora-accent)",
+            color: "#fff",
+          }}
+        >
+          <Icon
+            name={loadingLine !== null ? "refresh" : "message"}
+            size={13}
+            className={loadingLine !== null ? "animate-spin" : undefined}
+          />
+        </span>
+        <span
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            fontSize: 12,
+            fontWeight: 650,
+          }}
+        >
+          {loadingLine !== null ? loadingLabel : label}
+        </span>
+        <span
+          style={{
+            flex: "0 0 auto",
+            padding: "2px 7px",
+            borderRadius: 999,
+            background: "var(--aurora-chip)",
+            color: "var(--aurora-fg3)",
+            fontSize: 10,
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {activeIndex >= 0 ? activeIndex + 1 : 1}/{prompts.length}
+        </span>
+      </button>
+
+      {mobileOpen && (
+        <div
+          className="xl:hidden"
+          style={{ position: "fixed", inset: 0, zIndex: 120 }}
+        >
+          <button
+            type="button"
+            data-mobile-prompt-backdrop
+            tabIndex={-1}
+            aria-label={translations.conversation.closePromptNavigator}
+            onClick={closeMobileSheet}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              padding: 0,
+              border: 0,
+              background: "rgba(15,23,42,0.42)",
+              backdropFilter: "blur(4px)",
+              touchAction: "none",
+            }}
+          />
+          <section
+            ref={dialogRef}
+            id="mobile-prompt-navigator"
+            data-mobile-prompt-sheet
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mobile-prompt-navigator-title"
+            onKeyDown={handleMobileDialogKeyDown}
+            style={{
+              position: "absolute",
+              left: "50%",
+              bottom: 0,
+              width: "100%",
+              maxWidth: 640,
+              maxHeight: "min(78dvh, 680px)",
+              display: "flex",
+              flexDirection: "column",
+              transform: "translateX(-50%)",
+              border: "1px solid var(--aurora-border)",
+              borderBottom: 0,
+              borderRadius: "22px 22px 0 0",
+              background: "var(--aurora-surface-solid)",
+              color: "var(--aurora-fg1)",
+              boxShadow: "0 -24px 70px -30px rgba(15,23,42,0.55)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              aria-hidden="true"
+              style={{
+                width: 42,
+                height: 4,
+                margin: "8px auto 2px",
+                borderRadius: 999,
+                background: "var(--aurora-border)",
+                flex: "0 0 auto",
+              }}
+            />
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "8px 14px 10px 16px",
+                borderBottom: "1px solid var(--aurora-border)",
+                flex: "0 0 auto",
+              }}
+            >
+              <span
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 10,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "var(--aurora-accent-soft)",
+                  color: "var(--aurora-accent)",
+                  flex: "0 0 auto",
+                }}
+              >
+                <Icon name="message" size={15} />
+              </span>
+              <div style={{ minWidth: 0 }}>
+                <div id="mobile-prompt-navigator-title" style={{ fontSize: 14, fontWeight: 700 }}>
+                  {label}
+                </div>
+                <div style={{ marginTop: 1, color: "var(--aurora-fg4)", fontSize: 10.5 }}>
+                  {filteredPromptItems.length === prompts.length
+                    ? fmt(translations.conversation.promptCount, { count: prompts.length })
+                    : fmt(translations.conversation.filteredPromptCount, {
+                        visible: filteredPromptItems.length,
+                        total: prompts.length,
+                      })}
+                </div>
+              </div>
+              <button
+                type="button"
+                data-mobile-prompt-close
+                aria-label={translations.conversation.closePromptNavigator}
+                onClick={closeMobileSheet}
+                style={{
+                  width: 40,
+                  height: 40,
+                  marginLeft: "auto",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flex: "0 0 auto",
+                  border: "1px solid var(--aurora-border)",
+                  borderRadius: 12,
+                  background: "var(--aurora-chip)",
+                  color: "var(--aurora-fg3)",
+                  cursor: "pointer",
+                }}
+              >
+                <Icon name="close" size={15} />
+              </button>
+            </div>
+
+            <div style={{ padding: "10px 14px", flex: "0 0 auto" }}>
+              <label
+                style={{
+                  minHeight: 42,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  padding: "8px 11px",
+                  border: "1px solid var(--aurora-border)",
+                  borderRadius: 12,
+                  background: "var(--aurora-chip)",
+                  color: "var(--aurora-fg4)",
+                }}
+              >
+                <Icon name="search" size={14} style={{ flex: "0 0 auto" }} />
+                <span className="sr-only">
+                  {fmt(translations.conversation.searchPrompts, { count: prompts.length })}
+                </span>
+                <input
+                  ref={searchRef}
+                  data-mobile-prompt-search
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder={fmt(translations.conversation.searchPrompts, { count: prompts.length })}
+                  autoComplete="off"
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    padding: 0,
+                    border: 0,
+                    outline: 0,
+                    background: "transparent",
+                    color: "var(--aurora-fg1)",
+                    fontSize: 16,
+                  }}
+                />
+              </label>
+            </div>
+
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflowY: "auto",
+                overscrollBehavior: "contain",
+                padding: "0 10px calc(12px + env(safe-area-inset-bottom))",
+              }}
+            >
+              {filteredPromptItems.length === 0 ? (
+                <div
+                  data-mobile-prompt-empty
+                  style={{ padding: "34px 18px", textAlign: "center", color: "var(--aurora-fg4)", fontSize: 12 }}
+                >
+                  {translations.conversation.noMatchingPrompts}
+                </div>
+              ) : (
+                filteredPromptItems.map(({ prompt, index, snippet }) => {
+                  const active = prompt.line_number === activeLine;
+                  const isLoading = prompt.line_number === loadingLine;
+                  return (
+                    <button
+                      key={`${prompt.id}-${prompt.line_number}`}
+                      type="button"
+                      data-mobile-prompt-item={prompt.line_number}
+                      aria-current={active ? "true" : undefined}
+                      aria-busy={isLoading}
+                      disabled={loadingLine !== null}
+                      onClick={async () => {
+                        await onSelect(prompt);
+                        if (dialogRef.current) closeMobileSheet();
+                      }}
+                      style={{
+                        width: "100%",
+                        minHeight: 54,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 11,
+                        marginBottom: 5,
+                        padding: "9px 10px",
+                        border: active
+                          ? "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))"
+                          : "1px solid transparent",
+                        borderRadius: 12,
+                        background: active
+                          ? "color-mix(in srgb, var(--aurora-accent) 8%, var(--aurora-chip))"
+                          : "transparent",
+                        color: active ? "var(--aurora-accent)" : "var(--aurora-fg2)",
+                        textAlign: "left",
+                        cursor: loadingLine !== null ? "wait" : "pointer",
+                        opacity: loadingLine !== null && !isLoading ? 0.5 : 1,
+                        contentVisibility: "auto",
+                        containIntrinsicSize: "54px",
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 28,
+                          height: 28,
+                          borderRadius: 999,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          flex: "0 0 auto",
+                          background: active ? "var(--aurora-accent)" : "var(--aurora-chip)",
+                          color: active ? "#fff" : "var(--aurora-fg3)",
+                          fontSize: 9.5,
+                          fontWeight: 750,
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        {isLoading ? (
+                          <Icon name="refresh" size={12} className="animate-spin" />
+                        ) : (
+                          index + 1
+                        )}
+                      </span>
+                      <span
+                        style={{
+                          minWidth: 0,
+                          display: "-webkit-box",
+                          overflow: "hidden",
+                          WebkitBoxOrient: "vertical",
+                          WebkitLineClamp: 2,
+                          fontSize: 12.5,
+                          lineHeight: 1.35,
+                        }}
+                      >
+                        {isLoading ? loadingLabel : snippet}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+    </>
   );
 }
 
