@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -17,9 +17,11 @@ from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_conversation_companion_filter,
     build_subagent_summaries,
-    current_thread_id,
-    fold_codex_subagents,
+    conversation_root_thread_id,
+    fold_conversation_subagents,
+    is_conversation_subagent,
 )
 from ..services.user_filter import user_machine_ids
 
@@ -474,6 +476,7 @@ async def semantic_search(
     batch_size = max(100, limit * 10)
     rows: list = []
     logical_groups: set[tuple[str, str]] = set()
+    companion_roots_by_tool: dict[str, set[str]] = {}
     scanned = 0
     while len(logical_groups) < limit:
         batch = (
@@ -488,19 +491,21 @@ async def semantic_search(
         for row in batch:
             _chunk, did, tid, _title, _path, category, _synced, \
                 _source_modified, metadata, _file_size, _dist = row
-            values = metadata or {}
-            if category == "conversation" and tid == "codex":
-                if (
-                    str(values.get("thread_source") or "").strip().lower()
-                    == "subagent"
-                    and values.get("root_session_id")
-                ):
-                    logical_id = str(values["root_session_id"])
-                else:
-                    logical_id = current_thread_id(values) or str(did)
-                logical_groups.add(("codex", logical_id))
-            else:
-                logical_groups.add(("document", str(did)))
+            logical_id = (
+                conversation_root_thread_id(tid, _path, metadata)
+                if category == "conversation"
+                else None
+            )
+            logical_groups.add(
+                (tid, logical_id)
+                if logical_id
+                else ("document", str(did))
+            )
+            if logical_id and (
+                tid == "codex"
+                or is_conversation_subagent(tid, _path, metadata)
+            ):
+                companion_roots_by_tool.setdefault(tid, set()).add(logical_id)
         if len(batch) < batch_size:
             break
 
@@ -530,18 +535,12 @@ async def semantic_search(
         best_by_document[did] = item
         ranked_documents.append(item)
 
-    # Pull lightweight root/sibling metadata for every Codex group represented
+    # Pull lightweight root/sibling metadata for every agent group represented
     # by the ranked candidates. This lets a matching child navigate through its
     # canonical root even when the root's own embedding scored outside the
     # vector window.
-    root_thread_ids = {
-        group_id
-        for group_kind, group_id in logical_groups
-        if group_kind == "codex"
-    }
     companion_cards: dict = {}
-    if root_thread_ids:
-        root_ids = list(root_thread_ids)
+    if companion_roots_by_tool:
         companions_q = select(
             Document.id,
             Document.tool_id,
@@ -553,12 +552,12 @@ async def semantic_search(
             Document.metadata_,
             Document.file_size_bytes,
         ).where(
-            Document.tool_id == "codex",
             Document.category == "conversation",
-            or_(
-                Document.metadata_["session_id"].astext.in_(root_ids),
-                Document.metadata_["thread_id"].astext.in_(root_ids),
-                Document.metadata_["root_session_id"].astext.in_(root_ids),
+            build_conversation_companion_filter(
+                Document.tool_id,
+                Document.metadata_,
+                Document.relative_path,
+                companion_roots_by_tool,
             ),
         )
         if mids is not None:
@@ -601,7 +600,7 @@ async def semantic_search(
         )
         for item in hierarchy_cards.values()
     ]
-    hierarchy = fold_codex_subagents(conversation_refs)
+    hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         hierarchy,
         conversation_refs,

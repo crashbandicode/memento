@@ -24,11 +24,14 @@ from ..services.conversation_activity import (
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    FOLDABLE_CONVERSATION_TOOLS,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_root_thread_id,
     current_thread_id,
     effective_conversation_timestamp,
-    fold_codex_subagents,
+    explicit_subagent_parent_thread_id,
+    fold_conversation_subagents,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
@@ -124,6 +127,80 @@ async def list_projects(
     result = await db.execute(query)
     rows = result.all()
 
+    # The aggregate above intentionally stays cheap, but its raw document
+    # count includes every native subagent transcript. Reconcile agent-capable
+    # project counts with the same root/subagent presentation used by project
+    # detail and search so each card agrees with its drill-down.
+    logical_document_counts = {p.id: count or 0 for p, count in rows}
+    foldable_project_ids = [
+        p.id
+        for p, _count in rows
+        if p.tool_id in FOLDABLE_CONVERSATION_TOOLS
+    ]
+    if foldable_project_ids:
+        foldable_conversations_q = (
+            select(Document)
+            .options(load_only(
+                Document.id,
+                Document.project_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+                Document.source_modified_at,
+                Document.activity_at,
+                Document.synced_at,
+                Document.file_size_bytes,
+                Document.machine_id,
+            ))
+            .where(
+                Document.project_id.in_(foldable_project_ids),
+                Document.tool_id.in_(FOLDABLE_CONVERSATION_TOOLS),
+                Document.category == "conversation",
+            )
+        )
+        if selected_machine_id is not None:
+            foldable_conversations_q = foldable_conversations_q.where(
+                Document.machine_id == selected_machine_id
+            )
+        else:
+            foldable_conversations_q = apply_user_filter(
+                foldable_conversations_q,
+                mids,
+                Document.machine_id,
+            )
+        foldable_documents = (
+            await db.execute(foldable_conversations_q)
+        ).scalars().all()
+        conversations_by_project: dict[uuid.UUID, list[Document]] = {}
+        for document in foldable_documents:
+            if document.project_id is not None:
+                conversations_by_project.setdefault(
+                    document.project_id,
+                    [],
+                ).append(document)
+        for project_id, documents in conversations_by_project.items():
+            refs = [
+                ConversationRef(
+                    document_id=document.id,
+                    tool_id=document.tool_id,
+                    relative_path=document.relative_path,
+                    metadata=document.metadata_,
+                    title=document.title,
+                    source_modified_at=document.source_modified_at,
+                    activity_at=document.activity_at,
+                    synced_at=document.synced_at,
+                    file_size_bytes=document.file_size_bytes,
+                )
+                for document in documents
+            ]
+            hierarchy = fold_conversation_subagents(refs)
+            logical_document_counts[project_id] = (
+                logical_document_counts.get(project_id, 0)
+                - len(documents)
+                + len(hierarchy.visible_document_ids)
+            )
+
     return [
         {
             "id": str(p.id),
@@ -132,7 +209,7 @@ async def list_projects(
             "tool_id": p.tool_id,
             "source_path": p.source_path,
             "visibility": p.visibility,
-            "document_count": count or 0,
+            "document_count": logical_document_counts[p.id],
             "created_at": p.created_at.isoformat(),
             "updated_at": p.updated_at.isoformat() if p.updated_at else None,
         }
@@ -209,7 +286,7 @@ async def get_project(
         )
         for d in conv_meta
     ]
-    conversation_hierarchy = fold_codex_subagents(conversation_refs)
+    conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
         conversation_refs,
@@ -431,7 +508,7 @@ async def get_project_timeline(
         for row in all_rows
         if row[2] == "conversation"
     ]
-    conversation_hierarchy = fold_codex_subagents(conversation_refs)
+    conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
         conversation_refs,
@@ -792,25 +869,18 @@ async def get_project_conversations(
             for d in all_convs
         }
 
-    # Group subagents under their parent conversation.
-    # Subagent path: .../parent-id/subagents/agent-xxx.jsonl
-    # Parent path:   .../parent-id.jsonl
     main_convs: list = []
-    subagent_map: dict[str, list] = {}  # parent_doc_id → [subagent docs]
-    parent_path_to_id: dict[str, str] = {}
+    explicit_children: list = []
 
     for d in all_convs:
         rp = d.relative_path or ""
         # Skip the sidecar noise that isn't real conversation content.
         if ".meta.json" in rp or ".metadata.json" in rp or ".resolved" in rp:
             continue
-        if "/subagents/" in rp:
-            # Extract parent path: everything before /subagents/
-            parent_base = rp.split("/subagents/")[0] + ".jsonl"
-            subagent_map.setdefault(parent_base, []).append(d)
+        if explicit_subagent_parent_thread_id(rp):
+            explicit_children.append(d)
         else:
             main_convs.append(d)
-            parent_path_to_id[rp] = str(d.id)
 
     conversation_refs = [
         ConversationRef(
@@ -826,7 +896,7 @@ async def get_project_conversations(
         )
         for d in main_convs
     ]
-    conversation_hierarchy = fold_codex_subagents(conversation_refs)
+    conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
         conversation_refs,
@@ -840,6 +910,26 @@ async def get_project_conversations(
         for d in main_convs
         if d.id in conversation_hierarchy.visible_document_ids
     ]
+
+    # Reuse the native root-ID resolver for both Claude Code's
+    # `<root>.jsonl` layout and Cursor's `<root>/<root>.jsonl` layout.
+    roots_by_tool_and_thread = {
+        (d.tool_id, current_thread_id(d.metadata_)): d.id
+        for d in main_convs
+        if current_thread_id(d.metadata_)
+    }
+    subagent_map: dict[uuid.UUID, list] = {}
+    for child in explicit_children:
+        root_thread_id = conversation_root_thread_id(
+            child.tool_id,
+            child.relative_path,
+            child.metadata_,
+        )
+        root_document_id = roots_by_tool_and_thread.get(
+            (child.tool_id, root_thread_id)
+        )
+        if root_document_id is not None:
+            subagent_map.setdefault(root_document_id, []).append(child)
 
     # Legacy ``/subagents/`` children are presented inline rather than folded
     # by metadata.  Their latest real turn still contributes to the parent
@@ -862,7 +952,7 @@ async def get_project_conversations(
                             synced_at=child.synced_at,
                         )
                     )
-                    for child in subagent_map.get(d.relative_path or "", [])
+                    for child in subagent_map.get(d.id, [])
                 ),
             )
             if value is not None
@@ -921,7 +1011,7 @@ async def get_project_conversations(
     # latency (30 s observed).
     needed_ids: list = [d.id for d in page_convs]
     for d in page_convs:
-        for child in subagent_map.get(d.relative_path or "", []):
+        for child in subagent_map.get(d.id, []):
             needed_ids.append(child.id)
     msgs_by_doc: dict = {}
     if needed_ids:
@@ -1009,7 +1099,7 @@ async def get_project_conversations(
         messages = list(_parse_doc_messages(d))
 
         # Merge subagent messages inline, marked with subagent_name
-        child_docs = subagent_map.get(d.relative_path or "", [])
+        child_docs = subagent_map.get(d.id, [])
         for child in child_docs:
             child_msgs = [dict(message) for message in _parse_doc_messages(child)]
             child_name = child.title or (child.relative_path or "").split("/")[-1].replace(".jsonl", "")

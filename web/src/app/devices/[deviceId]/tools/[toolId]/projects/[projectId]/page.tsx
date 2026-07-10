@@ -8,8 +8,9 @@ import { getApiBase, authFetch } from "@/lib/api-client";
 import { mergeProjectFiles } from "@/lib/project-files";
 import { Icon, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
+import SubagentBadge from "@/components/conversations/SubagentBadge";
 
-interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; }
+interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; subagent_count?: number; is_subagent_orphan?: boolean; }
 interface ProjectInfo { id: string; slug: string; title: string; tool_id: string; source_path: string | null; }
 interface HierarchyFilesResponse { total: number; files: FileItem[]; project: ProjectInfo | null; }
 
@@ -250,6 +251,11 @@ export default function DeviceToolProjectPage() {
                     <div style={{ fontSize: 13, fontWeight: 500, color: "var(--aurora-fg1)", letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {f.title || f.relative_path.split("/").pop()}
                     </div>
+                    {Boolean(f.subagent_count) && (
+                      <div style={{ marginTop: 4 }}>
+                        <SubagentBadge count={f.subagent_count} orphan={f.is_subagent_orphan} />
+                      </div>
+                    )}
                     <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {f.relative_path}
                     </div>

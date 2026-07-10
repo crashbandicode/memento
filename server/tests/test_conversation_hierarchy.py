@@ -14,6 +14,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     build_subagent_summaries,
     effective_conversation_timestamp,
     fold_codex_subagents,
+    fold_conversation_subagents,
 )
 
 
@@ -27,6 +28,7 @@ def _ref(
     depth: int | None = None,
     agent_path: str | None = None,
     agent_nickname: str | None = None,
+    is_subagent: bool | None = None,
     path: str = "sessions/thread.jsonl",
     tool_id: str = "codex",
     timestamp: str = "2026-07-08T12:00:00+00:00",
@@ -44,6 +46,7 @@ def _ref(
             "agent_depth": depth,
             "agent_path": agent_path,
             "agent_nickname": agent_nickname,
+            "is_subagent": is_subagent,
         }.items()
         if value is not None
     }
@@ -144,7 +147,7 @@ class ConversationHierarchyTests(unittest.TestCase):
             )},
         )
 
-    def test_legacy_paths_and_unlinked_metadata_stay_visible(self) -> None:
+    def test_orphan_and_unlinked_metadata_stay_visible(self) -> None:
         legacy = _ref(
             "legacy-doc",
             session_id="legacy-child",
@@ -167,7 +170,92 @@ class ConversationHierarchyTests(unittest.TestCase):
             result.visible_document_ids,
             {"legacy-doc", "unlinked-doc", "other-tool-doc"},
         )
-        self.assertEqual(result.subagent_counts, {})
+        self.assertEqual(result.subagent_counts, {"legacy-doc": 1})
+        self.assertEqual(result.orphan_document_ids, {"legacy-doc"})
+
+    def test_claude_path_children_fold_into_root(self) -> None:
+        root = _ref(
+            "claude-root",
+            session_id="claude-thread",
+            tool_id="claude_code",
+            path="projects/sample/claude-thread.jsonl",
+            activity_timestamp="2026-07-08T10:00:00+00:00",
+        )
+        child_a = _ref(
+            "claude-child-a",
+            session_id="agent-a",
+            tool_id="claude_code",
+            path="projects/sample/claude-thread/subagents/agent-a.jsonl",
+            is_subagent=True,
+            activity_timestamp="2026-07-08T12:00:00+00:00",
+        )
+        child_b = _ref(
+            "claude-child-b",
+            session_id="agent-b",
+            tool_id="claude_code",
+            path="projects/sample/claude-thread/subagents/agent-b.jsonl",
+            is_subagent=True,
+        )
+
+        result = fold_conversation_subagents([root, child_a, child_b])
+        activity = build_logical_activity_map(result, [root, child_a, child_b])
+
+        self.assertEqual(result.visible_document_ids, {"claude-root"})
+        self.assertEqual(result.subagent_counts, {"claude-root": 2})
+        self.assertEqual(
+            activity["claude-root"],
+            datetime(2026, 7, 8, 12, tzinfo=timezone.utc),
+        )
+
+    def test_cursor_path_children_fold_into_root(self) -> None:
+        root = _ref(
+            "cursor-root",
+            session_id="cursor-thread",
+            tool_id="cursor",
+            path=(
+                "projects/sample/agent-transcripts/cursor-thread/"
+                "cursor-thread.jsonl"
+            ),
+        )
+        child = _ref(
+            "cursor-child",
+            session_id="cursor-child-thread",
+            tool_id="cursor",
+            path=(
+                "projects/sample/agent-transcripts/cursor-thread/"
+                "subagents/cursor-child-thread.jsonl"
+            ),
+            is_subagent=True,
+        )
+
+        result = fold_conversation_subagents([root, child])
+
+        self.assertEqual(result.visible_document_ids, {"cursor-root"})
+        self.assertEqual(result.subagent_counts, {"cursor-root": 1})
+
+    def test_cursor_root_copies_are_canonicalized_across_hosts(self) -> None:
+        old = _ref(
+            "cursor-old",
+            session_id="cursor-thread",
+            tool_id="cursor",
+            path="projects/windows/cursor-thread.jsonl",
+            timestamp="2026-07-08T10:00:00+00:00",
+        )
+        new = _ref(
+            "cursor-new",
+            session_id="cursor-thread",
+            tool_id="cursor",
+            path="projects/linux/cursor-thread.jsonl",
+            timestamp="2026-07-08T12:00:00+00:00",
+        )
+
+        result = fold_conversation_subagents([old, new])
+
+        self.assertEqual(result.visible_document_ids, {"cursor-new"})
+        self.assertEqual(
+            result.canonical_document_ids["cursor-old"],
+            "cursor-new",
+        )
 
     def test_non_codex_thread_with_same_uuid_is_not_treated_as_root(self) -> None:
         foreign = _ref("foreign-root", session_id="shared", tool_id="cursor")

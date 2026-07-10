@@ -26,6 +26,9 @@ class _Result:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return self
+
 
 class _Db:
     def __init__(self, results: list[_Result]) -> None:
@@ -44,7 +47,7 @@ class ProjectsDeviceScopeTests(unittest.IsolatedAsyncioTestCase):
             id=uuid.uuid4(),
             slug="project",
             title="Project",
-            tool_id="codex",
+            tool_id="obsidian",
             source_path="projects/project",
             visibility="private",
             created_at=now,
@@ -158,6 +161,61 @@ class ProjectsDeviceScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(db.statements), 2)
         self.assertIn("machines.collector_token_hash =", str(db.statements[0].compile()))
         self.assertIn("FROM projects", str(db.statements[1].compile()))
+
+    async def test_codex_project_count_folds_metadata_subagents(self) -> None:
+        self.project.tool_id = "codex"
+        root_thread_id = str(uuid.uuid4())
+        root = SimpleNamespace(
+            id=uuid.uuid4(),
+            project_id=self.project.id,
+            machine_id=uuid.uuid4(),
+            tool_id="codex",
+            title="Root",
+            relative_path="sessions/root.jsonl",
+            metadata_={
+                "session_id": root_thread_id,
+                "thread_id": root_thread_id,
+                "thread_source": "user",
+            },
+            source_modified_at=self.project.updated_at,
+            activity_at=self.project.updated_at,
+            synced_at=self.project.updated_at,
+            file_size_bytes=100,
+        )
+        child = SimpleNamespace(
+            id=uuid.uuid4(),
+            project_id=self.project.id,
+            machine_id=root.machine_id,
+            tool_id="codex",
+            title="Child",
+            relative_path="sessions/child.jsonl",
+            metadata_={
+                "session_id": str(uuid.uuid4()),
+                "thread_id": str(uuid.uuid4()),
+                "thread_source": "subagent",
+                "root_session_id": root_thread_id,
+            },
+            source_modified_at=self.project.updated_at,
+            activity_at=self.project.updated_at,
+            synced_at=self.project.updated_at,
+            file_size_bytes=90,
+        )
+        db = _Db([
+            _Result(rows=[(self.project, 2)]),
+            _Result(rows=[root, child]),
+        ])
+
+        projects = await list_projects(
+            tool_id="codex",
+            device_id=None,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(projects[0]["document_count"], 1)
+        conversation_sql = str(db.statements[1].compile())
+        self.assertNotIn("documents.content,", conversation_sql)
+        self.assertNotIn("documents.rendered_html", conversation_sql)
 
 
 if __name__ == "__main__":

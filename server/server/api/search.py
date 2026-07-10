@@ -11,10 +11,11 @@ from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
-    current_thread_id,
-    fold_codex_subagents,
+    fold_conversation_subagents,
+    group_conversation_root_thread_ids,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
@@ -106,7 +107,7 @@ async def search(
         query = query.where(Document.synced_at >= cutoff)
     query = apply_user_filter(query, mids, Document.machine_id)
 
-    # Fetch lightweight matching metadata first, fold logical Codex threads,
+    # Fetch lightweight matching metadata first, fold logical agent threads,
     # then paginate. Applying OFFSET before folding made page totals wrong and
     # let multi-host copies leak back in at page boundaries. No transcript
     # content is selected in this phase; bounded snippets are fetched only for
@@ -129,25 +130,28 @@ async def search(
             )
         )
     ).mappings().all()
-    root_thread_ids: set[str] = set()
-    for row in all_rows:
-        if row["category"] != "conversation" or row["tool_id"] != "codex":
-            continue
-        metadata = row["metadata"] or {}
-        if (
-            str(metadata.get("thread_source") or "").strip().lower()
-            == "subagent"
-            and metadata.get("root_session_id")
-        ):
-            root_thread_ids.add(str(metadata["root_session_id"]))
-        else:
-            thread_id = current_thread_id(metadata)
-            if thread_id:
-                root_thread_ids.add(thread_id)
+    matched_conversation_refs = [
+        ConversationRef(
+            document_id=row["id"],
+            tool_id=row["tool_id"],
+            relative_path=row["relative_path"],
+            metadata=row["metadata"],
+            title=row["title"],
+            source_modified_at=row["source_modified_at"],
+            activity_at=row["activity_at"],
+            synced_at=row["synced_at"],
+            file_size_bytes=row["file_size_bytes"],
+        )
+        for row in all_rows
+        if row["category"] == "conversation"
+    ]
+    roots_by_tool = group_conversation_root_thread_ids(
+        matched_conversation_refs,
+        path_children_only=True,
+    )
 
     hierarchy_rows = {row["id"]: row for row in all_rows}
-    if root_thread_ids:
-        root_ids = list(root_thread_ids)
+    if roots_by_tool:
         companions_q = select(
             Document.id.label("id"),
             Document.tool_id.label("tool_id"),
@@ -160,12 +164,12 @@ async def search(
             Document.activity_at.label("activity_at"),
             Document.metadata_.label("metadata"),
         ).where(
-            Document.tool_id == "codex",
             Document.category == "conversation",
-            or_(
-                Document.metadata_["session_id"].astext.in_(root_ids),
-                Document.metadata_["thread_id"].astext.in_(root_ids),
-                Document.metadata_["root_session_id"].astext.in_(root_ids),
+            build_conversation_companion_filter(
+                Document.tool_id,
+                Document.metadata_,
+                Document.relative_path,
+                roots_by_tool,
             ),
         )
         if device_id:
@@ -199,7 +203,7 @@ async def search(
         for row in hierarchy_rows.values()
         if row["category"] == "conversation"
     ]
-    hierarchy = fold_codex_subagents(conversation_refs)
+    hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         hierarchy,
         conversation_refs,

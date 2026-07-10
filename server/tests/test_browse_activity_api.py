@@ -113,7 +113,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
 
         payload = await list_device_tool_files(
             "device-token",
-            "codex",
+            "obsidian",
             project_id=None,
             category=None,
             offset=0,
@@ -176,7 +176,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
 
         payload = await list_device_tool_files(
             "device-token",
-            "codex",
+            "obsidian",
             project_id=str(project_id),
             category="conversation",
             offset=100,
@@ -243,7 +243,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
 
         payload = await list_device_tool_files(
             "device-token",
-            "codex",
+            "obsidian",
             project_id="none",
             category=None,
             offset=0,
@@ -258,7 +258,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
                 "id": "none",
                 "slug": "",
                 "title": "(No Project)",
-                "tool_id": "codex",
+                "tool_id": "obsidian",
                 "source_path": None,
             },
         )
@@ -271,7 +271,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await list_device_tool_files(
                 "device-token",
-                "codex",
+                "obsidian",
                 project_id="not-a-uuid",
                 category=None,
                 offset=0,
@@ -289,7 +289,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await list_device_tool_files(
                 "unknown-device",
-                "codex",
+                "obsidian",
                 project_id=str(uuid.uuid4()),
                 category=None,
                 offset=0,
@@ -310,7 +310,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await list_device_tool_files(
                 "device-token",
-                "codex",
+                "obsidian",
                 project_id=str(uuid.uuid4()),
                 category=None,
                 offset=0,
@@ -321,6 +321,84 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(len(db.statements), 2)
+
+    async def test_codex_device_files_fold_subagents_before_pagination(self) -> None:
+        machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
+        project_id = uuid.uuid4()
+        root_id = uuid.uuid4()
+        child_id = uuid.uuid4()
+        root_thread_id = str(uuid.uuid4())
+        root_activity = datetime(2026, 7, 9, 12, tzinfo=timezone.utc)
+        child_activity = datetime(2026, 7, 10, 12, tzinfo=timezone.utc)
+        project_row = (
+            project_id,
+            "codex-project",
+            "Codex project",
+            "codex",
+            "C:/src/codex-project",
+        )
+        root_row = (
+            root_id,
+            "Root",
+            "sessions/root.jsonl",
+            "conversation",
+            "jsonl",
+            100,
+            root_activity,
+            root_activity,
+            root_activity,
+            {
+                "session_id": root_thread_id,
+                "thread_id": root_thread_id,
+                "thread_source": "user",
+            },
+        )
+        child_row = (
+            child_id,
+            "Child",
+            "sessions/child.jsonl",
+            "conversation",
+            "jsonl",
+            90,
+            child_activity,
+            child_activity,
+            child_activity,
+            {
+                "session_id": str(uuid.uuid4()),
+                "thread_id": str(uuid.uuid4()),
+                "thread_source": "subagent",
+                "root_session_id": root_thread_id,
+            },
+        )
+        db = _Db([
+            _Result(scalar_value=machine),
+            _Result(rows=[project_row]),
+            _Result(rows=[root_row, child_row]),
+        ])
+
+        payload = await list_device_tool_files(
+            "device-token",
+            "codex",
+            project_id=str(project_id),
+            category=None,
+            offset=0,
+            limit=100,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual([item["id"] for item in payload["files"]], [str(root_id)])
+        self.assertEqual(payload["files"][0]["subagent_count"], 1)
+        self.assertEqual(
+            payload["files"][0]["activity_at"],
+            child_activity.isoformat(),
+        )
+        selected_keys = {
+            column.key for column in db.statements[2].selected_columns
+        }
+        self.assertIn("metadata", selected_keys)
+        self.assertNotIn("content", selected_keys)
 
     async def test_default_project_detail_does_not_select_document_payloads(self) -> None:
         project = SimpleNamespace(

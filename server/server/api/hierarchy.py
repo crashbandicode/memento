@@ -15,6 +15,12 @@ from ..services.conversation_activity import (
     conversation_list_timestamp_expression,
     effective_conversation_activity,
 )
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    FOLDABLE_CONVERSATION_TOOLS,
+    build_logical_activity_map,
+    fold_conversation_subagents,
+)
 
 router = APIRouter(prefix="/api/hierarchy", tags=["hierarchy"])
 
@@ -29,6 +35,11 @@ _DEVICE_FILE_COLUMNS = (
     Document.activity_at,
     Document.source_modified_at,
     Document.synced_at,
+)
+
+_CODEX_DEVICE_FILE_COLUMNS = (
+    *_DEVICE_FILE_COLUMNS,
+    Document.metadata_,
 )
 
 
@@ -64,6 +75,63 @@ def _device_file_row(row) -> dict:
         "activity_at": activity_at,
         "synced_at": synced_at.isoformat(),
     }
+
+
+def _fold_device_file_rows(
+    rows: list,
+    *,
+    tool_id: str,
+    offset: int,
+    limit: int,
+) -> tuple[int, list[dict]]:
+    """Fold native child transcripts before sorting and paginating."""
+    conversation_refs = [
+        ConversationRef(
+            document_id=row[0],
+            tool_id=tool_id,
+            relative_path=row[2],
+            metadata=row[9],
+            title=row[1],
+            source_modified_at=row[7],
+            activity_at=row[6],
+            synced_at=row[8],
+            file_size_bytes=row[5],
+        )
+        for row in rows
+        if row[3] == "conversation"
+    ]
+    hierarchy = fold_conversation_subagents(conversation_refs)
+    logical_activity = build_logical_activity_map(hierarchy, conversation_refs)
+    visible_rows = [
+        row
+        for row in rows
+        if row[3] != "conversation"
+        or row[0] in hierarchy.visible_document_ids
+    ]
+
+    def sort_key(row) -> tuple:
+        timestamp = (
+            logical_activity.get(row[0])
+            if row[3] == "conversation"
+            else row[8]
+        )
+        return timestamp, str(row[0])
+
+    visible_rows.sort(key=sort_key, reverse=True)
+    page = visible_rows[offset:offset + limit]
+    files = []
+    for row in page:
+        item = _device_file_row(row[:9])
+        if row[3] == "conversation":
+            timestamp = logical_activity.get(row[0])
+            if timestamp is not None:
+                item["activity_at"] = timestamp.isoformat()
+            item["subagent_count"] = hierarchy.subagent_counts.get(row[0], 0)
+            item["is_subagent_orphan"] = (
+                row[0] in hierarchy.orphan_document_ids
+            )
+        files.append(item)
+    return len(visible_rows), files
 
 
 def _project_summary(row) -> dict:
@@ -279,6 +347,23 @@ async def list_device_tool_files(
         }
     if category:
         criteria.append(Document.category == category)
+
+    # Agent-capable tools store each child as its own document. Load only the
+    # lightweight list columns plus metadata, fold once, then page visible
+    # logical files so a root with hundreds of children appears once.
+    if tool_id in FOLDABLE_CONVERSATION_TOOLS and category in (None, "conversation"):
+        folded_rows = (
+            await db.execute(
+                select(*_CODEX_DEVICE_FILE_COLUMNS).where(*criteria)
+            )
+        ).all()
+        total, files = _fold_device_file_rows(
+            folded_rows,
+            tool_id=tool_id,
+            offset=offset,
+            limit=limit,
+        )
+        return {"total": total, "files": files, "project": project}
 
     # Count directly against the filtered table.  Counting a subquery based
     # on ``select(Document)`` made PostgreSQL plan a projection containing the

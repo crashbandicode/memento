@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -19,10 +19,13 @@ from ..services.conversation_parser import (
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    FOLDABLE_CONVERSATION_TOOLS,
+    build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
     effective_conversation_timestamp,
-    fold_codex_subagents,
+    fold_conversation_subagents,
+    group_conversation_root_thread_ids,
 )
 from ..services.user_filter import user_machine_ids
 
@@ -49,28 +52,67 @@ async def get_conversation(
     """Get conversation metadata and message count."""
     mids = await user_machine_ids(db, _user)
 
-    result = await db.execute(select(Document).where(Document.id == doc_id))
+    result = await db.execute(
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.machine_id,
+            Document.tool_id,
+            Document.title,
+            Document.relative_path,
+            Document.metadata_,
+            Document.source_modified_at,
+            Document.activity_at,
+            Document.synced_at,
+            Document.file_size_bytes,
+        ))
+        .where(Document.id == doc_id)
+    )
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404)
     if mids is not None and doc.machine_id not in mids:
         raise HTTPException(status_code=404)
 
-    # Count messages efficiently (no full parse)
-    message_count = 0
-    if doc.content:
-        message_count = count_conversation_messages(doc.content, doc.tool_id)
-
+    # Normalized rows are written transactionally during ingest and are the
+    # viewer's indexed representation.  Prefer their cheap indexed count over
+    # hydrating and reparsing a potentially hundreds-of-megabytes JSONL blob.
+    count_result = await db.execute(
+        select(func.count()).where(ConversationMessage.document_id == doc_id)
+    )
+    message_count = count_result.scalar() or 0
     if message_count == 0:
-        count_result = await db.execute(
-            select(func.count()).where(ConversationMessage.document_id == doc_id)
-        )
-        message_count = count_result.scalar() or 0
+        raw_content = (
+            await db.execute(select(Document.content).where(Document.id == doc_id))
+        ).scalar_one_or_none()
+        if raw_content:
+            message_count = count_conversation_messages(raw_content, doc.tool_id)
 
     subagents: list[dict] = []
     is_subagent_orphan = False
     logical_activity: dict = {}
-    if doc.tool_id == "codex":
+    if doc.tool_id in FOLDABLE_CONVERSATION_TOOLS:
+        current_ref = ConversationRef(
+            document_id=doc.id,
+            tool_id=doc.tool_id,
+            relative_path=doc.relative_path,
+            metadata=doc.metadata_,
+            title=doc.title,
+            source_modified_at=doc.source_modified_at,
+            activity_at=doc.activity_at,
+            synced_at=doc.synced_at,
+            file_size_bytes=doc.file_size_bytes,
+        )
+        roots_by_tool = group_conversation_root_thread_ids([current_ref])
+        hierarchy_scope = or_(
+            Document.id == doc.id,
+            build_conversation_companion_filter(
+                Document.tool_id,
+                Document.metadata_,
+                Document.relative_path,
+                roots_by_tool,
+            ),
+        )
         hierarchy_q = (
             select(Document)
             .options(load_only(
@@ -86,8 +128,9 @@ async def get_conversation(
                 Document.file_size_bytes,
             ))
             .where(
-                Document.tool_id == "codex",
+                Document.tool_id == doc.tool_id,
                 Document.category == "conversation",
+                hierarchy_scope,
             )
         )
         if mids is not None:
@@ -107,7 +150,7 @@ async def get_conversation(
             )
             for item in hierarchy_docs
         ]
-        hierarchy = fold_codex_subagents(hierarchy_refs)
+        hierarchy = fold_conversation_subagents(hierarchy_refs)
         logical_activity = build_logical_activity_map(
             hierarchy,
             hierarchy_refs,
@@ -192,20 +235,87 @@ async def get_conversation_messages(
     """Get paginated, human-readable conversation messages."""
     mids = await user_machine_ids(db, _user)
 
-    result = await db.execute(select(Document).where(Document.id == doc_id))
+    result = await db.execute(
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.machine_id,
+            Document.tool_id,
+        ))
+        .where(Document.id == doc_id)
+    )
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404)
     if mids is not None and doc.machine_id not in mids:
         raise HTTPException(status_code=404)
 
+    # Prefer normalized rows. They are indexed by document and line number,
+    # preserve the viewer fields, and avoid reparsing the raw transcript for
+    # every initial page, prompt jump, and scroll page.
+    base_filter = [ConversationMessage.document_id == doc_id]
+    count_result = await db.execute(
+        select(func.count()).where(*base_filter)
+    )
+    total = count_result.scalar() or 0
+    if total > 0:
+        message_query = (
+            select(ConversationMessage)
+            .where(*base_filter)
+            .order_by(ConversationMessage.line_number)
+            .limit(limit)
+        )
+        if line_number is not None:
+            start_line = max(1, line_number - context_before)
+            start_count = await db.execute(
+                select(func.count()).where(
+                    *base_filter,
+                    ConversationMessage.line_number < start_line,
+                )
+            )
+            offset = start_count.scalar() or 0
+            message_query = message_query.where(
+                ConversationMessage.line_number >= start_line
+            )
+        else:
+            message_query = message_query.offset(offset)
+
+        msgs_result = await db.execute(message_query)
+        messages = msgs_result.scalars().all()
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "messages": [
+                {
+                    "id": m.id,
+                    "line_number": m.line_number,
+                    "role": m.role or m.message_type,
+                    "content": m.content,
+                    "thinking": (
+                        (m.metadata_ or {}).get("thinking")
+                        if m.metadata_ else None
+                    ),
+                    "tool_name": (m.metadata_ or {}).get("tool_name", ""),
+                    "tool_input": (m.metadata_ or {}).get("tool_input", ""),
+                    "tool_calls": _stored_tool_calls(m.metadata_),
+                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                    "raw_type": m.message_type or "",
+                }
+                for m in messages
+            ],
+        }
+
+    # Legacy/imported documents without normalized rows retain the tolerant
+    # raw parser as a compatibility fallback.
+    raw_content = (
+        await db.execute(select(Document.content).where(Document.id == doc_id))
+    ).scalar_one_or_none()
     if line_number is not None:
         offset = max(0, line_number - 1 - context_before)
-
-    # Parse from raw content with pagination (no full list in memory)
-    if doc.content:
-        total = count_conversation_messages(doc.content, doc.tool_id)
-        page = parse_conversation(doc.content, doc.tool_id, offset=offset, limit=limit)
+    if raw_content:
+        total = count_conversation_messages(raw_content, doc.tool_id)
+        page = parse_conversation(raw_content, doc.tool_id, offset=offset, limit=limit)
         return {
             "total": total,
             "offset": offset,
@@ -226,57 +336,7 @@ async def get_conversation_messages(
                 for i, m in enumerate(page)
             ],
         }
-
-    # Fallback to DB-stored messages
-    base_filter = [ConversationMessage.document_id == doc_id]
-    count_result = await db.execute(
-        select(func.count()).where(*base_filter)
-    )
-    total = count_result.scalar() or 0
-
-    message_query = (
-        select(ConversationMessage)
-        .where(*base_filter)
-        .order_by(ConversationMessage.line_number)
-        .limit(limit)
-    )
-
-    if line_number is not None:
-        start_line = max(1, line_number - context_before)
-        start_count = await db.execute(
-            select(func.count()).where(
-                *base_filter,
-                ConversationMessage.line_number < start_line,
-            )
-        )
-        offset = start_count.scalar() or 0
-        message_query = message_query.where(ConversationMessage.line_number >= start_line)
-    else:
-        message_query = message_query.offset(offset)
-
-    msgs_result = await db.execute(message_query)
-    messages = msgs_result.scalars().all()
-
-    return {
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "messages": [
-            {
-                "id": m.id,
-                "line_number": m.line_number,
-                "role": m.role or m.message_type,
-                "content": m.content,
-                "thinking": (m.metadata_ or {}).get("thinking") if m.metadata_ else None,
-                "tool_name": (m.metadata_ or {}).get("tool_name", ""),
-                "tool_input": (m.metadata_ or {}).get("tool_input", ""),
-                "tool_calls": _stored_tool_calls(m.metadata_),
-                "timestamp": m.timestamp.isoformat() if m.timestamp else None,
-                "raw_type": m.message_type or "",
-            }
-            for m in messages
-        ],
-    }
+    return {"total": 0, "offset": offset, "limit": limit, "messages": []}
 
 
 @router.get("/{doc_id}/prompts")
@@ -288,33 +348,28 @@ async def get_conversation_prompts(
     """Return a lightweight outline of every meaningful human prompt."""
     mids = await user_machine_ids(db, _user)
 
-    result = await db.execute(select(Document).where(Document.id == doc_id))
+    result = await db.execute(
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.machine_id,
+            Document.tool_id,
+        ))
+        .where(Document.id == doc_id)
+    )
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404)
     if mids is not None and doc.machine_id not in mids:
         raise HTTPException(status_code=404)
 
+    normalized_count = (
+        await db.execute(
+            select(func.count()).where(ConversationMessage.document_id == doc_id)
+        )
+    ).scalar() or 0
     prompts = []
-    # The viewer also parses raw content when it is present, assigning
-    # contiguous normalized line numbers. Build the outline from that same
-    # source so prompt anchors remain exact even when the stored DB rows have
-    # intentional gaps after a cleanup/backfill.
-    if doc.content:
-        parsed = parse_conversation(doc.content, doc.tool_id)
-        prompts = [
-            {
-                "id": index,
-                "line_number": index + 1,
-                "content": message.content.strip()[:500],
-                "timestamp": message.timestamp or None,
-            }
-            for index, message in enumerate(parsed)
-            if message.role == "user"
-            and message.content.strip()
-            and not message.content.lstrip().startswith("[Subagent Context]")
-        ][:2000]
-    else:
+    if normalized_count > 0:
         prompt_rows = await db.execute(
             select(
                 ConversationMessage.id,
@@ -339,5 +394,23 @@ async def get_conversation_prompts(
                 "content": clean[:500],
                 "timestamp": timestamp.isoformat() if timestamp else None,
             })
+    else:
+        raw_content = (
+            await db.execute(select(Document.content).where(Document.id == doc_id))
+        ).scalar_one_or_none()
+        if raw_content:
+            parsed = parse_conversation(raw_content, doc.tool_id)
+            prompts = [
+                {
+                    "id": index,
+                    "line_number": index + 1,
+                    "content": message.content.strip()[:500],
+                    "timestamp": message.timestamp or None,
+                }
+                for index, message in enumerate(parsed)
+                if message.role == "user"
+                and message.content.strip()
+                and not message.content.lstrip().startswith("[Subagent Context]")
+            ][:2000]
 
     return {"prompts": prompts}

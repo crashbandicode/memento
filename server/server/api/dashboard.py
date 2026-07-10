@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Date, cast, func, or_, select
+from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
@@ -17,10 +17,11 @@ from ..services.conversation_activity import (
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
+    build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
-    current_thread_id,
-    fold_codex_subagents,
+    fold_conversation_subagents,
+    group_conversation_root_thread_ids,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
@@ -92,8 +93,8 @@ async def get_dashboard(
 
     # Fetch a bounded, activity-ordered candidate set instead of folding every
     # visible conversation on each dashboard refresh.  If a candidate is a
-    # Codex subagent, pull its logical companions so the visible root still
-    # absorbs the child in dashboard presentation.
+    # child transcript, pull its logical companions so the visible root still
+    # absorbs the child in dashboard presentation for every supported tool.
     activity_expr = effective_conversation_activity_expression(
         Document.activity_at,
         Document.source_modified_at,
@@ -114,24 +115,27 @@ async def get_dashboard(
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
     candidate_rows = list((await db.execute(recent_convos_q)).all())
 
-    root_thread_ids: set[str] = set()
-    for row in candidate_rows:
-        if row[1] != "codex":
-            continue
-        metadata = row[8] or {}
-        if (
-            str(metadata.get("thread_source") or "").strip().lower() == "subagent"
-            and metadata.get("root_session_id")
-        ):
-            root_thread_ids.add(str(metadata["root_session_id"]))
-        else:
-            thread_id = current_thread_id(metadata)
-            if thread_id:
-                root_thread_ids.add(thread_id)
+    candidate_refs = [
+        ConversationRef(
+            document_id=row[0],
+            tool_id=row[1],
+            relative_path=row[7],
+            metadata=row[8],
+            title=row[2],
+            source_modified_at=row[9],
+            activity_at=row[10],
+            synced_at=row[3],
+            file_size_bytes=row[5],
+        )
+        for row in candidate_rows
+    ]
+    roots_by_tool = group_conversation_root_thread_ids(
+        candidate_refs,
+        path_children_only=True,
+    )
 
     all_convo_rows_by_id = {row[0]: row for row in candidate_rows}
-    if root_thread_ids:
-        root_ids = list(root_thread_ids)
+    if roots_by_tool:
         companions_q = (
             select(Document.id, Document.tool_id, Document.title,
                    Document.synced_at, Document.project_id, Document.file_size_bytes,
@@ -141,11 +145,11 @@ async def get_dashboard(
             .outerjoin(Project, Document.project_id == Project.id)
             .where(
                 Document.category == "conversation",
-                Document.tool_id == "codex",
-                or_(
-                    Document.metadata_["session_id"].astext.in_(root_ids),
-                    Document.metadata_["thread_id"].astext.in_(root_ids),
-                    Document.metadata_["root_session_id"].astext.in_(root_ids),
+                build_conversation_companion_filter(
+                    Document.tool_id,
+                    Document.metadata_,
+                    Document.relative_path,
+                    roots_by_tool,
                 ),
             )
         )
@@ -169,7 +173,7 @@ async def get_dashboard(
         )
         for row in all_convo_rows
     ]
-    conversation_hierarchy = fold_codex_subagents(conversation_refs)
+    conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
         conversation_refs,

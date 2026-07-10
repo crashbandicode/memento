@@ -14,7 +14,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Hashable, Iterable, Mapping
 
+from sqlalchemy import and_, false, or_
+
 from .conversation_activity import effective_conversation_activity
+
+
+FOLDABLE_CONVERSATION_TOOLS = frozenset({
+    "codex",
+    "claude_code",
+    "cursor",
+})
+_PATH_LINKED_SUBAGENT_TOOLS = frozenset({"claude_code", "cursor"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,17 +65,124 @@ def current_thread_id(metadata: Mapping[str, Any] | None) -> str | None:
     return str(value) if value else None
 
 
-def fold_codex_subagents(
+def explicit_subagent_parent_thread_id(relative_path: str | None) -> str | None:
+    """Return the parent UUID encoded by Claude/Cursor subagent paths."""
+    path = (relative_path or "").replace("\\", "/")
+    if "/subagents/" not in path:
+        return None
+    parent_base = path.split("/subagents/", 1)[0].rstrip("/")
+    parent_thread_id = parent_base.rsplit("/", 1)[-1]
+    return parent_thread_id or None
+
+
+def is_conversation_subagent(
+    tool_id: str | None,
+    relative_path: str | None,
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    """Recognize native subagent records without inspecting transcript text."""
+    if tool_id not in FOLDABLE_CONVERSATION_TOOLS:
+        return False
+    values = metadata or {}
+    if (
+        tool_id == "codex"
+        and str(values.get("thread_source") or "").strip().lower()
+        == "subagent"
+        and bool(values.get("root_session_id"))
+    ):
+        return True
+    return (
+        tool_id in _PATH_LINKED_SUBAGENT_TOOLS
+        and explicit_subagent_parent_thread_id(relative_path) is not None
+        and (
+            bool(values.get("is_subagent"))
+            or "/subagents/" in (relative_path or "").replace("\\", "/")
+        )
+    )
+
+
+def conversation_root_thread_id(
+    tool_id: str | None,
+    relative_path: str | None,
+    metadata: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the logical root ID shared by a root and all its children."""
+    if tool_id not in FOLDABLE_CONVERSATION_TOOLS:
+        return None
+    values = metadata or {}
+    if is_conversation_subagent(tool_id, relative_path, values):
+        if values.get("root_session_id"):
+            return str(values["root_session_id"])
+        return explicit_subagent_parent_thread_id(relative_path)
+    return current_thread_id(values)
+
+
+def group_conversation_root_thread_ids(
+    conversations: Iterable[ConversationRef],
+    *,
+    path_children_only: bool = False,
+) -> dict[str, set[str]]:
+    """Group represented logical roots by tool for companion queries."""
+    roots: dict[str, set[str]] = {}
+    for ref in conversations:
+        if (
+            path_children_only
+            and ref.tool_id in _PATH_LINKED_SUBAGENT_TOOLS
+            and not is_conversation_subagent(
+                ref.tool_id,
+                ref.relative_path,
+                ref.metadata,
+            )
+        ):
+            continue
+        root_thread_id = conversation_root_thread_id(
+            ref.tool_id,
+            ref.relative_path,
+            ref.metadata,
+        )
+        if ref.tool_id and root_thread_id:
+            roots.setdefault(ref.tool_id, set()).add(root_thread_id)
+    return roots
+
+
+def build_conversation_companion_filter(
+    tool_column,
+    metadata_column,
+    relative_path_column,
+    roots_by_tool: Mapping[str, Iterable[str]],
+):
+    """Build one reusable SQL predicate for roots, copies, and children."""
+    tool_scopes = []
+    for tool_id, root_values in roots_by_tool.items():
+        root_ids = sorted({str(value) for value in root_values if value})
+        if tool_id not in FOLDABLE_CONVERSATION_TOOLS or not root_ids:
+            continue
+        companion_clauses = [
+            metadata_column["session_id"].astext.in_(root_ids),
+            metadata_column["thread_id"].astext.in_(root_ids),
+            metadata_column["root_session_id"].astext.in_(root_ids),
+        ]
+        if tool_id in _PATH_LINKED_SUBAGENT_TOOLS:
+            companion_clauses.extend(
+                relative_path_column.like(f"%/{root_id}/subagents/%")
+                for root_id in root_ids
+            )
+        tool_scopes.append(
+            and_(tool_column == tool_id, or_(*companion_clauses))
+        )
+    return or_(*tool_scopes) if tool_scopes else false()
+
+
+def fold_conversation_subagents(
     conversations: Iterable[ConversationRef],
 ) -> ConversationHierarchy:
-    """Hide linked Codex children when a root is present.
+    """Hide linked Codex, Claude Code, and Cursor children under their root.
 
-    Descendants are grouped by ``root_session_id`` and counted by their own
-    ``session_id``/``thread_id`` rather than by document rows.  If the root
-    has not arrived yet, one deterministic child remains visible so the group
-    never disappears from the UI.  Explicit legacy ``/subagents/`` paths are
-    excluded; their established inline-message presentation is handled by the
-    project conversations endpoint.
+    Codex links children through metadata. Claude Code and Cursor encode the
+    parent session in their native ``/subagents/`` path. Descendants are
+    counted by their own session/thread ID rather than document rows. If the
+    root has not arrived yet, one deterministic child remains visible so the
+    group never disappears from the UI.
     """
 
     refs = list(conversations)
@@ -74,41 +191,38 @@ def fold_codex_subagents(
         ref.document_id: ref.document_id
         for ref in refs
     }
-    roots_by_thread: dict[str, list[ConversationRef]] = {}
-    children_by_root: dict[str, list[ConversationRef]] = {}
+    roots_by_thread: dict[tuple[str, str], list[ConversationRef]] = {}
+    children_by_root: dict[tuple[str, str], list[ConversationRef]] = {}
 
     for ref in refs:
-        path = (ref.relative_path or "").replace("\\", "/")
-        metadata = ref.metadata or {}
-        thread_id = current_thread_id(metadata)
-        is_metadata_child = (
-            ref.tool_id == "codex"
-            and str(metadata.get("thread_source") or "").strip().lower() == "subagent"
-            and bool(metadata.get("root_session_id"))
-            and "/subagents/" not in path
+        root_thread_id = conversation_root_thread_id(
+            ref.tool_id,
+            ref.relative_path,
+            ref.metadata,
         )
-
-        if is_metadata_child:
-            root_id = str(metadata["root_session_id"])
-            children_by_root.setdefault(root_id, []).append(ref)
-        elif (
-            ref.tool_id == "codex"
-            and thread_id
-            and "/subagents/" not in path
+        if not ref.tool_id or not root_thread_id:
+            continue
+        root_key = (ref.tool_id, root_thread_id)
+        if is_conversation_subagent(
+            ref.tool_id,
+            ref.relative_path,
+            ref.metadata,
         ):
-            roots_by_thread.setdefault(thread_id, []).append(ref)
+            children_by_root.setdefault(root_key, []).append(ref)
+        else:
+            roots_by_thread.setdefault(root_key, []).append(ref)
 
     subagent_counts: dict[Hashable, int] = {}
     orphan_ids: set[Hashable] = set()
     subagent_document_ids: dict[Hashable, tuple[Hashable, ...]] = {}
-    canonical_roots: dict[str, ConversationRef] = {}
+    canonical_roots: dict[tuple[str, str], ConversationRef] = {}
 
     # The same Codex data can be uploaded by several machines.  Canonicalize
     # those root rows by logical thread UUID before applying child groups so a
     # multi-host sync still renders exactly one top-level card.
-    for thread_id, roots in roots_by_thread.items():
+    for root_key, roots in roots_by_thread.items():
         canonical = max(roots, key=_canonical_root_sort_key)
-        canonical_roots[thread_id] = canonical
+        canonical_roots[root_key] = canonical
         visible_ids.difference_update(
             root.document_id
             for root in roots
@@ -117,7 +231,7 @@ def fold_codex_subagents(
         for root in roots:
             canonical_document_ids[root.document_id] = canonical.document_id
 
-    for root_thread_id, children in children_by_root.items():
+    for root_key, children in children_by_root.items():
         # A thread UUID identifies the logical child.  Fall back to the
         # document UUID for malformed/older metadata so it is still counted.
         children_by_thread: dict[str, list[ConversationRef]] = {}
@@ -132,7 +246,7 @@ def fold_codex_subagents(
         ]
         canonical_children.sort(key=_orphan_sort_key)
         count = len(canonical_children)
-        root = canonical_roots.get(root_thread_id)
+        root = canonical_roots.get(root_key)
 
         if root is not None:
             visible_ids.difference_update(child.document_id for child in children)
@@ -165,6 +279,13 @@ def fold_codex_subagents(
         subagent_document_ids=subagent_document_ids,
         canonical_document_ids=canonical_document_ids,
     )
+
+
+def fold_codex_subagents(
+    conversations: Iterable[ConversationRef],
+) -> ConversationHierarchy:
+    """Compatibility alias for the now cross-tool folding implementation."""
+    return fold_conversation_subagents(conversations)
 
 
 def build_subagent_summaries(
