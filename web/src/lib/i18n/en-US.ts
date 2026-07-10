@@ -149,6 +149,7 @@ const enUS: Translations = {
     messages: "messages",
     messagesTotal: "{total} messages total, {loaded} loaded",
     loadingMore: "Loading more messages...",
+    loadEarlier: "Load earlier messages",
     allLoaded: "All messages loaded",
     thinking: "Thinking",
     showThinking: "Show thinking",

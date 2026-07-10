@@ -140,6 +140,10 @@ function toolPreview(toolName: string, input: string, output: string): string {
   return fallback;
 }
 
+const MESSAGE_PAGE_SIZE = 50;
+const PROMPT_JUMP_CONTEXT_BEFORE = 12;
+const PROMPT_JUMP_WINDOW_SIZE = 120;
+
 export default function ConversationViewer({
   documentId,
   toolId,
@@ -154,32 +158,36 @@ export default function ConversationViewer({
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
+  const [hasEarlier, setHasEarlier] = useState(false);
   const [knownTotal, setKnownTotal] = useState(totalMessages);
   const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
   const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
   const { t, locale } = useI18n();
 
-  const loadMore = async () => {
-    if (loadingRef.current || !hasMore) return;
+  const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
+    if (loadingRef.current || (!force && !hasMore)) return;
     loadingRef.current = true;
     setLoading(true);
     try {
-      const res = await api.getMessages(documentId, offsetRef.current, 50);
+      const res = await api.getMessages(documentId, offsetRef.current, MESSAGE_PAGE_SIZE);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
+        if (messages.length === 0) startOffsetRef.current = res.offset;
         setMessages((prev) => {
           const existingIds = new Set(prev.map((m) => m.id));
           const newMsgs = res.messages.filter((m) => !existingIds.has(m.id));
           return [...prev, ...newMsgs];
         });
-        offsetRef.current += res.messages.length;
+        offsetRef.current = Math.max(offsetRef.current, res.offset + res.messages.length);
       }
       setHasMore(offsetRef.current < res.total);
+      setHasEarlier(startOffsetRef.current > 0);
     } catch (e) {
       console.error("Failed to load messages:", e);
     } finally {
@@ -188,17 +196,57 @@ export default function ConversationViewer({
     }
   };
 
+  const loadEarlier = async () => {
+    if (loadingRef.current || !hasEarlier) return;
+    const previousStart = startOffsetRef.current;
+    const nextOffset = Math.max(0, previousStart - MESSAGE_PAGE_SIZE);
+    const nextLimit = previousStart - nextOffset;
+    if (nextLimit <= 0) return;
+
+    const el = containerRef.current;
+    const previousScrollHeight = el?.scrollHeight ?? 0;
+    loadingRef.current = true;
+    setLoading(true);
+    try {
+      const res = await api.getMessages(documentId, nextOffset, nextLimit);
+      setKnownTotal(res.total);
+      if (res.messages.length > 0) {
+        startOffsetRef.current = res.offset;
+        setMessages((prev) => {
+          const existingIds = new Set(prev.map((message) => message.id));
+          return [
+            ...res.messages.filter((message) => !existingIds.has(message.id)),
+            ...prev,
+          ];
+        });
+        window.requestAnimationFrame(() => {
+          if (!el) return;
+          el.scrollTop += el.scrollHeight - previousScrollHeight;
+        });
+      }
+      setHasEarlier(startOffsetRef.current > 0);
+      setHasMore(offsetRef.current < res.total);
+    } catch (error) {
+      console.error("Failed to load earlier messages:", error);
+    } finally {
+      setLoading(false);
+      loadingRef.current = false;
+    }
+  };
+
   useEffect(() => {
     setMessages([]);
+    startOffsetRef.current = 0;
     offsetRef.current = 0;
     loadingRef.current = false;
     setHasMore(true);
+    setHasEarlier(false);
     setKnownTotal(totalMessages);
     setPrompts([]);
     setActivePromptLine(null);
     setPendingPromptLine(null);
     setNavigatingPromptLine(null);
-    loadMore();
+    loadMore({ force: true });
     api.getPrompts(documentId)
       .then((response) => {
         setPrompts(response.prompts);
@@ -214,7 +262,11 @@ export default function ConversationViewer({
   useEffect(() => {
     if (pendingPromptLine === null) return;
     const target = document.getElementById(`conversation-line-${pendingPromptLine}`);
-    if (!target) return;
+    if (!target) {
+      setPendingPromptLine(null);
+      setNavigatingPromptLine(null);
+      return;
+    }
     target.scrollIntoView({ behavior: "smooth", block: "start" });
     const timeout = window.setTimeout(() => {
       setPendingPromptLine(null);
@@ -262,31 +314,18 @@ export default function ConversationViewer({
       loadingRef.current = true;
       setLoading(true);
       try {
-        const collected: ConversationMessage[] = [];
-        let total = knownTotal ?? totalMessages ?? offsetRef.current;
-        while (offsetRef.current < prompt.line_number) {
-          const remaining = prompt.line_number - offsetRef.current;
-          const response = await api.getMessages(
-            documentId,
-            offsetRef.current,
-            Math.min(200, Math.max(50, remaining)),
-          );
-          total = response.total;
-          setKnownTotal(response.total);
-          if (response.messages.length === 0) break;
-          collected.push(...response.messages);
-          offsetRef.current += response.messages.length;
-        }
-        if (collected.length > 0) {
-          setMessages((previous) => {
-            const existingIds = new Set(previous.map((message) => message.id));
-            return [
-              ...previous,
-              ...collected.filter((message) => !existingIds.has(message.id)),
-            ];
-          });
-        }
-        setHasMore(offsetRef.current < total);
+        const response = await api.getMessagesAround(
+          documentId,
+          prompt.line_number,
+          PROMPT_JUMP_CONTEXT_BEFORE,
+          PROMPT_JUMP_WINDOW_SIZE,
+        );
+        setKnownTotal(response.total);
+        startOffsetRef.current = response.offset;
+        offsetRef.current = response.offset + response.messages.length;
+        setMessages(response.messages);
+        setHasEarlier(response.offset > 0);
+        setHasMore(offsetRef.current < response.total);
       } catch (error) {
         console.error("Failed to load prompt target:", error);
         setNavigatingPromptLine(null);
@@ -305,6 +344,9 @@ export default function ConversationViewer({
     <div style={{ position: "relative" }}>
       <div
         ref={containerRef}
+        data-conversation-viewer
+        data-loaded-messages={messages.length}
+        data-has-earlier={hasEarlier ? "true" : "false"}
         onScroll={handleScroll}
         className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
       >
@@ -313,6 +355,29 @@ export default function ConversationViewer({
         </div>
 
         <div className="space-y-3 max-w-4xl mx-auto pb-24 xl:pb-8">
+          {hasEarlier && (
+            <div style={{ display: "flex", justifyContent: "center" }}>
+              <button
+                type="button"
+                data-load-earlier-messages
+                onClick={loadEarlier}
+                disabled={loading}
+                style={{
+                  padding: "7px 12px",
+                  borderRadius: 999,
+                  border: "1px solid var(--aurora-border)",
+                  background: "var(--aurora-chip)",
+                  color: "var(--aurora-fg3)",
+                  fontSize: 12,
+                  cursor: loading ? "wait" : "pointer",
+                  opacity: loading ? 0.7 : 1,
+                }}
+              >
+                {t.conversation.loadEarlier}
+              </button>
+            </div>
+          )}
+
           {messages.map((msg, idx) => {
             const isHumanPrompt = (msg.role || msg.message_type) === "user"
               && !msg.content.includes("[Subagent Context]");
@@ -358,7 +423,7 @@ export default function ConversationViewer({
         {loading && (
           <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.loadingMore}</div>
         )}
-        {!hasMore && messages.length > 0 && (
+        {!hasMore && !hasEarlier && messages.length > 0 && (
           <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.allLoaded}</div>
         )}
       </div>

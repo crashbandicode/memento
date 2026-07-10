@@ -429,6 +429,14 @@ export const api = {
   getConversation: (id: string) => apiFetch<ConversationMeta>(`/api/conversations/${id}`),
   getMessages: (id: string, offset = 0, limit = 50) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
+  getMessagesAround: (id: string, lineNumber: number, contextBefore = 0, limit = 50) => {
+    const params = new URLSearchParams({
+      line_number: String(lineNumber),
+      context_before: String(contextBefore),
+      limit: String(limit),
+    });
+    return apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?${params}`);
+  },
   getPrompts: (id: string) =>
     apiFetch<ConversationPromptsResponse>(`/api/conversations/${id}/prompts`),
   getDailyDates: (days = 30, signal?: AbortSignal) => {

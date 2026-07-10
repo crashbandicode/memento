@@ -184,6 +184,8 @@ async def get_conversation_messages(
     doc_id: uuid.UUID,
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    line_number: int | None = Query(None, ge=1),
+    context_before: int = Query(0, ge=0, le=200),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -196,6 +198,9 @@ async def get_conversation_messages(
         raise HTTPException(status_code=404)
     if mids is not None and doc.machine_id not in mids:
         raise HTTPException(status_code=404)
+
+    if line_number is not None:
+        offset = max(0, line_number - 1 - context_before)
 
     # Parse from raw content with pagination (no full list in memory)
     if doc.content:
@@ -229,13 +234,27 @@ async def get_conversation_messages(
     )
     total = count_result.scalar() or 0
 
-    msgs_result = await db.execute(
+    message_query = (
         select(ConversationMessage)
         .where(*base_filter)
         .order_by(ConversationMessage.line_number)
-        .offset(offset)
         .limit(limit)
     )
+
+    if line_number is not None:
+        start_line = max(1, line_number - context_before)
+        start_count = await db.execute(
+            select(func.count()).where(
+                *base_filter,
+                ConversationMessage.line_number < start_line,
+            )
+        )
+        offset = start_count.scalar() or 0
+        message_query = message_query.where(ConversationMessage.line_number >= start_line)
+    else:
+        message_query = message_query.offset(offset)
+
+    msgs_result = await db.execute(message_query)
     messages = msgs_result.scalars().all()
 
     return {
