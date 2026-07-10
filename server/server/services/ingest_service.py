@@ -190,6 +190,13 @@ def _conversation_message_metadata(normalized) -> dict:
             strip_terminal_sequences(normalized.tool_input).replace("\x00", ""),
             MAX_STORED_AUXILIARY_CHARS,
         )
+    if normalized.session_context:
+        meta["session_context"] = _bounded_message_text(
+            strip_terminal_sequences(normalized.session_context).replace(
+                "\x00", ""
+            ),
+            MAX_STORED_AUXILIARY_CHARS,
+        )
     tool_calls = normalize_tool_calls(normalized.tool_calls)
     if tool_calls:
         meta["tool_calls"] = tool_calls
@@ -356,13 +363,24 @@ def _conversation_title_needs_derivation(
     candidate = (title or "").strip()
     if not candidate:
         return True
-    if tool_id != "codex":
-        return False
+    if tool_id == "codex":
+        from .conversation_parser import normalize_codex_user_payload
 
-    from .conversation_parser import normalize_codex_user_payload
+        role, normalized = normalize_codex_user_payload(candidate)
+        return role != "user" or normalized != candidate
+    if tool_id == "cursor":
+        from .conversation_parser import (
+            has_cursor_session_context_prefix,
+            split_cursor_user_payload,
+        )
 
-    role, normalized = normalize_codex_user_payload(candidate)
-    return role != "user" or normalized != candidate
+        normalized, _timestamp, context = split_cursor_user_payload(candidate)
+        return (
+            bool(context)
+            or normalized != candidate
+            or has_cursor_session_context_prefix(candidate)
+        )
+    return False
 
 
 def _friendly_conversation_title(
@@ -379,6 +397,10 @@ def _friendly_conversation_title(
         role, text = normalize_codex_user_payload(text)
         if role != "user":
             return None
+    elif tool_id == "cursor":
+        from .conversation_parser import split_cursor_user_payload
+
+        text, _timestamp, _context = split_cursor_user_payload(text)
     if not text or text.lower().startswith(_CLAUDE_LOCAL_COMMAND_PREFIXES):
         return None
 

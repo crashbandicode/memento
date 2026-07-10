@@ -23,6 +23,7 @@ class NormalizedMessage:
     tool_name: str = "" # If role=="tool", the tool that was used
     tool_input: str = ""  # Tool input/command
     thinking: str = ""  # Optional thinking/reasoning text kept separate from final response
+    session_context: str = ""  # Injected context kept separate from human text
     tool_calls: list[dict[str, str]] = field(default_factory=list)
     # Structured assistant tool calls. Each item has bounded ``name`` and
     # serialized ``input`` strings while the message itself remains one row.
@@ -52,6 +53,7 @@ _CODEX_SYSTEM_CONTEXT_RE = re.compile(
     r"|Files mentioned by the user\s*:"
     r"|<(?:environment_context|turn_aborted|app-context|collaboration_mode"
     r"|skills_instructions|plugins_instructions|multi_agent_mode|INSTRUCTIONS)\b"
+    r"|<(?:recommended_plugins|codex_internal_context)\b"
     r"|<permissions instructions>"
     r")",
     re.IGNORECASE,
@@ -72,6 +74,15 @@ _CURSOR_TIMESTAMP_VALUE_RE = re.compile(
 )
 _CURSOR_USER_QUERY_ENVELOPE_RE = re.compile(
     r"\A\s*<user_query>\s*(?P<content>[\s\S]*?)\s*</user_query>\s*\Z",
+    re.IGNORECASE,
+)
+_CURSOR_SESSION_CONTEXT_RE = re.compile(
+    r"\A\s*<(?P<tag>external_links|plugin_info|uploaded_documents)\b[^>]*>"
+    r"[\s\S]*?</(?P=tag)>\s*",
+    re.IGNORECASE,
+)
+_CURSOR_SESSION_CONTEXT_PREFIX_RE = re.compile(
+    r"\A\s*<(?:external_links|plugin_info|uploaded_documents)(?:\s|>)",
     re.IGNORECASE,
 )
 
@@ -112,6 +123,14 @@ def normalize_codex_user_payload(content: str) -> tuple[str, str]:
     return "user", text
 
 
+def is_claude_session_context_record(obj: dict) -> bool:
+    """Return whether Claude marks a user-shaped record as injected context."""
+    return any(
+        obj.get(name) is True
+        for name in ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly")
+    )
+
+
 def _parse_cursor_envelope_timestamp(value: str) -> str | None:
     """Return an ISO timestamp for Cursor's human-readable UTC envelope."""
     match = _CURSOR_TIMESTAMP_VALUE_RE.fullmatch(value.strip())
@@ -139,17 +158,26 @@ def _parse_cursor_envelope_timestamp(value: str) -> str | None:
     return parsed.replace(tzinfo=tz).isoformat()
 
 
-def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
-    """Remove only Cursor's leading metadata envelope from a user prompt.
+def split_cursor_user_payload(content: str) -> tuple[str, str, str]:
+    """Separate Cursor's leading context, timestamp, and human prompt.
 
-    Recent Cursor transcripts place a human-readable timestamp immediately
-    before an optional ``<user_query>`` wrapper. Literal tags elsewhere in a
-    prompt are user-authored content and must remain untouched.
+    Only balanced, leading envelopes with names observed in Cursor exports are
+    treated as product context. Literal tags inside a prompt remain untouched.
     """
-    text = content or ""
+    original = content or ""
+    text = original
+    context_parts: list[str] = []
+    while True:
+        context_match = _CURSOR_SESSION_CONTEXT_RE.match(text)
+        if context_match is None:
+            break
+        context_parts.append(context_match.group(0).strip())
+        text = text[context_match.end():]
+
     timestamp_match = _CURSOR_TIMESTAMP_ENVELOPE_RE.match(text)
     if timestamp_match is None:
-        return text, ""
+        prompt = text.strip() if context_parts else text
+        return prompt, "", "\n\n".join(context_parts)
 
     parsed_timestamp = _parse_cursor_envelope_timestamp(
         timestamp_match.group("value")
@@ -157,13 +185,25 @@ def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
     # Treat the tag as Cursor metadata only when its value has the exact
     # shape emitted by Cursor. A malformed leading tag may be user text.
     if parsed_timestamp is None:
-        return text, ""
+        prompt = text.strip() if context_parts else original
+        return prompt, "", "\n\n".join(context_parts)
     text = text[timestamp_match.end():]
 
     query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(text)
     if query_match is not None:
         text = query_match.group("content")
-    return text.strip(), parsed_timestamp
+    return text.strip(), parsed_timestamp, "\n\n".join(context_parts)
+
+
+def has_cursor_session_context_prefix(content: str | None) -> bool:
+    """Return whether text starts with a known Cursor context marker."""
+    return bool(_CURSOR_SESSION_CONTEXT_PREFIX_RE.match(content or ""))
+
+
+def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
+    """Return Cursor's human prompt and optional envelope timestamp."""
+    normalized, timestamp, _context = split_cursor_user_payload(content)
+    return normalized, timestamp
 
 
 def _codex_uuid(value: object) -> str | None:
@@ -356,6 +396,14 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             if not content.strip():
                 content = thinking
                 thinking = ""
+            if role == "user" and is_claude_session_context_record(obj):
+                return NormalizedMessage(
+                    role="system",
+                    content=content,
+                    thinking=thinking,
+                    timestamp=timestamp,
+                    raw_type="claude_context",
+                )
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
                 timestamp=timestamp, raw_type=msg_type,
@@ -592,8 +640,11 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             content, tool_calls = _extract_cursor_assistant_content(raw_content)
         else:
             content = _extract_content(raw_content)
+        session_context = ""
         if role == "user":
-            content, envelope_timestamp = normalize_cursor_user_payload(content)
+            content, envelope_timestamp, session_context = split_cursor_user_payload(
+                content
+            )
             if not envelope_timestamp:
                 # Older Cursor records can carry only the outer query wrapper.
                 # Match the whole payload so literal tags within a prompt are
@@ -604,6 +655,13 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             # Preserve a native machine timestamp if a future Cursor version
             # adds one; current transcripts carry it only in the envelope.
             timestamp = timestamp or envelope_timestamp
+            if session_context and not content.strip():
+                return NormalizedMessage(
+                    role="system",
+                    content=session_context,
+                    timestamp=timestamp,
+                    raw_type="cursor_context",
+                )
         if role in ("user", "assistant") and (content.strip() or tool_calls):
             # Skip tool_result/tool_use noise
             if not tool_calls and (
@@ -612,6 +670,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                 return None
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
+                session_context=session_context,
                 tool_calls=tool_calls, timestamp=timestamp,
                 raw_type=msg_type or role,
             )

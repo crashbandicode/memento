@@ -92,6 +92,37 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(role, "system")
         self.assertIn("environment_context", content)
 
+    def test_codex_recommended_plugins_bootstrap_is_system_context(self) -> None:
+        # Minimized from the real Dreamland Yoga "Clarify 95% usage"
+        # transcript. Codex emits this bootstrap as role=user even though it
+        # is product-provided session context, not a human prompt.
+        content = (
+            "<recommended_plugins>\n"
+            "Here is a list of plugins that are available but not installed.\n\n"
+            "- Figma (figma@openai-curated-remote)\n"
+            "- GitHub (github@openai-curated-remote)\n"
+            "</recommended_plugins>\n"
+            "# AGENTS.md instructions for C:\\repo\n"
+            "<INSTRUCTIONS>Use PowerShell.</INSTRUCTIONS>\n"
+            "<environment_context><cwd>C:\\repo</cwd></environment_context>"
+        )
+        raw = json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": content}],
+            },
+        })
+
+        msg = parse_conversation_line(raw, "codex")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "system")
+        self.assertEqual(msg.raw_type, "codex_context")
+        self.assertEqual(msg.content, content)
+
     def test_codex_plain_prompt_is_not_over_normalized(self) -> None:
         role, content = normalize_codex_user_payload(
             "Please explain how AGENTS.md instructions are loaded."
@@ -258,6 +289,50 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertIsNone(parse_conversation_line(raw, "claude_code"))
 
+    def test_claude_meta_prompt_is_session_context_not_human_input(self) -> None:
+        # Real Claude Code slash-command expansion records carry isMeta=true.
+        raw = json.dumps({
+            "type": "user",
+            "isMeta": True,
+            "timestamp": "2026-06-26T13:29:54.177Z",
+            "message": {
+                "role": "user",
+                "content": (
+                    "# /loop — schedule a recurring or self-paced prompt\n\n"
+                    "Synthetic command instructions.\n\n"
+                    "## Input\n\n15m Check prod for auth errors."
+                ),
+            },
+        })
+
+        msg = parse_conversation_line(raw, "claude_code")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "system")
+        self.assertEqual(msg.raw_type, "claude_context")
+
+    def test_claude_compaction_summary_is_session_context(self) -> None:
+        raw = json.dumps({
+            "type": "user",
+            "isCompactSummary": True,
+            "isVisibleInTranscriptOnly": True,
+            "message": {
+                "role": "user",
+                "content": (
+                    "This session is being continued from a previous "
+                    "conversation that ran out of context."
+                ),
+            },
+        })
+
+        msg = parse_conversation_line(raw, "claude_code")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "system")
+        self.assertEqual(msg.raw_type, "claude_context")
+
     def test_cursor_timestamp_envelope_is_removed_and_parsed(self) -> None:
         raw = json.dumps({
             "role": "user",
@@ -281,6 +356,53 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.role, "user")
         self.assertEqual(msg.content, "Move this workspace to Windows.")
         self.assertEqual(msg.timestamp, "2026-06-24T09:08:00-04:00")
+
+    def test_cursor_external_links_context_is_separated_from_prompt(self) -> None:
+        content = (
+            "<external_links>\n"
+            "### Potentially Relevant Websearch Results\n"
+            "Website URL: https://example.com\n"
+            "</external_links>\n"
+            "<timestamp>Friday, Jun 26, 2026, 12:35 PM (UTC-4)</timestamp>\n\n"
+            "don't raise the gap, we haven't had any oom issues"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(
+            msg.content,
+            "don't raise the gap, we haven't had any oom issues",
+        )
+        self.assertEqual(msg.timestamp, "2026-06-26T12:35:00-04:00")
+        self.assertIn("Potentially Relevant Websearch Results", msg.session_context)
+
+    def test_cursor_plugin_context_is_separated_from_prompt(self) -> None:
+        content = (
+            '<plugin_info kind="matched_installed">\n'
+            "display_name: Datadog\n"
+            "</plugin_info>\n\n"
+            "Can you inspect the dashboard without modifying anything?"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(
+            msg.content,
+            "Can you inspect the dashboard without modifying anything?",
+        )
+        self.assertIn("display_name: Datadog", msg.session_context)
 
     def test_cursor_utc_timestamp_envelope_uses_explicit_utc(self) -> None:
         raw = json.dumps({

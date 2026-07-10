@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import unittest
 import uuid
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.scripts.backfill_conversation_presentation import (  # noqa: E402
     BackfillStats,
+    _claude_context_identities,
     _codex_title_from_messages,
     _conversation_embedding_rows_query,
     _cursor_repair_document_ids_query,
@@ -141,6 +143,48 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         self.assertEqual(message.timestamp, existing)
         self.assertEqual(message.content, "Keep this prompt")
 
+    def test_cursor_context_is_separated_and_preserved_in_metadata(self) -> None:
+        message = SimpleNamespace(
+            role="user",
+            content=(
+                "<uploaded_documents>\n- C:\\tmp\\report.md\n"
+                "</uploaded_documents>\n\nReview the report."
+            ),
+            metadata_={},
+            timestamp=None,
+        )
+
+        changed, backfilled, preserved = _normalize_cursor_stored_message(message)
+
+        self.assertTrue(changed)
+        self.assertFalse(backfilled)
+        self.assertFalse(preserved)
+        self.assertEqual(message.content, "Review the report.")
+        self.assertIn("uploaded_documents", message.metadata_["session_context"])
+
+    def test_claude_context_scan_uses_native_metadata_not_prompt_text(self) -> None:
+        synthetic = json.dumps({
+            "type": "user",
+            "isMeta": True,
+            "timestamp": "2026-06-26T13:29:54.177Z",
+            "message": {"role": "user", "content": "Continue the monitor."},
+        })
+        human = json.dumps({
+            "type": "user",
+            "timestamp": "2026-06-26T13:30:54.177Z",
+            "message": {"role": "user", "content": "Continue the monitor."},
+        })
+
+        identities, count = _claude_context_identities(
+            f"{synthetic}\n{human}\n"
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            identities,
+            {("Continue the monitor.", "2026-06-26T13:29:54")},
+        )
+
     def test_invalid_cursor_timestamp_candidate_is_an_exact_noop(self) -> None:
         content = "<timestamp>sometime soon</timestamp> keep literal text"
         message = SimpleNamespace(content=content, timestamp=None)
@@ -175,6 +219,25 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         )
 
         self.assertEqual(title, "Find the root cause")
+
+    def test_truncated_cursor_context_title_uses_first_human_prompt(self) -> None:
+        title, manual_preserved = _cursor_title_from_messages(
+            '<plugin_info kind="matched_installed"> display_name: Datadog…',
+            [
+                SimpleNamespace(
+                    line_number=1,
+                    role="user",
+                    content="Can you inspect the dashboard without modifying it?",
+                )
+            ],
+            {},
+        )
+
+        self.assertFalse(manual_preserved)
+        self.assertEqual(
+            title,
+            "Can you inspect the dashboard without modifying it?",
+        )
 
     def test_legitimate_title_is_preserved(self) -> None:
         title = _codex_title_from_messages(
@@ -332,10 +395,13 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         self.assertIn("documents.tool_id", sql)
         self.assertIn("documents.category", sql)
         self.assertIn("exists (select 1", sql)
-        self.assertGreaterEqual(sql.count("~*"), 2)
-        self.assertGreaterEqual(
-            sum(value == r"^\s*<timestamp>" for value in params.values()),
-            2,
+        self.assertGreaterEqual(sql.count("~*"), 1)
+        self.assertIn(r"^\s*<timestamp>", params.values())
+        self.assertTrue(
+            any(
+                isinstance(value, str) and "external_links" in value
+                for value in params.values()
+            )
         )
 
     def test_cursor_batch_refreshes_dependent_state_and_model_input(self) -> None:

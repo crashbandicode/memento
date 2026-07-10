@@ -1135,6 +1135,131 @@ function ConversationToolCard({
   );
 }
 
+function sessionContextSummary(
+  content: string,
+  t: ReturnType<typeof useI18n>["t"],
+): string {
+  if (/<recommended_plugins\b/i.test(content)) return t.conversation.recommendedPlugins;
+  if (/<external_links\b/i.test(content)) return t.conversation.webSearchContext;
+  if (/<plugin_info\b/i.test(content)) return t.conversation.pluginContext;
+  if (/<uploaded_documents\b/i.test(content)) return t.conversation.uploadedDocuments;
+  if (/<codex_internal_context\b[^>]*\bsource=["']goal["']/i.test(content)) {
+    return t.conversation.activeGoalContext;
+  }
+  if (/This session is being continued from a previous conversation/i.test(content)) {
+    return t.conversation.conversationSummary;
+  }
+  if (/AGENTS\.md instructions|Base directory for this skill:/i.test(content)) {
+    return t.conversation.workspaceInstructions;
+  }
+  return t.conversation.sessionContextHint;
+}
+
+function ConversationContextCard({
+  content,
+  t,
+}: {
+  content: string;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = sessionContextSummary(content, t);
+
+  return (
+    <div
+      data-conversation-context
+      style={{
+        width: "100%",
+        minWidth: 0,
+        border: "1px dashed color-mix(in srgb, var(--aurora-fg4) 34%, var(--aurora-border))",
+        borderRadius: 11,
+        background: "color-mix(in srgb, var(--aurora-chip) 52%, transparent)",
+        overflow: "hidden",
+      }}
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        style={{
+          width: "100%",
+          minHeight: 46,
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          padding: "9px 12px",
+          border: 0,
+          background: "transparent",
+          color: "var(--aurora-fg2)",
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <span
+          aria-hidden="true"
+          style={{
+            width: 28,
+            height: 28,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flex: "0 0 auto",
+            borderRadius: 9,
+            background: "color-mix(in srgb, var(--aurora-accent) 10%, var(--aurora-surface-solid))",
+            color: "var(--aurora-accent)",
+          }}
+        >
+          <Icon name="layers" size={14} />
+        </span>
+        <span style={{ minWidth: 0, display: "grid", gap: 1 }}>
+          <span style={{ fontSize: 11.5, fontWeight: 650 }}>{t.conversation.sessionContext}</span>
+          <span
+            style={{
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              color: "var(--aurora-fg4)",
+              fontSize: 10.5,
+            }}
+          >
+            {summary}
+          </span>
+        </span>
+        <Icon
+          name="chevron_down"
+          size={13}
+          style={{
+            marginLeft: "auto",
+            color: "var(--aurora-fg4)",
+            transform: expanded ? "rotate(180deg)" : "none",
+            transition: "transform .15s ease",
+          }}
+        />
+      </button>
+      {expanded && (
+        <pre
+          style={{
+            margin: 0,
+            maxHeight: "min(50vh, 480px)",
+            overflow: "auto",
+            padding: "12px 14px",
+            borderTop: "1px solid var(--aurora-border)",
+            color: "var(--aurora-fg3)",
+            background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
+            fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
+            fontSize: 11,
+            lineHeight: 1.5,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {content}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 export const ChatBubble = memo(function ChatBubble({
   msg,
   toolId = "",
@@ -1151,6 +1276,7 @@ export const ChatBubble = memo(function ChatBubble({
   const content = cleanTerminalText(msg.content);
   const toolInput = cleanTerminalText(msg.tool_input ?? "");
   const thinking = cleanTerminalText(msg.thinking?.trim() || "");
+  const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   const [expanded, setExpanded] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
 
@@ -1229,6 +1355,11 @@ export const ChatBubble = memo(function ChatBubble({
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0 }}>
+          {sessionContext && (
+            <div style={{ marginBottom: 8 }}>
+              <ConversationContextCard content={sessionContext} t={t} />
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
             <span
               aria-hidden="true"
@@ -1450,7 +1581,14 @@ export const ChatBubble = memo(function ChatBubble({
     return <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />;
   }
 
-  // System — centered amber
+  const isSessionContext = /(?:^|_)(?:codex|claude|cursor)_context$/i.test(
+    msg.raw_type || msg.message_type || "",
+  ) || /^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)/i.test(content);
+  if (isSessionContext) {
+    return <ConversationContextCard content={content} t={t} />;
+  }
+
+  // Other system notices remain compact and centered.
   return (
     <div style={{ display: "flex", justifyContent: "center" }}>
       <div

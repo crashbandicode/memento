@@ -298,6 +298,9 @@ async def get_conversation_messages(
                     ),
                     "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                     "tool_input": (m.metadata_ or {}).get("tool_input", ""),
+                    "session_context": (m.metadata_ or {}).get(
+                        "session_context", ""
+                    ),
                     "tool_calls": _stored_tool_calls(m.metadata_),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
@@ -329,6 +332,7 @@ async def get_conversation_messages(
                     "thinking": m.thinking or None,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
+                    "session_context": m.session_context,
                     "tool_calls": _parsed_tool_calls(m),
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,

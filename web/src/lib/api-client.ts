@@ -247,6 +247,7 @@ export interface ConversationMessage {
   role: string | null;
   content: string;
   thinking?: string | null;
+  session_context?: string | null;
   tool_name?: string;
   tool_input?: string;
   tool_calls?: Array<{

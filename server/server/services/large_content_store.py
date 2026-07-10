@@ -89,3 +89,34 @@ def read_large_content_prefix(
         if close is not None:
             close()
     return payload.decode("utf-8", errors="replace")
+
+
+def read_large_content(
+    key: str,
+    *,
+    max_bytes: int = 128 * 1024 * 1024,
+    s3_client=None,
+) -> str:
+    """Read one bounded private transcript for an offline repair operation."""
+    if max_bytes <= 0:
+        return ""
+    client = s3_client or _client()
+    response = client.get_object(Bucket=settings.s3_bucket, Key=key)
+    declared_size = int(response.get("ContentLength", -1))
+    if declared_size > max_bytes:
+        body = response.get("Body")
+        if body is not None and getattr(body, "close", None) is not None:
+            body.close()
+        raise ValueError(
+            f"externalized transcript exceeds repair limit: {declared_size} bytes"
+        )
+    body = response["Body"]
+    try:
+        payload = body.read(max_bytes + 1)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+    if len(payload) > max_bytes:
+        raise ValueError("externalized transcript exceeds repair limit")
+    return payload.decode("utf-8", errors="replace")

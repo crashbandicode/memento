@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from collections import defaultdict
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -21,12 +22,18 @@ from server.db.models import ConversationMessage, Document, DocumentEmbedding
 from server.db.session import async_session_factory, engine
 from server.services.conversation_parser import (
     _extract_local_command,
+    _iter_json_objects,
     extract_codex_session_metadata,
+    has_cursor_session_context_prefix,
+    is_claude_session_context_record,
     normalize_codex_user_payload,
-    normalize_cursor_user_payload,
+    parse_conversation_line,
+    split_cursor_user_payload,
+    strip_terminal_sequences,
 )
 from server.services.ingest_service import (
     MAX_SEARCH_TEXT_CHARS,
+    MAX_STORED_MESSAGE_CHARS,
     _bounded_message_text,
     _conversation_title_needs_derivation,
     _friendly_codex_agent_title,
@@ -40,7 +47,10 @@ from server.services.embedding_service import (
     embedding_input_hash,
 )
 from server.services.conversation_activity import refresh_document_activity_at
-from server.services.large_content_store import read_large_content_prefix
+from server.services.large_content_store import (
+    read_large_content,
+    read_large_content_prefix,
+)
 from server.services.thread_metadata_service import _has_manual_title
 
 
@@ -61,6 +71,10 @@ CODEX_MIRROR_MESSAGE_TYPES = frozenset({"response_item", "user_message"})
 class BackfillStats:
     converted_local_commands: int = 0
     removed_local_command_caveats: int = 0
+    scanned_claude_context_records: int = 0
+    reclassified_claude_context: int = 0
+    existing_claude_context: int = 0
+    unmatched_claude_context_records: int = 0
     normalized_codex_prompts: int = 0
     reclassified_codex_context: int = 0
     deduplicated_codex_prompts: int = 0
@@ -70,6 +84,7 @@ class BackfillStats:
     invalidated_embedding_documents: int = 0
     cursor_candidate_documents: int = 0
     normalized_cursor_prompts: int = 0
+    separated_cursor_context: int = 0
     removed_cursor_envelope_only_messages: int = 0
     backfilled_cursor_message_timestamps: int = 0
     preserved_cursor_message_timestamps: int = 0
@@ -103,6 +118,13 @@ def _has_leading_cursor_timestamp(value: str | None) -> bool:
     return (value or "").lstrip().lower().startswith("<timestamp>")
 
 
+def _has_leading_cursor_envelope(value: str | None) -> bool:
+    """Return whether text begins with a known Cursor transport envelope."""
+    return _has_leading_cursor_timestamp(value) or has_cursor_session_context_prefix(
+        value
+    )
+
+
 def _normalize_cursor_stored_message(message) -> tuple[bool, bool, bool]:
     """Normalize one stored Cursor row.
 
@@ -112,16 +134,28 @@ def _normalize_cursor_stored_message(message) -> tuple[bool, bool, bool]:
     Invalid or user-authored ``<timestamp>`` text is an exact no-op.
     """
     content = message.content or ""
-    normalized, envelope_timestamp = normalize_cursor_user_payload(content)
-    if not envelope_timestamp:
+    normalized, envelope_timestamp, session_context = split_cursor_user_payload(
+        content
+    )
+    if not envelope_timestamp and not session_context:
         return False, False, False
 
     content_changed = normalized != content
     if content_changed:
         message.content = normalized
 
+    metadata_changed = False
+    if session_context:
+        metadata = dict(getattr(message, "metadata_", None) or {})
+        if metadata.get("session_context") != session_context:
+            metadata["session_context"] = session_context
+            message.metadata_ = metadata
+            metadata_changed = True
+
+    if not envelope_timestamp:
+        return content_changed or metadata_changed, False, False
     if message.timestamp is not None:
-        return content_changed, False, True
+        return content_changed or metadata_changed, False, True
 
     try:
         message.timestamp = datetime.fromisoformat(envelope_timestamp)
@@ -130,8 +164,12 @@ def _normalize_cursor_stored_message(message) -> tuple[bool, bool, bool]:
         # future parser regression cannot partially mutate production rows.
         if content_changed:
             message.content = content
+        if metadata_changed:
+            metadata = dict(getattr(message, "metadata_", None) or {})
+            metadata.pop("session_context", None)
+            message.metadata_ = metadata
         return False, False, False
-    return content_changed, True, False
+    return content_changed or metadata_changed, True, False
 
 
 def _cursor_title_from_messages(
@@ -140,10 +178,14 @@ def _cursor_title_from_messages(
     metadata: dict | None = None,
 ) -> tuple[str | None, bool]:
     """Return ``(title, manual_title_preserved)`` for an affected Cursor row."""
-    normalized_title, envelope_timestamp = normalize_cursor_user_payload(
-        current_title or ""
+    normalized_title, envelope_timestamp, session_context = (
+        split_cursor_user_payload(current_title or "")
     )
-    if not envelope_timestamp:
+    if (
+        not envelope_timestamp
+        and not session_context
+        and not has_cursor_session_context_prefix(current_title)
+    ):
         return current_title, False
 
     if _has_manual_title(metadata or {}):
@@ -379,6 +421,155 @@ async def _externalized_prefix(key: str) -> str:
         ) from exc
 
 
+async def _externalized_content(key: str) -> str:
+    try:
+        return await asyncio.to_thread(read_large_content, key)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to read externalized transcript for context repair: {key}"
+        ) from exc
+
+
+def _timestamp_bucket(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        value = value.isoformat()
+    return str(value).replace("Z", "+00:00")[:19]
+
+
+def _claude_context_identities(raw_content: str) -> tuple[set[tuple[str, str]], int]:
+    """Return stored-row identities for Claude's authoritative context flags."""
+    identities: set[tuple[str, str]] = set()
+    records = 0
+    for raw_object in _iter_json_objects(raw_content):
+        try:
+            obj = json.loads(raw_object)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict) or not is_claude_session_context_record(obj):
+            continue
+        parsed = parse_conversation_line(raw_object, "claude_code")
+        if (
+            parsed is None
+            or parsed.role != "system"
+            or parsed.raw_type != "claude_context"
+        ):
+            # Local-command records can also be isMeta=true; the shared parser
+            # intentionally keeps those as compact tool rows instead.
+            continue
+        clean_content = _bounded_message_text(
+            strip_terminal_sequences(parsed.content).replace("\x00", ""),
+            MAX_STORED_MESSAGE_CHARS,
+        )
+        if not clean_content.strip():
+            continue
+        identities.add((clean_content, _timestamp_bucket(parsed.timestamp)))
+        records += 1
+    return identities, records
+
+
+async def _repair_claude_context_batch(
+    db,
+    document_ids: list,
+) -> BackfillStats:
+    """Reclassify Claude's raw-metadata context rows without guessing by text."""
+    stats = BackfillStats()
+    rows = await db.execute(
+        select(
+            Document,
+            (func.coalesce(func.length(Document.content), 0) > 0).label(
+                "has_inline_embedding_content"
+            ),
+        )
+        .options(load_only(
+            Document.id,
+            Document.title,
+            Document.content,
+            Document.content_s3_key,
+        ))
+        .where(Document.id.in_(document_ids))
+        .with_for_update(of=Document)
+    )
+    documents: dict = {}
+    identities_by_document: dict = {}
+    inline_embedding_documents: set = set()
+    for document, has_inline_embedding_content in rows.all():
+        documents[document.id] = document
+        if has_inline_embedding_content:
+            inline_embedding_documents.add(document.id)
+        raw_content = document.content or ""
+        if not raw_content and document.content_s3_key:
+            raw_content = await _externalized_content(document.content_s3_key)
+        identities, record_count = _claude_context_identities(raw_content)
+        identities_by_document[document.id] = identities
+        stats.scanned_claude_context_records += record_count
+
+    fallback_embedding_documents = set(documents) - inline_embedding_documents
+    embedding_content_before = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+
+    message_rows = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.document_id.in_(document_ids),
+            ConversationMessage.role.in_(("user", "system")),
+        )
+        .order_by(
+            ConversationMessage.document_id,
+            ConversationMessage.line_number,
+            ConversationMessage.id,
+        )
+        .with_for_update(of=ConversationMessage)
+    )
+    matched_by_document: dict = defaultdict(set)
+    changed_documents: set = set()
+    for message in message_rows.scalars():
+        identity = (
+            message.content or "",
+            _timestamp_bucket(message.timestamp),
+        )
+        if identity not in identities_by_document.get(message.document_id, set()):
+            continue
+        matched_by_document[message.document_id].add(identity)
+        if message.role == "system" and message.message_type == "claude_context":
+            stats.existing_claude_context += 1
+            continue
+        message.role = "system"
+        message.message_type = "claude_context"
+        changed_documents.add(message.document_id)
+        stats.reclassified_claude_context += 1
+
+    stats.unmatched_claude_context_records = sum(
+        len(identities - matched_by_document.get(document_id, set()))
+        for document_id, identities in identities_by_document.items()
+    )
+    await db.flush()
+
+    for document_id in sorted(changed_documents, key=str):
+        await _refresh_document_search(db, documents[document_id])
+        stats.refreshed_search_documents += 1
+
+    embedding_content_after = await _conversation_embedding_content_by_document(
+        db,
+        fallback_embedding_documents,
+    )
+    embedding_changed_documents = {
+        document_id
+        for document_id in fallback_embedding_documents
+        if _embedding_input_changed(
+            has_inline_content=False,
+            previous_message_content=embedding_content_before.get(document_id, ""),
+            current_message_content=embedding_content_after.get(document_id, ""),
+        )
+    }
+    await _invalidate_changed_embeddings(db, embedding_changed_documents)
+    stats.invalidated_embedding_documents += len(embedding_changed_documents)
+    return stats
+
+
 async def _set_batch_timeouts(db) -> None:
     await db.execute(text("SET LOCAL statement_timeout = '25min'"))
     await db.execute(
@@ -536,7 +727,10 @@ def _cursor_repair_document_ids_query():
         .where(
             ConversationMessage.document_id == Document.id,
             ConversationMessage.role == "user",
-            ConversationMessage.content.op("~*")(r"^\s*<timestamp>"),
+            ConversationMessage.content.op("~*")(
+                r"^\s*<(timestamp|external_links|plugin_info|uploaded_documents)"
+                r"([[:space:]>])"
+            ),
         )
         .correlate(Document)
     )
@@ -615,10 +809,13 @@ async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
     for document_id, messages in messages_by_document.items():
         retained_messages = []
         for message in messages:
-            if not _has_leading_cursor_timestamp(message.content):
+            if not _has_leading_cursor_envelope(message.content):
                 retained_messages.append(message)
                 continue
 
+            had_context = bool(
+                split_cursor_user_payload(message.content or "")[2]
+            )
             content_changed, timestamp_backfilled, timestamp_preserved = (
                 _normalize_cursor_stored_message(message)
             )
@@ -631,7 +828,18 @@ async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
             if content_changed:
                 search_changed_documents.add(document_id)
                 stats.normalized_cursor_prompts += 1
+                if had_context:
+                    stats.separated_cursor_context += 1
             if not (message.content or "").strip():
+                metadata = dict(message.metadata_ or {})
+                context = str(metadata.pop("session_context", "")).strip()
+                if context:
+                    message.role = "system"
+                    message.message_type = "cursor_context"
+                    message.content = context
+                    message.metadata_ = metadata
+                    retained_messages.append(message)
+                    continue
                 await db.delete(message)
                 search_changed_documents.add(document_id)
                 stats.removed_cursor_envelope_only_messages += 1
@@ -646,30 +854,26 @@ async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
     await db.flush()
 
     for document_id, document in documents.items():
-        if _has_leading_cursor_timestamp(document.title):
-            normalized_title, envelope_timestamp = normalize_cursor_user_payload(
-                document.title or ""
+        if _has_leading_cursor_envelope(document.title):
+            normalized_title, _envelope_timestamp, _session_context = (
+                split_cursor_user_payload(document.title or "")
             )
-            if not envelope_timestamp:
+            activity_refresh_documents.add(document_id)
+            repaired_title, manual_preserved = _cursor_title_from_messages(
+                document.title,
+                messages_by_document.get(document_id, []),
+                document.metadata_,
+            )
+            if manual_preserved:
+                stats.preserved_manual_cursor_titles += 1
+            elif repaired_title and repaired_title != document.title:
+                document.title = repaired_title
+                search_changed_documents.add(document_id)
+                stats.renamed_conversations += 1
+                stats.rederived_cursor_titles += 1
+            elif normalized_title != document.title:
+                # This should only be reachable for an empty normalized title.
                 stats.invalid_cursor_envelopes += 1
-            else:
-                activity_refresh_documents.add(document_id)
-                repaired_title, manual_preserved = _cursor_title_from_messages(
-                    document.title,
-                    messages_by_document.get(document_id, []),
-                    document.metadata_,
-                )
-                if manual_preserved:
-                    stats.preserved_manual_cursor_titles += 1
-                elif repaired_title and repaired_title != document.title:
-                    document.title = repaired_title
-                    search_changed_documents.add(document_id)
-                    stats.renamed_conversations += 1
-                    stats.rederived_cursor_titles += 1
-                elif normalized_title != document.title:
-                    # This should only be reachable for an empty normalized
-                    # title. Report it as invalid rather than blanking a row.
-                    stats.invalid_cursor_envelopes += 1
 
     await db.flush()
 
@@ -725,6 +929,23 @@ async def backfill(
                 await db.rollback()
             else:
                 await db.commit()
+
+            claude_document_ids = list((await db.execute(
+                select(Document.id)
+                .where(
+                    Document.tool_id == "claude_code",
+                    Document.category == "conversation",
+                )
+                .order_by(Document.id)
+            )).scalars())
+            for offset in range(0, len(claude_document_ids), batch_size):
+                await _set_batch_timeouts(db)
+                batch = claude_document_ids[offset:offset + batch_size]
+                stats.add(await _repair_claude_context_batch(db, batch))
+                if dry_run:
+                    await db.rollback()
+                else:
+                    await db.commit()
 
             document_ids = list((await db.execute(
                 select(Document.id)
