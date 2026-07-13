@@ -3,16 +3,14 @@
 import {
   memo,
   type KeyboardEvent as ReactKeyboardEvent,
-  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import Link from "next/link";
-import { api, ConversationMessage, ConversationPrompt, invalidateConversationPrompts } from "@/lib/api-client";
+import { api, ConversationMessage, ConversationPrompt } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
-import { useSSE } from "@/lib/use-sse";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 
@@ -148,11 +146,13 @@ const PROMPT_JUMP_WINDOW_SIZE = 120;
 
 export default function ConversationViewer({
   documentId,
+  prompts,
   toolId,
   totalMessages,
   artifacts,
 }: {
   documentId: string;
+  prompts: ConversationPrompt[];
   toolId?: string;
   totalMessages?: number;
   artifacts?: Artifact[];
@@ -162,7 +162,6 @@ export default function ConversationViewer({
   const [hasMore, setHasMore] = useState(true);
   const [hasEarlier, setHasEarlier] = useState(false);
   const [knownTotal, setKnownTotal] = useState(totalMessages);
-  const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
   const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
@@ -170,24 +169,7 @@ export default function ConversationViewer({
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
-  const promptRefreshTimer = useRef<number | null>(null);
   const { t, locale } = useI18n();
-
-  const refreshPrompts = useCallback(async (initial = false) => {
-    try {
-      const response = await api.getPrompts(documentId);
-      setPrompts(response.prompts);
-      setActivePromptLine((previous) => {
-        if (initial) return response.prompts[0]?.line_number ?? null;
-        if (previous !== null && response.prompts.some((prompt) => prompt.line_number === previous)) {
-          return previous;
-        }
-        return response.prompts.at(-1)?.line_number ?? null;
-      });
-    } catch (error) {
-      console.error("Failed to load prompt outline:", error);
-    }
-  }, [documentId]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -261,35 +243,22 @@ export default function ConversationViewer({
     setHasMore(true);
     setHasEarlier(false);
     setKnownTotal(totalMessages);
-    setPrompts([]);
     setActivePromptLine(null);
     setPendingPromptLine(null);
     setNavigatingPromptLine(null);
     loadMore({ force: true });
-    void refreshPrompts(true);
-  }, [documentId, refreshPrompts]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // The dashboard already listens for collector file_synced events, but an
-  // open conversation used to fetch its prompt rail only on mount. Refresh
-  // the lightweight outline when this exact transcript is ingested; debounce
-  // chunked uploads so a burst triggers one request, not one per chunk.
-  useSSE((event) => {
-    if (event.data.document_id !== documentId) return;
-    if (promptRefreshTimer.current !== null) clearTimeout(promptRefreshTimer.current);
-    promptRefreshTimer.current = window.setTimeout(() => {
-      promptRefreshTimer.current = null;
-      invalidateConversationPrompts(documentId);
-      void refreshPrompts();
-    }, 250);
-  });
-
-  useEffect(() => () => {
-    if (promptRefreshTimer.current !== null) clearTimeout(promptRefreshTimer.current);
-  }, []);
+  }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (typeof totalMessages === "number") setKnownTotal(totalMessages);
   }, [totalMessages]);
+
+  useEffect(() => {
+    setActivePromptLine((previous) => {
+      if (previous !== null && prompts.some((prompt) => prompt.line_number === previous)) return previous;
+      return prompts[0]?.line_number ?? null;
+    });
+  }, [prompts]);
 
   useEffect(() => {
     if (pendingPromptLine === null) return;

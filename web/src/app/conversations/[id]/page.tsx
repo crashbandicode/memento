@@ -8,6 +8,7 @@ import ConversationViewer from "@/components/viewers/ConversationViewer";
 import { ToolGlyph } from "@/components/aurora/Icon";
 import { Chip } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
+import { useConversationPrompts } from "@/lib/use-conversation-prompts";
 
 interface RelatedPlan {
   id: string;
@@ -29,6 +30,7 @@ export default function ConversationPage() {
   const docId = params.id as string;
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
   const { t, locale } = useI18n();
+  const prompts = useConversationPrompts(docId);
 
   useEffect(() => {
     let cancelled = false;
@@ -152,6 +154,7 @@ export default function ConversationPage() {
       )}
       <ConversationViewer
         documentId={docId}
+        prompts={prompts}
         toolId={currentMeta?.tool_id}
         totalMessages={currentMeta?.message_count}
         artifacts={plans}
