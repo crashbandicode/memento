@@ -57,6 +57,9 @@ let state = {
   // openDashboard().
   dashboardLoadedFor: null,
   dashboardMinting: false,
+  // The framed web app reports route changes because its cross-origin URL is
+  // unreadable from this shell. Used to preserve context across Reload.
+  dashboardPath: "/app",
   // A github_login (system-browser OAuth + 127.0.0.1 loopback) is running.
   // The login page's button can be clicked again before the Rust side
   // resolves; a second run would open a second browser window and bind a
@@ -137,24 +140,38 @@ function deriveWebUrl(apiUrl) {
 // window.location.replace(); a second navigation races it and logs the user
 // straight back out (that regression looked like "logged out on every other
 // refresh").
-async function dashboardUrlFor(apiUrl, token, webBase) {
+function normalizeDashboardPath(path, webBase) {
+  try {
+    const target = new URL(path || "/app", webBase);
+    if (target.origin !== new URL(webBase).origin || !target.pathname.startsWith("/")) return "/app";
+    return `${target.pathname}${target.search}`;
+  } catch {
+    return "/app";
+  }
+}
+
+async function dashboardUrlFor(apiUrl, token, webBase, path = "/app") {
+  const nextPath = normalizeDashboardPath(path, webBase);
+  const embedPath = new URL(nextPath, webBase);
+  embedPath.searchParams.set("embed", "memento");
+  const next = `${embedPath.pathname}${embedPath.search}`;
   // Never logged in on this device — no collector token to exchange. Go to the
   // login page directly rather than /app, which would flash "Failed to load
   // dashboard" while AuthProvider redirects.
-  if (!token) return `${webBase}/auth/login?embed=memento&next=/app`;
+  if (!token) return `${webBase}/auth/login?embed=memento&next=${encodeURIComponent(next)}`;
   try {
     const jwt = await invoke("mint_web_token", {
       serverUrl: apiUrl,
       collectorToken: token,
     });
-    const p = new URLSearchParams({ token: jwt, next: "/app?embed=memento" });
+    const p = new URLSearchParams({ token: jwt, next });
     return `${webBase}/auth/handoff#${p.toString()}`;
   } catch (e) {
     // Offline, server down, or the token was revoked. Fall back to /app so a
     // user whose iframe storage is still intact gets in anyway; if it isn't,
     // the web app redirects to its own login. Not worth alarming anyone over.
     console.warn("mint_web_token failed, falling back to iframe-local auth:", e);
-    return `${webBase}/app?embed=memento`;
+    return `${webBase}${next}`;
   }
 }
 
@@ -176,8 +193,8 @@ async function openDashboard() {
   frame.classList.remove("hidden");
   document.body.classList.add("dashboard-fullscreen");
   const webBase = deriveWebUrl(apiUrl);
-  // Show the clean /app URL (never the token-bearing handoff URL).
-  urlEl.textContent = `${webBase}/app`;
+  // Show the current clean route (never the token-bearing handoff URL).
+  urlEl.textContent = `${webBase}${state.dashboardPath}`;
 
   // Already loaded for this server — don't re-mint + reload every time
   // the user flips back to the Dashboard tab.
@@ -197,7 +214,7 @@ async function openDashboard() {
   try {
     // ?embed=memento makes the web post the collector token back to us on the
     // next in-iframe login event; older web builds just ignore it.
-    iframe.src = await dashboardUrlFor(apiUrl, token, webBase);
+    iframe.src = await dashboardUrlFor(apiUrl, token, webBase, state.dashboardPath);
     state.dashboardLoadedFor = apiUrl;
   } finally {
     state.dashboardMinting = false;
@@ -227,7 +244,7 @@ async function reloadDashboardFrame() {
   const webBase = deriveWebUrl(apiUrl);
   state.dashboardMinting = true;
   try {
-    iframe.src = await dashboardUrlFor(apiUrl, token, webBase);
+    iframe.src = await dashboardUrlFor(apiUrl, token, webBase, state.dashboardPath);
     state.dashboardLoadedFor = apiUrl;
   } finally {
     state.dashboardMinting = false;
@@ -595,7 +612,7 @@ async function adoptCollectorToken(token, { refreshDashboard = false } = {}) {
 }
 
 // ─── Messages from the embedded dashboard ─────────────────────────
-// Two things the framed web app asks of us, both origin-guarded against the
+// Three things the framed web app asks of us, all origin-guarded against the
 // configured web origin (deriveWebUrl maps the saved API base to it):
 //
 //   memento:token         — the user logged in / registered *inside* the
@@ -608,9 +625,11 @@ async function adoptCollectorToken(token, { refreshDashboard = false } = {}) {
 //                           OAuth flow: system browser + a one-shot 127.0.0.1
 //                           loopback listener that delivers the collector
 //                           token back (see src-tauri/src/auth.rs).
+//   memento:navigation    — its current same-origin route, reported because
+//                           the parent cannot read a cross-origin iframe URL.
 window.addEventListener("message", async (evt) => {
   const data = evt.data;
-  if (!data || (data.type !== "memento:token" && data.type !== "memento:github-login")) return;
+  if (!data || !["memento:token", "memento:github-login", "memento:navigation"].includes(data.type)) return;
   const apiUrl = (state.config?.server_url || "").trim();
   if (!apiUrl) return;
   // Origin guard: only accept messages from the configured web origin. This
@@ -620,6 +639,19 @@ window.addEventListener("message", async (evt) => {
   try { expectedOrigin = new URL(deriveWebUrl(apiUrl)).origin; } catch { /* invalid url */ }
   if (!expectedOrigin || evt.origin !== expectedOrigin) {
     console.warn(`${data.type} from unexpected origin`, evt.origin);
+    return;
+  }
+
+  const iframe = document.getElementById("dashboardIframe");
+  if (evt.source !== iframe?.contentWindow) {
+    console.warn(`${data.type} from unexpected frame`);
+    return;
+  }
+
+  if (data.type === "memento:navigation") {
+    state.dashboardPath = normalizeDashboardPath(data.path, deriveWebUrl(apiUrl));
+    const urlEl = document.getElementById("dashboardUrl");
+    if (urlEl) urlEl.textContent = `${deriveWebUrl(apiUrl)}${state.dashboardPath}`;
     return;
   }
 

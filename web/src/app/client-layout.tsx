@@ -57,6 +57,17 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
     document.documentElement.lang = locale === "zh-CN" ? "zh" : "en";
   }, [locale, t.app.title, t.app.subtitle, pathname]);
 
+  // The desktop shell cannot inspect a cross-origin iframe's current URL.
+  // Report route changes explicitly so its Reload button can mint a fresh
+  // session without dropping the user back at /app.
+  useEffect(() => {
+    if (window.parent === window || pathname === "/auth/handoff") return;
+    window.parent.postMessage({
+      type: "memento:navigation",
+      path: `${window.location.pathname}${window.location.search}`,
+    }, "*");
+  }, [pathname]);
+
   return (
     <ThemeProvider>
       <I18nContext.Provider value={{ locale, t, setLocale: handleSetLocale }}>

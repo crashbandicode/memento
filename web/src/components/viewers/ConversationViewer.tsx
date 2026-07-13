@@ -3,14 +3,16 @@
 import {
   memo,
   type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import Link from "next/link";
-import { api, ConversationMessage, ConversationPrompt } from "@/lib/api-client";
+import { api, ConversationMessage, ConversationPrompt, invalidateConversationPrompts } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
+import { useSSE } from "@/lib/use-sse";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 
@@ -168,7 +170,24 @@ export default function ConversationViewer({
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
+  const promptRefreshTimer = useRef<number | null>(null);
   const { t, locale } = useI18n();
+
+  const refreshPrompts = useCallback(async (initial = false) => {
+    try {
+      const response = await api.getPrompts(documentId);
+      setPrompts(response.prompts);
+      setActivePromptLine((previous) => {
+        if (initial) return response.prompts[0]?.line_number ?? null;
+        if (previous !== null && response.prompts.some((prompt) => prompt.line_number === previous)) {
+          return previous;
+        }
+        return response.prompts.at(-1)?.line_number ?? null;
+      });
+    } catch (error) {
+      console.error("Failed to load prompt outline:", error);
+    }
+  }, [documentId]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -247,13 +266,26 @@ export default function ConversationViewer({
     setPendingPromptLine(null);
     setNavigatingPromptLine(null);
     loadMore({ force: true });
-    api.getPrompts(documentId)
-      .then((response) => {
-        setPrompts(response.prompts);
-        setActivePromptLine(response.prompts[0]?.line_number ?? null);
-      })
-      .catch((error) => console.error("Failed to load prompt outline:", error));
-  }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+    void refreshPrompts(true);
+  }, [documentId, refreshPrompts]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The dashboard already listens for collector file_synced events, but an
+  // open conversation used to fetch its prompt rail only on mount. Refresh
+  // the lightweight outline when this exact transcript is ingested; debounce
+  // chunked uploads so a burst triggers one request, not one per chunk.
+  useSSE((event) => {
+    if (event.data.document_id !== documentId) return;
+    if (promptRefreshTimer.current !== null) clearTimeout(promptRefreshTimer.current);
+    promptRefreshTimer.current = window.setTimeout(() => {
+      promptRefreshTimer.current = null;
+      invalidateConversationPrompts(documentId);
+      void refreshPrompts();
+    }, 250);
+  });
+
+  useEffect(() => () => {
+    if (promptRefreshTimer.current !== null) clearTimeout(promptRefreshTimer.current);
+  }, []);
 
   useEffect(() => {
     if (typeof totalMessages === "number") setKnownTotal(totalMessages);

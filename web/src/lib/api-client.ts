@@ -60,6 +60,11 @@ export function invalidateApiCache(prefix?: string) {
   for (const k of _cache.keys()) if (k.startsWith(prefix)) _cache.delete(k);
 }
 
+/** Drop the cached prompt outline for one conversation after its transcript changes. */
+export function invalidateConversationPrompts(id: string) {
+  invalidateApiCache(`${getApiBase()}/api/conversations/${id}/prompts`);
+}
+
 function getCached<T>(cacheKey: string): T | null {
   const hit = _cache.get(cacheKey);
   if (!hit) return null;
