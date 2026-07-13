@@ -53,6 +53,11 @@ let state = {
   // openDashboard().
   dashboardLoadedFor: null,
   dashboardMinting: false,
+  // A github_login (system-browser OAuth + 127.0.0.1 loopback) is running.
+  // The login page's button can be clicked again before the Rust side
+  // resolves; a second run would open a second browser window and bind a
+  // second listener. One at a time.
+  githubLoginInFlight: false,
 };
 
 // ─── Tabs ──────────────────────────────────────────────────────────
@@ -195,17 +200,22 @@ async function openDashboard() {
   }
 }
 
-document.getElementById("dashboardReload")?.addEventListener("click", async () => {
-  // Never contentWindow.location.reload(): the iframe is cross-origin with the
-  // Tauri parent (allow-same-origin makes it same-origin with the *server*,
-  // not with us), so touching it throws SecurityError. Reassigning src is the
-  // only way to reload it.
-  //
-  // Reload goes through dashboardUrlFor() too, so a manual refresh re-mints the
-  // JWT and an expired session heals itself. It's an explicit user action, so
-  // it deliberately bypasses the dashboardLoadedFor guard — but it still honors
-  // dashboardMinting, so hammering the button can't put two navigations in
-  // flight at once.
+// Force the dashboard iframe to reload with a freshly minted session.
+//
+// Never contentWindow.location.reload(): the iframe is cross-origin with the
+// Tauri parent (allow-same-origin makes it same-origin with the *server*, not
+// with us), so touching it throws SecurityError. Reassigning src is the only
+// way to reload it.
+//
+// Going through dashboardUrlFor() re-mints the web JWT, so an expired session
+// heals itself. This is only ever called for an explicit user action (the
+// reload button, or a completed out-of-frame GitHub sign-in), so it
+// deliberately bypasses the dashboardLoadedFor guard — but it still honors
+// dashboardMinting, so hammering it can't put two navigations in flight at
+// once, and it assigns iframe.src exactly ONCE (see dashboardUrlFor's
+// constraint: a second navigation races /auth/handoff's location.replace()
+// and logs the user straight back out).
+async function reloadDashboardFrame() {
   const iframe = document.getElementById("dashboardIframe");
   const apiUrl = (state.config?.server_url || "").trim();
   const token = (state.config?.server_token || "").trim();
@@ -218,6 +228,10 @@ document.getElementById("dashboardReload")?.addEventListener("click", async () =
   } finally {
     state.dashboardMinting = false;
   }
+}
+
+document.getElementById("dashboardReload")?.addEventListener("click", () => {
+  reloadDashboardFrame().catch((e) => console.warn("dashboard reload:", e));
 });
 
 document.getElementById("dashboardOpenExternal")?.addEventListener("click", async () => {
@@ -475,49 +489,116 @@ $("#saveBtn").addEventListener("click", async () => {
   }
 });
 
-// ─── Token hand-off from the embedded dashboard ───────────────────
-// First-time flow: the iframe shows the web's login/register page, the
-// user authenticates, and the web (knowing it's embedded by us) posts
-// `{ type: "memento:token", collector_token }` to window.parent. We
-// validate the message origin against the configured server, then save
-// the token and (re)start the collector — the only place this app
-// learns the token at all.
+// ─── Adopting a collector token ───────────────────────────────────
+// The collector token is this app's whole identity: it's what the daemon
+// syncs with, what configure_mcp writes into every AI tool's MCP entry,
+// and what mint_web_token exchanges for a web session. Whichever way we
+// got hold of one (in-iframe login, or the out-of-frame GitHub loopback),
+// the post-auth work is the same — so it lives here, once.
+//
+// `refreshDashboard` is the ONE difference between the two callers; see the
+// comments at the bottom. Getting it wrong reintroduces the double-navigation
+// bug that used to log people out on every other refresh.
+async function adoptCollectorToken(token, { refreshDashboard = false } = {}) {
+  state.config = { ...(state.config || {}), server_token: token };
+  const cfg = readForm();
+  await invoke("save_config", { cfg });
+  state.config = cfg;
+  try {
+    await invoke("configure_mcp", {
+      serverUrl: cfg.server_url,
+      serverToken: cfg.server_token,
+    });
+  } catch (e) { console.warn("configure_mcp:", e); }
+  // Replace any running collector with one that uses the new token.
+  try { await invoke("sidecar_stop"); } catch (e) { console.warn("sidecar_stop:", e); }
+  try { await invoke("sidecar_start"); } catch (e) { console.warn("sidecar_start:", e); }
+
+  if (refreshDashboard) {
+    // GitHub loopback path: the iframe never navigated (the OAuth dance
+    // happened in the system browser), so it's still parked on the login
+    // page with no navigation of its own in flight — there is nothing to
+    // race. Reload it exactly once, through the dashboardMinting-guarded
+    // helper, so it comes back up already signed in via /auth/handoff.
+    await reloadDashboardFrame();
+  } else {
+    // In-iframe login path: do NOT touch the iframe here — the user already
+    // authenticated inside it and is mid-navigation to /app. Force-reloading
+    // via the SSO handoff would race that navigation and look like a logout
+    // flash. The handoff path is reserved for the next time the user opens
+    // the Dashboard tab fresh (state.dashboardLoadedFor !== url).
+    // Remember the current load so the tab-flip skip still works.
+    state.dashboardLoadedFor = (state.config?.server_url || "").trim();
+  }
+}
+
+// ─── Messages from the embedded dashboard ─────────────────────────
+// Two things the framed web app asks of us, both origin-guarded against the
+// configured web origin (deriveWebUrl maps the saved API base to it):
+//
+//   memento:token         — the user logged in / registered *inside* the
+//                           iframe and the web handed us the collector token.
+//                           The only place this app learns the token at all.
+//   memento:github-login  — the user clicked "Continue with GitHub". That
+//                           can't run in-frame (github.com/login/oauth/authorize
+//                           sends `x-frame-options: deny`), so the page hands
+//                           the click to us and we run the standard desktop
+//                           OAuth flow: system browser + a one-shot 127.0.0.1
+//                           loopback listener that delivers the collector
+//                           token back (see src-tauri/src/auth.rs).
 window.addEventListener("message", async (evt) => {
   const data = evt.data;
-  if (!data || data.type !== "memento:token" || !data.collector_token) return;
+  if (!data || (data.type !== "memento:token" && data.type !== "memento:github-login")) return;
   const apiUrl = (state.config?.server_url || "").trim();
   if (!apiUrl) return;
-  // Origin guard: only accept messages from the configured web origin.
-  // deriveWebUrl maps the saved API base to the web origin.
+  // Origin guard: only accept messages from the configured web origin. This
+  // matters just as much for github-login as for the token — without it any
+  // page we happened to frame could kick off a sign-in flow.
   let expectedOrigin = "";
   try { expectedOrigin = new URL(deriveWebUrl(apiUrl)).origin; } catch { /* invalid url */ }
   if (!expectedOrigin || evt.origin !== expectedOrigin) {
-    console.warn("memento:token from unexpected origin", evt.origin);
+    console.warn(`${data.type} from unexpected origin`, evt.origin);
     return;
   }
-  try {
-    state.config = { ...(state.config || {}), server_token: data.collector_token };
-    const cfg = readForm();
-    await invoke("save_config", { cfg });
-    state.config = cfg;
+
+  if (data.type === "memento:token") {
+    if (!data.collector_token) return;
     try {
-      await invoke("configure_mcp", {
-        serverUrl: cfg.server_url,
-        serverToken: cfg.server_token,
-      });
-    } catch (e) { console.warn("configure_mcp:", e); }
-    // Replace any running collector with one that uses the new token.
-    try { await invoke("sidecar_stop"); } catch (e) { console.warn("sidecar_stop:", e); }
-    try { await invoke("sidecar_start"); } catch (e) { console.warn("sidecar_start:", e); }
-    // Do NOT touch the iframe here — the user already authenticated
-    // inside it and is mid-navigation to /app. Force-reloading via the
-    // SSO handoff would race that navigation and look like a logout
-    // flash. The handoff path is reserved for the next time the user
-    // opens the Dashboard tab fresh (state.dashboardLoadedFor !== url).
-    // Remember the current load so the tab-flip skip still works.
-    state.dashboardLoadedFor = (state.config?.server_url || "").trim();
+      await adoptCollectorToken(data.collector_token);
+    } catch (e) {
+      console.warn("memento:token handler:", e);
+    }
+    return;
+  }
+
+  // memento:github-login — the button is disabled in the page once it posts,
+  // but a stale/duplicated message must not spawn a second browser window and
+  // a second loopback listener.
+  if (state.githubLoginInFlight) return;
+  state.githubLoginInFlight = true;
+  try {
+    // Blocks until the user finishes in their browser and the loopback
+    // listener gets the token (or the Rust side times out after 5 minutes /
+    // rejects a bad nonce).
+    const res = await invoke("github_login", { serverUrl: apiUrl });
+    if (!res?.collector_token) throw new Error(t("auth.githubFailed"));
+    await adoptCollectorToken(res.collector_token, { refreshDashboard: true });
+    flash("ok", t("auth.okLoggedIn"));
   } catch (e) {
-    console.warn("memento:token handler:", e);
+    console.warn("github_login:", e);
+    // CmdError serializes as { message }; a thrown JS Error has .message too.
+    flash("err", e?.message || String(e) || t("auth.githubFailed"));
+    // Abandoned / timed-out / failed: the login page left its GitHub button
+    // disabled ("continue in your browser…"), so leaving the frame as-is would
+    // wedge the user with no way to retry. Reload it back to a fresh login
+    // page. Guarded + single-assignment like every other src write.
+    try {
+      await reloadDashboardFrame();
+    } catch (e2) {
+      console.warn("dashboard reload after failed github_login:", e2);
+    }
+  } finally {
+    state.githubLoginInFlight = false;
   }
 });
 

@@ -238,6 +238,10 @@ const enUS: Translations = {
     signingIn: "Signing you in…",
     githubOauthFailed: "GitHub sign-in failed, please try again",
     accountDisabled: "Account is not active",
+    returningToApp: "Returning to Memento…",
+    continueInBrowser: "Continue in your browser",
+    desktopHandoffFailed:
+      "Couldn't hand the session back to the desktop app — please sign in again",
   },
 
   // Token display + profile

@@ -63,6 +63,10 @@ const STRINGS = {
     "auth.needCreds": "Email and password are required.",
     "auth.okRegistered": "Registered — starting to sync…",
     "auth.okLoggedIn": "Signed in — starting to sync…",
+    // Fallback only: github_login normally rejects with its own detailed
+    // message (browser closed, timed out, nonce mismatch), which we show
+    // verbatim.
+    "auth.githubFailed": "GitHub sign-in failed. Please try again.",
     "update.text": "New version",
     "update.available": "available.",
     "update.upToDate": "You're on the latest version.",
@@ -133,6 +137,7 @@ const STRINGS = {
     "auth.needCreds": "邮箱和密码不能为空。",
     "auth.okRegistered": "注册成功,开始采集…",
     "auth.okLoggedIn": "登录成功,开始采集…",
+    "auth.githubFailed": "GitHub 登录失败,请重试。",
     "update.text": "新版本",
     "update.available": "可用。",
     "update.upToDate": "已是最新版本。",

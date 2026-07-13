@@ -18,10 +18,43 @@ export function GithubMark({ size = 16 }: { size?: number }) {
   );
 }
 
+/**
+ * Are we running inside the Memento desktop app's dashboard iframe?
+ * Same detection auth-context.tsx uses for maybePostTokenToDesktop(): the
+ * desktop loads the iframe with ?embed=memento once, which is stashed in
+ * sessionStorage so it survives the login redirect chain (which strips the
+ * query string).
+ */
+function isMementoEmbedded(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    if (new URLSearchParams(window.location.search).get("embed") === "memento") {
+      sessionStorage.setItem("memento_embed", "1");
+    }
+    if (sessionStorage.getItem("memento_embed") !== "1") return false;
+    return !!window.parent && window.parent !== window;
+  } catch {
+    return false;
+  }
+}
+
 /** Divider + "Continue with GitHub" button (full-page redirect to the API). */
 export function GithubLoginSection() {
   const { t } = useI18n();
+  const [handedToDesktop, setHandedToDesktop] = useState(false);
   const handleGithub = () => {
+    // Embedded in the desktop app: a redirect to github.com would die in the
+    // iframe (github.com/login/oauth/authorize sends `x-frame-options: deny`).
+    // Hand off to the parent instead — the desktop runs the OAuth flow in the
+    // system browser and collects the result over a 127.0.0.1 loopback listener.
+    if (isMementoEmbedded()) {
+      // targetOrigin "*": the parent is the desktop's tauri:// custom protocol
+      // whose origin we can't reliably know. The message carries no secret —
+      // it's a bare "the user clicked GitHub" signal.
+      window.parent.postMessage({ type: "memento:github-login" }, "*");
+      setHandedToDesktop(true);
+      return;
+    }
     // Read ?next= at click time from window.location (event handler — the
     // idiom these pages use instead of useSearchParams, which would force
     // them out of Next 16's static prerender).
@@ -45,9 +78,10 @@ export function GithubLoginSection() {
         size="lg"
         style={{ width: "100%", justifyContent: "center", gap: 8 }}
         onClick={handleGithub}
+        disabled={handedToDesktop}
       >
         <GithubMark size={16} />
-        {t.auth.continueWithGithub}
+        {handedToDesktop ? t.auth.continueInBrowser : t.auth.continueWithGithub}
       </Btn>
     </>
   );

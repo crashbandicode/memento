@@ -17,8 +17,17 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-/** Routes that don't require authentication — landing and auth pages. */
-const PUBLIC_PATHS = ["/", "/auth/login", "/auth/register", "/auth/handoff", "/auth/callback"];
+/** Routes that don't require authentication — landing and auth pages.
+ *  /auth/desktop does its own token check (it reads dr_token straight from
+ *  localStorage): AuthProvider must not bounce it to /auth/login mid-handoff. */
+const PUBLIC_PATHS = [
+  "/",
+  "/auth/login",
+  "/auth/register",
+  "/auth/handoff",
+  "/auth/callback",
+  "/auth/desktop",
+];
 
 /// Post the user's collector token to the parent window (the Memento
 /// desktop app) so it can configure + start the collector daemon. Only

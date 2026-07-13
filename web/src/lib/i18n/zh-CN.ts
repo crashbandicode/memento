@@ -248,6 +248,9 @@ const zhCN = {
     signingIn: "正在登录…",
     githubOauthFailed: "GitHub 登录失败,请重试",
     accountDisabled: "账号未激活或已停用",
+    returningToApp: "正在返回 Memento…",
+    continueInBrowser: "已在浏览器中打开,请在那里继续",
+    desktopHandoffFailed: "无法把登录信息交回桌面端,请重新登录",
   },
 
   // Token display + profile
