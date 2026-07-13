@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ConversationPrompt, invalidateConversationPrompts } from "./api-client";
+import { api, ConversationPrompt, invalidateConversationMessages, invalidateConversationPrompts } from "./api-client";
 import { useSSE } from "./use-sse";
 
 /**
@@ -9,8 +9,9 @@ import { useSSE } from "./use-sse";
  * transcript renderer. Large conversations can therefore refresh the mobile
  * navigator before their message body has finished rendering.
  */
-export function useConversationPrompts(documentId: string): ConversationPrompt[] {
+export function useConversationPrompts(documentId: string) {
   const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
+  const [syncVersion, setSyncVersion] = useState(0);
   const refreshTimer = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
@@ -33,6 +34,8 @@ export function useConversationPrompts(documentId: string): ConversationPrompt[]
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = null;
       invalidateConversationPrompts(documentId);
+      invalidateConversationMessages(documentId);
+      setSyncVersion((version) => version + 1);
       void refresh();
     }, 250);
   });
@@ -41,5 +44,5 @@ export function useConversationPrompts(documentId: string): ConversationPrompt[]
     if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
   }, []);
 
-  return prompts;
+  return { prompts, syncVersion };
 }

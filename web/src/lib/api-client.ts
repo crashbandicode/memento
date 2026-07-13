@@ -65,6 +65,11 @@ export function invalidateConversationPrompts(id: string) {
   invalidateApiCache(`${getApiBase()}/api/conversations/${id}/prompts`);
 }
 
+/** Drop cached message pages for one conversation after its transcript changes. */
+export function invalidateConversationMessages(id: string) {
+  invalidateApiCache(`${getApiBase()}/api/conversations/${id}/messages`);
+}
+
 function getCached<T>(cacheKey: string): T | null {
   const hit = _cache.get(cacheKey);
   if (!hit) return null;

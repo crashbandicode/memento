@@ -30,7 +30,7 @@ export default function ConversationPage() {
   const docId = params.id as string;
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
   const { t, locale } = useI18n();
-  const prompts = useConversationPrompts(docId);
+  const { prompts, syncVersion } = useConversationPrompts(docId);
 
   useEffect(() => {
     let cancelled = false;
@@ -155,6 +155,7 @@ export default function ConversationPage() {
       <ConversationViewer
         documentId={docId}
         prompts={prompts}
+        syncVersion={syncVersion}
         toolId={currentMeta?.tool_id}
         totalMessages={currentMeta?.message_count}
         artifacts={plans}

@@ -147,12 +147,14 @@ const PROMPT_JUMP_WINDOW_SIZE = 120;
 export default function ConversationViewer({
   documentId,
   prompts,
+  syncVersion,
   toolId,
   totalMessages,
   artifacts,
 }: {
   documentId: string;
   prompts: ConversationPrompt[];
+  syncVersion: number;
   toolId?: string;
   totalMessages?: number;
   artifacts?: Artifact[];
@@ -248,6 +250,13 @@ export default function ConversationViewer({
     setNavigatingPromptLine(null);
     loadMore({ force: true });
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A collector append emits one route-level sync signal. Fetch only the
+  // unseen tail and merge by id, preserving the reader's current position.
+  useEffect(() => {
+    if (syncVersion === 0) return;
+    void loadMore({ force: true });
+  }, [syncVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (typeof totalMessages === "number") setKnownTotal(totalMessages);
