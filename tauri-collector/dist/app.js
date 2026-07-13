@@ -29,6 +29,10 @@ const tauriProcess = window.__TAURI__.process; // .relaunch()
 // the tray for weeks, so this — not the check at startup — is what actually
 // delivers updates to anyone who doesn't reboot often.
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;  // 6 hours
+// This is deliberately a notice-only check. Installable updates always come
+// from crashbandicode/memento through Tauri's signed updater feed; an upstream
+// tag merely tells us that the fork should be rebased and rebuilt.
+const UPSTREAM_RELEASE_API = "https://api.github.com/repos/ddong8/memento/releases/latest";
 
 // Same set the Python collector knows about. Keep names in sync with
 // collector/collector/tools/*.py — these are the values used to index
@@ -300,16 +304,16 @@ async function boot() {
     activateTab("dashboard");
   }
 
-  // Fire-and-forget update check. Failures (no network, rate-limited
-  // GitHub API) are silent — banner just won't appear.
-  checkForUpdate().catch(() => {});
+  // Fire-and-forget checks. The signed fork feed is always checked first;
+  // upstream is only a notice source when this fork is already current.
+  checkReleaseStatus().catch(() => {});
 
   // ...and keep checking. Memento lives in the tray for weeks at a time, and
   // the webview is never reloaded while it does, so a one-shot check at
   // startup means a long-running instance never learns about anything
   // published after it launched. (Observed: an instance up for 7 days sat
   // through four releases without a peep.)
-  setInterval(() => { checkForUpdate().catch(() => {}); }, UPDATE_CHECK_INTERVAL_MS);
+  setInterval(() => { checkReleaseStatus().catch(() => {}); }, UPDATE_CHECK_INTERVAL_MS);
 
   // Tray menu "Check for updates" → Rust emits this. Clear the session
   // dismissal and force a fresh check; if no update, show a brief notice
@@ -321,8 +325,11 @@ async function boot() {
       if (update?.available) {
         await checkForUpdate();
       } else {
-        const v = await tauriApp.getVersion();
-        flash("ok", `Memento v${v} · ${t("update.upToDate")}`);
+        const upstreamFound = await checkForUpstreamRelease();
+        if (!upstreamFound) {
+          const v = await tauriApp.getVersion();
+          flash("ok", `Memento v${v} · ${t("update.upToDate")}`);
+        }
       }
     } catch (e) {
       flash("err", String(e?.message || e));
@@ -356,8 +363,8 @@ async function boot() {
 }
 
 // ─── Update check (Tauri auto-updater) ────────────────────────────
-// Uses tauri-plugin-updater under the hood:
-//   1. Fetches https://github.com/.../releases/latest/download/latest.json
+// Uses tauri-plugin-updater under the hood against this fork's release feed:
+//   1. Fetches crashbandicode/memento's latest.json
 //   2. Verifies the bundled .sig with our embedded ed25519 pubkey
 //   3. Downloads the signed NSIS installer to a temp dir
 //   4. Runs the installer; on Windows it self-terminates the running app,
@@ -370,16 +377,21 @@ async function checkForUpdate() {
     console.warn("Update check failed:", e);
     return;  // network down / signature invalid / endpoint 404 — silent
   }
-  if (!update?.available) return;
+  if (!update?.available) return false;
 
   // Dismissal is remembered per *version*, and deliberately checked after the
   // fetch rather than before it: brushing off v1 must not also silence v2.
   // (It used to store a bare "1", so one "Later" click muted every future
   // release for the life of the process — which, for a tray app, is forever.)
-  if (sessionStorage.getItem("update_dismissed") === update.version) return;
+  if (sessionStorage.getItem("fork_update_dismissed") === update.version) return true;
 
   // Mount the banner first so the user can dismiss without confirming.
-  showUpdateBanner(update.version, async () => {
+  showUpdateBanner({
+    message: `Memento v${update.version} is ready from this fork.`,
+    actionLabel: "Install",
+    dismissalKey: "fork_update_dismissed",
+    version: update.version,
+    onAction: async () => {
     if (!confirm(`Install Memento v${update.version} now? The app will restart automatically.`)) return;
     const banner = document.getElementById("updateBanner");
     banner.classList.add("hidden");
@@ -407,19 +419,69 @@ async function checkForUpdate() {
     } catch (e) {
       status.textContent = `Update failed: ${e?.message || e}`;
     }
+    },
   });
+  return true;
 }
 
-function showUpdateBanner(version, onInstall) {
+async function checkReleaseStatus() {
+  const forkUpdateAvailable = await checkForUpdate();
+  if (!forkUpdateAvailable) await checkForUpstreamRelease();
+}
+
+function compareVersions(left, right) {
+  const parts = (version) => String(version).replace(/^v/, "").split(/[.+-]/)
+    .slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+  const a = parts(left);
+  const b = parts(right);
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+async function checkForUpstreamRelease() {
+  let release;
+  try {
+    const response = await fetch(UPSTREAM_RELEASE_API, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!response.ok) return false;
+    release = await response.json();
+  } catch (e) {
+    console.warn("Upstream release notice check failed:", e);
+    return false;
+  }
+
+  const upstreamVersion = release?.tag_name?.replace(/^v/, "");
+  const currentVersion = await tauriApp.getVersion();
+  if (!upstreamVersion || compareVersions(upstreamVersion, currentVersion) <= 0) return false;
+  if (sessionStorage.getItem("upstream_release_dismissed") === upstreamVersion) return true;
+
+  showUpdateBanner({
+    message: `Upstream Memento v${upstreamVersion} is available; this fork needs a rebase before it can be installed.`,
+    actionLabel: "View release",
+    dismissalKey: "upstream_release_dismissed",
+    version: upstreamVersion,
+    onAction: async () => {
+      if (typeof release.html_url === "string" && release.html_url.startsWith("https://")) {
+        await tauriShell.open(release.html_url);
+      }
+    },
+  });
+  return true;
+}
+
+function showUpdateBanner({ message, actionLabel, dismissalKey, version, onAction }) {
   const banner = document.getElementById("updateBanner");
-  document.getElementById("updateBannerVersion").textContent = `v${version}`;
+  document.getElementById("updateBannerMessage").textContent = message;
   const link = document.getElementById("updateBannerDownload");
-  link.textContent = "Install";
+  link.textContent = actionLabel;
   link.href = "#";
-  link.onclick = (e) => { e.preventDefault(); onInstall(); };
+  link.onclick = (e) => { e.preventDefault(); onAction(); };
   document.getElementById("updateBannerDismiss").onclick = () => {
     banner.classList.add("hidden");
-    sessionStorage.setItem("update_dismissed", version);
+    sessionStorage.setItem(dismissalKey, version);
   };
   banner.classList.remove("hidden");
 }

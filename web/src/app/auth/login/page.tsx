@@ -12,6 +12,7 @@ import { GithubLoginSection, useGithubEnabled, useOauthErrorMessage } from "../g
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
   const [error, setError] = useState("");
   const { login } = useAuth();
   const { t } = useI18n();
@@ -23,7 +24,7 @@ export default function LoginPage() {
     e.preventDefault();
     setError("");
     try {
-      await login(email, password);
+      await login(email, password, totpCode);
       // Honor ?next= so visitors landing on a directed share land back on it
       // after authenticating, instead of dropping into the dashboard. Read
       // from window.location instead of useSearchParams() because the latter
@@ -115,6 +116,14 @@ export default function LoginPage() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
+            icon="lock"
+          />
+          <GhostInput
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            placeholder="Authenticator code (if enabled)"
+            value={totpCode}
+            onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
             icon="lock"
           />
           <Btn type="submit" size="lg" style={{ marginTop: 6, width: "100%", justifyContent: "center" }} iconRight="arrow_right">

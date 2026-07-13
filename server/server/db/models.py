@@ -265,6 +265,8 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | active | disabled
     collector_token: Mapped[str | None] = mapped_column(String(64), unique=True)
     github_id: Mapped[str | None] = mapped_column(String(50))
+    totp_secret: Mapped[str | None] = mapped_column(Text)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

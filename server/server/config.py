@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,9 +64,15 @@ class Settings(BaseSettings):
     #   closed      — registration endpoint refuses everyone
     registration_mode: str = "open"
 
+    # Restrict a deployment to its owner/admin account(s). This is stronger
+    # than registration_mode=closed: it also blocks existing viewer tokens,
+    # collector tokens, password logins, and GitHub OAuth identities.
+    single_user_mode: bool = False
+
     # GitHub OAuth login — set both to enable "Continue with GitHub".
     github_client_id: str = ""
     github_client_secret: str = ""
+    github_oauth_enabled: bool = True
     # Public base URL of this deployment (e.g. https://mem.ihasy.com),
     # used to build the OAuth redirect_uri {public_url}/api/auth/github/callback.
     # When unset, the redirect_uri is derived from the incoming request.

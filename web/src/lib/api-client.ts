@@ -406,6 +406,7 @@ export interface UserInfo {
   role: string;
   status: string;
   collector_token?: string | null;
+  totp_enabled?: boolean;
 }
 
 // --- API functions ---
@@ -461,10 +462,10 @@ export const api = {
     }),
   getRegistrationMode: () =>
     apiFetch<{ mode: "open" | "invite_only" | "closed"; has_any_user: boolean; github_enabled: boolean }>("/api/auth/registration-mode"),
-  login: (email: string, password: string) =>
+  login: (email: string, password: string, totpCode?: string) =>
     apiFetch<TokenResponse>("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, totp_code: totpCode || null }),
     }),
   getMe: (token: string) => apiFetch<UserInfo>("/api/auth/me", { token }),
   refreshToken: (token: string) =>
@@ -511,6 +512,18 @@ export const api = {
   },
   rotateCollectorToken: (token: string) =>
     apiFetch<UserInfo>("/api/auth/me/rotate-collector-token", { method: "POST", token }),
+  setupTotp: (token: string, password: string) =>
+    apiFetch<{ secret: string; provisioning_uri: string }>("/api/auth/me/totp/setup", {
+      method: "POST", token, body: JSON.stringify({ password }),
+    }),
+  confirmTotp: (token: string, password: string, code: string) =>
+    apiFetch<UserInfo>("/api/auth/me/totp/confirm", {
+      method: "POST", token, body: JSON.stringify({ password, code }),
+    }),
+  disableTotp: (token: string, password: string, code: string) =>
+    apiFetch<UserInfo>("/api/auth/me/totp/disable", {
+      method: "POST", token, body: JSON.stringify({ password, code }),
+    }),
   getProjectTimeline: (projectId: string, offset = 0, limit = 50, category?: string, order = "desc") => {
     const params = new URLSearchParams({ offset: String(offset), limit: String(limit), order });
     if (category) params.set("category", category);

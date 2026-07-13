@@ -4,7 +4,7 @@ version = "0.1.41"
 description = "Memento desktop — manages the local collector daemon"
 authors = ["ddong8"]
 license = "AGPL-3.0-only"
-repository = "https://github.com/ddong8/memento"
+repository = "https://github.com/crashbandicode/memento"
 edition = "2021"
 rust-version = "1.75"
 

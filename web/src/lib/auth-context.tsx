@@ -8,7 +8,7 @@ interface AuthState {
   user: UserInfo | null;
   token: string | null;
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, totpCode?: string) => Promise<void>;
   register: (email: string, password: string, name?: string, inviteCode?: string) => Promise<UserInfo>;
   logout: () => void;
   refreshMe: () => Promise<UserInfo | null>;
@@ -149,8 +149,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [loading, token, pathname, router]);
 
-  const login = async (email: string, password: string) => {
-    const res = await api.login(email, password);
+  const login = async (email: string, password: string, totpCode?: string) => {
+    const res = await api.login(email, password, totpCode);
     setToken(res.access_token);
     localStorage.setItem("dr_token", res.access_token);
     const me = await api.getMe(res.access_token);

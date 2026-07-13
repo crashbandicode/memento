@@ -13,7 +13,7 @@ type ImportSummary = {
 };
 
 export default function ProfilePage() {
-  const { user, token, logout } = useAuth();
+  const { user, token, logout, setUser } = useAuth();
   const { t } = useI18n();
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -21,6 +21,10 @@ export default function ProfilePage() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
   const [errMsg, setErrMsg] = useState<string>("");
+  const [totpPassword, setTotpPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [totpSetup, setTotpSetup] = useState<{ secret: string; provisioning_uri: string } | null>(null);
+  const [totpBusy, setTotpBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (!user) {
@@ -74,6 +78,39 @@ export default function ProfilePage() {
     }
   };
 
+  const beginTotpSetup = async () => {
+    if (!token || !totpPassword) return;
+    setErrMsg("");
+    setTotpBusy(true);
+    try {
+      setTotpSetup(await api.setupTotp(token, totpPassword));
+      setTotpCode("");
+    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    finally { setTotpBusy(false); }
+  };
+
+  const confirmTotp = async () => {
+    if (!token || !totpPassword || !totpCode) return;
+    setErrMsg("");
+    setTotpBusy(true);
+    try {
+      setUser(await api.confirmTotp(token, totpPassword, totpCode));
+      setTotpSetup(null); setTotpCode(""); setTotpPassword("");
+    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    finally { setTotpBusy(false); }
+  };
+
+  const disableTotp = async () => {
+    if (!token || !totpPassword || !totpCode) return;
+    setErrMsg("");
+    setTotpBusy(true);
+    try {
+      setUser(await api.disableTotp(token, totpPassword, totpCode));
+      setTotpCode(""); setTotpPassword("");
+    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    finally { setTotpBusy(false); }
+  };
+
   return (
     <div className="max-w-2xl mx-auto">
       <TopBar title={t.profile.title} subtitle={t.profile.subtitle} />
@@ -87,6 +124,28 @@ export default function ProfilePage() {
           label={t.profile.status}
           valueNode={<Chip tone={user.status === "active" ? "success" : "warn"}>{user.status}</Chip>}
         />
+      </Glass>
+
+      <SectionLabel>Security</SectionLabel>
+      <Glass padding={22} radius={20} style={{ marginBottom: 20 }}>
+        <Row label="Authenticator app (TOTP)" valueNode={<Chip tone={user.totp_enabled ? "success" : "warn"}>{user.totp_enabled ? "Enabled" : "Not enabled"}</Chip>} />
+        <p style={{ fontSize: 13, color: "var(--aurora-fg3)", margin: "14px 0" }}>
+          Add this account to an authenticator app, then enter its six-digit code whenever you sign in.
+        </p>
+        <input type="password" value={totpPassword} onChange={(e) => setTotpPassword(e.target.value)} placeholder="Current password" style={{ width: "100%", marginBottom: 10 }} />
+        {totpSetup && (
+          <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, background: "rgba(124,58,237,.08)", fontSize: 12 }}>
+            <strong>Add this setup key to your authenticator:</strong>
+            <code style={{ display: "block", overflowWrap: "anywhere", marginTop: 8 }}>{totpSetup.secret}</code>
+            <a href={totpSetup.provisioning_uri} style={{ display: "inline-block", marginTop: 8 }}>Open authenticator app</a>
+          </div>
+        )}
+        {totpSetup || user.totp_enabled ? (
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input inputMode="numeric" value={totpCode} onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit code" style={{ flex: "1 1 140px" }} />
+            <Btn size="sm" onClick={user.totp_enabled ? disableTotp : confirmTotp} disabled={totpBusy || !totpPassword || totpCode.length !== 6}>{user.totp_enabled ? "Disable TOTP" : "Confirm TOTP"}</Btn>
+          </div>
+        ) : <Btn size="sm" icon="lock" onClick={beginTotpSetup} disabled={totpBusy || !totpPassword}>Set up TOTP</Btn>}
       </Glass>
 
       <SectionLabel>{t.profile.backup}</SectionLabel>

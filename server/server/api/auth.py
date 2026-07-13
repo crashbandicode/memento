@@ -8,14 +8,13 @@ import hmac
 import json
 import secrets
 import time
-import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,8 +22,10 @@ from ..config import settings
 from ..db.models import InviteCode, User
 from ..db.session import get_db
 from ..middleware.auth import (
-    create_access_token, get_current_user, hash_password, require_role, verify_password,
+    create_access_token, get_current_user, hash_password, is_single_user_allowed,
+    verify_password,
 )
+from ..services.totp import encrypt_secret, new_secret, provisioning_uri, verify_code
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -45,6 +46,7 @@ class RegistrationModeResponse(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+    totp_code: str | None = None
 
 
 class TokenResponse(BaseModel):
@@ -61,6 +63,20 @@ class UserResponse(BaseModel):
     role: str
     status: str
     collector_token: str | None = None
+    totp_enabled: bool = False
+
+
+class TotpPasswordRequest(BaseModel):
+    password: str
+
+
+class TotpConfirmRequest(TotpPasswordRequest):
+    code: str
+
+
+class TotpSetupResponse(BaseModel):
+    secret: str
+    provisioning_uri: str
 
 
 @router.get("/registration-mode", response_model=RegistrationModeResponse)
@@ -69,9 +85,13 @@ async def registration_mode(db: AsyncSession = Depends(get_db)) -> RegistrationM
     count_result = await db.execute(select(User.id).limit(1))
     has_any = count_result.scalar_one_or_none() is not None
     return RegistrationModeResponse(
-        mode=settings.registration_mode,
+        mode="closed" if settings.single_user_mode else settings.registration_mode,
         has_any_user=has_any,
-        github_enabled=bool(settings.github_client_id and settings.github_client_secret),
+        github_enabled=bool(
+            settings.github_oauth_enabled
+            and settings.github_client_id
+            and settings.github_client_secret
+        ),
     )
 
 
@@ -88,6 +108,11 @@ async def register(
     # Is this the very first user? (bypasses registration_mode — bootstrap owner)
     count_result = await db.execute(select(User.id).limit(1))
     is_first_user = count_result.scalar_one_or_none() is None
+
+    # A single-user instance has exactly one bootstrap account; invites do
+    # not provide a bypass for creating additional identities.
+    if settings.single_user_mode and not is_first_user:
+        raise HTTPException(status_code=403, detail="Registration is closed")
 
     # Invite code path (checked whenever provided, required when mode = invite_only)
     invite: InviteCode | None = None
@@ -150,6 +175,7 @@ async def register(
         role=user.role,
         status=user.status,
         collector_token=user.collector_token,
+        totp_enabled=user.totp_enabled,
     )
 
 
@@ -175,7 +201,7 @@ async def token_exchange(
             )
             user = result.scalar_one_or_none()
 
-    if not user or user.status != "active":
+    if not user or user.status != "active" or not is_single_user_allowed(user):
         raise HTTPException(status_code=401, detail="Invalid collector token")
     token = create_access_token(str(user.id), user.role)
     return TokenResponse(access_token=token, user_id=str(user.id), role=user.role)
@@ -206,8 +232,10 @@ async def login(
     user = result.scalar_one_or_none()
     if not user or not user.hashed_password or not verify_password(req.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if user.status != "active":
+    if user.status != "active" or not is_single_user_allowed(user):
         raise HTTPException(status_code=403, detail="Account not yet approved")
+    if user.totp_enabled and not verify_code(user.totp_secret, req.totp_code):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token(str(user.id), user.role)
     return TokenResponse(access_token=token, user_id=str(user.id), role=user.role)
@@ -267,7 +295,7 @@ def _verify_state(state: str) -> str | None:
 @router.get("/github/authorize")
 async def github_authorize(request: Request, next: str = "") -> RedirectResponse:
     """Kick off the GitHub OAuth flow — full-page redirect to GitHub."""
-    if not settings.github_client_id:
+    if not settings.github_oauth_enabled or not settings.github_client_id:
         raise HTTPException(status_code=404, detail="GitHub OAuth not configured")
     params = urlencode({
         "client_id": settings.github_client_id,
@@ -376,6 +404,11 @@ async def github_callback(
         is_first_user = count_result.scalar_one_or_none() is None
         if is_first_user:
             role, user_status = "owner", "active"
+        elif settings.single_user_mode:
+            # Do not let OAuth introduce an account on a single-user
+            # deployment. The first owner can still link their own verified
+            # identity via the existing-account path above.
+            return _error("registration_closed")
         elif settings.registration_mode == "open":
             role, user_status = "viewer", "active"
         else:
@@ -394,7 +427,7 @@ async def github_callback(
         )
         db.add(user)
 
-    if user.status != "active":
+    if user.status != "active" or not is_single_user_allowed(user):
         return _error("account_disabled")
 
     await db.flush()
@@ -415,7 +448,56 @@ async def get_me(user: User = Depends(get_current_user)) -> UserResponse:
         role=user.role,
         status=user.status,
         collector_token=user.collector_token,
+        totp_enabled=user.totp_enabled,
     )
+
+
+@router.post("/me/totp/setup", response_model=TotpSetupResponse)
+async def setup_totp(
+    req: TotpPasswordRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TotpSetupResponse:
+    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    secret = new_secret()
+    user.totp_secret = encrypt_secret(secret)
+    user.totp_enabled = False
+    await db.flush()
+    return TotpSetupResponse(secret=secret, provisioning_uri=provisioning_uri(secret, user.email))
+
+
+@router.post("/me/totp/confirm", response_model=UserResponse)
+async def confirm_totp(
+    req: TotpConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_code(user.totp_secret, req.code):
+        raise HTTPException(status_code=400, detail="Invalid authenticator code")
+    user.totp_enabled = True
+    await db.flush()
+    return UserResponse(id=str(user.id), email=user.email, name=user.name, role=user.role,
+                        status=user.status, collector_token=user.collector_token, totp_enabled=True)
+
+
+@router.post("/me/totp/disable", response_model=UserResponse)
+async def disable_totp(
+    req: TotpConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.totp_enabled or not verify_code(user.totp_secret, req.code):
+        raise HTTPException(status_code=400, detail="Invalid authenticator code")
+    user.totp_secret = None
+    user.totp_enabled = False
+    await db.flush()
+    return UserResponse(id=str(user.id), email=user.email, name=user.name, role=user.role,
+                        status=user.status, collector_token=user.collector_token, totp_enabled=False)
 
 
 @router.post("/me/rotate-collector-token", response_model=UserResponse)

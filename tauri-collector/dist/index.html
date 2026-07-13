@@ -7,14 +7,10 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <!-- Update banner — only shown when the GitHub Releases check (in
-       app.js) finds a newer desktop-v* tag than this build's version. -->
+  <!-- Release banner — used both for signed updates from this fork and for
+       upstream-release notices that require a fork rebase. -->
   <div id="updateBanner" class="update-banner hidden">
-    <span class="update-text">
-      <span data-i18n="update.text">New version</span>
-      <strong id="updateBannerVersion"></strong>
-      <span data-i18n="update.available">available.</span>
-    </span>
+    <span id="updateBannerMessage" class="update-text"></span>
     <a href="#" id="updateBannerDownload" class="btn primary update-btn" data-i18n="update.btn">Install</a>
     <button class="update-close" id="updateBannerDismiss" aria-label="Dismiss">×</button>
   </div>
@@ -138,7 +134,7 @@
       <dl class="kv">
         <dt data-i18n="about.version">Desktop version</dt><dd id="appVersion">0.1.0</dd>
         <dt data-i18n="about.daemon">Collector daemon</dt><dd id="daemonInfo" data-i18n="about.daemonChecking">checking…</dd>
-        <dt data-i18n="about.project">Project</dt><dd><a href="https://github.com/ddong8/memento" target="_blank">github.com/ddong8/memento</a></dd>
+        <dt data-i18n="about.project">Project</dt><dd><a href="https://github.com/crashbandicode/memento" target="_blank">github.com/crashbandicode/memento</a></dd>
         <dt data-i18n="about.license">License</dt><dd>AGPL-3.0</dd>
       </dl>
     </section>

@@ -17,6 +17,11 @@ from ..db.models import User
 from ..db.session import get_db
 
 
+def is_single_user_allowed(user: User | None) -> bool:
+    """Whether ``user`` may access a single-user deployment."""
+    return not settings.single_user_mode or bool(user and user.role in {"owner", "admin"})
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -54,7 +59,7 @@ async def verify_collector_token(
     # Try per-user token first
     result = await db.execute(select(User).where(User.collector_token == x_collector_token))
     user = result.scalar_one_or_none()
-    if user:
+    if user and user.status == "active" and is_single_user_allowed(user):
         return user
 
     # Fallback: legacy global token → owner user
@@ -63,7 +68,7 @@ async def verify_collector_token(
             select(User).where(User.role == "owner", User.status == "active").limit(1)
         )
         owner = result.scalar_one_or_none()
-        if owner:
+        if owner and is_single_user_allowed(owner):
             return owner
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid collector token")
@@ -85,7 +90,7 @@ async def get_current_user(
 
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     user = result.scalar_one_or_none()
-    if user is None or user.status != "active":
+    if user is None or user.status != "active" or not is_single_user_allowed(user):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
 
     return user

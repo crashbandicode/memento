@@ -71,6 +71,13 @@ def _run_migrations(conn) -> None:
     except Exception:
         sp_gh.rollback()
 
+    if "totp_secret" not in user_cols:
+        conn.execute(text("ALTER TABLE users ADD COLUMN totp_secret TEXT"))
+    if "totp_enabled" not in user_cols:
+        conn.execute(text(
+            "ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+
     # Document.embedding_status + embedding_attempts: tracks whether the
     # embedding pipeline produced vectors so failures can be retried instead
     # of silently dropped. Existing rows get 'ok' if they already have any
