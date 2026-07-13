@@ -2,8 +2,8 @@
 
 Large payloads live in immutable spool files rather than SQLite. Queue claims are
 metadata-only and leased, so loading a batch cannot materialize several complete
-conversation histories in RAM. FULL snapshots coalesce while pending; DELTA rows
-remain ordered and immutable.
+conversation histories in RAM. Complete snapshots and adjacent pending DELTAs
+coalesce while an immutable in-flight revision retains its lease.
 """
 
 from __future__ import annotations
@@ -55,6 +55,9 @@ class QueueItem:
     metadata: dict[str, Any]
     created_at: float
     source_modified_at: float | None = None
+    base_hash: str | None = None
+    base_offset: int = 0
+    source_path: str | None = None
     retry_count: int = 0
     payload_path: str | None = None
     payload_bytes: int = 0
@@ -91,7 +94,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
         self._db_path = db_path
@@ -123,6 +126,9 @@ class SyncQueue:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at REAL NOT NULL,
                 source_modified_at REAL,
+                base_hash TEXT,
+                base_offset INTEGER NOT NULL DEFAULT 0,
+                source_path TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 payload_path TEXT,
@@ -171,6 +177,9 @@ class SyncQueue:
             # Kept nullable for queues created by older collectors. Those rows
             # retain their original enqueue-time fallback on upload.
             "source_modified_at": "REAL",
+            "base_hash": "TEXT",
+            "base_offset": "INTEGER NOT NULL DEFAULT 0",
+            "source_path": "TEXT",
         }
         for name, definition in queue_additions.items():
             if name not in queue_columns:
@@ -211,15 +220,15 @@ class SyncQueue:
         )
         self._conn.execute(
             """UPDATE queue AS old SET status='superseded'
-               WHERE old.status='pending' AND old.sync_strategy='full'
-                 AND old.is_partial=0
+               WHERE old.status='pending' AND old.is_partial=0
+                 AND old.sync_strategy IN ('full','delta')
                  AND EXISTS (
                     SELECT 1 FROM queue AS newer
                     WHERE newer.tool_name=old.tool_name
                       AND newer.relative_path=old.relative_path
                       AND newer.status='pending'
-                      AND newer.sync_strategy='full'
                       AND newer.is_partial=0
+                      AND newer.sync_strategy IN ('full','delta')
                       AND newer.id > old.id
                  )"""
         )
@@ -511,16 +520,75 @@ class SyncQueue:
         ).fetchone()
         return row[0] if row else None
 
+    def get_delta_base(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> tuple[str | None, int]:
+        """Return the earliest revision a new coalesced tail must extend."""
+        with self._lock:
+            # A queued complete snapshot is authoritative and should be
+            # refreshed in place instead of accumulating a tail behind it.
+            complete = self._conn.execute(
+                """SELECT 1 FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND is_partial=0 AND sync_strategy IN ('full','delta')
+                   LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if complete is not None:
+                return None, 0
+
+            # Re-read from the beginning of the one pending tail so repeated
+            # filesystem events replace it with a single current tail.
+            pending = self._conn.execute(
+                """SELECT base_hash, base_offset FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND is_partial=1 AND sync_strategy='delta'
+                   ORDER BY id ASC LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if pending is not None:
+                return pending[0], int(pending[1] or 0)
+
+            # A leased revision is immutable. A new tail may safely target its
+            # end because the same-path FIFO barrier prevents overtaking it.
+            uploading = self._conn.execute(
+                """SELECT content_hash, offset FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='uploading'
+                     AND sync_strategy IN ('full','delta')
+                   ORDER BY id DESC LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if uploading is not None:
+                return uploading[0], int(uploading[1] or 0)
+
+            synced = self._conn.execute(
+                """SELECT synced_hash, synced_offset FROM file_state
+                   WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if synced is None or not synced[0]:
+                return None, 0
+            return str(synced[0]), int(synced[1] or 0)
+
     def enqueue(self, tool_name: str, category: str, content_type: str,
                 relative_path: str, content: str, content_hash: str,
                 file_size: int, sync_strategy: str, is_partial: bool = False,
                 offset: int = 0, metadata: dict | None = None,
-                source_modified_at: float | None = None) -> int:
+                source_modified_at: float | None = None,
+                base_hash: str | None = None, base_offset: int = 0,
+                source_path: str | None = None) -> int:
         del file_size  # payload byte size is measured after sanitization below
-        is_full = sync_strategy == "full" and not is_partial
+        is_complete_snapshot = (
+            sync_strategy in {"full", "delta"} and not is_partial
+        )
+        is_coalescible_delta = (
+            sync_strategy == "delta" and is_partial and bool(base_hash)
+        )
 
-        # Avoid writing another spool file for an identical FULL observation.
-        if is_full:
+        # Avoid writing another spool file for an identical complete observation.
+        if is_complete_snapshot:
             with self._lock:
                 if self._observed_hash_locked(tool_name, relative_path) == content_hash:
                     row = self._conn.execute(
@@ -534,6 +602,7 @@ class SyncQueue:
 
         inline_content, payload_path, payload_bytes = self._store_payload(content)
         old_payload_path: str | None = None
+        superseded_payload_paths: list[str] = []
         now = time.time()
         metadata_json = json.dumps(metadata or {}, default=str)
 
@@ -542,7 +611,10 @@ class SyncQueue:
                 self._conn.execute("BEGIN IMMEDIATE")
 
                 # Re-check after the spool write closes the concurrent-enqueue race.
-                if is_full and self._observed_hash_locked(tool_name, relative_path) == content_hash:
+                if (
+                    is_complete_snapshot
+                    and self._observed_hash_locked(tool_name, relative_path) == content_hash
+                ):
                     row = self._conn.execute(
                         """SELECT id FROM queue
                            WHERE tool_name=? AND relative_path=?
@@ -555,14 +627,23 @@ class SyncQueue:
                     return int(row[0]) if row else 0
 
                 existing = None
-                if is_full:
+                if is_complete_snapshot:
                     existing = self._conn.execute(
                         """SELECT id, payload_path FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status='pending' AND sync_strategy='full'
-                             AND is_partial=0
+                             AND status='pending' AND is_partial=0
+                             AND sync_strategy IN ('full','delta')
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
+                    ).fetchone()
+                elif is_coalescible_delta:
+                    existing = self._conn.execute(
+                        """SELECT id, payload_path FROM queue
+                           WHERE tool_name=? AND relative_path=?
+                             AND status='pending' AND sync_strategy='delta'
+                             AND is_partial=1 AND base_hash=? AND base_offset=?
+                           ORDER BY id DESC LIMIT 1""",
+                        (tool_name, relative_path, base_hash, int(base_offset)),
                     ).fetchone()
 
                 if existing:
@@ -572,13 +653,15 @@ class SyncQueue:
                         """UPDATE queue SET category=?, content_type=?, content=?,
                            content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
                            offset=?, metadata=?, source_modified_at=?, retry_count=0,
+                           base_hash=?, base_offset=?, source_path=?,
                            status='pending', payload_path=?, payload_bytes=?,
                            lease_token=NULL, lease_until=NULL, available_at=0,
                            last_attempt_at=NULL, last_error=NULL
                            WHERE id=? AND status='pending'""",
                         (category, content_type, inline_content, content_hash,
                          payload_bytes, sync_strategy, int(is_partial), offset,
-                         metadata_json, source_modified_at, payload_path,
+                         metadata_json, source_modified_at, base_hash,
+                         int(base_offset), source_path, payload_path,
                          payload_bytes, item_id),
                     )
                 else:
@@ -587,14 +670,34 @@ class SyncQueue:
                            tool_name, category, content_type, relative_path, content,
                            content_hash, file_size, sync_strategy, is_partial, offset,
                            metadata, created_at, source_modified_at, payload_path,
-                           payload_bytes, available_at
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                           payload_bytes, available_at, base_hash, base_offset,
+                           source_path
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)""",
                         (tool_name, category, content_type, relative_path,
                          inline_content, content_hash, payload_bytes, sync_strategy,
                          int(is_partial), offset, metadata_json, now,
-                         source_modified_at, payload_path, payload_bytes),
+                         source_modified_at, payload_path, payload_bytes,
+                         base_hash, int(base_offset), source_path),
                     )
                     item_id = int(cursor.lastrowid)
+
+                if is_complete_snapshot:
+                    superseded = self._conn.execute(
+                        """SELECT id, payload_path FROM queue
+                           WHERE tool_name=? AND relative_path=? AND status='pending'
+                             AND sync_strategy IN ('full','delta') AND id<>?""",
+                        (tool_name, relative_path, item_id),
+                    ).fetchall()
+                    superseded_payload_paths.extend(
+                        str(row[1]) for row in superseded if row[1]
+                    )
+                    self._conn.execute(
+                        """UPDATE queue SET status='superseded', payload_path=NULL,
+                                  content='', lease_token=NULL, lease_until=NULL
+                           WHERE tool_name=? AND relative_path=? AND status='pending'
+                             AND sync_strategy IN ('full','delta') AND id<>?""",
+                        (tool_name, relative_path, item_id),
+                    )
 
                 self._conn.execute(
                     """INSERT INTO file_state (
@@ -619,6 +722,9 @@ class SyncQueue:
 
         if old_payload_path and old_payload_path != payload_path:
             self._discard_payload(old_payload_path)
+        for stale_payload_path in superseded_payload_paths:
+            if stale_payload_path != payload_path:
+                self._discard_payload(stale_payload_path)
         return item_id
 
     @_rollback_on_error
@@ -650,7 +756,8 @@ class SyncQueue:
                           q.created_at, q.source_modified_at, q.retry_count,
                           q.payload_path,
                           CASE WHEN q.payload_bytes > 0
-                               THEN q.payload_bytes ELSE q.file_size END
+                               THEN q.payload_bytes ELSE q.file_size END,
+                          q.base_hash, q.base_offset, q.source_path
                    FROM queue AS q
                    WHERE q.status='pending' AND COALESCE(q.available_at, 0) <= ?
                      AND NOT EXISTS (
@@ -731,6 +838,8 @@ class SyncQueue:
                 ),
                 retry_count=int(row[13]), payload_path=row[14],
                 payload_bytes=int(row[15] or row[6]),
+                base_hash=row[16], base_offset=int(row[17] or 0),
+                source_path=row[18],
                 lease_token=token,
             ))
         return items
@@ -853,13 +962,14 @@ class SyncQueue:
                 self._conn.rollback()
                 return False
 
-            # A newer complete FULL snapshot covers any older FULL or DELTA
+            # A newer complete snapshot covers any older FULL or DELTA
             # payload for this path. Drop the failed predecessor so a legacy
             # strategy transition cannot wedge the authoritative snapshot.
             has_successor = self._conn.execute(
                 """SELECT 1 FROM queue
                    WHERE tool_name=? AND relative_path=? AND status='pending'
-                     AND sync_strategy='full' AND is_partial=0 AND id > ? LIMIT 1""",
+                     AND sync_strategy IN ('full','delta')
+                     AND is_partial=0 AND id > ? LIMIT 1""",
                 (row[0], row[1], item.id),
             ).fetchone() is not None
 
@@ -885,6 +995,65 @@ class SyncQueue:
                 )
             self._conn.commit()
         self._discard_payload(payload_path)
+        return True
+
+    @_rollback_on_error
+    def mark_delta_conflict(self, item: QueueItem) -> bool:
+        """Discard a rejected delta chain and require one complete snapshot."""
+        if not item.lease_token:
+            return False
+        payload_paths: list[str] = []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                """SELECT tool_name, relative_path, payload_path FROM queue
+                   WHERE id=? AND status='uploading' AND lease_token=?
+                     AND sync_strategy='delta' AND is_partial=1""",
+                (item.id, item.lease_token),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return False
+
+            if row[2]:
+                payload_paths.append(str(row[2]))
+            pending = self._conn.execute(
+                """SELECT payload_path FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND sync_strategy='delta' AND is_partial=1""",
+                (row[0], row[1]),
+            ).fetchall()
+            payload_paths.extend(str(candidate[0]) for candidate in pending if candidate[0])
+
+            self._conn.execute(
+                """UPDATE queue SET status='superseded', payload_path=NULL,
+                          content='', lease_token=NULL, lease_until=NULL,
+                          last_error='delta base mismatch'
+                   WHERE id=? AND status='uploading' AND lease_token=?""",
+                (item.id, item.lease_token),
+            )
+            self._conn.execute(
+                """UPDATE queue SET status='superseded', payload_path=NULL,
+                          content='', lease_token=NULL, lease_until=NULL,
+                          last_error='delta base mismatch'
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND sync_strategy='delta' AND is_partial=1""",
+                (row[0], row[1]),
+            )
+            self._conn.execute(
+                """UPDATE file_state
+                   SET last_hash=synced_hash,
+                       last_offset=COALESCE(synced_offset, 0),
+                       observed_hash=synced_hash,
+                       observed_offset=COALESCE(synced_offset, 0),
+                       observed_at=synced_at
+                   WHERE tool_name=? AND relative_path=?""",
+                (row[0], row[1]),
+            )
+            self._conn.commit()
+
+        for payload_path in payload_paths:
+            self._discard_payload(payload_path)
         return True
 
     def get_file_state(self, tool_name: str, relative_path: str) -> tuple[str | None, int]:

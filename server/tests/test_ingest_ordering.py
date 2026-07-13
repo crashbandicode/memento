@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.db.models import Document, SyncState  # noqa: E402
-from server.services.ingest_service import ingest_file  # noqa: E402
+from server.services.ingest_service import (  # noqa: E402
+    DeltaBaseMismatch,
+    _merge_delta_metadata,
+    ingest_file,
+)
 
 
 class _ScalarResult:
@@ -87,6 +91,30 @@ def _ingest_kwargs(doc: Document, **overrides) -> dict:
 
 
 class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
+    def test_delta_metadata_accumulates_counts_and_preserves_first_timestamp(self) -> None:
+        merged = _merge_delta_metadata(
+            {
+                "total_lines": 10,
+                "message_types": {"event_msg": 7, "response_item": 3},
+                "first_timestamp": "first",
+                "last_timestamp": "old-last",
+            },
+            {
+                "total_lines": 4,
+                "message_types": {"event_msg": 1, "response_item": 3},
+                "first_timestamp": "tail-first",
+                "last_timestamp": "new-last",
+            },
+        )
+
+        self.assertEqual(merged["total_lines"], 14)
+        self.assertEqual(merged["message_types"], {
+            "event_msg": 8,
+            "response_item": 6,
+        })
+        self.assertEqual(merged["first_timestamp"], "first")
+        self.assertEqual(merged["last_timestamp"], "new-last")
+
     async def test_committed_newer_full_rejects_older_full_under_source_lock(
         self,
     ) -> None:
@@ -285,6 +313,73 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
                         timestamp=200.0,
                     ),
                 )
+
+    async def test_guarded_delta_rejects_mismatched_committed_base(self) -> None:
+        doc = _document(content_hash="committed-hash", timestamp=100.0, offset=100)
+        sync = _sync_state(doc, offset=100)
+        db = _OrderedSession(None, sync, doc)
+
+        with self.assertRaises(DeltaBaseMismatch) as raised:
+            await ingest_file(
+                db,
+                **_ingest_kwargs(
+                    doc,
+                    content_hash="delta-hash",
+                    file_size=10,
+                    mode="delta",
+                    offset=110,
+                    base_hash="wrong-hash",
+                    base_offset=100,
+                ),
+            )
+
+        self.assertEqual(raised.exception.expected_hash, "committed-hash")
+        self.assertEqual(raised.exception.expected_offset, 100)
+        self.assertEqual(doc.content_hash, "committed-hash")
+
+    async def test_guarded_delta_accepts_exact_committed_base(self) -> None:
+        doc = _document(content_hash="committed-hash", timestamp=100.0, offset=100)
+        sync = _sync_state(doc, offset=100)
+        db = _OrderedSession(None, sync, doc)
+
+        with patch(
+            "server.services.ingest_service.ensure_tool",
+            new=AsyncMock(side_effect=RuntimeError("guard passed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "guard passed"):
+                await ingest_file(
+                    db,
+                    **_ingest_kwargs(
+                        doc,
+                        content_hash="delta-hash",
+                        file_size=10,
+                        mode="delta",
+                        offset=110,
+                        base_hash="committed-hash",
+                        base_offset=100,
+                    ),
+                )
+
+    async def test_guarded_delta_retry_is_idempotent_after_lost_response(self) -> None:
+        doc = _document(content_hash="delta-hash", timestamp=200.0, offset=110)
+        sync = _sync_state(doc, offset=110)
+        db = _OrderedSession(None, sync, doc)
+
+        result = await ingest_file(
+            db,
+            **_ingest_kwargs(
+                doc,
+                content_hash="delta-hash",
+                file_size=10,
+                mode="delta",
+                offset=110,
+                base_hash="committed-hash",
+                base_offset=100,
+            ),
+        )
+
+        self.assertIs(result, doc)
+        self.assertEqual(getattr(doc, "_memento_ingest_disposition"), "idempotent")
 
 
 if __name__ == "__main__":

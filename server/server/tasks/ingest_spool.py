@@ -177,6 +177,8 @@ async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
             file_size=payload_path.stat().st_size,
             mode=meta.get("mode", "full"),
             offset=meta.get("offset", 0),
+            base_hash=meta.get("base_hash"),
+            base_offset=meta.get("base_offset"),
             metadata=dict(meta.get("metadata", {})),
             timestamp=meta.get("timestamp"),
             machine_id=machine_id,

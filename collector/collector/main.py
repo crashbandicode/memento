@@ -493,8 +493,12 @@ def main() -> None:
         config.queue_db_path,
         spool_threshold=config.queue_spool_threshold,
     )
-    sync_client = SyncClient(queue, config)
     watcher = FileWatcher(available, queue, config)
+    sync_client = SyncClient(
+        queue,
+        config,
+        full_resync_callback=watcher.request_full_resync,
+    )
 
     # Graceful shutdown
     shutdown = False

@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from watchdog.events import FileModifiedEvent
 
 from collector.parsers.base import ParseResult
+from collector.parsers.jsonl import JsonlParser
+from collector.queue import SyncQueue
 from collector.tools.base import (
     Category,
     ContentType,
@@ -215,6 +217,111 @@ def test_file_processing_enqueues_source_filesystem_mtime(tmp_path: Path) -> Non
 
     assert len(queue.enqueued) == 1
     assert queue.enqueued[0]["source_modified_at"] == expected_mtime
+
+
+def test_delta_processing_uses_guarded_base_and_force_full_fallback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    first = '{"role":"user","message":{"content":"first"}}\n'
+    second = '{"role":"assistant","message":{"content":"second"}}\n'
+    path.write_text(first + second, encoding="utf-8")
+    base_offset = len(first.encode("utf-8"))
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return "observed-hash", path.stat().st_size
+
+        def get_delta_base(self, _tool_name: str, _relative_path: str):
+            return "base-hash", base_offset
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    watcher._process_file_changed(path)
+    watcher._process_file_changed(path, force_full=True)
+
+    incremental, complete = queue.enqueued
+    assert "second" in incremental["content"]
+    assert "first" not in incremental["content"]
+    assert incremental["is_partial"] is True
+    assert incremental["base_hash"] == "base-hash"
+    assert incremental["base_offset"] == base_offset
+    assert incremental["source_path"] == str(path)
+    assert "first" in complete["content"]
+    assert "second" in complete["content"]
+    assert complete["is_partial"] is False
+    assert complete["base_hash"] is None
+    assert complete["base_offset"] == 0
+
+
+def test_large_jsonl_append_queues_only_the_new_guarded_tail(tmp_path: Path) -> None:
+    path = tmp_path / "large-session.jsonl"
+    record = json.dumps({
+        "type": "event_msg",
+        "payload": {"text": "x" * 1000},
+    }, separators=(",", ":"))
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        for _ in range(18_000):
+            stream.write(record + "\n")
+    base_source_size = path.stat().st_size
+    assert base_source_size > 16 * 1024 * 1024
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/large-session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = SyncQueue(tmp_path / "queue" / "sync.db", spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    try:
+        watcher._process_file_changed(path)
+        complete = queue.claim_batch(max_bytes=32 * 1024 * 1024)[0]
+        assert complete.is_partial is False
+        assert complete.payload_bytes > 16 * 1024 * 1024
+        assert queue.mark_synced(complete)
+
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            for _ in range(256):
+                stream.write(record + "\n")
+
+        watcher._process_file_changed(path)
+        tail = queue.claim_batch(max_bytes=32 * 1024 * 1024)[0]
+        assert tail.is_partial is True
+        assert tail.base_hash == complete.content_hash
+        assert tail.base_offset == base_source_size
+        assert tail.offset == path.stat().st_size
+        assert tail.payload_bytes < 512 * 1024
+        assert len(queue.read_payload_text(tail).splitlines()) == 256
+    finally:
+        queue.close()
 
 
 def test_mutation_during_read_defers_without_advancing_source_revision(

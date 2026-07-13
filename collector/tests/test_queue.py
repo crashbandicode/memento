@@ -27,7 +27,10 @@ class SyncQueueTests(unittest.TestCase):
     def _enqueue(self, path: str, content: str, content_hash: str,
                  strategy: str = "full", partial: bool = False,
                  offset: int = 0,
-                 source_modified_at: float | None = None) -> int:
+                 source_modified_at: float | None = None,
+                 base_hash: str | None = None,
+                 base_offset: int = 0,
+                 source_path: str | None = None) -> int:
         return self.queue.enqueue(
             tool_name="codex",
             category="conversation",
@@ -41,6 +44,9 @@ class SyncQueueTests(unittest.TestCase):
             offset=offset,
             metadata={"title": content_hash},
             source_modified_at=source_modified_at,
+            base_hash=base_hash,
+            base_offset=base_offset,
+            source_path=source_path,
         )
 
     def _status_rows(self) -> list[tuple]:
@@ -160,16 +166,72 @@ class SyncQueueTests(unittest.TestCase):
         second = self.queue.claim_batch()[0]
         self.assertEqual(second.offset, 20)
 
+    def test_pending_guarded_delta_coalesces_from_earliest_base(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            ("hash-0", 10),
+        )
+
+        first_id = self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+        )
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            ("hash-0", 10),
+        )
+        second_id = self._enqueue(
+            "history.jsonl", "tail-1\ntail-2", "hash-2", "delta", True, 30,
+            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+        )
+
+        self.assertEqual(second_id, first_id)
+        self.assertEqual(self.queue.pending_count(), 1)
+        item = self.queue.claim_batch()[0]
+        self.assertEqual(item.base_hash, "hash-0")
+        self.assertEqual(item.base_offset, 10)
+        self.assertEqual(item.source_path, "/tmp/history.jsonl")
+        self.assertEqual(self.queue.read_payload_text(item), "tail-1\ntail-2")
+
+    def test_delta_conflict_discards_chain_and_resets_to_synced_base(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+        )
+        active = self.queue.claim_batch()[0]
+        self._enqueue(
+            "history.jsonl", "tail-2", "hash-2", "delta", True, 30,
+            base_hash="hash-1", base_offset=20, source_path="/tmp/history.jsonl",
+        )
+
+        self.assertTrue(self.queue.mark_delta_conflict(active))
+        self.assertEqual(self.queue.pending_count(), 0)
+        self.assertEqual(
+            self.queue.get_file_state("codex", "history.jsonl"),
+            ("hash-0", 10),
+        )
+        self.assertEqual(
+            [row[2] for row in self._status_rows()],
+            ["synced", "superseded", "superseded"],
+        )
+
     def test_mixed_strategies_cannot_claim_same_path_concurrently(self) -> None:
         self._enqueue("same.jsonl", "delta", "hash-delta", "delta", True, 10)
         self._enqueue("same.jsonl", "full", "hash-full", "full", False, 20)
 
         first_batch = self.queue.claim_batch(batch_size=10)
         self.assertEqual(len(first_batch), 1)
-        self.assertEqual(first_batch[0].sync_strategy, "delta")
+        self.assertEqual(first_batch[0].sync_strategy, "full")
         self.assertEqual(self.queue.claim_batch(batch_size=10), [])
-        self.assertTrue(self.queue.mark_failed(first_batch[0], "legacy delta rejected"))
-        self.assertEqual(self.queue.claim_batch()[0].sync_strategy, "full")
+        self.assertTrue(self.queue.mark_synced(first_batch[0]))
+        self.assertEqual(
+            [row[2] for row in self._status_rows()],
+            ["superseded", "synced"],
+        )
 
     def test_claim_is_metadata_only_and_enforces_global_byte_budget(self) -> None:
         self._enqueue("one.jsonl", "a" * 70_000, "hash-1")

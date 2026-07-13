@@ -17,7 +17,11 @@ from ..db.models import User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
-from ..services.ingest_service import ingest_file, _get_ingest_semaphore
+from ..services.ingest_service import (
+    DeltaBaseMismatch,
+    _get_ingest_semaphore,
+    ingest_file,
+)
 from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
     ChunkValidationError,
@@ -51,6 +55,8 @@ class IngestFileRequest(BaseModel):
     offset: int = 0
     file_size: int = 0
     sync_strategy: str = "full"
+    base_hash: str | None = None
+    base_offset: int | None = Field(default=None, ge=0)
     metadata: dict = {}
     timestamp: float | None = None
     content: str = ""
@@ -103,6 +109,20 @@ def _reject_synthetic_metadata_file_upload(
             status_code=400,
             detail="metadata updates must use /api/ingest/metadata",
         )
+
+
+async def _ingest_with_delta_guard(**kwargs):
+    try:
+        return await ingest_file(**kwargs)
+    except DeltaBaseMismatch as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "delta_base_mismatch",
+                "expected_hash": exc.expected_hash,
+                "expected_offset": exc.expected_offset,
+            },
+        ) from exc
 
 
 @router.post("/metadata", response_model=IngestMetadataResponse)
@@ -165,7 +185,7 @@ async def ingest_file_endpoint(
     machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
     measured_size = len(req.content.encode("utf-8"))
 
-    doc = await ingest_file(
+    doc = await _ingest_with_delta_guard(
         db=db,
         tool_id=req.tool,
         category=req.category,
@@ -180,6 +200,8 @@ async def ingest_file_endpoint(
         timestamp=req.timestamp,
         machine_id=str(machine.id),
         user_id=str(_collector_user.id),
+        base_hash=req.base_hash,
+        base_offset=req.base_offset,
     )
     return IngestResponse(document_id=str(doc.id), message="Ingested successfully")
 
@@ -208,7 +230,7 @@ async def ingest_file_upload(
     reported_size = max(0, int(meta.get("file_size") or 0))
     machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
 
-    doc = await ingest_file(
+    doc = await _ingest_with_delta_guard(
         db=db,
         tool_id=meta["tool"],
         category=meta["category"],
@@ -223,6 +245,8 @@ async def ingest_file_upload(
         timestamp=meta.get("timestamp"),
         machine_id=str(machine.id),
         user_id=str(_collector_user.id),
+        base_hash=meta.get("base_hash"),
+        base_offset=meta.get("base_offset"),
     )
     return IngestResponse(document_id=str(doc.id), message="Uploaded successfully")
 

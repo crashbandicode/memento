@@ -18,6 +18,7 @@ from collector.sync_client import (  # noqa: E402
     CHUNK_RETRY_BASE_SECONDS,
     CHUNK_UPLOAD_MAX_ATTEMPTS,
     CHUNK_SIZE,
+    DeltaBaseConflict,
     SyncClient,
 )
 
@@ -38,6 +39,7 @@ class _FakeQueue:
     def __init__(self, size: int) -> None:
         self.stream = _BoundedStream(size)
         self.renewals = 0
+        self.delta_conflicts: list[QueueItem] = []
 
     @contextmanager
     def open_payload(self, _item: QueueItem):
@@ -49,6 +51,10 @@ class _FakeQueue:
 
     def read_payload_text(self, _item: QueueItem) -> str:
         return "payload"
+
+    def mark_delta_conflict(self, item: QueueItem) -> bool:
+        self.delta_conflicts.append(item)
+        return True
 
 
 class _Response:
@@ -134,6 +140,7 @@ class SyncClientStreamingTests(unittest.TestCase):
         client._running = True
         client._pause_requested = threading.Event()
         client._client = http_client
+        client._full_resync_callback = None
         return client
 
     def test_all_upload_routes_use_source_mtime_and_legacy_fallback(self) -> None:
@@ -183,6 +190,55 @@ class SyncClientStreamingTests(unittest.TestCase):
         self.assertEqual(http_client.chunk_sizes, [CHUNK_SIZE, CHUNK_SIZE, 123])
         self.assertEqual(queue.stream.largest_read, CHUNK_SIZE)
         self.assertEqual(queue.renewals, 3)
+
+    def test_guarded_delta_uses_synchronous_multipart_and_sends_base(self) -> None:
+        size = CHUNK_SIZE + 123
+        queue = _FakeQueue(size)
+        client = self._client(queue, _FakeHttpClient())
+        routes: list[tuple[str, dict]] = []
+        client._upload_multipart = (
+            lambda payload, _stream: routes.append(("multipart", payload)) or True
+        )
+        client._upload_chunked = (
+            lambda payload, _item: routes.append(("chunked", payload)) or True
+        )
+        item = self._item(size)
+        item.sync_strategy = "delta"
+        item.is_partial = True
+        item.offset = 300
+        item.base_hash = "base-hash"
+        item.base_offset = 100
+
+        self.assertTrue(client._upload(item))
+        self.assertEqual(routes[0][0], "multipart")
+        self.assertEqual(routes[0][1]["mode"], "delta")
+        self.assertEqual(routes[0][1]["base_hash"], "base-hash")
+        self.assertEqual(routes[0][1]["base_offset"], 100)
+
+    def test_delta_base_conflict_retires_chain_and_requests_full_resync(self) -> None:
+        queue = _FakeQueue(100)
+        client = self._client(queue, _FakeHttpClient())
+        requested: list[str] = []
+        client._full_resync_callback = requested.append
+        captured: list[dict] = []
+
+        def reject(payload: dict) -> bool:
+            captured.append(payload)
+            raise DeltaBaseConflict(payload["relative_path"])
+
+        client._upload_json = reject
+        item = self._item(100)
+        item.sync_strategy = "delta"
+        item.is_partial = True
+        item.offset = 200
+        item.base_hash = "base-hash"
+        item.base_offset = 100
+        item.source_path = "/tmp/thread.jsonl"
+
+        self.assertTrue(client._upload(item))
+        self.assertEqual(captured[0]["base_hash"], "base-hash")
+        self.assertEqual(queue.delta_conflicts, [item])
+        self.assertEqual(requested, ["/tmp/thread.jsonl"])
 
     def test_response_lost_retries_same_accepted_chunk_then_continues(self) -> None:
         total_size = CHUNK_SIZE + 123

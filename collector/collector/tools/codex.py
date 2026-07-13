@@ -295,7 +295,7 @@ class CodexTool(BaseTool):
                 tool_name=self.name,
                 category=Category.CONVERSATION,
                 content_type=ContentType.JSONL,
-                sync_strategy=SyncStrategy.FULL,
+                sync_strategy=SyncStrategy.DELTA,
                 relative_path=rel_str,
                 metadata=meta,
             )

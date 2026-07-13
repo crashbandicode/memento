@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 import time
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 import httpx
 
@@ -21,10 +21,19 @@ CHUNK_RETRY_BASE_SECONDS = 0.5
 CHUNK_RETRY_MAX_SECONDS = 4.0
 
 
+class DeltaBaseConflict(RuntimeError):
+    """The server no longer has the exact revision a tail extends."""
+
+
 class SyncClient:
     """Background worker that safely drains leased queue items."""
 
-    def __init__(self, queue: SyncQueue, config: CollectorConfig) -> None:
+    def __init__(
+        self,
+        queue: SyncQueue,
+        config: CollectorConfig,
+        full_resync_callback: Callable[[str], None] | None = None,
+    ) -> None:
         self._queue = queue
         self._config = config
         self._running = False
@@ -32,6 +41,7 @@ class SyncClient:
         self._pause_requested = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
+        self._full_resync_callback = full_resync_callback
         try:
             from importlib.metadata import version
             collector_version = version("memento-brain-collector")
@@ -182,6 +192,9 @@ class SyncClient:
                 else item.created_at
             ),
         }
+        if item.is_partial and item.base_hash:
+            payload["base_hash"] = item.base_hash
+            payload["base_offset"] = item.base_offset
 
         try:
             if item.sync_strategy == "metadata":
@@ -193,11 +206,34 @@ class SyncClient:
             if size <= self._config.large_file_threshold:
                 payload["content"] = self._queue.read_payload_text(item)
                 return self._upload_json(payload)
-            if size <= CHUNK_SIZE:
+            if (
+                item.is_partial
+                and size <= getattr(
+                    self._config,
+                    "max_delta_upload_bytes",
+                    16 * 1024 * 1024,
+                )
+            ) or size <= CHUNK_SIZE:
                 with self._queue.open_payload(item) as stream:
                     return self._upload_multipart(payload, stream)
             return self._upload_chunked(payload, item)
 
+        except DeltaBaseConflict:
+            if not self._queue.mark_delta_conflict(item):
+                logger.warning(
+                    "Delta base conflict could not retire queue item %s/%s",
+                    item.tool_name,
+                    item.relative_path,
+                )
+                return False
+            logger.warning(
+                "Delta base changed for %s/%s; scheduling a complete snapshot",
+                item.tool_name,
+                item.relative_path,
+            )
+            if self._full_resync_callback and item.source_path:
+                self._full_resync_callback(item.source_path)
+            return True
         except httpx.ConnectError:
             logger.warning("Server unreachable, will retry later")
             return False
@@ -229,6 +265,7 @@ class SyncClient:
 
     def _upload_json(self, payload: dict) -> bool:
         resp = self._client.post("/api/ingest/file", json=payload)
+        self._raise_delta_conflict(resp, payload)
         if resp.status_code in (200, 201):
             return True
         logger.warning(
@@ -243,6 +280,7 @@ class SyncClient:
             data={"metadata": json.dumps(payload)},
             files={"content": ("content.txt", content_stream, "text/plain")},
         )
+        self._raise_delta_conflict(resp, payload)
         if resp.status_code in (200, 201):
             return True
         logger.warning(
@@ -306,6 +344,8 @@ class SyncClient:
                     else:
                         if resp.status_code in (200, 201):
                             break
+                        if resp.status_code == 409 and payload.get("mode") == "delta":
+                            raise DeltaBaseConflict(payload["relative_path"])
                         if resp.status_code == 429 or 500 <= resp.status_code < 600:
                             retry_reason = f"HTTP {resp.status_code}"
                         else:
@@ -340,6 +380,11 @@ class SyncClient:
 
         logger.info("Chunked upload complete: %s", payload["relative_path"])
         return True
+
+    @staticmethod
+    def _raise_delta_conflict(response, payload: dict) -> None:
+        if response.status_code == 409 and payload.get("mode") == "delta":
+            raise DeltaBaseConflict(payload["relative_path"])
 
     @property
     def is_connected(self) -> bool:

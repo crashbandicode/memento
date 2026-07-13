@@ -244,6 +244,20 @@ def _validated_chunk_coordinates(
             raise ChunkValidationError(f"invalid {field} metadata")
     if meta.get("mode", "full") not in ("full", "delta"):
         raise ChunkValidationError("mode must be full or delta")
+    base_hash = meta.get("base_hash")
+    base_offset = meta.get("base_offset")
+    if base_hash is not None and (
+        not isinstance(base_hash, str) or not base_hash or len(base_hash) > 64
+    ):
+        raise ChunkValidationError("base_hash must be a non-empty hash string")
+    if base_offset is not None and (
+        isinstance(base_offset, bool)
+        or not isinstance(base_offset, int)
+        or base_offset < 0
+    ):
+        raise ChunkValidationError("base_offset must be a non-negative integer")
+    if (base_hash is None) != (base_offset is None):
+        raise ChunkValidationError("base_hash and base_offset must be provided together")
     if not isinstance(meta.get("metadata", {}), dict):
         raise ChunkValidationError("metadata must be an object")
     if isinstance(meta.get("offset", 0), bool):
@@ -338,6 +352,8 @@ def stage_chunk(
                 "sync_strategy",
                 "metadata",
                 "timestamp",
+                "base_hash",
+                "base_offset",
                 "total_chunks",
             ):
                 if existing_meta.get(field) != meta.get(field):

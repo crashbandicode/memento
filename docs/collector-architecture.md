@@ -31,7 +31,7 @@
 │  ├─ 找到归属工具        │  tool_map: root_path → Tool
 │  ├─ tool.classify_file  │  → FileClassification
 │  ├─ 哈希变更检测        │  size + mtime + 前 256KB SHA-256
-│  ├─ 入队前脱敏          │  sanitize_text / sanitize_json(防本地 SQLite 取证泄密)
+│  ├─ 入队前脱敏          │  sanitize_text / sanitize_json / sanitize_jsonl
 │  ├─ 选择解析器          │  Markdown/JSONL/JSON/TOML/SQLite + Antigravity .pb/vscdb
 │  └─ parser.parse()      │  → 内容 + 偏移量 + 元数据
 └─────────────┬───────────┘
@@ -39,16 +39,17 @@
               ▼
 ┌─────────────────────────┐
 │  SyncQueue (SQLite)     │  WAL 模式，线程安全
-│  ├─ queue 表            │  待同步项（content, hash, metadata）
-│  └─ file_state 表       │  每文件的 hash + offset 记录
+│  ├─ queue 表            │  持久 payload、base hash/offset、同路径合并
+│  └─ file_state 表       │  observed 与 committed hash/offset 分离
 └─────────────┬───────────┘
               │
               ▼
 ┌─────────────────────────┐
-│  SyncClient             │  后台线程 + 5 并发上传
+│  SyncClient             │  后台线程 + 默认 2 并发上传
 │  ├─ < 1MB: JSON POST    │  /api/ingest/file
 │  ├─ 1-2MB: multipart    │  /api/ingest/file/upload
-│  └─ > 2MB: 分块上传     │  /api/ingest/file/chunk (2MB/块)
+│  ├─ DELTA ≤16MB         │  同步 multipart，可立即返回 base 冲突
+│  └─ FULL > 2MB          │  /api/ingest/file/chunk (2MB/块)
 └─────────────┬───────────┘
               │ HTTP + X-Collector-Token
               ▼
@@ -118,7 +119,7 @@
 | `config.toml` | config | TOML | FULL | 模型、推理级别、个性设置 |
 | `AGENTS.md` | identity | Markdown | FULL | Agent 指令 |
 | `history.jsonl` | history | JSONL | DELTA | 所有会话的用户输入历史 |
-| `sessions/**/*.jsonl` | conversation | JSONL | **FULL** | 活跃会话（FULL 避免丢失头部的 user_message） |
+| `sessions/**/*.jsonl` | conversation | JSONL | **DELTA** | 活跃会话；带 committed hash/offset 校验和 FULL 回退 |
 | `archived_sessions/*.jsonl` | conversation | JSONL | **FULL** | 归档会话 |
 | `logs_1.sqlite` | state | SQLite | POLL | 结构化日志 |
 | `state_5.sqlite` | state | SQLite | POLL | 线程和任务状态 |
@@ -262,8 +263,11 @@ hash = SHA-256(file_size + ":" + mtime_ns + first_256KB_content)
 
 对于 JSONL 等追加写入的文件：
 - 首次：从头读取，记录文件大小作为 offset
-- 后续：从 offset 位置开始读取新内容
-- 文件缩小（截断）：从头重新读取
+- 后续：从服务器已确认或同路径 FIFO 前驱的 offset 开始读取新内容
+- 待上传 DELTA 会从最早未提交 base 重新读取并原位替换，因此每个活跃文件最多保留一个待传 tail
+- 每个 DELTA 携带 base hash + base offset；服务器不完全匹配时返回 `409 delta_base_mismatch`
+- 收到 409 后采集器丢弃旧 tail 链并立即安排一次完整快照
+- 文件缩小（截断）或一次新增超过 16MB 时从头重新读取
 
 ---
 
@@ -275,6 +279,9 @@ hash = SHA-256(file_size + ":" + mtime_ns + first_256KB_content)
 | 1-2 MB | multipart 表单 | `POST /api/ingest/file/upload` |
 | > 2 MB | 2MB 分块上传 | `POST /api/ingest/file/chunk` |
 
+带 base 校验的 DELTA 在 16MB 以内始终走同步 JSON/multipart 路径，使服务器的
+409 冲突能够直接触发采集器 FULL 回退；更大的增量 burst 会先转换成完整快照。
+
 每个上传请求携带以下 Header：
 - `X-Collector-Token`：用户的采集器认证 token
 - `X-Device-Id`：设备唯一标识（持久化 UUID）
@@ -282,7 +289,7 @@ hash = SHA-256(file_size + ":" + mtime_ns + first_256KB_content)
 - `X-Device-Platform`：操作系统（Darwin / Windows / Linux）
 - `X-Collector-Version`：采集器版本号
 
-失败重试：指数退避（1s → 30s），最多 10 次后标记为 dead。
+失败重试：指数退避并持久保留 payload；普通网络故障不会丢弃或 dead-letter 数据。
 
 ---
 
@@ -295,6 +302,7 @@ hash = SHA-256(file_size + ":" + mtime_ns + first_256KB_content)
 | `MEMENTO_SERVER_URL` | `http://localhost:8001` | 服务器地址 |
 | `MEMENTO_SERVER_TOKEN` | `""` | 采集器认证 token |
 | `MEMENTO_OBSIDIAN_VAULT_PATH` | 自动发现 | Obsidian vault 路径 |
+| `MEMENTO_MAX_DELTA_UPLOAD_BYTES` | `16777216` | 单次受保护 DELTA 上限；超过后 FULL 回退 |
 | `MEMENTO_NONINTERACTIVE` | `""` | 设为 `1` 跳过 setup 所有 prompt(配合上面的 URL/TOKEN 做脚本化安装) |
 
 ### 持久化配置

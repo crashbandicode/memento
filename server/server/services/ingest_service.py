@@ -111,6 +111,20 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
 }
 
 
+class DeltaBaseMismatch(RuntimeError):
+    """A guarded append does not extend the server's committed revision."""
+
+    def __init__(
+        self,
+        *,
+        expected_hash: str | None,
+        expected_offset: int,
+    ) -> None:
+        super().__init__("delta base does not match committed source revision")
+        self.expected_hash = expected_hash
+        self.expected_offset = expected_offset
+
+
 def _logical_document_file_size(
     *,
     mode: str,
@@ -125,6 +139,29 @@ def _logical_document_file_size(
     # Collector DELTA offsets are the cumulative source end position. Preserve
     # the existing total as a fallback for legacy senders with a zero offset.
     return max(safe_payload, max(0, int(offset)), max(0, int(existing_size)))
+
+
+def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
+    """Accumulate parser statistics while preserving first-source metadata."""
+    merged = {**existing, **incoming}
+    existing_lines = existing.get("total_lines")
+    incoming_lines = incoming.get("total_lines")
+    if isinstance(existing_lines, int) and isinstance(incoming_lines, int):
+        merged["total_lines"] = existing_lines + incoming_lines
+
+    existing_types = existing.get("message_types")
+    incoming_types = incoming.get("message_types")
+    if isinstance(existing_types, dict) and isinstance(incoming_types, dict):
+        combined: dict[str, int] = {}
+        for source in (existing_types, incoming_types):
+            for key, value in source.items():
+                if isinstance(value, int):
+                    combined[str(key)] = combined.get(str(key), 0) + value
+        merged["message_types"] = combined
+
+    if existing.get("first_timestamp"):
+        merged["first_timestamp"] = existing["first_timestamp"]
+    return merged
 
 
 async def _invalidate_embeddings_for_revision(
@@ -766,6 +803,8 @@ async def ingest_file(
     content_s3_key: str | None = None,
     content_already_sanitized: bool = False,
     content_had_sensitive: bool = False,
+    base_hash: str | None = None,
+    base_offset: int | None = None,
 ) -> Document:
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
@@ -845,6 +884,25 @@ async def ingest_file(
             )
             setattr(doc, "_memento_ingest_disposition", "idempotent")
             return doc
+
+    if mode == "delta" and base_hash is not None:
+        expected_hash = sync_row.last_hash if sync_row is not None else None
+        expected_offset = int(sync_row.last_offset or 0) if sync_row is not None else 0
+        committed_matches_state = (
+            doc is not None
+            and expected_hash is not None
+            and doc.content_hash == expected_hash
+        )
+        if (
+            not committed_matches_state
+            or expected_hash != base_hash
+            or base_offset is None
+            or expected_offset != int(base_offset)
+        ):
+            raise DeltaBaseMismatch(
+                expected_hash=expected_hash,
+                expected_offset=expected_offset,
+            )
 
     if mode == "full" and doc is not None and doc.content_hash == content_hash:
         pointer_is_current = (
@@ -1076,8 +1134,13 @@ async def ingest_file(
         existing_metadata = dict(doc.metadata_ or {})
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
+        metadata_update = (
+            _merge_delta_metadata(existing_metadata, stored_metadata)
+            if mode == "delta"
+            else {**existing_metadata, **stored_metadata}
+        )
         merged_metadata, _, _ = _prepare_document_metadata(
-            {**existing_metadata, **stored_metadata},
+            metadata_update,
             tool_id=tool_id,
         )
         doc.metadata_ = merged_metadata

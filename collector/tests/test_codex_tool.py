@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from collector.tools import codex as codex_module
+from collector.tools.base import SyncStrategy
 from collector.tools.codex import CodexTool
 
 
@@ -118,6 +119,7 @@ def test_user_root_identity_and_cwd_use_one_initial_read(
     classification = codex_tool.classify_file(path)
 
     assert classification is not None
+    assert classification.sync_strategy == SyncStrategy.DELTA
     assert initial_reads == 1
     assert classification.metadata == {
         "session_name": path.stem,

@@ -109,6 +109,41 @@ class ChunkIngestApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_guarded_delta_mismatch_returns_resyncable_conflict(self) -> None:
+        payload = {
+            "tool": "codex",
+            "category": "conversation",
+            "content_type": "jsonl",
+            "relative_path": "sessions/thread.jsonl",
+            "hash": "next-hash",
+            "mode": "delta",
+            "offset": 20,
+            "file_size": 5,
+            "base_hash": "base-hash",
+            "base_offset": 10,
+            "content": "tail\n",
+        }
+        with (
+            patch.object(ingest_api, "ensure_device", new_callable=AsyncMock),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=ingest_api.DeltaBaseMismatch(
+                    expected_hash="server-hash",
+                    expected_offset=15,
+                ),
+            ),
+        ):
+            response = self.client.post("/api/ingest/file", json=payload)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], {
+            "code": "delta_base_mismatch",
+            "expected_hash": "server-hash",
+            "expected_offset": 15,
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

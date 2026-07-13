@@ -22,7 +22,7 @@ from .parsers.markdown import MarkdownParser
 from .parsers.sqlite_parser import SqliteParser
 from .parsers.toml_parser import TomlParser
 from .queue import SyncQueue
-from .sanitizer import sanitize_json, sanitize_text
+from .sanitizer import sanitize_json, sanitize_jsonl, sanitize_text
 from .tools.base import BaseTool, ContentType, SyncStrategy
 
 logger = logging.getLogger("collector.watcher")
@@ -175,6 +175,8 @@ class FileWatcher:
         self._scan_cancel_event = threading.Event()
         self._scan_lock = threading.Lock()
         self._processing_lock = threading.Lock()
+        self._resync_lock = threading.Lock()
+        self._resyncing_paths: set[str] = set()
         self._handlers: list[_DebouncedHandler] = []
         self._tool_map: dict[str, BaseTool] = {}  # root_path_str -> tool
 
@@ -246,6 +248,47 @@ class FileWatcher:
                 return tool
         return None
 
+    def request_full_resync(self, source_path: str) -> None:
+        """Schedule one complete snapshot after the server rejects a delta base."""
+        path = Path(source_path)
+        path_key = normalize_path(str(path))
+        with self._resync_lock:
+            if path_key in self._resyncing_paths or self._stop_event.is_set():
+                return
+            self._resyncing_paths.add(path_key)
+
+        def run() -> None:
+            try:
+                for _attempt in range(3):
+                    if self._stop_event.is_set() or not path.is_file():
+                        return
+                    self._on_file_changed(path, force_full=True)
+                    current_hash = _file_hash(path)
+                    tool = self._find_tool(path)
+                    if tool is None:
+                        return
+                    classification = tool.classify_file(path)
+                    if classification is None:
+                        return
+                    observed_hash, _ = self._queue.get_file_state(
+                        classification.tool_name,
+                        classification.relative_path,
+                    )
+                    if current_hash and observed_hash == current_hash:
+                        logger.info("Queued complete resync for %s", path)
+                        return
+                    time.sleep(0.5)
+                logger.warning("Could not capture a stable complete resync for %s", path)
+            finally:
+                with self._resync_lock:
+                    self._resyncing_paths.discard(path_key)
+
+        threading.Thread(
+            target=run,
+            name="memento-delta-resync",
+            daemon=True,
+        ).start()
+
     def _get_parser(self, content_type: ContentType) -> BaseParser | None:
         ext_map = {
             ContentType.MARKDOWN: ".md",
@@ -308,16 +351,16 @@ class FileWatcher:
                 conv["cascade_id"],
             )
 
-    def _on_file_changed(self, path: Path) -> None:
+    def _on_file_changed(self, path: Path, force_full: bool = False) -> None:
         """Serialize parsing and make shutdown a hard callback boundary."""
         if self._stop_event.is_set():
             return
         with self._processing_lock:
             if self._stop_event.is_set():
                 return
-            self._process_file_changed(path)
+            self._process_file_changed(path, force_full=force_full)
 
-    def _process_file_changed(self, path: Path) -> None:
+    def _process_file_changed(self, path: Path, force_full: bool = False) -> None:
         tool = self._find_tool(path)
         if tool is None:
             return
@@ -347,22 +390,52 @@ class FileWatcher:
         if not current_hash:
             return
 
-        last_hash, last_offset = self._queue.get_file_state(
+        last_hash, _ = self._queue.get_file_state(
             classification.tool_name, classification.relative_path,
         )
 
         # For FULL sync, skip if hash unchanged
-        if classification.sync_strategy == SyncStrategy.FULL and current_hash == last_hash:
+        if (
+            not force_full
+            and classification.sync_strategy == SyncStrategy.FULL
+            and current_hash == last_hash
+        ):
             return
 
         # Determine read offset for delta sync
         read_offset = 0
-        if classification.sync_strategy == SyncStrategy.DELTA:
-            if file_size < last_offset:
+        base_hash: str | None = None
+        base_offset = 0
+        if classification.sync_strategy == SyncStrategy.DELTA and not force_full:
+            base_hash, base_offset = self._queue.get_delta_base(
+                classification.tool_name,
+                classification.relative_path,
+            )
+            if file_size < base_offset:
                 # File was truncated, re-sync from beginning
                 read_offset = 0
+                base_hash = None
+                base_offset = 0
             else:
-                read_offset = last_offset
+                read_offset = base_offset
+            max_delta_bytes = getattr(
+                self._config,
+                "max_delta_upload_bytes",
+                16 * 1024 * 1024,
+            )
+            if (
+                read_offset > 0
+                and file_size - read_offset
+                > max_delta_bytes
+            ):
+                logger.info(
+                    "Delta burst exceeds %d bytes; queueing complete snapshot for %s",
+                    max_delta_bytes,
+                    path,
+                )
+                read_offset = 0
+                base_hash = None
+                base_offset = 0
 
         # Parse (with error protection)
         try:
@@ -391,7 +464,9 @@ class FileWatcher:
             return
 
         # Sanitize before enqueue (defense-in-depth vs local SQLite leak)
-        if classification.content_type in (ContentType.JSON, ContentType.JSONL):
+        if classification.content_type == ContentType.JSONL:
+            san = sanitize_jsonl(parsed_content)
+        elif classification.content_type == ContentType.JSON:
             san = sanitize_json(parsed_content)
         else:
             san = sanitize_text(parsed_content)
@@ -424,6 +499,9 @@ class FileWatcher:
             offset=new_offset,
             metadata=classification.metadata,
             source_modified_at=source_modified_at,
+            base_hash=base_hash if is_partial else None,
+            base_offset=base_offset if is_partial else 0,
+            source_path=str(path),
         )
 
         logger.info(
