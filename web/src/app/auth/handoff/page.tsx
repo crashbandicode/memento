@@ -20,7 +20,10 @@ export default function HandoffPage() {
     const params = new URLSearchParams(hash);
     const token = params.get("token");
     const next = params.get("next");
-    const dest = next && next.startsWith("/") ? next : "/app";
+    // Only allow same-origin relative paths — reject "//host" and "/\host"
+    // (browsers normalize backslash to slash, making it protocol-relative).
+    const dest =
+      next && next.startsWith("/") && !/^\/[/\\]/.test(next) ? next : "/app";
 
     if (!token) {
       setFailed(true);

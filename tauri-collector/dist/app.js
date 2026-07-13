@@ -48,6 +48,11 @@ const $ = (sel) => document.querySelector(sel);
 let state = {
   config: null,
   status: { running: false },
+  // Which server the dashboard iframe is currently loaded for, and whether a
+  // JWT mint is in flight for it. Both gate iframe.src assignment — see
+  // openDashboard().
+  dashboardLoadedFor: null,
+  dashboardMinting: false,
 };
 
 // ─── Tabs ──────────────────────────────────────────────────────────
@@ -65,7 +70,10 @@ function activateTab(name) {
   // trapped with no way back to the Server tab. openDashboard() owns the
   // fullscreen decision; every other tab exits fullscreen.
   if (name === "dashboard") {
-    openDashboard();
+    // Fire-and-forget: openDashboard() is async (it mints a web JWT). Nothing
+    // here depends on its result, but swallow rejections so a failed mint can
+    // never surface as an unhandled promise rejection.
+    openDashboard().catch(() => {});
   } else {
     document.body.classList.remove("dashboard-fullscreen");
   }
@@ -103,6 +111,44 @@ function deriveWebUrl(apiUrl) {
   return base;
 }
 
+// Pick the URL to load the dashboard iframe at.
+//
+// The collector token in state.config survives app updates; the WebView's
+// localStorage (where the web app keeps its JWT under "dr_token") does NOT —
+// an update/reinstall wipes it. So we mint a fresh web JWT from the durable
+// collector token on every dashboard open and hand it to the web app via
+// /auth/handoff, which stores it and navigates on to `next` itself. Minting
+// every time also means an expired JWT self-heals; there is nothing to cache.
+//
+// The JWT goes in the URL FRAGMENT, never the query string: fragments are not
+// sent to the server, so the token stays out of access logs and Referer.
+//
+// CONSTRAINT: the caller must assign iframe.src exactly ONCE from this result
+// and must never force a follow-up reload. /auth/handoff performs its own
+// window.location.replace(); a second navigation races it and logs the user
+// straight back out (that regression looked like "logged out on every other
+// refresh").
+async function dashboardUrlFor(apiUrl, token, webBase) {
+  // Never logged in on this device — no collector token to exchange. Go to the
+  // login page directly rather than /app, which would flash "Failed to load
+  // dashboard" while AuthProvider redirects.
+  if (!token) return `${webBase}/auth/login?embed=memento&next=/app`;
+  try {
+    const jwt = await invoke("mint_web_token", {
+      serverUrl: apiUrl,
+      collectorToken: token,
+    });
+    const p = new URLSearchParams({ token: jwt, next: "/app?embed=memento" });
+    return `${webBase}/auth/handoff#${p.toString()}`;
+  } catch (e) {
+    // Offline, server down, or the token was revoked. Fall back to /app so a
+    // user whose iframe storage is still intact gets in anyway; if it isn't,
+    // the web app redirects to its own login. Not worth alarming anyone over.
+    console.warn("mint_web_token failed, falling back to iframe-local auth:", e);
+    return `${webBase}/app?embed=memento`;
+  }
+}
+
 async function openDashboard() {
   const apiUrl = (state.config?.server_url || "").trim();
   const token = (state.config?.server_token || "").trim();
@@ -130,40 +176,48 @@ async function openDashboard() {
     return;
   }
 
-  // The iframe is same-origin with the server, so its localStorage
-  // (where the web app keeps the JWT after login) persists across
-  // src reassignments. We don't need a separate SSO handoff round-trip
-  // for "open the dashboard" — relying on iframe-local storage avoids
-  // the redirect cycle that can flicker through /auth/login on older
-  // web builds without a /auth/handoff route.
-  //
-  // Picking the landing URL:
-  //   - have a saved token → user already authenticated on this device
-  //     at least once via the in-iframe login, so /app will use the
-  //     iframe's JWT (or, if it was cleared, redirect to /auth/login).
-  //   - no token yet → go straight to /auth/login to avoid the brief
-  //     "Failed to load dashboard" flash that /app renders while it's
-  //     getting redirected by AuthProvider.
-  // ?embed=memento makes the (new) web post the collector token back
-  // to us on the *next* login event; older web builds just ignore it.
-  const target = token
-    ? `${webBase}/app?embed=memento`
-    : `${webBase}/auth/login?embed=memento&next=/app`;
-  iframe.src = target;
-  state.dashboardLoadedFor = apiUrl;
+  // dashboardLoadedFor alone can't gate this: it's only set AFTER the mint,
+  // and the mint is a network round-trip (up to 20s). A second entry during
+  // that window — impatient double-click on the tab, or the post-Save
+  // setTimeout landing on top of the startup call — would sail past the guard
+  // above and assign iframe.src a second time, racing the first hand-off's
+  // location.replace(). That is exactly the two-navigations bug that used to
+  // log people out on every other refresh. One mint in flight at a time.
+  if (state.dashboardMinting) return;
+  state.dashboardMinting = true;
+  try {
+    // ?embed=memento makes the web post the collector token back to us on the
+    // next in-iframe login event; older web builds just ignore it.
+    iframe.src = await dashboardUrlFor(apiUrl, token, webBase);
+    state.dashboardLoadedFor = apiUrl;
+  } finally {
+    state.dashboardMinting = false;
+  }
 }
 
-document.getElementById("dashboardReload")?.addEventListener("click", () => {
-  // The earlier attempt (contentWindow.location.reload()) always threw
-  // a SecurityError: the iframe is cross-origin with the Tauri parent
-  // (allow-same-origin makes the iframe same-origin with the *server*,
-  // not with us). Reassigning iframe.src to /app on the same origin
-  // keeps localStorage (the JWT) intact and avoids the SSO handoff
-  // round-trip that was flickering through /auth/login.
+document.getElementById("dashboardReload")?.addEventListener("click", async () => {
+  // Never contentWindow.location.reload(): the iframe is cross-origin with the
+  // Tauri parent (allow-same-origin makes it same-origin with the *server*,
+  // not with us), so touching it throws SecurityError. Reassigning src is the
+  // only way to reload it.
+  //
+  // Reload goes through dashboardUrlFor() too, so a manual refresh re-mints the
+  // JWT and an expired session heals itself. It's an explicit user action, so
+  // it deliberately bypasses the dashboardLoadedFor guard — but it still honors
+  // dashboardMinting, so hammering the button can't put two navigations in
+  // flight at once.
   const iframe = document.getElementById("dashboardIframe");
   const apiUrl = (state.config?.server_url || "").trim();
-  if (!apiUrl) return;
-  iframe.src = `${deriveWebUrl(apiUrl)}/app?embed=memento`;
+  const token = (state.config?.server_token || "").trim();
+  if (!apiUrl || state.dashboardMinting) return;
+  const webBase = deriveWebUrl(apiUrl);
+  state.dashboardMinting = true;
+  try {
+    iframe.src = await dashboardUrlFor(apiUrl, token, webBase);
+    state.dashboardLoadedFor = apiUrl;
+  } finally {
+    state.dashboardMinting = false;
+  }
 });
 
 document.getElementById("dashboardOpenExternal")?.addEventListener("click", async () => {
