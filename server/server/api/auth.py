@@ -323,6 +323,9 @@ async def github_callback(
     def _error(error_code: str) -> RedirectResponse:
         return RedirectResponse(f"{frontend}/auth/login?error={error_code}", status_code=302)
 
+    if not settings.github_oauth_enabled:
+        return _error("github_oauth_failed")
+
     next_path = _verify_state(state)
     if next_path is None or not code:
         return _error("github_oauth_failed")
