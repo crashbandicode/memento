@@ -34,6 +34,7 @@ from ..services.message_search import (
     normalize_search_query,
     suggest_corrected_query,
 )
+from ..services.conversation_markdown import is_meaningful_human_prompt
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -241,6 +242,7 @@ async def get_conversation_messages(
     doc_id: uuid.UUID,
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    tail: bool = Query(False),
     line_number: int | None = Query(None, ge=1),
     context_before: int = Query(0, ge=0, le=200),
     db: AsyncSession = Depends(get_db),
@@ -273,6 +275,8 @@ async def get_conversation_messages(
     )
     total = count_result.scalar() or 0
     if total > 0:
+        if tail is True and line_number is None:
+            offset = max(0, total - limit)
         message_query = (
             select(ConversationMessage)
             .where(*base_filter)
@@ -337,6 +341,8 @@ async def get_conversation_messages(
         offset = max(0, line_number - 1 - context_before)
     if raw_content:
         total = count_conversation_messages(raw_content, doc.tool_id)
+        if tail is True and line_number is None:
+            offset = max(0, total - limit)
         page = parse_conversation(raw_content, doc.tool_id, offset=offset, limit=limit)
         return {
             "total": total,
@@ -532,11 +538,7 @@ async def get_conversation_prompts(
         )
         for message_id, line_number, content, timestamp, metadata in prompt_rows.all():
             clean = (content or "").strip()
-            if (
-                not clean
-                or clean.startswith("[Subagent Context]")
-                or _stored_interaction(metadata, "interaction_response") is not None
-            ):
+            if not is_meaningful_human_prompt(clean, metadata):
                 continue
             prompts.append({
                 "id": message_id,
@@ -558,10 +560,12 @@ async def get_conversation_prompts(
                     "timestamp": message.timestamp or None,
                 }
                 for index, message in enumerate(parsed)
-                if message.role == "user"
-                and message.content.strip()
-                and not message.content.lstrip().startswith("[Subagent Context]")
-                and message.interaction_response is None
+                if is_meaningful_human_prompt(
+                    message.content,
+                    {"interaction_response": message.interaction_response}
+                    if message.interaction_response else {},
+                    message.role,
+                )
             ]
 
     return {"prompts": prompts}

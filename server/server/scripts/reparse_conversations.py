@@ -39,7 +39,7 @@ from server.services.ingest_service import (
 from server.services.large_content_store import read_large_content
 
 
-PARSER_REVISION = "question-interactions-v1"
+PARSER_REVISION = "codex-tools-v2"
 SUPPORTED_TOOLS = ("codex", "claude_code", "cursor")
 COPY_BATCH_SIZE = 2_000
 SOURCE_READ_SLACK_BYTES = 1

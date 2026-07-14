@@ -6,9 +6,10 @@ import { api, ConversationMeta, ExportDiagnostics } from "@/lib/api-client";
 import { fmt, useI18n } from "@/lib/i18n";
 import ConversationViewer from "@/components/viewers/ConversationViewer";
 import { ToolGlyph } from "@/components/aurora/Icon";
-import { Chip } from "@/components/aurora/primitives";
+import { Btn, Chip } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
+import { MarkdownExportDialog } from "@/components/conversations/MarkdownExportForm";
 
 interface RelatedPlan {
   id: string;
@@ -29,6 +30,7 @@ export default function ConversationPage() {
   const params = useParams();
   const docId = params.id as string;
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
+  const [showExport, setShowExport] = useState(false);
   const { t, locale } = useI18n();
   const { prompts, syncVersion } = useConversationPrompts(docId);
 
@@ -63,11 +65,14 @@ export default function ConversationPage() {
           <div className="text-gray-400 text-center">{t.loading}</div>
         ) : (
           <>
-            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 6 }}>
               <ToolGlyph id={currentMeta.tool_id} size={32} />
-              <h2 style={{ margin: 0, fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
+              <h2 style={{ margin: 0, minWidth: 0, flex: "1 1 280px", fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
                 {currentMeta.title || currentMeta.relative_path}
               </h2>
+              <Btn size="sm" variant="glass" icon="arrow_down" onClick={() => setShowExport(true)}>
+                Export
+              </Btn>
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
               <Chip>{currentMeta.tool_id}</Chip>
@@ -160,6 +165,9 @@ export default function ConversationPage() {
         totalMessages={currentMeta?.message_count}
         artifacts={plans}
       />
+      {showExport && (
+        <MarkdownExportDialog documentId={docId} onClose={() => setShowExport(false)} />
+      )}
     </div>
   );
 }

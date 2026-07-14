@@ -69,6 +69,7 @@ const enUS: Translations = {
     tools: "Tools",
     daily: "Daily",
     search: "Search",
+    export: "Export",
     devices: "Devices",
     admin: "Admin",
     projects: "Projects",

@@ -197,6 +197,75 @@ class ConversationParserTests(unittest.TestCase):
             ["Proceed"],
         )
 
+    def test_codex_ordinary_tool_calls_and_outputs_are_preserved(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-14T12:00:00Z",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "call-exec-1",
+                    "input": "text(await tools.shell_command({command: 'Get-Date'}));",
+                },
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-14T12:00:01Z",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-exec-1",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\n"},
+                        {"type": "input_text", "text": "Exit code: 0"},
+                    ],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].role, "tool")
+        self.assertEqual(messages[0].tool_name, "exec")
+        self.assertIn("Get-Date", messages[0].tool_input)
+        self.assertEqual(messages[0].raw_type, "tool_call")
+        self.assertEqual(messages[1].role, "tool")
+        self.assertEqual(messages[1].tool_name, "Tool result")
+        self.assertEqual(messages[1].content, "Script completed\n\nExit code: 0")
+        self.assertEqual(messages[1].raw_type, "tool_output")
+
+    def test_codex_function_and_web_search_calls_are_preserved(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": "call-shell-1",
+                    "arguments": {"command": "Get-Process"},
+                },
+            }),
+            json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "web_search_call",
+                    "call_id": "call-search-1",
+                    "query": "Memento documentation",
+                    "status": "completed",
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual([message.tool_name for message in messages], [
+            "shell_command",
+            "web_search",
+        ])
+        self.assertIn("Get-Process", messages[0].tool_input)
+        self.assertEqual(messages[1].tool_input, "Memento documentation")
+
     def test_question_response_can_resume_across_delta_boundaries(self) -> None:
         cursor_question_raw = json.dumps({
             "role": "assistant",

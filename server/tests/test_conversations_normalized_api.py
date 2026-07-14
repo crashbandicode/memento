@@ -136,6 +136,34 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("conversation_messages.line_number >=", message_sql)
         self.assertNotIn("documents.content", message_sql)
 
+    async def test_tail_returns_latest_normalized_rows(self) -> None:
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=4306),
+            _Result(rows=[self.message(4305), self.message(4306)]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=2,
+            tail=True,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["total"], 4306)
+        self.assertEqual(payload["offset"], 4304)
+        self.assertEqual(
+            [item["line_number"] for item in payload["messages"]],
+            [4305, 4306],
+        )
+        message_sql = str(db.statements[2].compile())
+        self.assertIn("OFFSET", message_sql.upper())
+        self.assertNotIn("documents.content", message_sql)
+
     async def test_prompts_prefer_normalized_rows(self) -> None:
         db = _Db([
             _Result(scalar_value=self.doc),

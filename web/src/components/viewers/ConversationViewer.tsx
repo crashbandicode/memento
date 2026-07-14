@@ -149,8 +149,21 @@ function toolPreview(toolName: string, input: string, output: string): string {
 }
 
 const MESSAGE_PAGE_SIZE = 50;
+const LIVE_TAIL_SIZE = 200;
 const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
+
+function mergeMessagesChronologically(
+  current: ConversationMessage[],
+  incoming: ConversationMessage[],
+): ConversationMessage[] {
+  const byId = new Map(current.map((message) => [String(message.id), message]));
+  incoming.forEach((message) => byId.set(String(message.id), message));
+  return Array.from(byId.values()).sort((left, right) => {
+    const lineDifference = left.line_number - right.line_number;
+    return lineDifference || String(left.id).localeCompare(String(right.id));
+  });
+}
 
 type PairedQuestionResponse = {
   response: QuestionInteractionResponse;
@@ -183,7 +196,10 @@ export default function ConversationViewer({
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
+  const rangeLoadedRef = useRef(false);
   const loadingRef = useRef(false);
+  const syncingTailRef = useRef(false);
+  const latestPromptLineRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
   const { questionIds, questionResponses } = useMemo(() => {
     const ids = new Set<string>();
@@ -211,13 +227,15 @@ export default function ConversationViewer({
       const res = await api.getMessages(documentId, offsetRef.current, MESSAGE_PAGE_SIZE);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
-        if (messages.length === 0) startOffsetRef.current = res.offset;
-        setMessages((prev) => {
-          const existingIds = new Set(prev.map((m) => m.id));
-          const newMsgs = res.messages.filter((m) => !existingIds.has(m.id));
-          return [...prev, ...newMsgs];
-        });
-        offsetRef.current = Math.max(offsetRef.current, res.offset + res.messages.length);
+        if (!rangeLoadedRef.current) {
+          startOffsetRef.current = res.offset;
+          rangeLoadedRef.current = true;
+        }
+        setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
+        offsetRef.current = Math.max(
+          offsetRef.current,
+          res.offset + res.messages.length,
+        );
       }
       setHasMore(offsetRef.current < res.total);
       setHasEarlier(startOffsetRef.current > 0);
@@ -245,13 +263,7 @@ export default function ConversationViewer({
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
         startOffsetRef.current = res.offset;
-        setMessages((prev) => {
-          const existingIds = new Set(prev.map((message) => message.id));
-          return [
-            ...res.messages.filter((message) => !existingIds.has(message.id)),
-            ...prev,
-          ];
-        });
+        setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
         window.requestAnimationFrame(() => {
           if (!el) return;
           el.scrollTop += el.scrollHeight - previousScrollHeight;
@@ -267,11 +279,41 @@ export default function ConversationViewer({
     }
   };
 
+  const loadLatestTail = useCallback(async () => {
+    if (syncingTailRef.current) return;
+    syncingTailRef.current = true;
+    try {
+      const res = await api.getLatestMessages(documentId, LIVE_TAIL_SIZE);
+      setKnownTotal(res.total);
+      if (res.messages.length > 0) {
+        const tailEnd = res.offset + res.messages.length;
+        if (!rangeLoadedRef.current) {
+          startOffsetRef.current = res.offset;
+          offsetRef.current = tailEnd;
+          rangeLoadedRef.current = true;
+        } else if (res.offset <= offsetRef.current) {
+          // Extend the contiguous loaded range only when the tail overlaps it.
+          // A disjoint tail remains visible while ordinary paging fills the gap.
+          offsetRef.current = Math.max(offsetRef.current, tailEnd);
+        }
+        setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
+      }
+      setHasEarlier(startOffsetRef.current > 0);
+      setHasMore(offsetRef.current < res.total);
+    } catch (error) {
+      console.error("Failed to load latest messages:", error);
+    } finally {
+      syncingTailRef.current = false;
+    }
+  }, [documentId]);
+
   useEffect(() => {
     setMessages([]);
     startOffsetRef.current = 0;
     offsetRef.current = 0;
+    rangeLoadedRef.current = false;
     loadingRef.current = false;
+    syncingTailRef.current = false;
     setHasMore(true);
     setHasEarlier(false);
     setKnownTotal(totalMessages);
@@ -281,18 +323,20 @@ export default function ConversationViewer({
     loadMore({ force: true });
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // A collector append emits one route-level sync signal. Fetch only the
-  // unseen tail and merge by id, preserving the reader's current position.
+  // A collector append can arrive while the reader has only the beginning or
+  // a prompt-centered window loaded. Fetch the actual server tail rather than
+  // the next historical page so new questions and responses appear live.
   useEffect(() => {
     if (syncVersion === 0) return;
-    void loadMore({ force: true });
-  }, [syncVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+    void loadLatestTail();
+  }, [syncVersion, loadLatestTail]);
 
   useEffect(() => {
     if (typeof totalMessages === "number") setKnownTotal(totalMessages);
   }, [totalMessages]);
 
   useEffect(() => {
+    latestPromptLineRef.current = prompts.at(-1)?.line_number ?? null;
     setActivePromptLine((previous) => {
       if (previous !== null && prompts.some((prompt) => prompt.line_number === previous)) return previous;
       return prompts[0]?.line_number ?? null;
@@ -360,10 +404,23 @@ export default function ConversationViewer({
           PROMPT_JUMP_CONTEXT_BEFORE,
           PROMPT_JUMP_WINDOW_SIZE,
         );
+        let nextMessages = response.messages;
+        let contiguousEnd = response.offset + response.messages.length;
+        if (
+          lineNumber === latestPromptLineRef.current
+          && contiguousEnd < response.total
+        ) {
+          const tail = await api.getLatestMessages(documentId, LIVE_TAIL_SIZE);
+          nextMessages = mergeMessagesChronologically(nextMessages, tail.messages);
+          if (tail.offset <= contiguousEnd) {
+            contiguousEnd = Math.max(contiguousEnd, tail.offset + tail.messages.length);
+          }
+        }
         setKnownTotal(response.total);
         startOffsetRef.current = response.offset;
-        offsetRef.current = response.offset + response.messages.length;
-        setMessages(response.messages);
+        offsetRef.current = contiguousEnd;
+        rangeLoadedRef.current = true;
+        setMessages(nextMessages);
         setHasEarlier(response.offset > 0);
         setHasMore(offsetRef.current < response.total);
       } catch (error) {
@@ -377,7 +434,7 @@ export default function ConversationViewer({
     }
 
     setPendingPromptLine(lineNumber);
-  }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [documentId]);
 
   const navigateToPrompt = async (prompt: ConversationPrompt) => {
     setActivePromptLine(prompt.line_number);
@@ -698,6 +755,7 @@ function ConversationSearchBar({
               key={result.id}
               type="button"
               role="option"
+              aria-selected="false"
               data-conversation-search-hit={result.line_number}
               onClick={() => void selectResult(result)}
               style={{

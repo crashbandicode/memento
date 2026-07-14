@@ -500,9 +500,30 @@ def parse_conversation_object(
             if role in ("developer", "system"):
                 return None  # Skip system prompts
             p_type = payload.get("type", "")
-            if p_type in ("function_call", "custom_tool_call"):
-                tool_name = _coerce_text(payload.get("name"))
-                raw_input = payload.get("arguments", payload.get("input", {}))
+            if p_type in ("function_call", "custom_tool_call", "web_search_call"):
+                tool_name = _coerce_text(payload.get("name")) or (
+                    "web_search" if p_type == "web_search_call" else p_type
+                )
+                if "arguments" in payload:
+                    raw_input = payload.get("arguments")
+                elif "input" in payload:
+                    raw_input = payload.get("input")
+                elif "query" in payload:
+                    raw_input = payload.get("query")
+                else:
+                    raw_input = {
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {
+                            "type",
+                            "id",
+                            "call_id",
+                            "name",
+                            "namespace",
+                            "status",
+                            "internal_chat_message_metadata_passthrough",
+                        }
+                    }
                 tool_call_id = _bounded_interaction_text(
                     payload.get("call_id") or payload.get("id"),
                     512,
@@ -525,26 +546,38 @@ def parse_conversation_object(
                         interaction=interaction,
                         tool_call_id=tool_call_id,
                     )
-                return None
+                return NormalizedMessage(
+                    role="tool",
+                    content=f"[{tool_name}]",
+                    tool_name=tool_name,
+                    tool_input=_serialize_tool_input(raw_input),
+                    timestamp=timestamp,
+                    raw_type="tool_call",
+                    source_id=tool_call_id,
+                    tool_call_id=tool_call_id,
+                )
             if p_type in ("function_call_output", "custom_tool_call_output"):
                 raw_output = payload.get("output", payload.get("result", ""))
-                # Codex does not repeat the function name on output rows. Only
-                # accept the structured answer envelope used by
-                # request_user_input so ordinary function outputs remain out
-                # of the normalized conversation, as before.
-                if "answers" not in _json_mapping(raw_output):
-                    return None
                 tool_call_id = _bounded_interaction_text(
                     payload.get("call_id") or payload.get("id"),
                     512,
                 )
+                is_question_response = "answers" in _json_mapping(raw_output)
                 return NormalizedMessage(
                     role="tool",
-                    content=_serialize_tool_input(raw_output),
-                    tool_name="Question response",
+                    content=_extract_codex_tool_output(raw_output),
+                    tool_name=(
+                        "Question response" if is_question_response else "Tool result"
+                    ),
                     timestamp=timestamp,
-                    raw_type="question_tool_output",
-                    source_id=f"{tool_call_id}:response" if tool_call_id else "",
+                    raw_type=(
+                        "question_tool_output" if is_question_response else "tool_output"
+                    ),
+                    source_id=(
+                        f"{tool_call_id}:response"
+                        if is_question_response and tool_call_id
+                        else f"{tool_call_id}:output" if tool_call_id else ""
+                    ),
                     tool_call_id=tool_call_id,
                 )
             # Skip reasoning — AI internal thought process, not a reply
@@ -1427,6 +1460,16 @@ def _extract_codex_content(content_list) -> str:
         elif isinstance(item, str):
             parts.append(item)
     return "\n".join(parts)
+
+
+def _extract_codex_tool_output(value: object) -> str:
+    """Render Codex tool results without leaking their transport envelope."""
+    if isinstance(value, list):
+        extracted = _extract_codex_content(value).strip()
+        if extracted:
+            return extracted
+    serialized = _serialize_tool_input(value).strip()
+    return serialized or "(tool returned no textual output)"
 
 
 def _iter_decoded_json_objects(raw_content: str):

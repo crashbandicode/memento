@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import admin, auth, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tools
+from .api import admin, auth, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -447,6 +447,7 @@ app.include_router(ingest.router)
 app.include_router(tools.router)
 app.include_router(documents.router)
 app.include_router(conversations.router)
+app.include_router(conversation_exports.router)
 app.include_router(projects.router)
 app.include_router(daily.router)
 app.include_router(search.router)

@@ -164,6 +164,17 @@ export interface ToolDetail extends ToolSummary {
   categories: Record<string, number>;
 }
 
+export interface ProjectSummary {
+  id: string;
+  slug: string;
+  title: string;
+  tool_id: string;
+  source_path: string;
+  document_count: number;
+  created_at: string;
+  updated_at: string | null;
+}
+
 export interface DocumentSummary {
   id: string;
   relative_path: string;
@@ -220,6 +231,31 @@ export interface ConversationMeta {
   subagents?: ConversationSubagentSummary[];
   activity_at?: string | null;
   synced_at: string;
+}
+
+export interface ConversationMarkdownExportSettings {
+  start_at?: string | null;
+  end_at?: string | null;
+  prompt_range?: string;
+  query?: string;
+  tool_ids?: string[];
+  project_ids?: string[];
+  include_subagents?: boolean;
+  include_low_activity?: boolean;
+  include_tools: boolean;
+  include_thinking: boolean;
+  include_session_context: boolean;
+  include_timestamps: boolean;
+  output?: "zip" | "combined";
+  max_threads?: number;
+}
+
+export interface MarkdownExportDownload {
+  blob: Blob;
+  filename: string;
+  exportedThreads: number | null;
+  matchingThreads: number | null;
+  truncated: boolean;
 }
 
 export interface ExportDiagnostics {
@@ -507,6 +543,39 @@ export interface UserInfo {
 
 // --- API functions ---
 
+async function markdownExportDownload(
+  path: string,
+  init?: RequestInit,
+): Promise<MarkdownExportDownload> {
+  const response = await authFetch(`${getApiBase()}${path}`, init);
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try {
+      const body = await response.json() as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      const text = await response.text();
+      if (text) detail = text;
+    }
+    throw new Error(detail);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const regular = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const filename = encoded
+    ? decodeURIComponent(encoded)
+    : regular || `memento-conversations-${new Date().toISOString().slice(0, 10)}.zip`;
+  const exported = response.headers.get("X-Memento-Exported-Threads");
+  const matching = response.headers.get("X-Memento-Matching-Threads");
+  return {
+    blob: await response.blob(),
+    filename,
+    exportedThreads: exported === null ? null : Number(exported),
+    matchingThreads: matching === null ? null : Number(matching),
+    truncated: response.headers.get("X-Memento-Truncated") === "true",
+  };
+}
+
 export interface PublicStats {
   total_documents: number;
   total_messages: number;
@@ -517,6 +586,7 @@ export interface PublicStats {
 export const api = {
   getPublicStats: () => apiFetch<PublicStats>("/api/public/stats"),
   getTools: () => apiFetch<ToolSummary[]>("/api/tools"),
+  getProjects: () => apiFetch<ProjectSummary[]>("/api/projects"),
   getTool: (id: string) => apiFetch<ToolDetail>(`/api/tools/${id}`),
   getToolFiles: (id: string, category?: string, offset = 0, limit = 50) => {
     const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
@@ -525,8 +595,30 @@ export const api = {
   },
   getDocument: (id: string) => apiFetch<DocumentDetail>(`/api/documents/${id}`),
   getConversation: (id: string) => apiFetch<ConversationMeta>(`/api/conversations/${id}`),
+  exportConversationMarkdown: (
+    id: string,
+    settings: ConversationMarkdownExportSettings,
+  ) => {
+    const params = new URLSearchParams();
+    if (settings.start_at) params.set("start_at", settings.start_at);
+    if (settings.end_at) params.set("end_at", settings.end_at);
+    if (settings.prompt_range) params.set("prompt_range", settings.prompt_range);
+    params.set("include_tools", String(settings.include_tools));
+    params.set("include_thinking", String(settings.include_thinking));
+    params.set("include_session_context", String(settings.include_session_context));
+    params.set("include_timestamps", String(settings.include_timestamps));
+    return markdownExportDownload(`/api/exports/conversations/${id}?${params}`);
+  },
+  exportConversationsMarkdown: (settings: ConversationMarkdownExportSettings) =>
+    markdownExportDownload("/api/exports/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
   getMessages: (id: string, offset = 0, limit = 50) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
+  getLatestMessages: (id: string, limit = 200) =>
+    apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?tail=true&limit=${limit}`),
   getMessagesAround: (id: string, lineNumber: number, contextBefore = 0, limit = 50) => {
     const params = new URLSearchParams({
       line_number: String(lineNumber),

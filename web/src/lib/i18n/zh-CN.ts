@@ -70,6 +70,7 @@ const zhCN = {
     tools: "工具",
     daily: "日报",
     search: "搜索",
+    export: "导出",
     devices: "设备",
     admin: "管理",
     projects: "项目",
