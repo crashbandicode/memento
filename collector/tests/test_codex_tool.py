@@ -24,6 +24,7 @@ def codex_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CodexTool:
     monkeypatch.setattr(codex_module, "_thread_info_cache", None)
     monkeypatch.setattr(codex_module, "_thread_info_cache_signature", None)
     monkeypatch.setattr(codex_module, "_history_cache", None)
+    monkeypatch.setattr(codex_module, "_history_cache_signature", None)
     return CodexTool()
 
 
@@ -43,6 +44,29 @@ def _rollout_path(root: Path, thread_id: str) -> Path:
 def _write_records(path: Path, records: list[dict], *, prefix: str = "") -> None:
     content = prefix + "\n".join(json.dumps(record) for record in records) + "\n"
     path.write_text(content, encoding="utf-8")
+
+
+def test_history_cache_refreshes_after_append(codex_tool: CodexTool) -> None:
+    history_path = codex_tool.root_path / "history.jsonl"
+    history_path.write_text(
+        json.dumps({"session_id": ROOT_ID, "ts": 1, "text": "first"}) + "\n",
+        encoding="utf-8",
+    )
+
+    first = codex_module._load_history(codex_tool.root_path)
+    assert [entry["text"] for entry in first[ROOT_ID]] == ["first"]
+
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"session_id": ROOT_ID, "ts": 2, "text": "second"})
+            + "\n"
+        )
+
+    refreshed = codex_module._load_history(codex_tool.root_path)
+    assert [entry["text"] for entry in refreshed[ROOT_ID]] == [
+        "first",
+        "second",
+    ]
 
 
 def _session_meta(**payload: object) -> dict:

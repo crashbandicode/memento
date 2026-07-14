@@ -17,7 +17,20 @@ class JsonlParser(BaseParser):
     def can_parse(self, path: Path) -> bool:
         return path.suffix.lower() == ".jsonl"
 
-    def parse(self, path: Path, offset: int = 0) -> ParseResult:
+    def parse(
+        self,
+        path: Path,
+        offset: int = 0,
+        *,
+        end_offset: int | None = None,
+    ) -> ParseResult:
+        """Parse a byte-bounded JSONL revision.
+
+        ``end_offset`` lets the watcher capture an immutable prefix of an
+        append-only transcript while the writer continues adding later
+        records.  Reading in binary mode keeps offsets exact for UTF-8 and
+        avoids consuming a half-written final record.
+        """
         line_count = 0
         title = ""
         first_timestamp = ""
@@ -27,18 +40,38 @@ class JsonlParser(BaseParser):
         content_size = 0
 
         file_size = path.stat().st_size
+        bounded_end = file_size if end_offset is None else min(file_size, end_offset)
         is_partial = offset > 0
 
-        if offset > file_size:
+        if offset > bounded_end:
             offset = 0
             is_partial = False
 
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        new_offset = offset
+        with open(path, "rb") as f:
             if offset > 0:
                 f.seek(offset)
 
-            for line in f:
-                line = line.rstrip("\n")
+            while f.tell() < bounded_end:
+                line_start = f.tell()
+                raw_line = f.readline(bounded_end - line_start)
+                if not raw_line:
+                    break
+                terminated = raw_line.endswith(b"\n")
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+                # A bounded capture can intersect a record that is still
+                # being appended.  Leave that tail for the next guarded delta
+                # unless it is already a complete JSON value.
+                parsed_object = None
+                if not terminated:
+                    try:
+                        parsed_object = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        new_offset = line_start
+                        break
+
+                new_offset = f.tell()
                 if not line:
                     continue
 
@@ -50,23 +83,24 @@ class JsonlParser(BaseParser):
 
                 # Lightweight metadata extraction (only parse first 100 chars for type/timestamp)
                 try:
-                    obj = json.loads(line)
-                    msg_type = obj.get("type", "unknown")
+                    obj = parsed_object if parsed_object is not None else json.loads(line)
+                    if not isinstance(obj, dict):
+                        continue
+                    msg_type = str(obj.get("type") or "unknown")
                     message_types[msg_type] = message_types.get(msg_type, 0) + 1
 
                     if msg_type == "ai-title" and not title:
-                        title = obj.get("title", "")
+                        title = str(obj.get("title") or "")
 
                     ts = obj.get("timestamp", "")
                     if ts:
                         if not first_timestamp:
                             first_timestamp = ts
                         last_timestamp = ts
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     continue
 
         content = "\n".join(content_parts)
-        new_offset = path.stat().st_size
 
         metadata: dict = {
             "message_types": message_types,
@@ -76,7 +110,7 @@ class JsonlParser(BaseParser):
             metadata["first_timestamp"] = first_timestamp
         if last_timestamp:
             metadata["last_timestamp"] = last_timestamp
-        if content_size >= MAX_CONTENT_SIZE:
+        if MAX_CONTENT_SIZE and content_size >= MAX_CONTENT_SIZE:
             metadata["truncated"] = True
 
         return ParseResult(

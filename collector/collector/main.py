@@ -136,10 +136,13 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
             action = cmd.get("action")
             cmd_id = cmd.get("id")
 
-            # Ack FIRST before executing (prevents restart loops)
+            # Ack FIRST before executing.  If the ack is lost, leave the
+            # command queued and retry it on the next poll instead of running
+            # the same destructive/expensive action repeatedly.
+            acknowledged = not cmd_id
             if cmd_id:
                 try:
-                    httpx.post(
+                    ack_response = httpx.post(
                         f"{config.server.url}/api/devices/commands/{cmd_id}/ack",
                         headers={
                             "X-Collector-Token": config.server.token,
@@ -148,8 +151,12 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
                         timeout=5,
                         verify=SSL_CONTEXT,
                     )
+                    acknowledged = ack_response.status_code == 200
                 except Exception:
-                    pass
+                    acknowledged = False
+            if not acknowledged:
+                logger.warning("Deferring command %s until its ack succeeds", cmd_id)
+                continue
 
             if action == "resync":
                 logger.info("Received resync — draining uploads before full re-scan")
@@ -175,6 +182,19 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
                     sync_client.resume()
                 threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
                 logger.info("Resync triggered — cache cleared, re-scan started")
+            elif action == "repair-conversations":
+                queued = sum(
+                    watcher.request_relative_resync(
+                        str(target.get("tool_name", "")),
+                        str(target.get("relative_path", "")),
+                    )
+                    for target in cmd.get("paths", [])[:2]
+                    if isinstance(target, dict)
+                )
+                logger.info(
+                    "Received targeted conversation repair — %d snapshots queued",
+                    queued,
+                )
             elif action == "update":
                 if config.auto_update_enabled:
                     logger.info("Received update command from server")

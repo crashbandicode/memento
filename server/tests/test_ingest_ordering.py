@@ -14,6 +14,7 @@ from server.db.models import Document, SyncState  # noqa: E402
 from server.services.ingest_service import (  # noqa: E402
     DeltaBaseMismatch,
     _merge_delta_metadata,
+    _set_stored_source_identity,
     ingest_file,
 )
 
@@ -43,7 +44,7 @@ class _OrderedSession:
 
 
 def _document(*, content_hash: str, timestamp: float, offset: int = 100) -> Document:
-    return Document(
+    document = Document(
         id=uuid.uuid4(),
         tool_id="codex",
         machine_id=uuid.uuid4(),
@@ -57,6 +58,12 @@ def _document(*, content_hash: str, timestamp: float, offset: int = 100) -> Docu
         needs_review=False,
         source_modified_at=datetime.fromtimestamp(timestamp, tz=timezone.utc),
     )
+    _set_stored_source_identity(
+        document,
+        document.content,
+        revision_hash=content_hash,
+    )
+    return document
 
 
 def _sync_state(doc: Document, *, offset: int) -> SyncState:
@@ -266,6 +273,28 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
                         persist_content=False,
                         content_s3_key="raw/user/device/new-full.txt",
                         content_already_sanitized=True,
+                    ),
+                )
+
+    async def test_same_hash_full_repairs_unverified_inline_snapshot(self) -> None:
+        doc = _document(content_hash="same-hash", timestamp=100.0)
+        doc.metadata_ = {}
+        sync = _sync_state(doc, offset=100)
+        db = _OrderedSession(None, sync, doc)
+
+        with patch(
+            "server.services.ingest_service.ensure_tool",
+            new=AsyncMock(side_effect=RuntimeError("repair path reached")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "repair path reached"):
+                await ingest_file(
+                    db,
+                    **_ingest_kwargs(
+                        doc,
+                        content_hash="same-hash",
+                        file_size=100,
+                        offset=100,
+                        timestamp=300.0,
                     ),
                 )
 

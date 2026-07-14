@@ -25,6 +25,7 @@ from server.services.conversation_parser import (
     _iter_json_objects,
     extract_codex_session_metadata,
     has_cursor_session_context_prefix,
+    is_codex_user_mirror_pair,
     is_claude_session_context_record,
     normalize_codex_user_payload,
     parse_conversation_line,
@@ -218,9 +219,13 @@ def _is_codex_mirror_pair(first, second) -> bool:
         return False
     if abs(first.line_number - second.line_number) > 1:
         return False
-    return (
-        first.timestamp.isoformat()[:19] == second.timestamp.isoformat()[:19]
-        and first.content == second.content
+    return is_codex_user_mirror_pair(
+        first.message_type,
+        first.content,
+        first.timestamp,
+        second.message_type,
+        second.content,
+        second.timestamp,
     )
 
 
@@ -633,8 +638,8 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
 
     changed_documents: set = set()
     for document_id, messages in messages_by_document.items():
-        mirror_candidates: dict[tuple[str, str], object] = {}
         retained_messages = []
+        previous_mirror_candidate = None
         for message in messages:
             if message.role == "user":
                 changed, became_context = _normalize_codex_stored_message(message)
@@ -645,24 +650,33 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
                     else:
                         stats.normalized_codex_prompts += 1
 
-            if message.role == "user":
-                dedupe_key = None
-                if (
-                    message.message_type in CODEX_MIRROR_MESSAGE_TYPES
-                    and message.timestamp is not None
-                ):
-                    dedupe_key = (
-                        message.timestamp.isoformat()[:19],
-                        message.content,
-                    )
-                previous = mirror_candidates.get(dedupe_key) if dedupe_key else None
-                if previous is not None and _is_codex_mirror_pair(previous, message):
+            if (
+                previous_mirror_candidate is not None
+                and _is_codex_mirror_pair(previous_mirror_candidate, message)
+            ):
+                if message.message_type == "user_message":
+                    await db.delete(previous_mirror_candidate)
+                    if (
+                        retained_messages
+                        and retained_messages[-1] is previous_mirror_candidate
+                    ):
+                        retained_messages.pop()
+                    retained_messages.append(message)
+                else:
                     await db.delete(message)
-                    changed_documents.add(document_id)
-                    stats.deduplicated_codex_prompts += 1
-                    continue
-                if dedupe_key is not None:
-                    mirror_candidates[dedupe_key] = message
+                previous_mirror_candidate = None
+                changed_documents.add(document_id)
+                stats.deduplicated_codex_prompts += 1
+                continue
+
+            if (
+                message.role == "user"
+                and message.message_type in CODEX_MIRROR_MESSAGE_TYPES
+                and message.timestamp is not None
+            ):
+                previous_mirror_candidate = message
+            else:
+                previous_mirror_candidate = None
             retained_messages.append(message)
         messages_by_document[document_id] = retained_messages
 

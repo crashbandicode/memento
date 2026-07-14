@@ -155,6 +155,37 @@ class SyncQueueTests(unittest.TestCase):
         self.assertEqual(state[1], "hash-2")
         self.assertIsNotNone(state[2])
 
+    def test_clear_file_state_forces_identical_complete_snapshot_to_requeue(self) -> None:
+        relative_path = "sessions/thread.jsonl"
+        self._enqueue(relative_path, "complete", "hash-1", "delta")
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self.assertEqual(
+            self._enqueue(relative_path, "complete", "hash-1", "delta"),
+            0,
+        )
+
+        self.queue.clear_file_state("codex", relative_path)
+        item_id = self._enqueue(relative_path, "complete", "hash-1", "delta")
+
+        self.assertGreater(item_id, 0)
+        self.assertEqual(self.queue.pending_count(), 1)
+        self.assertEqual(
+            self.queue.read_payload_text(self.queue.claim_batch()[0]),
+            "complete",
+        )
+
+    def test_server_requested_repair_moves_ahead_of_ordinary_backlog(self) -> None:
+        self._enqueue("sessions/ordinary.jsonl", "ordinary", "hash-ordinary")
+        self._enqueue("sessions/repair.jsonl", "repair", "hash-repair")
+
+        self.assertEqual(
+            self.queue.prioritize_file("codex", "sessions/repair.jsonl"),
+            1,
+        )
+
+        claimed = self.queue.claim_batch(batch_size=1)[0]
+        self.assertEqual(claimed.relative_path, "sessions/repair.jsonl")
+
     def test_delta_rows_remain_fifo_and_one_per_path(self) -> None:
         self._enqueue("history.jsonl", "first", "hash-1", "delta", True, 10)
         self._enqueue("history.jsonl", "second", "hash-2", "delta", True, 20)

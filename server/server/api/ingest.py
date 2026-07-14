@@ -11,20 +11,23 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import User
+from ..db.models import Document, User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
 from ..services.ingest_service import (
     DeltaBaseMismatch,
+    STORED_SOURCE_REVISION_KEY,
     _get_ingest_semaphore,
     ingest_file,
 )
 from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
     ChunkValidationError,
+    has_completion_receipt,
     stage_chunk,
 )
 from ..services.thread_metadata_service import apply_codex_thread_title_update
@@ -83,6 +86,42 @@ class IngestMetadataResponse(BaseModel):
     matched: int
     updated: int
     ignored: int
+
+
+async def _completed_upload_needs_reprocessing(
+    db: AsyncSession,
+    *,
+    machine_id: UUID,
+    meta: dict,
+) -> bool:
+    """Check whether a receipt predates the database's current source proof."""
+    if meta.get("mode", "full") != "full":
+        return False
+    tool_id = meta.get("tool")
+    relative_path = meta.get("relative_path")
+    expected_hash = meta.get("hash")
+    if not all(isinstance(value, str) and value for value in (
+        tool_id,
+        relative_path,
+        expected_hash,
+    )):
+        return False
+
+    row = (
+        await db.execute(
+            select(Document.content_hash, Document.metadata_).where(
+                Document.machine_id == machine_id,
+                Document.tool_id == tool_id,
+                Document.relative_path == relative_path,
+            )
+        )
+    ).one_or_none()
+    if row is None or row.content_hash != expected_hash:
+        return True
+    if meta.get("category") != "conversation":
+        return False
+    stored_metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    return stored_metadata.get(STORED_SOURCE_REVISION_KEY) != expected_hash
 
 
 def _reject_synthetic_metadata_file_upload(
@@ -310,7 +349,7 @@ async def ingest_file_chunk(
 
     # Validate device ownership in a short, committed transaction before any
     # durable acknowledgement. This transaction does not span parsing/ingest.
-    await ensure_device(
+    machine = await ensure_device(
         db,
         x_device_id,
         x_device_name,
@@ -318,23 +357,41 @@ async def ingest_file_chunk(
         user_id=_collector_user.id,
     )
     await db.commit()
+    user_id = str(_collector_user.id)
+    force_reprocess = False
+    if has_completion_receipt(
+        meta=meta,
+        user_id=user_id,
+        device_id=x_device_id,
+    ):
+        force_reprocess = await _completed_upload_needs_reprocessing(
+            db,
+            machine_id=machine.id,
+            meta=meta,
+        )
     try:
-        job_id, complete = await asyncio.to_thread(
+        staged = await asyncio.to_thread(
             stage_chunk,
             meta=meta,
             chunk_data=chunk_data,
-            user_id=str(_collector_user.id),
+            user_id=user_id,
             device_id=x_device_id,
             device_name=x_device_name,
             device_platform=x_device_platform,
+            force_reprocess=force_reprocess,
         )
     except ChunkValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not complete:
+    if not staged.complete:
         return IngestResponse(
             document_id="pending",
             message=f"Chunk {int(meta['chunk_index']) + 1}/{int(meta['total_chunks'])} received",
+        )
+    if not staged.should_enqueue:
+        return IngestResponse(
+            document_id=f"completed:{staged.job_id}",
+            message="Upload was already durably ingested",
         )
 
     # The ready marker and every chunk are fsynced before this response. Celery
@@ -344,14 +401,17 @@ async def ingest_file_chunk(
         from ..tasks.ingest_spool import process_spooled_ingest
         await asyncio.to_thread(
             process_spooled_ingest.apply_async,
-            args=[job_id],
+            args=[staged.job_id],
             queue="ingest",
             retry=False,
         )
     except Exception:
-        logger.exception("Ready spool job %s could not be queued; recovery will retry", job_id)
+        logger.exception(
+            "Ready spool job %s could not be queued; recovery will retry",
+            staged.job_id,
+        )
     return IngestResponse(
-        document_id=f"queued:{job_id}",
+        document_id=f"queued:{staged.job_id}",
         message=f"Received {int(meta['total_chunks'])} chunks; durable ingest queued",
     )
 

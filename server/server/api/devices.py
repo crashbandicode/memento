@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import AccessLog, ConversationMessage, Document, DocumentVersion, Machine, Project, SyncState, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
-from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
 
@@ -29,6 +28,9 @@ _cmd_counter = 0
 # 5-minute TTL — uses time.monotonic() so clock changes can't break TTL math.
 _PYPI_CACHE_TTL = 300.0
 _pypi_version_cache: dict[str, tuple[str | None, float]] = {}
+_REPAIR_ACTION = "repair-conversations"
+_REPAIR_BATCH_SIZE = 2
+_STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
 
 
 def _enqueue_command(device_collector_id: str, action: str) -> int:
@@ -345,6 +347,31 @@ async def get_commands(
             machine.collector_version = x_collector_version
 
     commands = _command_queue.get(x_device_id, [])
+    if machine and any(cmd.get("action") == _REPAIR_ACTION for cmd in commands):
+        repair_result = await db.execute(
+            select(Document.tool_id, Document.relative_path)
+            .where(
+                Document.machine_id == machine.id,
+                Document.category == "conversation",
+                Document.tool_id.in_(("codex", "claude_code", "cursor")),
+                func.coalesce(
+                    Document.metadata_[_STORED_SOURCE_REVISION_KEY].as_string(),
+                    "",
+                ) != Document.content_hash,
+            )
+            .order_by(Document.file_size_bytes, Document.id)
+            .limit(_REPAIR_BATCH_SIZE)
+        )
+        repair_paths = [
+            {"tool_name": tool_name, "relative_path": relative_path}
+            for tool_name, relative_path in repair_result.all()
+        ]
+        return [
+            {**command, "paths": repair_paths}
+            if command.get("action") == _REPAIR_ACTION
+            else command
+            for command in commands
+        ]
     return commands
 
 

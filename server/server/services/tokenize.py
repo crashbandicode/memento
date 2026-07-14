@@ -21,6 +21,7 @@ import re
 from typing import Iterable
 
 _PUNCT_RE = re.compile(r"[\s　]+|[\.,;:!?\-_/\\()\[\]{}\"'`~@#$%^&*+=<>|]+")
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 # Huge JSONL conversations can push jieba + Postgres tsvector into OOM /
 # cripplingly slow index build. 200 KB of prose is ~60 K CJK chars,
 # empirically covers the topic of a doc; ingest path still stores the full
@@ -36,21 +37,25 @@ def _segment(text: str) -> Iterable[str]:
     lazily so the module loads even if the optional dep is missing."""
     if not text:
         return []
+    pieces = [piece for piece in _PUNCT_RE.split(text) if piece]
+    if not any(_CJK_RE.search(piece) for piece in pieces):
+        return pieces
     try:
         import jieba  # type: ignore
     except ImportError:
         # Fallback: whitespace / punctuation split. Works for English, loses
         # Chinese word boundaries but still better than nothing.
-        return (t for t in _PUNCT_RE.split(text) if t)
+        return pieces
 
     tokens: list[str] = []
-    for piece in _PUNCT_RE.split(text):
-        if not piece:
-            continue
+    for piece in pieces:
         # jieba.cut_for_search adds short sub-tokens (bigrams inside long
-        # words), better for recall than `cut`. For non-CJK strings it
-        # returns the original piece, which is fine.
-        tokens.extend(jieba.cut_for_search(piece))
+        # words), better for recall than `cut`. ASCII spans are already
+        # tokenized by punctuation and bypass jieba entirely.
+        if _CJK_RE.search(piece):
+            tokens.extend(jieba.cut_for_search(piece))
+        else:
+            tokens.append(piece)
     return tokens
 
 

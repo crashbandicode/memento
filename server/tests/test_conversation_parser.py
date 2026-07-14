@@ -20,6 +20,70 @@ from server.services.conversation_parser import (  # noqa: E402
 
 
 class ConversationParserTests(unittest.TestCase):
+    def test_nullable_transport_fields_do_not_create_or_crash_messages(self) -> None:
+        cases = (
+            (
+                "codex",
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": None}},
+            ),
+            (
+                "codex",
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": None}},
+            ),
+            (
+                "codex",
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": None}],
+                    },
+                },
+            ),
+            ("codex", {"type": "event_msg", "payload": None}),
+            ("claude_code", {"type": "assistant", "message": None}),
+            (
+                "claude_code",
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": None}],
+                    },
+                },
+            ),
+            (
+                "cursor",
+                {
+                    "role": "user",
+                    "message": {"content": [{"type": "text", "text": None}]},
+                },
+            ),
+        )
+
+        for tool_id, record in cases:
+            with self.subTest(tool_id=tool_id, record=record):
+                self.assertIsNone(parse_conversation_line(json.dumps(record), tool_id))
+
+    def test_cursor_nullable_prose_preserves_structured_tool_call(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": None},
+                    {"type": "tool_use", "name": "Read", "input": {"path": "a.py"}},
+                ]
+            },
+        })
+
+        message = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertEqual(message.content, "")
+        self.assertEqual(message.tool_calls, [{"name": "Read", "input": '{"path": "a.py"}'}])
+
     def test_codex_request_wrapper_keeps_only_the_human_request(self) -> None:
         wrapped = (
             "# Context from my IDE setup:\n\n"
@@ -145,6 +209,215 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(role, "user")
         self.assertEqual(content, prompt)
 
+    def test_codex_cross_transport_pair_is_one_canonical_prompt(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-13T21:41:31.790Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Keep going"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T21:41:31.791Z",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "prompt-1",
+                    "message": "Keep going",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(count_conversation_messages(raw, "codex"), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "user_message")
+        self.assertEqual(messages[0].source_id, "prompt-1")
+
+    def test_codex_attachment_suffix_still_pairs_with_event_prompt(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-13T21:29:26.189Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Inspect this screenshot\n[local image metadata]",
+                    }],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T21:29:26.189Z",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "prompt-with-image",
+                    "message": "Inspect this screenshot",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "Inspect this screenshot")
+
+    def test_codex_assistant_transport_group_is_one_canonical_message(self) -> None:
+        rows = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T16:45:13.158Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Final answer",
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-13T16:45:13.184Z",
+                "payload": {
+                    "type": "message",
+                    "id": "assistant-response-id",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Final answer"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T16:45:13.184Z",
+                "payload": {"type": "token_count", "info": {}},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T16:45:13.213Z",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-id",
+                    "last_agent_message": "Final answer",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(count_conversation_messages(raw, "codex"), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "agent_message")
+        self.assertEqual(messages[0].content, "Final answer")
+
+    def test_codex_lone_assistant_response_is_not_discarded(self) -> None:
+        raw = json.dumps({
+            "type": "response_item",
+            "timestamp": "2026-07-13T16:45:13.184Z",
+            "payload": {
+                "type": "message",
+                "id": "assistant-response-id",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Only copy"}],
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "response_item")
+        self.assertEqual(messages[0].content, "Only copy")
+
+    def test_codex_lone_task_complete_message_is_not_discarded(self) -> None:
+        raw = json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-07-13T16:45:13.213Z",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-id",
+                "last_agent_message": "Recovered final answer",
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "task_complete")
+        self.assertEqual(messages[0].content, "Recovered final answer")
+
+    def test_codex_identical_same_second_prompts_keep_distinct_client_ids(self) -> None:
+        rows = []
+        for client_id, milliseconds in (("prompt-a", 100), ("prompt-b", 200)):
+            timestamp = f"2026-07-13T21:41:31.{milliseconds:03d}Z"
+            rows.extend([
+                {
+                    "type": "response_item",
+                    "timestamp": timestamp,
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "timestamp": timestamp,
+                    "payload": {
+                        "type": "user_message",
+                        "client_id": client_id,
+                        "message": "continue",
+                    },
+                },
+            ])
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(count_conversation_messages(raw, "codex"), 2)
+        self.assertEqual([message.source_id for message in messages], [
+            "prompt-a",
+            "prompt-b",
+        ])
+
+    def test_claude_uuid_not_content_is_the_message_identity(self) -> None:
+        def row(source_id: str) -> dict:
+            return {
+                "uuid": source_id,
+                "type": "user",
+                "timestamp": "2026-07-13T21:34:42.980Z",
+                "message": {"role": "user", "content": "repeat"},
+            }
+
+        distinct = "\n".join(json.dumps(row(value)) for value in ("a", "b"))
+        replayed = "\n".join(json.dumps(row("a")) for _ in range(2))
+
+        self.assertEqual(count_conversation_messages(distinct, "claude_code"), 2)
+        self.assertEqual(count_conversation_messages(replayed, "claude_code"), 1)
+
+    def test_cursor_preserves_identical_same_second_source_items(self) -> None:
+        row = {
+            "role": "user",
+            "message": {
+                "content": (
+                    "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+                    "(UTC-4)</timestamp>\n<user_query>repeat</user_query>"
+                )
+            },
+        }
+        raw = "\n".join(json.dumps(row) for _ in range(2))
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(count_conversation_messages(raw, "cursor"), 2)
+        self.assertEqual([message.content for message in messages], [
+            "repeat",
+            "repeat",
+        ])
+
     def test_codex_session_metadata_uses_current_thread_and_root_ids(self) -> None:
         root_id = "11111111-1111-4111-8111-111111111111"
         current_id = "22222222-2222-4222-8222-222222222222"
@@ -223,6 +496,19 @@ class ConversationParserTests(unittest.TestCase):
     def test_terminal_sequence_stripping_handles_csi_and_osc(self) -> None:
         value = "a\u001b[31mred\u001b[0m b\u001b]0;title\u0007c"
         self.assertEqual(strip_terminal_sequences(value), "ared bc")
+
+    def test_terminal_sequence_stripping_handles_charset_and_fe_escapes(
+        self,
+    ) -> None:
+        value = "a\u001b(B+ b\u001b)0- c\u001b7saved"
+        self.assertEqual(strip_terminal_sequences(value), "a+ b- csaved")
+
+    def test_terminal_sequence_stripping_removes_truncated_escape(self) -> None:
+        value = "before\u001b …[+1214 chars] after"
+        self.assertEqual(
+            strip_terminal_sequences(value),
+            "before …[+1214 chars] after",
+        )
 
     def test_claude_standalone_tool_use_is_rendered_as_tool(self) -> None:
         raw = json.dumps({

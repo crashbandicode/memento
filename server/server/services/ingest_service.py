@@ -74,6 +74,9 @@ MAX_DOCUMENT_METADATA_BYTES = 256 * 1024
 MAX_METADATA_STRING_CHARS = 16 * 1024
 MAX_USER_HISTORY_ENTRIES = 2_000
 MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
+STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
+STORED_SOURCE_HASH_KEY = "_stored_source_hash"
+STORED_SOURCE_SIZE_KEY = "_stored_source_size"
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -94,6 +97,9 @@ _ESSENTIAL_METADATA_KEYS = {
     "root_session_id",
     "session_id",
     "source",
+    STORED_SOURCE_HASH_KEY,
+    STORED_SOURCE_REVISION_KEY,
+    STORED_SOURCE_SIZE_KEY,
     "thread_id",
     "thread_source",
     "title",
@@ -106,6 +112,9 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "codex_title_revision",
     "codex_title_revisions",
     "memento_title_source",
+    STORED_SOURCE_HASH_KEY,
+    STORED_SOURCE_REVISION_KEY,
+    STORED_SOURCE_SIZE_KEY,
     "title_is_manual",
     "title_source",
 }
@@ -139,6 +148,43 @@ def _logical_document_file_size(
     # Collector DELTA offsets are the cumulative source end position. Preserve
     # the existing total as a fallback for legacy senders with a zero offset.
     return max(safe_payload, max(0, int(offset)), max(0, int(existing_size)))
+
+
+def _stored_source_is_current(
+    doc: Document,
+    revision_hash: str,
+    *,
+    incoming_s3_key: str | None = None,
+) -> bool:
+    """Return whether the persisted raw blob is complete for this revision."""
+    if doc.category != "conversation":
+        return True
+    metadata = dict(doc.metadata_ or {})
+    return bool(
+        (doc.content is not None or doc.content_s3_key)
+        and (not incoming_s3_key or doc.content_s3_key == incoming_s3_key)
+        and metadata.get(STORED_SOURCE_REVISION_KEY) == revision_hash
+        and metadata.get(STORED_SOURCE_HASH_KEY)
+        and metadata.get(STORED_SOURCE_SIZE_KEY) is not None
+    )
+
+
+def _set_stored_source_identity(
+    doc: Document,
+    content: str,
+    *,
+    revision_hash: str | None,
+) -> None:
+    """Record the exact sanitized blob and optional full source revision."""
+    encoded = content.encode("utf-8")
+    metadata = dict(doc.metadata_ or {})
+    metadata[STORED_SOURCE_HASH_KEY] = hashlib.sha256(encoded).hexdigest()
+    metadata[STORED_SOURCE_SIZE_KEY] = len(encoded)
+    if revision_hash:
+        metadata[STORED_SOURCE_REVISION_KEY] = revision_hash
+    else:
+        metadata.pop(STORED_SOURCE_REVISION_KEY, None)
+    doc.metadata_ = metadata
 
 
 def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
@@ -237,7 +283,53 @@ def _conversation_message_metadata(normalized) -> dict:
     tool_calls = normalize_tool_calls(normalized.tool_calls)
     if tool_calls:
         meta["tool_calls"] = tool_calls
+    if normalized.source_id:
+        meta["source_id"] = _bounded_message_text(
+            str(normalized.source_id),
+            256,
+        )
     return meta
+
+
+def iter_stored_conversation_messages(content: str, tool_id: str):
+    """Yield the exact normalized representation persisted during ingest.
+
+    Live ingestion and offline reparses must share this boundary.  Keeping the
+    terminal cleanup, size limits, metadata projection, and timestamp parsing
+    here prevents a historical repair from creating rows that a subsequent
+    collector update would immediately rewrite differently.
+    """
+    from .conversation_parser import (
+        iter_conversation_messages,
+        strip_terminal_sequences,
+    )
+
+    for normalized in iter_conversation_messages(content, tool_id):
+        if normalized.role not in ("user", "assistant", "tool", "system"):
+            continue
+        full_clean_content = strip_terminal_sequences(normalized.content).replace(
+            "\x00", ""
+        )
+        if not full_clean_content.strip() and not normalized.tool_calls:
+            continue
+        clean_content = _bounded_message_text(
+            full_clean_content,
+            MAX_STORED_MESSAGE_CHARS,
+        )
+        timestamp = None
+        if normalized.timestamp:
+            try:
+                timestamp = datetime.fromisoformat(
+                    normalized.timestamp.replace("Z", "+00:00")
+                )
+            except (ValueError, AttributeError):
+                pass
+        yield (
+            normalized,
+            clean_content,
+            _conversation_message_metadata(normalized),
+            timestamp,
+        )
 
 
 def _json_size(value: object) -> int:
@@ -873,10 +965,10 @@ async def ingest_file(
         # Touch last_synced_at so dashboards know we still see this file,
         # but skip all the actual ingestion work + the post-ingest task.
         sync_row.last_synced_at = received_at
-        pointer_is_current = (
-            persist_content
-            or not content_s3_key
-            or (doc is not None and doc.content_s3_key == content_s3_key)
+        pointer_is_current = _stored_source_is_current(
+            doc,
+            content_hash,
+            incoming_s3_key=content_s3_key,
         )
         if pointer_is_current:
             doc.source_modified_at = max(
@@ -905,10 +997,10 @@ async def ingest_file(
             )
 
     if mode == "full" and doc is not None and doc.content_hash == content_hash:
-        pointer_is_current = (
-            persist_content
-            or not content_s3_key
-            or doc.content_s3_key == content_s3_key
+        pointer_is_current = _stored_source_is_current(
+            doc,
+            content_hash,
+            incoming_s3_key=content_s3_key,
         )
         if pointer_is_current:
             if (
@@ -1067,6 +1159,14 @@ async def ingest_file(
     )
     now = received_at
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
+    previous_stored_revision = (
+        (doc.metadata_ or {}).get(STORED_SOURCE_REVISION_KEY)
+        if doc is not None
+        else None
+    )
+    stored_blob_content = content
+    stored_revision_hash = content_hash if mode == "full" else None
+    preserve_stored_source_identity = False
 
     if doc is not None and category in _EMBEDDING_CATEGORIES:
         previous_embedding_content_hash = doc.embedding_content_hash
@@ -1119,12 +1219,19 @@ async def ingest_file(
             # the complete normalized history; the immutable S3 object remains
             # the last full source snapshot until the next externalized FULL.
             doc.content = None
+            preserve_stored_source_identity = True
         elif mode == "delta" and doc.content:
             # For large files, replace instead of append to avoid unbounded growth
             if len(doc.content) + len(content) > 10_000_000:
                 doc.content = content  # Replace with latest delta
+                stored_revision_hash = None
             else:
                 doc.content = doc.content + "\n" + content
+                if previous_stored_revision == base_hash:
+                    stored_revision_hash = content_hash
+                else:
+                    stored_revision_hash = None
+            stored_blob_content = doc.content
         else:
             doc.content = content
         if persist_content and not preserve_externalized_delta:
@@ -1171,6 +1278,13 @@ async def ingest_file(
             file_size_bytes=file_size,
         )
         db.add(version)
+
+    if category == "conversation" and not preserve_stored_source_identity:
+        _set_stored_source_identity(
+            doc,
+            stored_blob_content,
+            revision_hash=stored_revision_hash,
+        )
 
     from sqlalchemy import func as _func, update as _update
 
@@ -1487,9 +1601,9 @@ async def _extract_messages(
 ) -> str:
     """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
-        _iter_json_objects,
-        parse_conversation_line,
-        strip_terminal_sequences,
+        codex_assistant_transport_priority,
+        is_codex_assistant_mirror_pair,
+        is_codex_user_mirror_pair,
     )
 
     search_parts: list[str] = []
@@ -1579,87 +1693,110 @@ async def _extract_messages(
     line_num = start_line
     batch: list[ConversationMessage] = []
     batch_bytes = 0
-    seen_contents: set[str] = set()  # Deduplicate identical messages
-    # Walk the content with the tolerant JSON iterator so pretty-printed
-    # multi-line entries from Claude Code (Windows 2.1.x) don't get
-    # shattered into unparseable single-character fragments by split("\n").
-    for line in _iter_json_objects(content):
-        line = line.strip()
-        if not line:
-            continue
+    delta_tail = None
+    if mode == "delta" and start_line > 1:
+        delta_tail = (
+            await db.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == doc.id)
+                .order_by(ConversationMessage.line_number.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
-        # Use conversation_parser for normalized output. We store user / assistant
-        # plus OpenClaw-style tool / system (compaction summaries) so the
-        # conversation viewer + /api/search can see the full transcript —
-        # downstream "daily activity" queries already filter to user+assistant
-        # on their side, so this doesn't inflate message counts.
-        normalized = parse_conversation_line(line, tool_id)
-        if normalized and normalized.role in ("user", "assistant", "tool", "system"):
-            full_clean_content = strip_terminal_sequences(normalized.content).replace(
-                "\x00", ""
+    # The shared iterator is the single source of truth for semantic identity,
+    # pagination, counting, and ingestion.  In particular, it preserves valid
+    # repeated prompts and collapses only Codex's observed cross-transport pair.
+    for normalized, clean_content, meta, ts in iter_stored_conversation_messages(
+        content,
+        tool_id,
+    ):
+        # A filesystem event can split Codex's adjacent response/event
+        # transport pair across two DELTA uploads.  If the previous DB row
+        # is the pending response copy, promote it to the canonical event
+        # in place instead of inserting a duplicate.  The explicit
+        # source_paired flag prevents a new in-payload pair from being
+        # compared with an older tail row.
+        if (
+            mode == "delta"
+            and tool_id == "codex"
+            and normalized.role == "user"
+            and normalized.raw_type == "user_message"
+            and not normalized.source_paired
+            and delta_tail is not None
+            and delta_tail.line_number == line_num - 1
+            and delta_tail.role == "user"
+            and is_codex_user_mirror_pair(
+                delta_tail.message_type,
+                delta_tail.content,
+                delta_tail.timestamp,
+                normalized.raw_type,
+                clean_content,
+                ts,
             )
-            if not full_clean_content.strip() and not normalized.tool_calls:
-                continue
-            clean_content = _bounded_message_text(
-                full_clean_content,
-                MAX_STORED_MESSAGE_CHARS,
-            )
-            # Deduplicate: same role + content + timestamp (within same second).
-            # This prevents event_msg/user_message and response_item/user duplicates
-            # while keeping genuinely repeated inputs across different turns.
-            ts_bucket = (normalized.timestamp or "")[:19]  # truncate to second
-            dedupe_hash = hashlib.md5()
-            dedupe_hash.update(f"{normalized.role}:{ts_bucket}:".encode())
-            dedupe_hash.update(clean_content.encode("utf-8"))
-            dedupe_hash.update(
-                json.dumps(
-                    normalized.tool_calls,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
-            dedupe_key = dedupe_hash.hexdigest()
-            if dedupe_key in seen_contents:
-                continue
-            seen_contents.add(dedupe_key)
-            ts = None
-            if normalized.timestamp:
-                try:
-                    ts = datetime.fromisoformat(
-                        normalized.timestamp.replace("Z", "+00:00")
-                    )
-                except (ValueError, AttributeError):
-                    pass
-
-            meta = _conversation_message_metadata(normalized)
-            batch.append(
-                ConversationMessage(
-                    document_id=doc.id,
-                    line_number=line_num,
-                    message_type=_bounded_message_text(
-                        normalized.raw_type or normalized.role,
-                        50,
-                    ),
-                    role=normalized.role,
-                    content=clean_content,
-                    metadata_=meta,
-                    timestamp=ts,
-                )
-            )
+        ):
+            delta_tail.message_type = "user_message"
+            delta_tail.content = clean_content
+            delta_tail.metadata_ = meta
+            delta_tail.timestamp = ts
             add_search_text(normalized.role, clean_content)
-            batch_bytes += (
-                len(clean_content.encode("utf-8"))
-                + sum(len(str(value).encode("utf-8")) for value in meta.values())
-                + 256
+            delta_tail = None
+            continue
+        if (
+            mode == "delta"
+            and tool_id == "codex"
+            and normalized.role == "assistant"
+            and not normalized.source_paired
+            and delta_tail is not None
+            and delta_tail.line_number == line_num - 1
+            and delta_tail.role == "assistant"
+            and is_codex_assistant_mirror_pair(
+                delta_tail.message_type,
+                delta_tail.content,
+                delta_tail.timestamp,
+                normalized.raw_type,
+                clean_content,
+                ts,
             )
-            line_num += 1
+        ):
+            if codex_assistant_transport_priority(
+                normalized.raw_type,
+            ) > codex_assistant_transport_priority(delta_tail.message_type):
+                delta_tail.message_type = normalized.raw_type
+                delta_tail.content = clean_content
+                delta_tail.metadata_ = meta
+                delta_tail.timestamp = ts
+            add_search_text(normalized.role, clean_content)
+            delta_tail = None
+            continue
+        batch.append(
+            ConversationMessage(
+                document_id=doc.id,
+                line_number=line_num,
+                message_type=_bounded_message_text(
+                    normalized.raw_type or normalized.role,
+                    50,
+                ),
+                role=normalized.role,
+                content=clean_content,
+                metadata_=meta,
+                timestamp=ts,
+            )
+        )
+        add_search_text(normalized.role, clean_content)
+        batch_bytes += (
+            len(clean_content.encode("utf-8"))
+            + sum(len(str(value).encode("utf-8")) for value in meta.values())
+            + 256
+        )
+        line_num += 1
 
-            # Flush in batches to avoid memory issues with large files
-            if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
-                db.add_all(batch)
-                await db.flush()
-                batch = []
-                batch_bytes = 0
+        # Flush in batches to avoid memory issues with large files
+        if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
+            db.add_all(batch)
+            await db.flush()
+            batch = []
+            batch_bytes = 0
 
     if batch:
         db.add_all(batch)
@@ -1673,44 +1810,101 @@ async def _extract_messages(
             from .conversation_parser import normalize_codex_user_payload
 
             codex_normalizer = normalize_codex_user_payload
-        # Inject history entries that aren't already in DB (by content dedup)
+        # history.jsonl is append-only within a session, so its per-session
+        # ordinal is a stable source identity.  Retain a timestamp/content
+        # multiset only as a compatibility bridge for rows ingested before
+        # source IDs were persisted.  A plain set of content incorrectly
+        # discarded valid repeated prompts and reused negative line numbers
+        # on later DELTA uploads.
+        from collections import Counter
+
         existing = await db.execute(
-            select(ConversationMessage.content).where(
+            select(
+                ConversationMessage.content,
+                ConversationMessage.timestamp,
+                ConversationMessage.metadata_,
+                ConversationMessage.line_number,
+            ).where(
                 ConversationMessage.document_id == doc.id,
                 ConversationMessage.role == "user",
             )
         )
-        existing_texts = {r[0] for r in existing.all()}
+        existing_rows = existing.all()
+        existing_identities = Counter(
+            (
+                row.content,
+                int(row.timestamp.timestamp()) if row.timestamp else None,
+            )
+            for row in existing_rows
+        )
+        existing_source_ids = {
+            str((row.metadata_ or {}).get("source_id"))
+            for row in existing_rows
+            if (row.metadata_ or {}).get("source_id")
+        }
+        used_history_lines = {
+            row.line_number for row in existing_rows if row.line_number < 0
+        }
         injected = 0
-        for entry in user_history:
+        next_free_history_index = 0
+        for history_index, entry in enumerate(user_history):
             text = entry.get("text", "").strip()
             if codex_normalizer is not None:
                 history_role, text = codex_normalizer(text)
                 if history_role != "user":
                     continue
             ts_epoch = entry.get("ts", 0)
-            if not text or text in existing_texts:
+            if not text:
                 continue
-            existing_texts.add(text)
             ts = None
             if ts_epoch:
-                ts = datetime.fromtimestamp(ts_epoch, tz=timezone.utc)
+                try:
+                    ts = datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc)
+                except (OSError, OverflowError, TypeError, ValueError):
+                    ts = None
             clean_history = _bounded_message_text(
                 text.replace("\x00", ""),
                 MAX_STORED_MESSAGE_CHARS,
             )
+            source_id = f"codex-history:{history_index}"
+            if source_id in existing_source_ids:
+                continue
+            identity = (
+                clean_history,
+                int(ts.timestamp()) if ts is not None else None,
+            )
+            if existing_identities[identity] > 0:
+                existing_identities[identity] -= 1
+                continue
+
+            preferred_line = _history_line_number(history_index)
+            if preferred_line in used_history_lines:
+                while (
+                    next_free_history_index < MAX_USER_HISTORY_ENTRIES
+                    and _history_line_number(next_free_history_index)
+                    in used_history_lines
+                ):
+                    next_free_history_index += 1
+                if next_free_history_index >= MAX_USER_HISTORY_ENTRIES:
+                    break
+                history_line = _history_line_number(next_free_history_index)
+                next_free_history_index += 1
+            else:
+                history_line = preferred_line
+            used_history_lines.add(history_line)
             db.add(
                 ConversationMessage(
                     document_id=doc.id,
-                    line_number=_history_line_number(injected),
+                    line_number=history_line,
                     message_type="history_user_message"[:50],
                     role="user",
                     content=clean_history,
-                    metadata_={},
+                    metadata_={"source_id": source_id},
                     timestamp=ts,
                 )
             )
             add_search_text("user", clean_history)
+            existing_source_ids.add(source_id)
             injected += 1
         if injected:
             await db.flush()

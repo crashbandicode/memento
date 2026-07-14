@@ -17,6 +17,7 @@ import shutil
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import UUID
@@ -48,6 +49,24 @@ SourceIdentity = tuple[str, str, str, str]
 
 class ChunkValidationError(ValueError):
     """Raised when collector chunk metadata is unsafe or inconsistent."""
+
+
+@dataclass(frozen=True)
+class StagedChunk:
+    """Result of durably staging one chunk.
+
+    Iteration intentionally preserves the historical ``(job_id, complete)``
+    contract for callers that unpack the result. ``should_enqueue`` separates
+    a newly-ready job from an idempotent retry backed by a completion receipt.
+    """
+
+    job_id: str
+    complete: bool
+    should_enqueue: bool
+
+    def __iter__(self):
+        yield self.job_id
+        yield self.complete
 
 
 def _job_id(meta: dict[str, Any], user_id: str, device_id: str) -> str:
@@ -164,6 +183,17 @@ def _completion_path(job_id: str, root: Path) -> Path:
     if not _JOB_ID_RE.fullmatch(job_id):
         raise ChunkValidationError("invalid spool job id")
     return root / "completed" / f"{job_id}.json"
+
+
+def has_completion_receipt(
+    *,
+    meta: dict[str, Any],
+    user_id: str,
+    device_id: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> bool:
+    """Return whether this exact authenticated upload was already committed."""
+    return _completion_path(_job_id(meta, user_id, device_id), root).is_file()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -286,16 +316,21 @@ def stage_chunk(
     device_id: str,
     device_name: str,
     device_platform: str,
+    force_reprocess: bool = False,
     root: Path = DEFAULT_SPOOL_ROOT,
-) -> tuple[str, bool]:
+) -> StagedChunk:
     """Atomically persist one chunk and mark the job ready when complete."""
     chunk_index, total_chunks = _validated_chunk_coordinates(meta, len(chunk_data))
     job_id = _job_id(meta, user_id, device_id)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     with spool_job_lock(job_id, root=root, purpose="stage"):
-        if _completion_path(job_id, root).is_file():
-            return job_id, True
+        completion_path = _completion_path(job_id, root)
+        if completion_path.is_file():
+            if not force_reprocess:
+                return StagedChunk(job_id, complete=True, should_enqueue=False)
+            completion_path.unlink()
+            _fsync_directory(completion_path.parent)
 
         job_dir = _job_dir(job_id, root)
         job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -392,7 +427,7 @@ def stage_chunk(
                 )
             if not (job_dir / "ready").exists():
                 _atomic_write(job_dir / "ready", b"ready\n")
-        return job_id, complete
+        return StagedChunk(job_id, complete=complete, should_enqueue=complete)
 
 
 def _ready_candidate_job_ids(

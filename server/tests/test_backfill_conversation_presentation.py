@@ -94,6 +94,8 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         )
 
         self.assertTrue(_is_codex_mirror_pair(response_item, user_message))
+        response_item.content = "keep going\n[local image metadata]"
+        self.assertTrue(_is_codex_mirror_pair(response_item, user_message))
         self.assertFalse(_is_codex_mirror_pair(response_item, repeated_history))
         self.assertFalse(_is_codex_mirror_pair(user_message, user_message))
 

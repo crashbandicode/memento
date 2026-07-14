@@ -23,36 +23,61 @@ _thread_info_lock = threading.RLock()
 
 
 _history_cache: dict[str, list[dict]] | None = None
+_history_cache_signature: tuple[object, ...] | None = None
+_history_lock = threading.RLock()
 
 
-def _load_history(codex_home: Path) -> dict[str, list[dict]]:
-    """Read history.jsonl — maps session_id → list of {ts, text} user inputs."""
-    global _history_cache
-    if _history_cache is not None:
-        return _history_cache
-
-    history_file = codex_home / "history.jsonl"
-    result: dict[str, list[dict]] = {}
-    if not history_file.exists():
-        _history_cache = result
-        return result
-
+def _history_file_signature(history_file: Path) -> tuple[object, ...]:
     try:
-        with open(history_file, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                sid = obj.get("session_id", "")
-                text = obj.get("text", "")
-                ts = obj.get("ts", 0)
-                if sid and text:
-                    result.setdefault(sid, []).append({"ts": ts, "text": text})
-    except Exception:
-        pass
-    _history_cache = result
-    return result
+        stat = history_file.stat()
+        return (str(history_file.resolve()), stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        return (str(history_file.resolve()), None, None)
+
+
+def _load_history(
+    codex_home: Path,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, list[dict]]:
+    """Read history.jsonl — maps session_id → list of {ts, text} user inputs."""
+    global _history_cache, _history_cache_signature
+    history_file = codex_home / "history.jsonl"
+    signature = _history_file_signature(history_file)
+    with _history_lock:
+        if (
+            not force_refresh
+            and _history_cache is not None
+            and _history_cache_signature == signature
+        ):
+            return _history_cache
+
+        result: dict[str, list[dict]] = {}
+        if history_file.exists():
+            try:
+                with open(
+                    history_file,
+                    "r",
+                    encoding="utf-8",
+                    errors="ignore",
+                ) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        sid = obj.get("session_id", "")
+                        text = obj.get("text", "")
+                        ts = obj.get("ts", 0)
+                        if sid and text:
+                            result.setdefault(sid, []).append(
+                                {"ts": ts, "text": text}
+                            )
+            except Exception:
+                pass
+        _history_cache = result
+        _history_cache_signature = signature
+        return result
 
 
 def _state_db_signature(state_db: Path) -> tuple[object, ...]:

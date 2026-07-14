@@ -386,7 +386,6 @@ async def get_conversation_prompts(
                 ConversationMessage.role == "user",
             )
             .order_by(ConversationMessage.line_number)
-            .limit(2000)
         )
         for message_id, line_number, content, timestamp in prompt_rows.all():
             clean = (content or "").strip()
@@ -415,6 +414,6 @@ async def get_conversation_prompts(
                 if message.role == "user"
                 and message.content.strip()
                 and not message.content.lstrip().startswith("[Subagent Context]")
-            ][:2000]
+            ]
 
     return {"prompts": prompts}

@@ -17,6 +17,7 @@ from server.services.ingest_spool import (  # noqa: E402
     MAX_CHUNKS,
     MAX_UPLOAD_BYTES,
     ChunkValidationError,
+    StagedChunk,
     assemble_job,
     blocked_job_ids,
     cleanup_completion_receipts,
@@ -83,7 +84,8 @@ class IngestSpoolTests(unittest.TestCase):
         *,
         user_id: str = "11111111-1111-1111-1111-111111111111",
         device_id: str = "device-1",
-    ) -> tuple[str, bool]:
+        force_reprocess: bool = False,
+    ) -> StagedChunk:
         return stage_chunk(
             meta=meta,
             chunk_data=data,
@@ -91,6 +93,7 @@ class IngestSpoolTests(unittest.TestCase):
             device_id=device_id,
             device_name="Yoga",
             device_platform="Windows",
+            force_reprocess=force_reprocess,
             root=self.root,
         )
 
@@ -974,12 +977,21 @@ class IngestSpoolTests(unittest.TestCase):
         remove_job(job_id, self.root)
         self.assertFalse((self.root / job_id).exists())
 
-        repeated_job_id, repeated_complete = self._stage(meta, b"done")
+        repeated = self._stage(meta, b"done")
+        repeated_job_id, repeated_complete = repeated
         self.assertEqual(repeated_job_id, job_id)
         self.assertTrue(repeated_complete)
+        self.assertFalse(repeated.should_enqueue)
         self.assertFalse((self.root / job_id).exists())
 
+        forced = self._stage(meta, b"done", force_reprocess=True)
+        self.assertEqual(forced.job_id, job_id)
+        self.assertTrue(forced.complete)
+        self.assertTrue(forced.should_enqueue)
+        self.assertTrue((self.root / job_id / "ready").exists())
+
         receipt = self.root / "completed" / f"{job_id}.json"
+        mark_job_complete(job_id, document_id="document-2", root=self.root)
         os.utime(receipt, (1.0, 1.0))
         self.assertEqual(
             cleanup_completion_receipts(root=self.root, max_age_seconds=60),

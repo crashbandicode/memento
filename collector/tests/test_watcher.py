@@ -28,6 +28,23 @@ def _modified(path: Path) -> FileModifiedEvent:
     return FileModifiedEvent(str(path))
 
 
+def test_relative_resync_resolves_only_files_below_the_tool_root(tmp_path: Path) -> None:
+    root = tmp_path / "codex"
+    transcript = root / "sessions" / "thread.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    tool = SimpleNamespace(name="codex", root_path=root)
+    watcher = object.__new__(FileWatcher)
+    watcher._tools = [tool]
+    requested: list[str] = []
+    watcher.request_full_resync = requested.append
+
+    assert watcher.request_relative_resync("codex", "sessions/thread.jsonl") is True
+    assert requested == [str(transcript.resolve())]
+    assert watcher.request_relative_resync("codex", "../outside.jsonl") is False
+    assert watcher.request_relative_resync("unknown", "sessions/thread.jsonl") is False
+
+
 def test_event_storm_uses_one_worker_and_coalesces_path(
     monkeypatch,
     tmp_path: Path,
@@ -272,6 +289,63 @@ def test_delta_processing_uses_guarded_base_and_force_full_fallback(
     assert complete["is_partial"] is False
     assert complete["base_hash"] is None
     assert complete["base_offset"] == 0
+
+
+def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "active-session.jsonl"
+    first = '{"type":"event_msg","payload":{"type":"user_message","message":"first"}}\n'
+    second = '{"type":"event_msg","payload":{"type":"user_message","message":"second"}}\n'
+    path.write_text(first, encoding="utf-8")
+    prefix_size = path.stat().st_size
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/active-session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+
+    class AppendingParser(JsonlParser):
+        def parse(self, changed_path, offset=0, *, end_offset=None):
+            result = super().parse(
+                changed_path,
+                offset=offset,
+                end_offset=end_offset,
+            )
+            with changed_path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(second)
+            return result
+
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [AppendingParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    try:
+        watcher._process_file_changed(path, force_full=True)
+        complete = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert complete.is_partial is False
+        assert complete.offset == prefix_size
+        assert "first" in queue.read_payload_text(complete)
+        assert "second" not in queue.read_payload_text(complete)
+        assert queue.mark_synced(complete)
+
+        watcher._parsers = [JsonlParser()]
+        watcher._process_file_changed(path)
+        tail = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert tail.is_partial is True
+        assert tail.base_hash == complete.content_hash
+        assert tail.base_offset == prefix_size
+        assert "second" in queue.read_payload_text(tail)
+        assert "first" not in queue.read_payload_text(tail)
+    finally:
+        queue.close()
 
 
 def test_large_jsonl_append_queues_only_the_new_guarded_tail(tmp_path: Path) -> None:

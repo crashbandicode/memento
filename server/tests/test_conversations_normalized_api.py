@@ -148,6 +148,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["prompts"][0]["content"], "A prompt")
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
+        prompt_sql = str(db.statements[2].compile()).upper()
+        self.assertNotIn(" LIMIT ", prompt_sql)
 
     async def test_metadata_counts_normalized_rows_and_scopes_codex_hierarchy(self) -> None:
         root_thread_id = self.doc.metadata_["session_id"]

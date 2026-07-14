@@ -33,6 +33,18 @@ logger = logging.getLogger("collector.watcher")
 _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
 
 
+def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
+    """Hash one observed source revision without restatting a growing file."""
+    try:
+        h = hashlib.sha256()
+        h.update(f"{size}:{mtime_ns}".encode())
+        with open(path, "rb") as f:
+            h.update(f.read(min(_FAST_HASH_READ, size)))
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
 def _file_hash(path: Path) -> str:
     """Fast file change detection: size + mtime + hash of first 256KB.
 
@@ -41,14 +53,11 @@ def _file_hash(path: Path) -> str:
     """
     try:
         stat = path.stat()
-        h = hashlib.sha256()
-        # Mix in size + mtime for fast detection
-        h.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
-        # Only hash the first 256KB (covers headers + recent content)
-        with open(path, "rb") as f:
-            data = f.read(_FAST_HASH_READ)
-            h.update(data)
-        return h.hexdigest()
+        return _file_hash_revision(
+            path,
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+        )
     except OSError:
         return ""
 
@@ -259,22 +268,35 @@ class FileWatcher:
 
         def run() -> None:
             try:
+                if self._stop_event.is_set() or not path.is_file():
+                    return
+                tool = self._find_tool(path)
+                if tool is None:
+                    return
+                classification = tool.classify_file(path)
+                if classification is None:
+                    return
+                # Force-full means the server explicitly needs the complete
+                # payload even when the local source revision has not changed.
+                # Without clearing this observation, SyncQueue.enqueue treats
+                # the snapshot as an identical no-op and uploads nothing.
+                self._queue.clear_file_state(
+                    classification.tool_name,
+                    classification.relative_path,
+                )
                 for _attempt in range(3):
                     if self._stop_event.is_set() or not path.is_file():
                         return
                     self._on_file_changed(path, force_full=True)
-                    current_hash = _file_hash(path)
-                    tool = self._find_tool(path)
-                    if tool is None:
-                        return
-                    classification = tool.classify_file(path)
-                    if classification is None:
-                        return
-                    observed_hash, _ = self._queue.get_file_state(
+                    self._queue.prioritize_file(
                         classification.tool_name,
                         classification.relative_path,
                     )
-                    if current_hash and observed_hash == current_hash:
+                    observed_hash, observed_offset = self._queue.get_file_state(
+                        classification.tool_name,
+                        classification.relative_path,
+                    )
+                    if observed_hash and observed_offset > 0:
                         logger.info("Queued complete resync for %s", path)
                         return
                     time.sleep(0.5)
@@ -288,6 +310,22 @@ class FileWatcher:
             name="memento-delta-resync",
             daemon=True,
         ).start()
+
+    def request_relative_resync(self, tool_name: str, relative_path: str) -> bool:
+        """Safely resolve and queue one server-selected conversation snapshot."""
+        tool = next((item for item in self._tools if item.name == tool_name), None)
+        if tool is None or not isinstance(relative_path, str):
+            return False
+        normalized_relative = relative_path.replace("\\", "/")
+        parts = [part for part in normalized_relative.split("/") if part not in ("", ".")]
+        if not parts or ".." in parts or Path(normalized_relative).is_absolute():
+            return False
+        root = tool.root_path.resolve()
+        source_path = root.joinpath(*parts).resolve()
+        if not path_starts_with(str(source_path), str(root)) or not source_path.is_file():
+            return False
+        self.request_full_resync(str(source_path))
+        return True
 
     def _get_parser(self, content_type: ContentType) -> BaseParser | None:
         ext_map = {
@@ -386,7 +424,11 @@ class FileWatcher:
         source_revision = (source_stat.st_size, source_stat.st_mtime_ns)
 
         # Check if file content actually changed
-        current_hash = _file_hash(path)
+        current_hash = _file_hash_revision(
+            path,
+            size=file_size,
+            mtime_ns=source_stat.st_mtime_ns,
+        )
         if not current_hash:
             return
 
@@ -440,6 +482,12 @@ class FileWatcher:
         # Parse (with error protection)
         try:
             parser = self._get_parser(classification.content_type)
+            append_only_snapshot = (
+                force_full
+                and classification.sync_strategy == SyncStrategy.DELTA
+                and classification.content_type == ContentType.JSONL
+                and isinstance(parser, JsonlParser)
+            )
             if parser is None:
                 try:
                     content = path.read_text(encoding="utf-8", errors="replace")
@@ -449,7 +497,14 @@ class FileWatcher:
                 new_offset = path.stat().st_size
                 is_partial = read_offset > 0
             else:
-                result = parser.parse(path, offset=read_offset)
+                if append_only_snapshot:
+                    result = parser.parse(
+                        path,
+                        offset=0,
+                        end_offset=file_size,
+                    )
+                else:
+                    result = parser.parse(path, offset=read_offset)
                 parsed_content = result.content
                 new_offset = result.offset if result.offset else path.stat().st_size
                 is_partial = result.is_partial
@@ -459,6 +514,15 @@ class FileWatcher:
         except Exception:
             logger.debug("Parse error for %s, skipping", path)
             return
+
+        if append_only_snapshot:
+            current_hash = _file_hash_revision(
+                path,
+                size=new_offset,
+                mtime_ns=source_stat.st_mtime_ns,
+            )
+            if not current_hash:
+                return
 
         if not parsed_content.strip():
             return
@@ -481,7 +545,15 @@ class FileWatcher:
             final_stat = path.stat()
         except OSError:
             return
-        if (final_stat.st_size, final_stat.st_mtime_ns) != source_revision:
+        if append_only_snapshot:
+            same_file = (
+                source_stat.st_dev == final_stat.st_dev
+                and source_stat.st_ino == final_stat.st_ino
+            )
+            if not same_file or final_stat.st_size < source_stat.st_size:
+                logger.debug("Source was replaced while processing %s; deferring", path)
+                return
+        elif (final_stat.st_size, final_stat.st_mtime_ns) != source_revision:
             logger.debug("Source changed while processing %s; deferring", path)
             return
         source_modified_at = source_stat.st_mtime

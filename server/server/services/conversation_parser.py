@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -29,6 +30,15 @@ class NormalizedMessage:
     # serialized ``input`` strings while the message itself remains one row.
     timestamp: str = ""
     raw_type: str = ""  # Original message type
+    # Stable identity from the source transcript when one exists.  This is
+    # deliberately separate from rendered content: repeated prompts are valid
+    # conversation events and must not be collapsed merely because their text
+    # and wall-clock second happen to match.
+    source_id: str = ""
+    # Internal signal for delta ingestion: the iterator already observed and
+    # collapsed the adjacent Codex response/event transport pair in this
+    # payload, so it must not be reconciled against an older database tail.
+    source_paired: bool = False
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -36,7 +46,8 @@ class NormalizedMessage:
 # Conversation viewers are not terminal emulators, so retaining these bytes
 # produces visible replacement glyphs and misleading text.
 _ANSI_ESCAPE_RE = re.compile(
-    r"\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
+    r"\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~]"
+    r"|[ -/]+[0-~]|[0-~])"
     r"|\x9B[0-?]*[ -/]*[@-~]"
 )
 
@@ -91,6 +102,11 @@ _MAX_STRUCTURED_TOOL_NAME_BYTES = 256
 _MAX_STRUCTURED_TOOL_INPUT_BYTES = 64 * 1024
 _MAX_STRUCTURED_TOOL_CALL_BYTES = 128 * 1024
 _TOOL_INPUT_TRUNCATION_MARKER = "\n\n[... tool input truncated by Memento ...]"
+_CODEX_ASSISTANT_TRANSPORT_PRIORITY = {
+    "agent_message": 3,
+    "response_item": 2,
+    "task_complete": 1,
+}
 _CURSOR_REDACTED_TRANSPORT_LINE_RE = re.compile(
     r"(^|\n)[ \t]*\[REDACTED\][ \t]*(?=\n|$)",
     re.IGNORECASE | re.MULTILINE,
@@ -322,8 +338,25 @@ def extract_codex_session_metadata(raw_content: str) -> dict:
 
 
 def strip_terminal_sequences(text: str) -> str:
-    """Remove ANSI CSI/OSC terminal control sequences from plain text."""
-    return _ANSI_ESCAPE_RE.sub("", text)
+    """Remove ANSI/ECMA-48 terminal control sequences from plain text."""
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    # Truncated command output can cut an escape sequence before its final
+    # byte.  A plain-text viewer should never retain the orphan ESC/C1 byte.
+    return stripped.replace("\x1b", "").replace("\x9b", "")
+
+
+def _coerce_text(value: object) -> str:
+    """Normalize nullable or scalar transcript fields without inventing text."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _as_mapping(value: object) -> dict:
+    """Return a transcript object only when its runtime shape is a mapping."""
+    return value if isinstance(value, dict) else {}
 
 
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
@@ -333,6 +366,20 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
     except json.JSONDecodeError:
         return None
 
+    return parse_conversation_object(obj, tool_id)
+
+
+def parse_conversation_object(
+    obj: object,
+    tool_id: str,
+) -> NormalizedMessage | None:
+    """Normalize an already-decoded source record.
+
+    Bulk parsing uses this entry point so each multi-gigabyte corpus record is
+    decoded once. ``parse_conversation_line`` remains the compatibility API
+    for callers and tests that receive an isolated JSON string.
+    """
+
     if not isinstance(obj, dict):
         return None
 
@@ -341,9 +388,10 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
 
     # --- Claude Code format ---
     if tool_id == "claude_code":
+        source_id = str(obj.get("uuid") or obj.get("promptId") or "")
         if msg_type in ("user", "assistant"):
-            message = obj.get("message", {})
-            role = message.get("role", msg_type)
+            message = _as_mapping(obj.get("message"))
+            role = _coerce_text(message.get("role") or msg_type)
             raw_content = message.get("content", "")
 
             # Claude Code records slash commands as synthetic user messages.
@@ -359,6 +407,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                     tool_input=tool_input,
                     timestamp=timestamp,
                     raw_type="local_command",
+                    source_id=source_id,
                 )
 
             # Claude's API represents a tool result as a message whose outer
@@ -373,6 +422,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                     tool_name="Tool result",
                     timestamp=timestamp,
                     raw_type="tool_result",
+                    source_id=source_id,
                 )
 
             tool_use = _extract_tool_use(raw_content)
@@ -385,6 +435,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                     tool_input=tool_input,
                     timestamp=timestamp,
                     raw_type="tool_use",
+                    source_id=source_id,
                 )
 
             # Extract thinking separately from final text (Claude extended thinking)
@@ -403,27 +454,35 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                     thinking=thinking,
                     timestamp=timestamp,
                     raw_type="claude_context",
+                    source_id=source_id,
                 )
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
-                timestamp=timestamp, raw_type=msg_type,
+                timestamp=timestamp, raw_type=msg_type, source_id=source_id,
             )
 
         if msg_type == "ai-title":
             return None  # Skip title lines
 
         if msg_type == "system":
-            content = _extract_content(obj.get("message", {}).get("content", ""))
+            message = _as_mapping(obj.get("message"))
+            content = _extract_content(message.get("content", ""))
             if not content.strip() or "<command-name>" in content:
                 return None  # Skip command metadata
-            return NormalizedMessage(role="system", content=content, timestamp=timestamp, raw_type=msg_type)
+            return NormalizedMessage(
+                role="system",
+                content=content,
+                timestamp=timestamp,
+                raw_type=msg_type,
+                source_id=source_id,
+            )
 
         # Skip: file-history-snapshot, queue-operation, etc.
         return None
 
     # --- Codex format ---
     if tool_id == "codex":
-        payload = obj.get("payload", {})
+        payload = _as_mapping(obj.get("payload"))
 
         if msg_type == "response_item":
             role = payload.get("role", "")
@@ -433,9 +492,17 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             # Skip reasoning — AI internal thought process, not a reply
             if p_type == "reasoning":
                 return None
-            # Skip assistant response_item/message — duplicates event_msg/agent_message
             if p_type == "message" and role == "assistant":
-                return None
+                content = _extract_codex_content(payload.get("content", []))
+                if not content.strip():
+                    return None
+                return NormalizedMessage(
+                    role="assistant",
+                    content=content,
+                    timestamp=timestamp,
+                    raw_type=msg_type,
+                    source_id=str(payload.get("id") or ""),
+                )
             # User response_item/message — real user input (not system context)
             if p_type == "message" and role == "user":
                 content = _extract_codex_content(payload.get("content", []))
@@ -453,6 +520,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                         if normalized_role == "system"
                         else msg_type
                     ),
+                    source_id=str(payload.get("id") or ""),
                 )
             return None
 
@@ -462,7 +530,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                 return None
             # User message — the actual user input in Codex
             if event_type == "user_message":
-                text = payload.get("message", "")
+                text = _coerce_text(payload.get("message"))
                 if text.strip():
                     normalized_role, text = normalize_codex_user_payload(text)
                     return NormalizedMessage(
@@ -474,17 +542,36 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                             if normalized_role == "system"
                             else "user_message"
                         ),
+                        source_id=str(
+                            payload.get("client_id") or payload.get("id") or ""
+                        ),
                     )
                 return None
             # Agent message — intermediate commentary in new Codex, sole reply in old Codex.
             # Kept as assistant message; if task_complete also exists, ingest dedup handles it.
             if event_type == "agent_message":
-                text = payload.get("message", "")
+                text = _coerce_text(payload.get("message"))
                 if text.strip():
-                    return NormalizedMessage(role="assistant", content=text, timestamp=timestamp, raw_type="agent_message")
+                    return NormalizedMessage(
+                        role="assistant",
+                        content=text,
+                        timestamp=timestamp,
+                        raw_type="agent_message",
+                        source_id=str(
+                            payload.get("client_id") or payload.get("id") or ""
+                        ),
+                    )
                 return None
-            # Task complete — last_agent_message duplicates the last agent_message, skip
             if event_type == "task_complete":
+                text = _coerce_text(payload.get("last_agent_message"))
+                if text.strip():
+                    return NormalizedMessage(
+                        role="assistant",
+                        content=text,
+                        timestamp=timestamp,
+                        raw_type="task_complete",
+                        source_id=str(payload.get("turn_id") or ""),
+                    )
                 return None
             return None
 
@@ -545,7 +632,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             # Summary line auto-generated when OpenClaw compacts context.
             # Surface as a system message so it's searchable + visible in the
             # transcript instead of being silently dropped.
-            summary = obj.get("summary") or ""
+            summary = _coerce_text(obj.get("summary"))
             if summary.strip():
                 return NormalizedMessage(
                     role="system", content=summary.strip(),
@@ -575,8 +662,8 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             return None  # Skip metadata line
 
         if msg_type in ("user", "assistant"):
-            message = obj.get("message", {})
-            role = message.get("role", msg_type)
+            message = _as_mapping(obj.get("message"))
+            role = _coerce_text(message.get("role") or msg_type)
             content = _extract_content(message.get("content", ""))
             thinking = str(obj.get("thinking_text", "") or "").strip()
             raw_type = obj.get("content_source") or obj.get("fallback_source") or msg_type
@@ -603,16 +690,16 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             )
 
         if msg_type == "tool":
-            tool_name = obj.get("tool_name", "tool")
-            tool_input = obj.get("tool_input", "")
-            content = obj.get("content", f"[{tool_name}]")
+            tool_name = _coerce_text(obj.get("tool_name") or "tool")
+            tool_input = _coerce_text(obj.get("tool_input"))
+            content = _extract_content(obj.get("content", f"[{tool_name}]"))
             return NormalizedMessage(
                 role="tool", content=content, tool_name=tool_name,
                 tool_input=tool_input, timestamp=timestamp, raw_type=msg_type,
             )
 
         if msg_type == "system":
-            message = obj.get("message", {})
+            message = _as_mapping(obj.get("message"))
             content = _extract_content(message.get("content", ""))
             if content.strip():
                 raw_type = obj.get("content_source") or obj.get("fallback_source") or msg_type
@@ -634,6 +721,19 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
             raw_content = message.get("content", "")
         else:
             raw_content = message
+        source_id = str(
+            obj.get("id")
+            or obj.get("uuid")
+            or obj.get("bubbleId")
+            or (
+                message.get("id")
+                or message.get("uuid")
+                or message.get("bubbleId")
+                if isinstance(message, dict)
+                else ""
+            )
+            or ""
+        )
         thinking = _extract_thinking_parts(raw_content)
         tool_calls: list[dict[str, str]] = []
         if role == "assistant":
@@ -661,6 +761,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                     content=session_context,
                     timestamp=timestamp,
                     raw_type="cursor_context",
+                    source_id=source_id,
                 )
         if role in ("user", "assistant") and (content.strip() or tool_calls):
             # Skip tool_result/tool_use noise
@@ -672,7 +773,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
                 role=role, content=content, thinking=thinking,
                 session_context=session_context,
                 tool_calls=tool_calls, timestamp=timestamp,
-                raw_type=msg_type or role,
+                raw_type=msg_type or role, source_id=source_id,
             )
         return None
 
@@ -812,13 +913,17 @@ def _extract_thinking_parts(content) -> str:
             continue
         t = item.get("type", "")
         if t == "thinking":
-            text = item.get("thinking", "")
+            text = _coerce_text(item.get("thinking"))
             if text:
                 parts.append(text)
         elif t == "redacted_thinking":
             data = item.get("data", "")
             if data:
-                parts.append(f"[redacted thinking: {len(data)} bytes]")
+                if isinstance(data, (bytes, bytearray, str, list, dict)):
+                    size = len(data)
+                else:
+                    size = len(_coerce_text(data))
+                parts.append(f"[redacted thinking: {size} bytes]")
     return "\n\n".join(parts)
 
 
@@ -915,8 +1020,7 @@ def _extract_cursor_assistant_content(
 
         item_type = item.get("type")
         if item_type == "text":
-            text = item.get("text", "")
-            text = text if isinstance(text, str) else str(text)
+            text = _coerce_text(item.get("text"))
             # Cursor can append the transport placeholder to real prose in the
             # same text block, so remove only exact standalone lines.
             text = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
@@ -949,7 +1053,7 @@ def _extract_content(content) -> str:
             if isinstance(item, dict):
                 t = item.get("type")
                 if t == "text":
-                    parts.append(item.get("text", ""))
+                    parts.append(_coerce_text(item.get("text")))
                 elif t in ("tool_use", "toolCall"):
                     # Claude uses tool_use + input; OpenClaw uses toolCall + arguments.
                     name = item.get("name", "tool")
@@ -959,14 +1063,20 @@ def _extract_content(content) -> str:
                 elif t in ("tool_result", "toolResult"):
                     result = item.get("content", item.get("output", ""))
                     if isinstance(result, list):
-                        result = " ".join(r.get("text", "") for r in result if isinstance(r, dict))
+                        result = " ".join(
+                            _coerce_text(block.get("text"))
+                            for block in result
+                            if isinstance(block, dict)
+                        )
                     parts.append(f"[Result]\n{str(result)}")
             elif isinstance(item, str):
                 parts.append(item)
         return _strip_system_tags("\n".join(parts))
     if isinstance(content, dict):
-        return content.get("text", json.dumps(content, ensure_ascii=False))
-    return str(content)
+        if "text" in content:
+            return _strip_system_tags(_coerce_text(content.get("text")))
+        return json.dumps(content, ensure_ascii=False)
+    return _coerce_text(content)
 
 
 def _extract_codex_content(content_list) -> str:
@@ -974,18 +1084,18 @@ def _extract_codex_content(content_list) -> str:
     if isinstance(content_list, str):
         return content_list
     if not isinstance(content_list, list):
-        return str(content_list)
+        return _coerce_text(content_list)
     parts = []
     for item in content_list:
         if isinstance(item, dict):
-            parts.append(item.get("text", ""))
+            parts.append(_coerce_text(item.get("text")))
         elif isinstance(item, str):
             parts.append(item)
     return "\n".join(parts)
 
 
-def _iter_json_objects(raw_content: str):
-    """Yield JSON object source strings from mixed compact JSONL / pretty-
+def _iter_decoded_json_objects(raw_content: str):
+    """Yield decoded values from mixed compact JSONL / pretty-
     printed content. Claude Code's VS Code extension on Windows sometimes
     writes entries as indented multi-line JSON in the same ``.jsonl`` file
     as compact ones; splitting on newlines loses those multi-line objects
@@ -1005,10 +1115,7 @@ def _iter_json_objects(raw_content: str):
             break
         try:
             obj, end = decoder.raw_decode(raw_content, i)
-            # Re-serialize as a single compact line so downstream
-            # parse_conversation_line (which expects one JSON per string)
-            # works unchanged.
-            yield json.dumps(obj, ensure_ascii=False)
+            yield obj
             i = end
         except json.JSONDecodeError:
             # Couldn't parse starting here — advance to next newline and
@@ -1017,6 +1124,12 @@ def _iter_json_objects(raw_content: str):
             if next_nl < 0:
                 break
             i = next_nl + 1
+
+
+def _iter_json_objects(raw_content: str):
+    """Compatibility iterator returning one compact JSON string per value."""
+    for obj in _iter_decoded_json_objects(raw_content):
+        yield json.dumps(obj, ensure_ascii=False)
 
 
 def _pretty_leading_json(text: str) -> str:
@@ -1152,66 +1265,283 @@ def _count_hermes_messages(raw_content: str) -> int:
     return n
 
 
-def parse_conversation(raw_content: str, tool_id: str, offset: int = 0, limit: int | None = None) -> list[NormalizedMessage]:
-    """Parse JSONL conversation into normalized messages. Supports pagination."""
+def _message_timestamp(value: object) -> datetime | None:
+    """Parse a transcript timestamp without discarding sub-second identity."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_codex_user_mirror_pair(
+    first_type: str | None,
+    first_content: str,
+    first_timestamp: object,
+    second_type: str | None,
+    second_content: str,
+    second_timestamp: object,
+) -> bool:
+    """Return whether two rows are Codex's two transports for one prompt.
+
+    The records are paired structurally, not by a coarse timestamp/content
+    fingerprint.  ``response_item`` can include attachment annotations that
+    are absent from the following ``user_message``, so a prefix relationship
+    is accepted, but only for the known cross-type pair within 250 ms.
+    """
+    if {first_type, second_type} != {"response_item", "user_message"}:
+        return False
+    first_time = _message_timestamp(first_timestamp)
+    second_time = _message_timestamp(second_timestamp)
+    if first_time is None or second_time is None:
+        return False
+    if abs((second_time - first_time).total_seconds()) > 0.250:
+        return False
+    left = (first_content or "").strip()
+    right = (second_content or "").strip()
+    if not left or not right:
+        return False
+    return left == right or left.startswith(right) or right.startswith(left)
+
+
+def is_codex_assistant_mirror_pair(
+    first_type: str | None,
+    first_content: str,
+    first_timestamp: object,
+    second_type: str | None,
+    second_content: str,
+    second_timestamp: object,
+) -> bool:
+    """Return whether two Codex assistant transports represent one message.
+
+    Current Codex writes ``agent_message``, ``response_item``, and (for the
+    final reply) ``task_complete`` copies.  A copy is collapsed only inside
+    that known transport family, with exact/prefix content and close native
+    timestamps.  A lone transport is retained instead of being discarded on
+    the assumption that another copy must exist.
+    """
+    pair = {first_type, second_type}
+    if pair not in (
+        {"agent_message", "response_item"},
+        {"agent_message", "task_complete"},
+        {"response_item", "task_complete"},
+    ):
+        return False
+    first_time = _message_timestamp(first_timestamp)
+    second_time = _message_timestamp(second_timestamp)
+    if first_time is None or second_time is None:
+        return False
+    if abs((second_time - first_time).total_seconds()) > 1.0:
+        return False
+    left = (first_content or "").strip()
+    right = (second_content or "").strip()
+    if not left or not right:
+        return False
+    return left == right or left.startswith(right) or right.startswith(left)
+
+
+def codex_assistant_transport_priority(raw_type: str | None) -> int:
+    """Return the presentation preference for a Codex assistant transport."""
+    return _CODEX_ASSISTANT_TRANSPORT_PRIORITY.get(raw_type or "", 0)
+
+
+def iter_conversation_messages(
+    raw_content: str,
+    tool_id: str,
+) -> Iterator[NormalizedMessage]:
+    """Yield semantic messages once, using identities supplied by each tool.
+
+    Claude UUIDs and Codex client IDs are authoritative identities. Cursor's
+    exported JSONL currently has neither mirrored transport rows nor stable
+    IDs, so each source item is preserved.  This intentionally avoids any
+    role/content/second heuristic: two identical prompts are still two turns.
+    """
+    if tool_id == "hermes":
+        yield from _parse_hermes_session(raw_content, 0, None)
+        return
+
+    seen_source_ids: set[str] = set()
+    pending_codex_user: tuple[int, NormalizedMessage] | None = None
+    pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
+
+    def should_emit(message: NormalizedMessage) -> bool:
+        if not message.source_id:
+            return True
+        source_key = f"{tool_id}:{message.source_id}"
+        if source_key in seen_source_ids:
+            return False
+        seen_source_ids.add(source_key)
+        return True
+
+    for record_index, source_object in enumerate(
+        _iter_decoded_json_objects(raw_content)
+    ):
+        message = parse_conversation_object(source_object, tool_id)
+
+        if (
+            pending_codex_user is not None
+            and record_index - pending_codex_user[0] > 2
+        ):
+            pending = pending_codex_user[1]
+            pending_codex_user = None
+            if should_emit(pending):
+                yield pending
+
+        if (
+            pending_codex_assistant is not None
+            and record_index - pending_codex_assistant[0] > 4
+        ):
+            pending = pending_codex_assistant[1]
+            pending_codex_assistant = None
+            if should_emit(pending):
+                yield pending
+
+        is_codex_response_user = (
+            tool_id == "codex"
+            and message is not None
+            and message.role == "user"
+            and message.raw_type == "response_item"
+        )
+        if is_codex_response_user:
+            if pending_codex_assistant is not None:
+                pending = pending_codex_assistant[1]
+                pending_codex_assistant = None
+                if should_emit(pending):
+                    yield pending
+            if pending_codex_user is not None:
+                pending = pending_codex_user[1]
+                if should_emit(pending):
+                    yield pending
+            pending_codex_user = (record_index, message)
+            continue
+
+        is_codex_event_user = (
+            tool_id == "codex"
+            and message is not None
+            and message.role == "user"
+            and message.raw_type == "user_message"
+        )
+        if is_codex_event_user:
+            if pending_codex_assistant is not None:
+                pending = pending_codex_assistant[1]
+                pending_codex_assistant = None
+                if should_emit(pending):
+                    yield pending
+            if pending_codex_user is not None:
+                pending_index, pending = pending_codex_user
+                if not (
+                    record_index - pending_index <= 2
+                    and is_codex_user_mirror_pair(
+                        pending.raw_type,
+                        pending.content,
+                        pending.timestamp,
+                        message.raw_type,
+                        message.content,
+                        message.timestamp,
+                    )
+                ):
+                    if should_emit(pending):
+                        yield pending
+                else:
+                    message.source_paired = True
+                pending_codex_user = None
+            if should_emit(message):
+                yield message
+            continue
+
+        is_codex_assistant_transport = (
+            tool_id == "codex"
+            and message is not None
+            and message.role == "assistant"
+            and codex_assistant_transport_priority(message.raw_type) > 0
+        )
+        if is_codex_assistant_transport:
+            if pending_codex_user is not None:
+                pending = pending_codex_user[1]
+                pending_codex_user = None
+                if should_emit(pending):
+                    yield pending
+            if pending_codex_assistant is not None:
+                pending_index, pending = pending_codex_assistant
+                if (
+                    record_index - pending_index <= 4
+                    and is_codex_assistant_mirror_pair(
+                        pending.raw_type,
+                        pending.content,
+                        pending.timestamp,
+                        message.raw_type,
+                        message.content,
+                        message.timestamp,
+                    )
+                ):
+                    if (
+                        codex_assistant_transport_priority(message.raw_type)
+                        > codex_assistant_transport_priority(pending.raw_type)
+                    ):
+                        pending = message
+                    pending.source_paired = True
+                    pending_codex_assistant = (record_index, pending)
+                    continue
+                if should_emit(pending):
+                    yield pending
+            pending_codex_assistant = (record_index, message)
+            continue
+
+        if message is None:
+            continue
+        if pending_codex_user is not None:
+            pending = pending_codex_user[1]
+            pending_codex_user = None
+            if should_emit(pending):
+                yield pending
+        if pending_codex_assistant is not None:
+            pending = pending_codex_assistant[1]
+            pending_codex_assistant = None
+            if should_emit(pending):
+                yield pending
+        if should_emit(message):
+            yield message
+
+    if pending_codex_user is not None:
+        pending = pending_codex_user[1]
+        if should_emit(pending):
+            yield pending
+    if pending_codex_assistant is not None:
+        pending = pending_codex_assistant[1]
+        if should_emit(pending):
+            yield pending
+
+
+def parse_conversation(
+    raw_content: str,
+    tool_id: str,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[NormalizedMessage]:
+    """Parse a conversation into the same semantic sequence used by ingest."""
     if tool_id == "hermes":
         return _parse_hermes_session(raw_content, offset, limit)
-    import hashlib
-    messages = []
-    seen: set[str] = set()
-    skipped = 0
-    for line in _iter_json_objects(raw_content):
-        if not line.strip():
+    if limit is not None and limit <= 0:
+        return []
+    messages: list[NormalizedMessage] = []
+    for index, message in enumerate(iter_conversation_messages(raw_content, tool_id)):
+        if index < offset:
             continue
-        msg = parse_conversation_line(line.strip(), tool_id)
-        if msg and msg.role in ("user", "assistant"):
-            # Deduplicate: same role + content + timestamp (within same second)
-            # Prevents event_msg/user_message and response_item/user duplicates
-            ts_bucket = (msg.timestamp or "")[:19]
-            calls = json.dumps(msg.tool_calls, ensure_ascii=False, separators=(",", ":"))
-            dedupe_key = hashlib.md5(
-                f"{msg.role}:{ts_bucket}:{msg.content}:{calls}".encode()
-            ).hexdigest()
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            if skipped < offset:
-                skipped += 1
-                continue
-            messages.append(msg)
-            if limit and len(messages) >= limit:
-                break
-        elif msg:
-            if skipped < offset:
-                skipped += 1
-                continue
-            messages.append(msg)
-            if limit and len(messages) >= limit:
-                break
+        messages.append(message)
+        if limit is not None and len(messages) >= limit:
+            break
     return messages
 
 
 def count_conversation_messages(raw_content: str, tool_id: str) -> int:
-    """Count messages without building full list — memory efficient."""
+    """Count exactly the semantic sequence returned by ``parse_conversation``."""
     if tool_id == "hermes":
         return _count_hermes_messages(raw_content)
-    import hashlib
-    count = 0
-    seen: set[str] = set()
-    for line in _iter_json_objects(raw_content):
-        if not line.strip():
-            continue
-        msg = parse_conversation_line(line.strip(), tool_id)
-        if msg and msg.role in ("user", "assistant"):
-            ts_bucket = (msg.timestamp or "")[:19]
-            calls = json.dumps(msg.tool_calls, ensure_ascii=False, separators=(",", ":"))
-            dedupe_key = hashlib.md5(
-                f"{msg.role}:{ts_bucket}:{msg.content}:{calls}".encode()
-            ).hexdigest()
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            count += 1
-        elif msg:
-            count += 1
-    return count
+    return sum(1 for _ in iter_conversation_messages(raw_content, tool_id))

@@ -1136,6 +1136,31 @@ class SyncQueue:
         for row in rows:
             self._discard_payload(row[0])
 
+    @_rollback_on_error
+    def clear_file_state(self, tool_name: str, relative_path: str) -> None:
+        """Forget one observed revision so a force-full upload cannot dedupe away."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "DELETE FROM file_state WHERE tool_name=? AND relative_path=?",
+                (tool_name, relative_path),
+            )
+            self._conn.commit()
+
+    @_rollback_on_error
+    def prioritize_file(self, tool_name: str, relative_path: str) -> int:
+        """Move a server-requested repair ahead of ordinary backlog rows."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cursor = self._conn.execute(
+                """UPDATE queue
+                   SET created_at=0, available_at=0
+                   WHERE tool_name=? AND relative_path=? AND status='pending'""",
+                (tool_name, relative_path),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
