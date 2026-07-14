@@ -367,14 +367,25 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
         </div>
       )}
 
-      <div className="mt-5 flex flex-wrap justify-end gap-2">
-        {onClose && <Btn variant="ghost" onClick={onClose} disabled={busy}>Cancel</Btn>}
+      <div
+        data-export-actions
+        className="sticky bottom-0 z-20 -mx-4 mt-5 grid grid-cols-2 gap-2 border-t px-4 pb-1 pt-3 sm:static sm:mx-0 sm:flex sm:flex-wrap sm:justify-end sm:border-0 sm:p-0"
+        style={{
+          borderColor: "var(--aurora-border)",
+          background: "var(--aurora-surface-solid)",
+        }}
+      >
+        {onClose && (
+          <div className="hidden sm:block">
+            <Btn variant="ghost" onClick={onClose} disabled={busy}>Cancel</Btn>
+          </div>
+        )}
         {documentId && (
-          <Btn variant="glass" icon="copy" onClick={() => void copyRichText()} disabled={busy || Boolean(dateError)}>
+          <Btn className="w-full sm:w-auto" variant="glass" icon="copy" onClick={() => void copyRichText()} disabled={busy || Boolean(dateError)}>
             {busy ? "Working…" : "Copy rich text"}
           </Btn>
         )}
-        <Btn icon="arrow_down" onClick={() => void runExport()} disabled={busy || Boolean(dateError)}>
+        <Btn className="w-full sm:w-auto" icon="arrow_down" onClick={() => void runExport()} disabled={busy || Boolean(dateError)}>
           {busy ? "Preparing export…" : global ? "Export conversations" : "Export thread"}
         </Btn>
       </div>
@@ -403,7 +414,7 @@ export function MarkdownExportDialog({ documentId, onClose }: { documentId: stri
       <Glass
         padding="clamp(16px, 3vw, 24px)"
         radius={22}
-        className="w-full max-w-2xl max-h-[92vh] overflow-y-auto"
+        className="w-full max-w-2xl max-h-[92dvh] overflow-y-auto sm:max-h-[92vh]"
         style={{ background: "var(--aurora-surface-solid)" }}
       >
         <div className="flex items-start justify-between gap-4 mb-5">
