@@ -70,6 +70,11 @@ export function invalidateConversationMessages(id: string) {
   invalidateApiCache(`${getApiBase()}/api/conversations/${id}/messages`);
 }
 
+/** Drop cached within-thread search pages after the transcript changes. */
+export function invalidateConversationSearch(id: string) {
+  invalidateApiCache(`${getApiBase()}/api/conversations/${id}/search`);
+}
+
 function getCached<T>(cacheKey: string): T | null {
   const hit = _cache.get(cacheKey);
   if (!hit) return null;

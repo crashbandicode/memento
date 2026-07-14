@@ -1,7 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ConversationPrompt, invalidateConversationMessages, invalidateConversationPrompts } from "./api-client";
+import {
+  api,
+  ConversationPrompt,
+  invalidateConversationMessages,
+  invalidateConversationPrompts,
+  invalidateConversationSearch,
+} from "./api-client";
 import { useSSE } from "./use-sse";
 
 /**
@@ -10,22 +16,28 @@ import { useSSE } from "./use-sse";
  * navigator before their message body has finished rendering.
  */
 export function useConversationPrompts(documentId: string) {
-  const [prompts, setPrompts] = useState<ConversationPrompt[]>([]);
+  const [promptState, setPromptState] = useState<{
+    documentId: string;
+    prompts: ConversationPrompt[];
+  }>({ documentId, prompts: [] });
   const [syncVersion, setSyncVersion] = useState(0);
   const refreshTimer = useRef<number | null>(null);
+  const prompts = promptState.documentId === documentId
+    ? promptState.prompts
+    : [];
 
   const refresh = useCallback(async () => {
     try {
       const response = await api.getPrompts(documentId);
-      setPrompts(response.prompts);
+      setPromptState({ documentId, prompts: response.prompts });
     } catch (error) {
       console.error("Failed to load prompt outline:", error);
     }
   }, [documentId]);
 
   useEffect(() => {
-    setPrompts([]);
-    void refresh();
+    const timer = window.setTimeout(() => void refresh(), 0);
+    return () => window.clearTimeout(timer);
   }, [documentId, refresh]);
 
   useSSE((event) => {
@@ -35,6 +47,7 @@ export function useConversationPrompts(documentId: string) {
       refreshTimer.current = null;
       invalidateConversationPrompts(documentId);
       invalidateConversationMessages(documentId);
+      invalidateConversationSearch(documentId);
       setSyncVersion((version) => version + 1);
       void refresh();
     }, 250);

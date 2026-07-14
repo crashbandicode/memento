@@ -152,6 +152,7 @@ const MESSAGE_PAGE_SIZE = 50;
 const LIVE_TAIL_SIZE = 200;
 const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
+const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
 
 function mergeMessagesChronologically(
   current: ConversationMessage[],
@@ -200,6 +201,7 @@ export default function ConversationViewer({
   const loadingRef = useRef(false);
   const syncingTailRef = useRef(false);
   const latestPromptLineRef = useRef<number | null>(null);
+  const promptLinesRef = useRef<number[]>([]);
   const { t, locale } = useI18n();
   const { questionIds, questionResponses } = useMemo(() => {
     const ids = new Set<string>();
@@ -336,6 +338,7 @@ export default function ConversationViewer({
   }, [totalMessages]);
 
   useEffect(() => {
+    promptLinesRef.current = prompts.map((prompt) => prompt.line_number);
     latestPromptLineRef.current = prompts.at(-1)?.line_number ?? null;
     setActivePromptLine((previous) => {
       if (previous !== null && prompts.some((prompt) => prompt.line_number === previous)) return previous;
@@ -406,6 +409,27 @@ export default function ConversationViewer({
         );
         let nextMessages = response.messages;
         let contiguousEnd = response.offset + response.messages.length;
+        const promptIndex = promptLinesRef.current.indexOf(lineNumber);
+        const nextPromptLine = promptIndex >= 0
+          ? promptLinesRef.current[promptIndex + 1]
+          : undefined;
+        while (
+          nextMessages.length < PROMPT_JUMP_MAX_WINDOW_SIZE
+          && contiguousEnd < response.total
+          && (
+            nextPromptLine === undefined
+            || (nextMessages.at(-1)?.line_number ?? 0) < nextPromptLine
+          )
+        ) {
+          const page = await api.getMessages(
+            documentId,
+            contiguousEnd,
+            Math.min(200, PROMPT_JUMP_MAX_WINDOW_SIZE - nextMessages.length),
+          );
+          if (page.messages.length === 0) break;
+          nextMessages = mergeMessagesChronologically(nextMessages, page.messages);
+          contiguousEnd = page.offset + page.messages.length;
+        }
         if (
           lineNumber === latestPromptLineRef.current
           && contiguousEnd < response.total
@@ -580,6 +604,16 @@ function ConversationSearchBar({
   const [open, setOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const deepLinkHandledRef = useRef("");
+  const searchSnapshotRef = useRef({
+    query: "",
+    results: [] as ConversationSearchHit[],
+    nextAfterLine: null as number | null,
+    hasMore: false,
+  });
+
+  useEffect(() => {
+    searchSnapshotRef.current = { query, results, nextAfterLine, hasMore };
+  }, [query, results, nextAfterLine, hasMore]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -647,7 +681,46 @@ function ConversationSearchBar({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [documentId, query, syncVersion]);
+  }, [documentId, query]);
+
+  // Refresh the result window after a collector append without collapsing a
+  // paged/scrolled search back to its first 50 rows. Search is chronological,
+  // so refreshing at most the first 100 rows and retaining the already-loaded
+  // suffix keeps the cursor stable while incorporating edits near the front.
+  useEffect(() => {
+    if (syncVersion === 0) return;
+    const snapshot = searchSnapshotRef.current;
+    const cleanQuery = snapshot.query.trim();
+    if (!cleanQuery || snapshot.results.length === 0) return;
+
+    const controller = new AbortController();
+    const refreshLimit = Math.min(100, Math.max(50, snapshot.results.length));
+    setLoading(true);
+    api.searchConversation(documentId, cleanQuery, null, refreshLimit, controller.signal)
+      .then((response) => {
+        if (searchSnapshotRef.current.query.trim() !== cleanQuery) return;
+        setResults((previous) => {
+          const refreshedIds = new Set(response.results.map((result) => result.id));
+          const preservedSuffix = previous
+            .slice(refreshLimit)
+            .filter((result) => !refreshedIds.has(result.id));
+          return [...response.results, ...preservedSuffix];
+        });
+        if (snapshot.results.length <= refreshLimit) {
+          setNextAfterLine(response.next_after_line);
+          setHasMore(response.has_more);
+        }
+      })
+      .catch((error: unknown) => {
+        if ((error as { name?: string })?.name !== "AbortError") {
+          console.error("Failed to refresh conversation search:", error);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [documentId, syncVersion]);
 
   const loadMoreResults = async () => {
     if (loading || nextAfterLine === null) return;
