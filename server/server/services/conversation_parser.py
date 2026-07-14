@@ -25,9 +25,16 @@ class NormalizedMessage:
     tool_input: str = ""  # Tool input/command
     thinking: str = ""  # Optional thinking/reasoning text kept separate from final response
     session_context: str = ""  # Injected context kept separate from human text
-    tool_calls: list[dict[str, str]] = field(default_factory=list)
+    tool_calls: list[dict[str, object]] = field(default_factory=list)
     # Structured assistant tool calls. Each item has bounded ``name`` and
     # serialized ``input`` strings while the message itself remains one row.
+    interaction: dict[str, object] | None = None
+    # Normalized cross-tool interactive prompt (for example Claude's
+    # AskUserQuestion, Cursor's AskQuestion, or Codex request_user_input).
+    interaction_response: dict[str, object] | None = None
+    # A response remains its own source row, but carries a stable link back to
+    # the interaction so the viewer can present the pair as one decision card.
+    tool_call_id: str = ""
     timestamp: str = ""
     raw_type: str = ""  # Original message type
     # Stable identity from the source transcript when one exists.  This is
@@ -414,20 +421,22 @@ def parse_conversation_object(
             # role is "user".  It is not human input: the content blocks are
             # typed tool_result and must render as a tool card, otherwise large
             # terminal dumps become giant purple User bubbles.
-            tool_result = _extract_tool_result_content(raw_content)
+            tool_result = _extract_tool_result_details(raw_content)
             if role == "user" and tool_result is not None:
+                result_content, tool_call_id = tool_result
                 return NormalizedMessage(
                     role="tool",
-                    content=tool_result or "(tool returned no textual output)",
+                    content=result_content or "(tool returned no textual output)",
                     tool_name="Tool result",
                     timestamp=timestamp,
                     raw_type="tool_result",
                     source_id=source_id,
+                    tool_call_id=tool_call_id,
                 )
 
             tool_use = _extract_tool_use(raw_content)
             if role == "assistant" and tool_use is not None:
-                tool_name, tool_input = tool_use
+                tool_name, tool_input, tool_call_id, interaction = tool_use
                 return NormalizedMessage(
                     role="tool",
                     content=f"[{tool_name}]",
@@ -436,6 +445,8 @@ def parse_conversation_object(
                     timestamp=timestamp,
                     raw_type="tool_use",
                     source_id=source_id,
+                    interaction=interaction,
+                    tool_call_id=tool_call_id,
                 )
 
             # Extract thinking separately from final text (Claude extended thinking)
@@ -489,6 +500,53 @@ def parse_conversation_object(
             if role in ("developer", "system"):
                 return None  # Skip system prompts
             p_type = payload.get("type", "")
+            if p_type in ("function_call", "custom_tool_call"):
+                tool_name = _coerce_text(payload.get("name"))
+                raw_input = payload.get("arguments", payload.get("input", {}))
+                tool_call_id = _bounded_interaction_text(
+                    payload.get("call_id") or payload.get("id"),
+                    512,
+                )
+                interaction = normalize_question_interaction(
+                    tool_name,
+                    raw_input,
+                    source="codex",
+                    interaction_id=tool_call_id,
+                )
+                if interaction is not None:
+                    return NormalizedMessage(
+                        role="tool",
+                        content=f"[{tool_name}]",
+                        tool_name=tool_name,
+                        tool_input=_serialize_tool_input(raw_input),
+                        timestamp=timestamp,
+                        raw_type="question_tool_call",
+                        source_id=tool_call_id,
+                        interaction=interaction,
+                        tool_call_id=tool_call_id,
+                    )
+                return None
+            if p_type in ("function_call_output", "custom_tool_call_output"):
+                raw_output = payload.get("output", payload.get("result", ""))
+                # Codex does not repeat the function name on output rows. Only
+                # accept the structured answer envelope used by
+                # request_user_input so ordinary function outputs remain out
+                # of the normalized conversation, as before.
+                if "answers" not in _json_mapping(raw_output):
+                    return None
+                tool_call_id = _bounded_interaction_text(
+                    payload.get("call_id") or payload.get("id"),
+                    512,
+                )
+                return NormalizedMessage(
+                    role="tool",
+                    content=_serialize_tool_input(raw_output),
+                    tool_name="Question response",
+                    timestamp=timestamp,
+                    raw_type="question_tool_output",
+                    source_id=f"{tool_call_id}:response" if tool_call_id else "",
+                    tool_call_id=tool_call_id,
+                )
             # Skip reasoning — AI internal thought process, not a reply
             if p_type == "reasoning":
                 return None
@@ -810,17 +868,23 @@ def _strip_system_tags(text: str) -> str:
     return text.strip()
 
 
-def _extract_tool_result_content(content) -> str | None:
-    """Return Claude/OpenClaw tool-result text, or None if no such block exists."""
+def _extract_tool_result_details(content) -> tuple[str, str] | None:
+    """Return Claude/OpenClaw tool-result text and its originating call ID."""
     if not isinstance(content, list):
         return None
 
     found = False
     parts: list[str] = []
+    tool_call_id = ""
     for item in content:
         if not isinstance(item, dict) or item.get("type") not in ("tool_result", "toolResult"):
             continue
         found = True
+        if not tool_call_id:
+            tool_call_id = _bounded_interaction_text(
+                item.get("tool_use_id") or item.get("tool_call_id"),
+                512,
+            )
         result = item.get("content", item.get("output", ""))
         if isinstance(result, list):
             nested: list[str] = []
@@ -839,7 +903,13 @@ def _extract_tool_result_content(content) -> str | None:
 
     if not found:
         return None
-    return strip_terminal_sequences("\n\n".join(parts)).strip()
+    return strip_terminal_sequences("\n\n".join(parts)).strip(), tool_call_id
+
+
+def _extract_tool_result_content(content) -> str | None:
+    """Compatibility wrapper returning only Claude/OpenClaw result text."""
+    details = _extract_tool_result_details(content)
+    return details[0] if details is not None else None
 
 
 def _extract_local_command(content) -> tuple[str, str, str] | None:
@@ -869,8 +939,10 @@ def _extract_local_command(content) -> tuple[str, str, str] | None:
     return None
 
 
-def _extract_tool_use(content) -> tuple[str, str] | None:
-    """Return a standalone Claude tool invocation as (name, formatted input)."""
+def _extract_tool_use(
+    content,
+) -> tuple[str, str, str, dict[str, object] | None] | None:
+    """Return a standalone Claude tool invocation and optional interaction."""
     if not isinstance(content, list):
         return None
 
@@ -893,7 +965,22 @@ def _extract_tool_use(content) -> tuple[str, str] | None:
             tool_input = value
         else:
             tool_input = json.dumps(value, ensure_ascii=False, indent=2)
-        return name, strip_terminal_sequences(tool_input).strip()
+        tool_call_id = _bounded_interaction_text(
+            item.get("id") or item.get("call_id"),
+            512,
+        )
+        interaction = normalize_question_interaction(
+            name,
+            value,
+            source="claude_code",
+            interaction_id=tool_call_id,
+        )
+        return (
+            name,
+            strip_terminal_sequences(tool_input).strip(),
+            tool_call_id,
+            interaction,
+        )
     return None
 
 
@@ -952,7 +1039,234 @@ def _serialize_tool_input(value: object) -> str:
     return _bounded_tool_text(serialized, _MAX_STRUCTURED_TOOL_INPUT_BYTES)
 
 
-def normalize_tool_calls(value: object) -> list[dict[str, str]]:
+_QUESTION_TOOL_NAMES = {
+    "askquestion",
+    "askuserquestion",
+    "request_user_input",
+}
+_MAX_INTERACTION_QUESTIONS = 8
+_MAX_INTERACTION_OPTIONS = 12
+CURSOR_QUESTION_RESPONSE_WINDOW = 4
+
+
+def _json_mapping(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _bounded_interaction_text(value: object, limit: int) -> str:
+    return _bounded_tool_text(_coerce_text(value).strip(), limit)
+
+
+def normalize_question_interaction(
+    tool_name: str,
+    raw_input: object,
+    *,
+    source: str,
+    interaction_id: object = "",
+) -> dict[str, object] | None:
+    """Normalize interactive-question payloads emitted by supported tools."""
+    if tool_name.strip().casefold() not in _QUESTION_TOOL_NAMES:
+        return None
+    payload = _json_mapping(raw_input)
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list):
+        return None
+
+    questions: list[dict[str, object]] = []
+    for index, raw_question in enumerate(raw_questions[:_MAX_INTERACTION_QUESTIONS]):
+        if not isinstance(raw_question, dict):
+            continue
+        prompt = _bounded_interaction_text(
+            raw_question.get("prompt") or raw_question.get("question"),
+            4096,
+        )
+        if not prompt:
+            continue
+        question_id = _bounded_interaction_text(
+            raw_question.get("id")
+            or raw_question.get("header")
+            or f"question-{index + 1}",
+            256,
+        )
+        header = _bounded_interaction_text(
+            raw_question.get("header") or raw_question.get("label_short"),
+            512,
+        )
+        multiple = bool(
+            raw_question.get("multiSelect")
+            or raw_question.get("allow_multiple")
+            or raw_question.get("type") == "multi_select"
+        )
+        options: list[dict[str, str]] = []
+        raw_options = raw_question.get("options")
+        if isinstance(raw_options, list):
+            for option_index, raw_option in enumerate(
+                raw_options[:_MAX_INTERACTION_OPTIONS]
+            ):
+                if isinstance(raw_option, str):
+                    raw_option = {"label": raw_option}
+                if not isinstance(raw_option, dict):
+                    continue
+                label = _bounded_interaction_text(raw_option.get("label"), 1024)
+                if not label:
+                    continue
+                option_id = _bounded_interaction_text(
+                    raw_option.get("id") or label or f"option-{option_index + 1}",
+                    512,
+                )
+                option = {"id": option_id, "label": label}
+                description = _bounded_interaction_text(
+                    raw_option.get("description") or raw_option.get("preview"),
+                    4096,
+                )
+                short_label = _bounded_interaction_text(
+                    raw_option.get("label_short"),
+                    512,
+                )
+                if description:
+                    option["description"] = description
+                if short_label:
+                    option["short_label"] = short_label
+                options.append(option)
+
+        if options:
+            question_type = "multi_select" if multiple else "single_select"
+        else:
+            question_type = "free_text"
+        questions.append({
+            "id": question_id,
+            "header": header,
+            "prompt": prompt,
+            "type": question_type,
+            "allow_custom": True,
+            "options": options,
+        })
+
+    if not questions:
+        return None
+    return {
+        "kind": "question",
+        "id": _bounded_interaction_text(interaction_id, 512),
+        "source": _bounded_interaction_text(source, 64),
+        "tool_name": _bounded_interaction_text(tool_name, 256),
+        "questions": questions,
+    }
+
+
+def _answer_texts(value: object) -> list[str]:
+    if isinstance(value, dict):
+        value = value.get("answers", value.get("answer", value.get("value")))
+    if isinstance(value, list):
+        return [
+            text
+            for item in value
+            if (text := _bounded_interaction_text(item, 4096))
+        ]
+    text = _bounded_interaction_text(value, 4096)
+    return [text] if text else []
+
+
+def _claude_answer_for_prompt(
+    raw_text: str,
+    prompt: str,
+    next_prompt: str | None,
+) -> str:
+    marker = f'"{prompt}"="'
+    start = raw_text.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    if next_prompt:
+        end = raw_text.find(f'", "{next_prompt}"="', start)
+    else:
+        end = raw_text.find('". You can now continue', start)
+    if end < 0:
+        end = len(raw_text)
+    return _bounded_interaction_text(raw_text[start:end].rstrip('". '), 4096)
+
+
+def build_question_response(
+    interaction: dict[str, object],
+    raw_output: object,
+) -> dict[str, object]:
+    """Build a shared answer model from structured or human-readable output."""
+    if isinstance(raw_output, str):
+        raw_text = _bounded_interaction_text(raw_output, 16 * 1024)
+        parsed = _json_mapping(raw_output)
+    else:
+        raw_text = _bounded_interaction_text(
+            json.dumps(raw_output, ensure_ascii=False, default=str),
+            16 * 1024,
+        )
+        parsed = raw_output if isinstance(raw_output, dict) else {}
+    structured_answers = parsed.get("answers")
+    if not isinstance(structured_answers, dict):
+        structured_answers = {}
+
+    raw_questions = interaction.get("questions")
+    questions = raw_questions if isinstance(raw_questions, list) else []
+    answers: list[dict[str, object]] = []
+    for index, question in enumerate(questions):
+        if not isinstance(question, dict):
+            continue
+        question_id = _coerce_text(question.get("id"))
+        answer_values = _answer_texts(structured_answers.get(question_id))
+        if not answer_values and raw_text:
+            prompt = _coerce_text(question.get("prompt"))
+            next_prompt = None
+            if index + 1 < len(questions) and isinstance(questions[index + 1], dict):
+                next_prompt = _coerce_text(questions[index + 1].get("prompt"))
+            claude_answer = _claude_answer_for_prompt(raw_text, prompt, next_prompt)
+            if claude_answer:
+                answer_values = [claude_answer]
+        if not answer_values and len(questions) == 1 and raw_text:
+            answer_values = [raw_text]
+
+        combined = "\n".join(answer_values)
+        selected: list[str] = []
+        options = question.get("options")
+        if isinstance(options, list):
+            folded = combined.casefold()
+            exact = folded.strip()
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                option_id = _coerce_text(option.get("id"))
+                label = _coerce_text(option.get("label"))
+                candidates = [item.casefold() for item in (option_id, label) if item]
+                if any(candidate == exact for candidate in candidates) or any(
+                    len(candidate) > 1
+                    and re.search(rf"(?<!\w){re.escape(candidate)}(?!\w)", folded)
+                    for candidate in candidates
+                ):
+                    selected.append(option_id or label)
+        if answer_values or selected:
+            answers.append({
+                "question_id": question_id,
+                "text": combined,
+                "selected_option_ids": selected,
+            })
+
+    lowered = raw_text.casefold()
+    status = "cancelled" if "cancel" in lowered and not answers else "answered"
+    return {
+        "kind": "question_response",
+        "interaction_id": _bounded_interaction_text(interaction.get("id"), 512),
+        "status": status,
+        "answers": answers,
+        "raw_text": raw_text,
+    }
+
+
+def normalize_tool_calls(value: object) -> list[dict[str, object]]:
     """Return the safe, bounded public representation of assistant tools.
 
     This accepts both raw Cursor ``tool_use`` blocks and the ``name``/``input``
@@ -963,7 +1277,7 @@ def normalize_tool_calls(value: object) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
 
-    calls: list[dict[str, str]] = []
+    calls: list[dict[str, object]] = []
     total_bytes = 0
     for raw_call in value:
         if len(calls) >= _MAX_STRUCTURED_TOOL_CALLS:
@@ -989,13 +1303,34 @@ def normalize_tool_calls(value: object) -> list[dict[str, str]]:
             break
         serialized_input = _bounded_tool_text(serialized_input, remaining)
         total_bytes += name_bytes + len(serialized_input.encode("utf-8"))
-        calls.append({"name": name, "input": serialized_input})
+        normalized_call: dict[str, object] = {
+            "name": name,
+            "input": serialized_input,
+        }
+        interaction = raw_call.get("interaction")
+        if isinstance(interaction, dict):
+            interaction = normalize_question_interaction(
+                _coerce_text(interaction.get("tool_name") or name),
+                {"questions": interaction.get("questions")},
+                source=_coerce_text(interaction.get("source")),
+                interaction_id=interaction.get("id"),
+            )
+        else:
+            interaction = normalize_question_interaction(
+                name,
+                raw_input,
+                source="cursor",
+                interaction_id=raw_call.get("id") or raw_call.get("call_id"),
+            )
+        if interaction:
+            normalized_call["interaction"] = interaction
+        calls.append(normalized_call)
     return calls
 
 
 def _extract_cursor_assistant_content(
     content: object,
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, list[dict[str, object]]]:
     """Separate Cursor prose from structured assistant tool invocations."""
     if not isinstance(content, list):
         prose = _CURSOR_REDACTED_TRANSPORT_LINE_RE.sub(
@@ -1355,6 +1690,8 @@ def codex_assistant_transport_priority(raw_type: str | None) -> int:
 def iter_conversation_messages(
     raw_content: str,
     tool_id: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
 ) -> Iterator[NormalizedMessage]:
     """Yield semantic messages once, using identities supplied by each tool.
 
@@ -1370,6 +1707,16 @@ def iter_conversation_messages(
     seen_source_ids: set[str] = set()
     pending_codex_user: tuple[int, NormalizedMessage] | None = None
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
+    pending_questions = {
+        _coerce_text(interaction.get("id")): interaction
+        for interaction in (initial_question_interactions or [])
+        if isinstance(interaction, dict) and interaction.get("id")
+    }
+    pending_cursor_question: tuple[int, dict[str, object]] | None = None
+    for interaction in reversed(initial_question_interactions or []):
+        if isinstance(interaction, dict) and interaction.get("source") == "cursor":
+            pending_cursor_question = (-1, interaction)
+            break
 
     def should_emit(message: NormalizedMessage) -> bool:
         if not message.source_id:
@@ -1384,6 +1731,53 @@ def iter_conversation_messages(
         _iter_decoded_json_objects(raw_content)
     ):
         message = parse_conversation_object(source_object, tool_id)
+
+        if (
+            pending_cursor_question is not None
+            and record_index - pending_cursor_question[0]
+            > CURSOR_QUESTION_RESPONSE_WINDOW
+        ):
+            pending_cursor_question = None
+
+        if message is not None:
+            if message.tool_call_id and message.tool_call_id in pending_questions:
+                interaction = pending_questions.pop(message.tool_call_id)
+                message.interaction_response = build_question_response(
+                    interaction,
+                    message.content,
+                )
+                message.tool_name = "Question response"
+
+            if (
+                tool_id == "cursor"
+                and message.role == "user"
+                and pending_cursor_question is not None
+            ):
+                _pending_index, interaction = pending_cursor_question
+                message.interaction_response = build_question_response(
+                    interaction,
+                    message.content,
+                )
+                pending_cursor_question = None
+
+            if message.interaction is not None:
+                interaction_id = _coerce_text(message.interaction.get("id"))
+                if not interaction_id:
+                    interaction_id = f"{tool_id}:{record_index}:question"
+                    message.interaction["id"] = interaction_id
+                pending_questions[interaction_id] = message.interaction
+
+            for call in message.tool_calls:
+                interaction = call.get("interaction")
+                if not isinstance(interaction, dict):
+                    continue
+                interaction_id = _coerce_text(interaction.get("id"))
+                if not interaction_id:
+                    interaction_id = f"{tool_id}:{record_index}:question"
+                    interaction["id"] = interaction_id
+                pending_questions[interaction_id] = interaction
+                if tool_id == "cursor":
+                    pending_cursor_question = (record_index, interaction)
 
         if (
             pending_codex_user is not None

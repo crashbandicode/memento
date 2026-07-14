@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "server"))
 from server.services.conversation_parser import (  # noqa: E402
     count_conversation_messages,
     extract_codex_session_metadata,
+    iter_conversation_messages,
     normalize_codex_user_payload,
     normalize_cursor_user_payload,
     parse_conversation,
@@ -20,6 +21,222 @@ from server.services.conversation_parser import (  # noqa: E402
 
 
 class ConversationParserTests(unittest.TestCase):
+    def test_claude_question_and_tool_response_are_structured(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "timestamp": "2026-07-14T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-1",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [{
+                                "header": "Release",
+                                "question": "How should I ship this?",
+                                "multiSelect": False,
+                                "options": [
+                                    {"label": "Deploy now", "description": "Build and deploy immediately."},
+                                    {"label": "Hold", "description": "Leave the change local."},
+                                ],
+                            }],
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "user-1",
+                "timestamp": "2026-07-14T10:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-1",
+                        "content": (
+                            'Your questions have been answered: '
+                            '"How should I ship this?"="Deploy now". '
+                            "You can now continue with these answers in mind."
+                        ),
+                    }],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 2)
+        interaction = messages[0].interaction
+        assert interaction is not None
+        self.assertEqual(interaction["id"], "toolu-1")
+        self.assertEqual(interaction["questions"][0]["type"], "single_select")
+        self.assertEqual(interaction["questions"][0]["options"][0]["label"], "Deploy now")
+        response = messages[1].interaction_response
+        assert response is not None
+        self.assertEqual(response["interaction_id"], "toolu-1")
+        self.assertEqual(response["answers"][0]["selected_option_ids"], ["Deploy now"])
+
+    def test_cursor_question_response_supports_multiple_selection(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "role": "assistant",
+                "timestamp": "2026-07-14T11:00:00Z",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "cursor-question-1",
+                        "name": "AskQuestion",
+                        "input": {
+                            "questions": [{
+                                "id": "targets",
+                                "prompt": "Which targets should I build?",
+                                "allow_multiple": True,
+                                "options": [
+                                    {"id": "web", "label": "Web"},
+                                    {"id": "desktop", "label": "Desktop"},
+                                ],
+                            }],
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "role": "user",
+                "timestamp": "2026-07-14T11:00:02Z",
+                "message": {"content": [{"type": "text", "text": "Web and Desktop"}]},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        interaction = messages[0].tool_calls[0]["interaction"]
+        self.assertEqual(interaction["questions"][0]["type"], "multi_select")
+        response = messages[1].interaction_response
+        assert response is not None
+        self.assertEqual(response["answers"][0]["selected_option_ids"], ["web", "desktop"])
+
+    def test_cursor_free_text_does_not_match_one_character_option_id(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "role": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "cursor-question-2",
+                        "name": "AskQuestion",
+                        "input": {
+                            "questions": [{
+                                "id": "scope",
+                                "prompt": "How should this work?",
+                                "options": [
+                                    {"id": "a", "label": "Automatic"},
+                                    {"id": "m", "label": "Manual"},
+                                ],
+                            }],
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "I want a custom workflow"}]},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        response = messages[1].interaction_response
+        assert response is not None
+        self.assertEqual(response["answers"][0]["selected_option_ids"], [])
+
+    def test_codex_request_user_input_call_and_output_are_preserved(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-14T12:00:00Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "call_id": "call-question-1",
+                    "arguments": json.dumps({
+                        "questions": [{
+                            "id": "rollout",
+                            "header": "Rollout",
+                            "question": "Proceed with deployment?",
+                            "options": [
+                                {"label": "Proceed", "description": "Deploy the verified build."},
+                                {"label": "Pause", "description": "Keep the build local."},
+                            ],
+                        }],
+                    }),
+                },
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-14T12:00:03Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-question-1",
+                    "output": json.dumps({
+                        "answers": {"rollout": {"answers": ["Proceed"]}},
+                    }),
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].tool_name, "request_user_input")
+        self.assertEqual(messages[0].interaction["questions"][0]["id"], "rollout")
+        self.assertEqual(
+            messages[1].interaction_response["answers"][0]["selected_option_ids"],
+            ["Proceed"],
+        )
+
+    def test_question_response_can_resume_across_delta_boundaries(self) -> None:
+        cursor_question_raw = json.dumps({
+            "role": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": "cursor-split-1",
+                    "name": "AskQuestion",
+                    "input": {
+                        "questions": [{
+                            "id": "choice",
+                            "prompt": "Pick a path",
+                            "options": [
+                                {"id": "safe", "label": "Safe path"},
+                                {"id": "fast", "label": "Fast path"},
+                            ],
+                        }],
+                    },
+                }],
+            },
+        })
+        question = list(iter_conversation_messages(cursor_question_raw, "cursor"))[0]
+        interaction = question.tool_calls[0]["interaction"]
+
+        cursor_response_raw = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": "Safe path"}]},
+        })
+        response = list(iter_conversation_messages(
+            cursor_response_raw,
+            "cursor",
+            initial_question_interactions=[interaction],
+        ))[0]
+
+        self.assertEqual(response.interaction_response["interaction_id"], "cursor-split-1")
+        self.assertEqual(
+            response.interaction_response["answers"][0]["selected_option_ids"],
+            ["safe"],
+        )
+
     def test_nullable_transport_fields_do_not_create_or_crash_messages(self) -> None:
         cases = (
             (

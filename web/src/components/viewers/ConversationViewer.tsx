@@ -15,6 +15,8 @@ import {
   ConversationMessage,
   ConversationPrompt,
   ConversationSearchHit,
+  QuestionInteraction,
+  QuestionInteractionResponse,
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import MarkdownViewer from "./MarkdownViewer";
@@ -150,6 +152,11 @@ const MESSAGE_PAGE_SIZE = 50;
 const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
 
+type PairedQuestionResponse = {
+  response: QuestionInteractionResponse;
+  message: ConversationMessage;
+};
+
 export default function ConversationViewer({
   documentId,
   prompts,
@@ -178,6 +185,23 @@ export default function ConversationViewer({
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
   const { t, locale } = useI18n();
+  const { questionIds, questionResponses } = useMemo(() => {
+    const ids = new Set<string>();
+    const responses = new Map<string, PairedQuestionResponse>();
+    messages.forEach((message) => {
+      if (message.interaction?.id) ids.add(message.interaction.id);
+      message.tool_calls?.forEach((call) => {
+        if (call.interaction?.id) ids.add(call.interaction.id);
+      });
+      if (message.interaction_response?.interaction_id) {
+        responses.set(message.interaction_response.interaction_id, {
+          response: message.interaction_response,
+          message,
+        });
+      }
+    });
+    return { questionIds: ids, questionResponses: responses };
+  }, [messages]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -405,7 +429,14 @@ export default function ConversationViewer({
           )}
 
           {messages.map((msg, idx) => {
+            if (
+              msg.interaction_response?.interaction_id
+              && questionIds.has(msg.interaction_response.interaction_id)
+            ) {
+              return null;
+            }
             const isHumanPrompt = (msg.role || msg.message_type) === "user"
+              && !msg.interaction_response
               && !msg.content.includes("[Subagent Context]");
             return (
               <div
@@ -414,7 +445,13 @@ export default function ConversationViewer({
                 data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
                 style={{ scrollMarginTop: 16 }}
               >
-                <ChatBubble msg={msg} toolId={toolId} locale={locale} t={t} />
+                <ChatBubble
+                  msg={msg}
+                  toolId={toolId}
+                  locale={locale}
+                  t={t}
+                  questionResponses={questionResponses}
+                />
               </div>
             );
           })}
@@ -1395,6 +1432,303 @@ function ConversationToolCard({
   );
 }
 
+function questionSourceLabel(source: string): string {
+  if (source === "claude_code") return "Claude Code";
+  if (source === "cursor") return "Cursor";
+  if (source === "codex") return "Codex";
+  return source || "AI tool";
+}
+
+function QuestionInteractionCard({
+  interaction,
+  pairedResponse,
+  t,
+}: {
+  interaction: QuestionInteraction;
+  pairedResponse?: PairedQuestionResponse;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const response = pairedResponse?.response;
+  const statusLabel = response?.status === "cancelled"
+    ? t.conversation.cancelled
+    : response
+      ? t.conversation.answered
+      : t.conversation.awaitingResponse;
+  const statusColor = response?.status === "cancelled"
+    ? "#B45309"
+    : response
+      ? "#059669"
+      : "var(--aurora-fg4)";
+
+  return (
+    <div
+      data-question-interaction={interaction.id}
+      className="mx-0.5 min-w-0 sm:mx-1"
+      style={{ width: "100%" }}
+    >
+      {pairedResponse && (
+        <span
+          id={`conversation-line-${pairedResponse.message.line_number}`}
+          aria-hidden="true"
+          style={{ display: "block", position: "relative", top: -8, scrollMarginTop: 16 }}
+        />
+      )}
+      <div
+        style={{
+          width: "100%",
+          minWidth: 0,
+          overflow: "hidden",
+          borderRadius: 14,
+          border: "1px solid color-mix(in srgb, var(--aurora-accent) 22%, var(--aurora-border))",
+          background: "color-mix(in srgb, var(--aurora-accent) 3%, var(--aurora-surface-solid))",
+          boxShadow: "0 4px 18px rgba(15,23,42,0.045)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 8,
+            padding: "11px 13px",
+            borderBottom: "1px solid var(--aurora-border)",
+            background: "color-mix(in srgb, var(--aurora-accent) 6%, transparent)",
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 30,
+              height: 30,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: 10,
+              color: "var(--aurora-accent)",
+              background: "color-mix(in srgb, var(--aurora-accent) 13%, var(--aurora-surface-solid))",
+            }}
+          >
+            <Icon name="message" size={15} />
+          </span>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--aurora-fg1)" }}>
+            {t.conversation.interactiveQuestion}
+          </span>
+          <span
+            style={{
+              padding: "3px 7px",
+              borderRadius: 999,
+              background: "var(--aurora-chip)",
+              color: "var(--aurora-fg3)",
+              fontSize: 9.5,
+              fontWeight: 650,
+            }}
+          >
+            {questionSourceLabel(interaction.source)}
+          </span>
+          <span
+            data-question-status={response?.status || "pending"}
+            style={{
+              marginLeft: "auto",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              color: statusColor,
+              fontSize: 10.5,
+              fontWeight: 650,
+            }}
+          >
+            {response && <Icon name={response.status === "cancelled" ? "close" : "check"} size={12} />}
+            {statusLabel}
+          </span>
+        </div>
+
+        <div style={{ display: "grid", gap: 14, padding: "14px 13px 15px" }}>
+          {interaction.questions.map((question, questionIndex) => {
+            const answer = response?.answers.find((item) => item.question_id === question.id);
+            const selectedIds = new Set(answer?.selected_option_ids || []);
+            const hint = question.type === "multi_select"
+              ? t.conversation.chooseMany
+              : question.type === "single_select"
+                ? t.conversation.chooseOne
+                : t.conversation.freeResponse;
+            const showCustomAnswer = Boolean(answer?.text && selectedIds.size === 0);
+            return (
+              <section
+                key={`${question.id}-${questionIndex}`}
+                style={{
+                  minWidth: 0,
+                  paddingTop: questionIndex ? 14 : 0,
+                  borderTop: questionIndex ? "1px solid var(--aurora-border)" : undefined,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 7, marginBottom: 6 }}>
+                  {question.header && (
+                    <span
+                      style={{
+                        color: "var(--aurora-accent)",
+                        fontSize: 9.5,
+                        fontWeight: 750,
+                        letterSpacing: "0.07em",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      {question.header}
+                    </span>
+                  )}
+                  <span style={{ color: "var(--aurora-fg4)", fontSize: 9.5 }}>{hint}</span>
+                </div>
+                <div
+                  style={{
+                    marginBottom: question.options.length ? 10 : 0,
+                    color: "var(--aurora-fg1)",
+                    fontSize: 13.5,
+                    fontWeight: 620,
+                    lineHeight: 1.48,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {question.prompt}
+                </div>
+
+                {question.options.length > 0 && (
+                  <div
+                    role={question.type === "multi_select" ? "group" : "radiogroup"}
+                    aria-label={question.prompt}
+                    style={{ display: "grid", gap: 7 }}
+                  >
+                    {question.options.map((option) => {
+                      const selected = selectedIds.has(option.id);
+                      return (
+                        <div
+                          key={option.id}
+                          role={question.type === "multi_select" ? "checkbox" : "radio"}
+                          aria-checked={selected}
+                          data-question-option={option.id}
+                          data-selected={selected ? "true" : "false"}
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "24px minmax(0, 1fr)",
+                            gap: 9,
+                            padding: "9px 10px",
+                            borderRadius: 10,
+                            border: selected
+                              ? "1px solid color-mix(in srgb, var(--aurora-accent) 52%, var(--aurora-border))"
+                              : "1px solid var(--aurora-border)",
+                            background: selected
+                              ? "color-mix(in srgb, var(--aurora-accent) 9%, var(--aurora-surface-solid))"
+                              : "color-mix(in srgb, var(--aurora-chip) 36%, transparent)",
+                          }}
+                        >
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              width: 20,
+                              height: 20,
+                              marginTop: 1,
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              borderRadius: question.type === "multi_select" ? 6 : 999,
+                              border: selected ? "1px solid var(--aurora-accent)" : "1px solid var(--aurora-fg4)",
+                              background: selected ? "var(--aurora-accent)" : "transparent",
+                              color: selected ? "#fff" : "transparent",
+                            }}
+                          >
+                            <Icon name="check" size={12} strokeWidth={2.2} />
+                          </span>
+                          <span style={{ minWidth: 0 }}>
+                            <span
+                              style={{
+                                display: "block",
+                                color: selected ? "var(--aurora-accent)" : "var(--aurora-fg2)",
+                                fontSize: 12.5,
+                                fontWeight: selected ? 680 : 580,
+                                lineHeight: 1.4,
+                                overflowWrap: "anywhere",
+                              }}
+                            >
+                              {option.short_label || option.label}
+                            </span>
+                            {option.description && (
+                              <span
+                                style={{
+                                  display: "block",
+                                  marginTop: 2,
+                                  color: "var(--aurora-fg4)",
+                                  fontSize: 10.5,
+                                  lineHeight: 1.45,
+                                  overflowWrap: "anywhere",
+                                }}
+                              >
+                                {option.description}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {showCustomAnswer && (
+                  <div
+                    data-question-response
+                    style={{
+                      marginTop: 9,
+                      padding: "9px 10px",
+                      borderRadius: 10,
+                      border: "1px solid color-mix(in srgb, #10B981 25%, var(--aurora-border))",
+                      background: "color-mix(in srgb, #10B981 6%, var(--aurora-surface-solid))",
+                    }}
+                  >
+                    <div style={{ marginBottom: 4, color: "#059669", fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                      {t.conversation.customResponse}
+                    </div>
+                    <div style={{ color: "var(--aurora-fg2)", fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                      {answer?.text}
+                    </div>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function QuestionResponseCard({
+  response,
+  t,
+}: {
+  response: QuestionInteractionResponse;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const text = response.answers.map((answer) => answer.text).filter(Boolean).join("\n\n")
+    || response.raw_text;
+  return (
+    <div
+      data-question-response={response.interaction_id}
+      style={{
+        margin: "0 2px",
+        padding: "10px 12px",
+        borderRadius: 12,
+        border: "1px solid color-mix(in srgb, #10B981 25%, var(--aurora-border))",
+        background: "color-mix(in srgb, #10B981 6%, var(--aurora-surface-solid))",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5, color: "#059669", fontSize: 10.5, fontWeight: 700 }}>
+        <Icon name={response.status === "cancelled" ? "close" : "check"} size={12} />
+        {response.status === "cancelled" ? t.conversation.cancelled : t.conversation.yourResponse}
+      </div>
+      <div style={{ color: "var(--aurora-fg2)", fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+        {text}
+      </div>
+    </div>
+  );
+}
+
 function sessionContextSummary(
   content: string,
   t: ReturnType<typeof useI18n>["t"],
@@ -1525,11 +1859,13 @@ export const ChatBubble = memo(function ChatBubble({
   toolId = "",
   locale,
   t,
+  questionResponses = new Map(),
 }: {
   msg: ConversationMessage;
   toolId?: string;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
+  questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
 }) {
   const role = msg.role || msg.message_type || "unknown";
   const toolName = msg.tool_name ?? "";
@@ -1539,6 +1875,10 @@ export const ChatBubble = memo(function ChatBubble({
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   const [expanded, setExpanded] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
+
+  if (msg.interaction_response) {
+    return <QuestionResponseCard response={msg.interaction_response} t={t} />;
+  }
 
   // User — right aligned, violet gradient.
   // OpenClaw subagent sessions inject a synthetic "user" message at the top
@@ -1710,10 +2050,11 @@ export const ChatBubble = memo(function ChatBubble({
       ? structuredToolCalls.map((call) => ({
           name: call.name,
           input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
+          interaction: call.interaction,
         }))
       : legacySegments
           .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
-          .map((segment) => ({ name: segment.name, input: segment.input }));
+          .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
     const isLong = narrative.length > 500;
     const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
     const hasSeparateThinking = Boolean(thinking && thinking !== narrative);
@@ -1821,11 +2162,20 @@ export const ChatBubble = memo(function ChatBubble({
               style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
             >
               {toolCalls.map((call, index) => (
-                <ConversationToolCard
-                  key={`${call.name}-${index}`}
-                  name={call.name}
-                  input={call.input}
-                />
+                call.interaction ? (
+                  <QuestionInteractionCard
+                    key={`${call.name}-${index}`}
+                    interaction={call.interaction}
+                    pairedResponse={questionResponses.get(call.interaction.id)}
+                    t={t}
+                  />
+                ) : (
+                  <ConversationToolCard
+                    key={`${call.name}-${index}`}
+                    name={call.name}
+                    input={call.input}
+                  />
+                )
               ))}
             </div>
           )}
@@ -1838,6 +2188,15 @@ export const ChatBubble = memo(function ChatBubble({
   // output stay collapsed until requested, keeping long agent sessions easy
   // to scan while retaining every detail.
   if (role === "tool") {
+    if (msg.interaction) {
+      return (
+        <QuestionInteractionCard
+          interaction={msg.interaction}
+          pairedResponse={questionResponses.get(msg.interaction.id)}
+          t={t}
+        />
+      );
+    }
     return <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />;
   }
 

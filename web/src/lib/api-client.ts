@@ -250,6 +250,50 @@ export interface ExportDiagnostics {
   browser_recording_highlight_count?: number;
 }
 
+export interface QuestionOption {
+  id: string;
+  label: string;
+  description?: string;
+  short_label?: string;
+}
+
+export interface QuestionItem {
+  id: string;
+  header?: string;
+  prompt: string;
+  type: "single_select" | "multi_select" | "free_text";
+  allow_custom: boolean;
+  options: QuestionOption[];
+}
+
+export interface QuestionInteraction {
+  kind: "question";
+  id: string;
+  source: string;
+  tool_name: string;
+  questions: QuestionItem[];
+}
+
+export interface QuestionAnswer {
+  question_id: string;
+  text: string;
+  selected_option_ids: string[];
+}
+
+export interface QuestionInteractionResponse {
+  kind: "question_response";
+  interaction_id: string;
+  status: "answered" | "cancelled";
+  answers: QuestionAnswer[];
+  raw_text: string;
+}
+
+export interface ConversationToolCall {
+  name: string;
+  input: string;
+  interaction?: QuestionInteraction;
+}
+
 export interface ConversationMessage {
   id: number;
   line_number: number;
@@ -260,10 +304,9 @@ export interface ConversationMessage {
   session_context?: string | null;
   tool_name?: string;
   tool_input?: string;
-  tool_calls?: Array<{
-    name: string;
-    input: string;
-  }>;
+  tool_calls?: ConversationToolCall[];
+  interaction?: QuestionInteraction | null;
+  interaction_response?: QuestionInteractionResponse | null;
   raw_type?: string;
   metadata?: Record<string, unknown>;
   timestamp: string | null;

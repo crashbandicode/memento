@@ -283,6 +283,10 @@ def _conversation_message_metadata(normalized) -> dict:
     tool_calls = normalize_tool_calls(normalized.tool_calls)
     if tool_calls:
         meta["tool_calls"] = tool_calls
+    if normalized.interaction:
+        meta["interaction"] = normalized.interaction
+    if normalized.interaction_response:
+        meta["interaction_response"] = normalized.interaction_response
     if normalized.source_id:
         meta["source_id"] = _bounded_message_text(
             str(normalized.source_id),
@@ -291,7 +295,12 @@ def _conversation_message_metadata(normalized) -> dict:
     return meta
 
 
-def iter_stored_conversation_messages(content: str, tool_id: str):
+def iter_stored_conversation_messages(
+    content: str,
+    tool_id: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
+):
     """Yield the exact normalized representation persisted during ingest.
 
     Live ingestion and offline reparses must share this boundary.  Keeping the
@@ -304,7 +313,11 @@ def iter_stored_conversation_messages(content: str, tool_id: str):
         strip_terminal_sequences,
     )
 
-    for normalized in iter_conversation_messages(content, tool_id):
+    for normalized in iter_conversation_messages(
+        content,
+        tool_id,
+        initial_question_interactions=initial_question_interactions,
+    ):
         if normalized.role not in ("user", "assistant", "tool", "system"):
             continue
         full_clean_content = strip_terminal_sequences(normalized.content).replace(
@@ -330,6 +343,46 @@ def iter_stored_conversation_messages(content: str, tool_id: str):
             _conversation_message_metadata(normalized),
             timestamp,
         )
+
+
+def _pending_question_interactions(
+    recent_rows: list[ConversationMessage],
+) -> list[dict[str, object]]:
+    """Recover delta-boundary questions without reviving stale Cursor prompts."""
+    from .conversation_parser import CURSOR_QUESTION_RESPONSE_WINDOW
+
+    if not recent_rows:
+        return []
+
+    newest_line = max(int(row.line_number or 0) for row in recent_rows)
+    pending: dict[str, dict[str, object]] = {}
+    for recent in reversed(recent_rows):
+        metadata = recent.metadata_ if isinstance(recent.metadata_, dict) else {}
+        direct = metadata.get("interaction")
+        interactions = [direct] if isinstance(direct, dict) else []
+        calls = metadata.get("tool_calls")
+        if isinstance(calls, list):
+            interactions.extend(
+                interaction
+                for call in calls
+                if isinstance(call, dict)
+                and isinstance((interaction := call.get("interaction")), dict)
+            )
+        for interaction in interactions:
+            interaction_id = str(interaction.get("id") or "")
+            if not interaction_id:
+                continue
+            if (
+                interaction.get("source") == "cursor"
+                and newest_line - int(recent.line_number or 0)
+                > CURSOR_QUESTION_RESPONSE_WINDOW
+            ):
+                continue
+            pending[interaction_id] = interaction
+        response = metadata.get("interaction_response")
+        if isinstance(response, dict):
+            pending.pop(str(response.get("interaction_id") or ""), None)
+    return list(pending.values())
 
 
 def _json_size(value: object) -> int:
@@ -1708,15 +1761,18 @@ async def _extract_messages(
     batch: list[ConversationMessage] = []
     batch_bytes = 0
     delta_tail = None
+    initial_question_interactions: list[dict[str, object]] = []
     if mode == "delta" and start_line > 1:
-        delta_tail = (
+        recent_rows = (
             await db.execute(
                 select(ConversationMessage)
                 .where(ConversationMessage.document_id == doc.id)
                 .order_by(ConversationMessage.line_number.desc())
-                .limit(1)
+                .limit(32)
             )
-        ).scalar_one_or_none()
+        ).scalars().all()
+        delta_tail = recent_rows[0] if recent_rows else None
+        initial_question_interactions = _pending_question_interactions(recent_rows)
 
     # The shared iterator is the single source of truth for semantic identity,
     # pagination, counting, and ingestion.  In particular, it preserves valid
@@ -1724,6 +1780,7 @@ async def _extract_messages(
     for normalized, clean_content, meta, ts in iter_stored_conversation_messages(
         content,
         tool_id,
+        initial_question_interactions=initial_question_interactions,
     ):
         # A filesystem event can split Codex's adjacent response/event
         # transport pair across two DELTA uploads.  If the previous DB row

@@ -39,15 +39,22 @@ from ..services.user_filter import user_machine_ids
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
-def _parsed_tool_calls(message: object) -> list[dict[str, str]]:
+def _parsed_tool_calls(message: object) -> list[dict[str, object]]:
     return normalize_tool_calls(getattr(message, "tool_calls", None))
 
 
-def _stored_tool_calls(metadata: object) -> list[dict[str, str]]:
+def _stored_tool_calls(metadata: object) -> list[dict[str, object]]:
     """Read the same bounded tool-call shape used by raw-content parsing."""
     if not isinstance(metadata, dict):
         return []
     return normalize_tool_calls(metadata.get("tool_calls"))
+
+
+def _stored_interaction(metadata: object, key: str) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    return value if isinstance(value, dict) else None
 
 
 @router.get("/{doc_id}")
@@ -309,6 +316,11 @@ async def get_conversation_messages(
                         "session_context", ""
                     ),
                     "tool_calls": _stored_tool_calls(m.metadata_),
+                    "interaction": _stored_interaction(m.metadata_, "interaction"),
+                    "interaction_response": _stored_interaction(
+                        m.metadata_,
+                        "interaction_response",
+                    ),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
                 }
@@ -341,6 +353,8 @@ async def get_conversation_messages(
                     "tool_input": m.tool_input,
                     "session_context": m.session_context,
                     "tool_calls": _parsed_tool_calls(m),
+                    "interaction": m.interaction,
+                    "interaction_response": m.interaction_response,
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
                 }
@@ -508,6 +522,7 @@ async def get_conversation_prompts(
                 ConversationMessage.line_number,
                 ConversationMessage.content,
                 ConversationMessage.timestamp,
+                ConversationMessage.metadata_,
             )
             .where(
                 ConversationMessage.document_id == doc_id,
@@ -515,9 +530,13 @@ async def get_conversation_prompts(
             )
             .order_by(ConversationMessage.line_number)
         )
-        for message_id, line_number, content, timestamp in prompt_rows.all():
+        for message_id, line_number, content, timestamp, metadata in prompt_rows.all():
             clean = (content or "").strip()
-            if not clean or clean.startswith("[Subagent Context]"):
+            if (
+                not clean
+                or clean.startswith("[Subagent Context]")
+                or _stored_interaction(metadata, "interaction_response") is not None
+            ):
                 continue
             prompts.append({
                 "id": message_id,
@@ -542,6 +561,7 @@ async def get_conversation_prompts(
                 if message.role == "user"
                 and message.content.strip()
                 and not message.content.lstrip().startswith("[Subagent Context]")
+                and message.interaction_response is None
             ]
 
     return {"prompts": prompts}

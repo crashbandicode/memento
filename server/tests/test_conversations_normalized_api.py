@@ -140,7 +140,16 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         db = _Db([
             _Result(scalar_value=self.doc),
             _Result(scalar_value=2),
-            _Result(rows=[(7, 12, "A prompt", self.now)]),
+            _Result(rows=[
+                (7, 12, "A prompt", self.now, {}),
+                (
+                    8,
+                    13,
+                    "The selected answer",
+                    self.now,
+                    {"interaction_response": {"interaction_id": "question-1"}},
+                ),
+            ]),
         ])
 
         payload = await get_conversation_prompts(
@@ -151,6 +160,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["prompts"][0]["line_number"], 12)
         self.assertEqual(payload["prompts"][0]["content"], "A prompt")
+        self.assertEqual(len(payload["prompts"]), 1)
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
         prompt_sql = str(db.statements[2].compile()).upper()
