@@ -16,8 +16,8 @@ export const I18nContext = createContext<{
   t: Translations;
   setLocale: (l: Locale) => void;
 }>({
-  locale: "zh-CN",
-  t: zhCN,
+  locale: "en-US",
+  t: enUS,
   setLocale: () => {},
 });
 

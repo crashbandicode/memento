@@ -198,6 +198,10 @@ const zhCN = {
     filteredPromptCount: "显示 {visible} / {total} 条提示词",
     searchPrompts: "搜索 {count} 条提示词",
     noMatchingPrompts: "没有匹配的提示词",
+    searchMessages: "搜索此对话中的所有消息",
+    clearSearch: "清除对话搜索",
+    matchingMessages: "{count} 条匹配消息",
+    noMatchingMessages: "没有匹配的消息",
     closePromptNavigator: "关闭提示词导航",
     promptFallback: "提示词 {number}",
     lastActivity: "最近活动",
@@ -236,10 +240,20 @@ const zhCN = {
   // Search
   searchPage: {
     title: "搜索",
+    subtitle: "搜索所有对话消息或同步文件",
+    scopeLabel: "搜索范围",
+    conversations: "对话",
+    files: "文件与笔记",
     placeholder: "搜索所有 AI 工具数据...",
+    messagePlaceholder: "搜索所有用户和助手消息...",
     allTools: "所有工具",
     results: "找到 {total} 条结果，关键词 \"{query}\"",
     noResults: "未找到结果",
+    you: "你",
+    assistant: "助手",
+    fuzzyMatch: "模糊匹配",
+    subagentMatch: "子代理",
+    loadMore: "加载更多结果",
   },
 
   // Devices

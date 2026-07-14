@@ -3,13 +3,19 @@
 import {
   memo,
   type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import Link from "next/link";
-import { api, ConversationMessage, ConversationPrompt } from "@/lib/api-client";
+import {
+  api,
+  ConversationMessage,
+  ConversationPrompt,
+  ConversationSearchHit,
+} from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
@@ -303,9 +309,9 @@ export default function ConversationViewer({
     }
   };
 
-  const navigateToPrompt = async (prompt: ConversationPrompt) => {
-    const anchorId = `conversation-line-${prompt.line_number}`;
-    setNavigatingPromptLine(prompt.line_number);
+  const navigateToLine = useCallback(async (lineNumber: number) => {
+    const anchorId = `conversation-line-${lineNumber}`;
+    setNavigatingPromptLine(lineNumber);
     if (!document.getElementById(anchorId) && loadingRef.current) {
       await new Promise<void>((resolve) => {
         const startedAt = Date.now();
@@ -326,7 +332,7 @@ export default function ConversationViewer({
       try {
         const response = await api.getMessagesAround(
           documentId,
-          prompt.line_number,
+          lineNumber,
           PROMPT_JUMP_CONTEXT_BEFORE,
           PROMPT_JUMP_WINDOW_SIZE,
         );
@@ -346,12 +352,22 @@ export default function ConversationViewer({
       }
     }
 
+    setPendingPromptLine(lineNumber);
+  }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const navigateToPrompt = async (prompt: ConversationPrompt) => {
     setActivePromptLine(prompt.line_number);
-    setPendingPromptLine(prompt.line_number);
+    await navigateToLine(prompt.line_number);
   };
 
   return (
     <div style={{ position: "relative" }}>
+      <ConversationSearchBar
+        documentId={documentId}
+        syncVersion={syncVersion}
+        onSelectLine={navigateToLine}
+        t={t}
+      />
       <div
         ref={containerRef}
         data-conversation-viewer
@@ -447,6 +463,240 @@ export default function ConversationViewer({
         loadingLabel={t.loading}
         onSelect={navigateToPrompt}
       />
+    </div>
+  );
+}
+
+function ConversationSearchBar({
+  documentId,
+  syncVersion,
+  onSelectLine,
+  t,
+}: {
+  documentId: string;
+  syncVersion: number;
+  onSelectLine: (lineNumber: number) => void | Promise<void>;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ConversationSearchHit[]>([]);
+  const [nextAfterLine, setNextAfterLine] = useState<number | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const deepLinkHandledRef = useRef("");
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const initialQuery = params.get("q") || "";
+    const initialLine = Number(params.get("line"));
+    setQuery(initialQuery);
+    if (initialQuery) setOpen(true);
+    const deepLinkKey = `${documentId}:${initialLine}`;
+    if (
+      Number.isInteger(initialLine)
+      && initialLine > 0
+      && deepLinkHandledRef.current !== deepLinkKey
+    ) {
+      deepLinkHandledRef.current = deepLinkKey;
+      void onSelectLine(initialLine);
+    }
+  }, [documentId, onSelectLine]);
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setOpen(true);
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }
+      if (event.key === "Escape" && document.activeElement === inputRef.current) {
+        setOpen(false);
+        inputRef.current?.blur();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) {
+      setResults([]);
+      setHasMore(false);
+      setNextAfterLine(null);
+      setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setLoading(true);
+      api.searchConversation(documentId, cleanQuery, null, 50, controller.signal)
+        .then((response) => {
+          setResults(response.results);
+          setNextAfterLine(response.next_after_line);
+          setHasMore(response.has_more);
+          setOpen(true);
+        })
+        .catch((error: unknown) => {
+          if ((error as { name?: string })?.name !== "AbortError") {
+            console.error("Failed to search conversation:", error);
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setLoading(false);
+        });
+    }, 280);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [documentId, query, syncVersion]);
+
+  const loadMoreResults = async () => {
+    if (loading || nextAfterLine === null) return;
+    setLoading(true);
+    try {
+      const response = await api.searchConversation(
+        documentId,
+        query.trim(),
+        nextAfterLine,
+        50,
+      );
+      const existing = new Set(results.map((result) => result.id));
+      setResults((previous) => [
+        ...previous,
+        ...response.results.filter((result) => !existing.has(result.id)),
+      ]);
+      setNextAfterLine(response.next_after_line);
+      setHasMore(response.has_more);
+    } catch (error) {
+      console.error("Failed to load more conversation search results:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const selectResult = async (result: ConversationSearchHit) => {
+    await onSelectLine(result.line_number);
+    const url = new URL(window.location.href);
+    url.searchParams.set("line", String(result.line_number));
+    url.searchParams.set("q", query.trim());
+    window.history.replaceState(window.history.state, "", url);
+    setOpen(false);
+  };
+
+  return (
+    <div data-conversation-search style={{ position: "relative", zIndex: 30, marginBottom: 10 }}>
+      <label
+        className="aurora-input"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          width: "100%",
+          background: "var(--aurora-surface-solid)",
+        }}
+      >
+        <Icon name="search" size={15} style={{ color: "var(--aurora-fg3)", flex: "0 0 auto" }} />
+        <input
+          ref={inputRef}
+          data-conversation-search-input
+          type="search"
+          value={query}
+          onFocus={() => query.trim() && setOpen(true)}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder={t.conversation.searchMessages}
+          aria-label={t.conversation.searchMessages}
+          style={{ flex: 1, minWidth: 0, border: 0, outline: 0, background: "transparent", color: "var(--aurora-fg1)", fontSize: 13 }}
+        />
+        {loading && <span aria-label={t.loading} style={{ color: "var(--aurora-fg4)", fontSize: 11 }}>…</span>}
+        {query && (
+          <button
+            type="button"
+            onClick={() => { setQuery(""); setOpen(false); inputRef.current?.focus(); }}
+            aria-label={t.conversation.clearSearch}
+            style={{ border: 0, background: "transparent", color: "var(--aurora-fg4)", cursor: "pointer", padding: 2 }}
+          >
+            ×
+          </button>
+        )}
+        <kbd style={{ color: "var(--aurora-fg4)", fontSize: 10, border: "1px solid var(--aurora-border)", borderRadius: 5, padding: "1px 5px" }}>
+          {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘F" : "Ctrl F"}
+        </kbd>
+      </label>
+
+      {open && query.trim() && (
+        <div
+          data-conversation-search-results
+          role="listbox"
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            right: 0,
+            maxHeight: "min(420px, 60vh)",
+            overflowY: "auto",
+            border: "1px solid var(--aurora-border)",
+            borderRadius: 15,
+            background: "var(--aurora-surface-solid)",
+            boxShadow: "0 18px 45px rgba(15,23,42,0.18)",
+            padding: 7,
+          }}
+        >
+          <div style={{ padding: "4px 7px 7px", color: "var(--aurora-fg4)", fontSize: 11 }}>
+            {loading && results.length === 0
+              ? t.loading
+              : fmt(t.conversation.matchingMessages, { count: results.length })}
+          </div>
+          {!loading && results.length === 0 && (
+            <div style={{ padding: 18, textAlign: "center", color: "var(--aurora-fg4)", fontSize: 12 }}>
+              {t.conversation.noMatchingMessages}
+            </div>
+          )}
+          {results.map((result) => (
+            <button
+              key={result.id}
+              type="button"
+              role="option"
+              data-conversation-search-hit={result.line_number}
+              onClick={() => void selectResult(result)}
+              style={{
+                display: "block",
+                width: "100%",
+                border: 0,
+                borderTop: "1px solid var(--aurora-border)",
+                background: "transparent",
+                color: "var(--aurora-fg2)",
+                padding: "9px 8px",
+                textAlign: "left",
+                cursor: "pointer",
+              }}
+            >
+              <span style={{ display: "flex", gap: 7, alignItems: "center", marginBottom: 4, fontSize: 10, color: "var(--aurora-fg4)" }}>
+                <span style={{ color: result.role === "user" ? "var(--aurora-accent)" : "var(--aurora-success)" }}>
+                  {result.role === "user" ? t.searchPage.you : t.searchPage.assistant}
+                </span>
+                {result.match_type === "fuzzy" && <span>{t.searchPage.fuzzyMatch}</span>}
+                <span style={{ marginLeft: "auto" }}>#{result.line_number}</span>
+              </span>
+              <span style={{ display: "block", fontSize: 12, lineHeight: 1.45 }}>{result.snippet}</span>
+            </button>
+          ))}
+          {hasMore && nextAfterLine !== null && (
+            <button
+              type="button"
+              onClick={() => void loadMoreResults()}
+              disabled={loading}
+              style={{ width: "100%", border: 0, borderTop: "1px solid var(--aurora-border)", background: "transparent", color: "var(--aurora-accent)", padding: 10, cursor: loading ? "wait" : "pointer", fontSize: 12, fontWeight: 650 }}
+            >
+              {loading ? "…" : t.searchPage.loadMore}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

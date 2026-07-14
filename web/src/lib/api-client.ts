@@ -334,6 +334,49 @@ export interface SearchResult {
   }[];
 }
 
+export interface ConversationSearchHit {
+  id: number;
+  line_number: number;
+  role: "user" | "assistant" | string;
+  snippet: string;
+  timestamp: string | null;
+  score: number;
+  match_type: "exact" | "full_text" | "fuzzy" | string;
+}
+
+export interface ConversationSearchResponse {
+  query: string;
+  results: ConversationSearchHit[];
+  next_after_line: number | null;
+  has_more: boolean;
+  corrected_query: string | null;
+}
+
+export interface GlobalMessageSearchHit extends ConversationSearchHit {
+  matched_document_id: string;
+  is_subagent_hit: boolean;
+}
+
+export interface GlobalMessageSearchGroup {
+  id: string;
+  tool_id: string;
+  relative_path: string;
+  title: string | null;
+  activity_at: string | null;
+  subagent_count: number;
+  is_subagent_orphan: boolean;
+  subagents: ConversationSubagentSummary[];
+  hits: GlobalMessageSearchHit[];
+}
+
+export interface GlobalMessageSearchResponse {
+  query: string;
+  results: GlobalMessageSearchGroup[];
+  next_cursor: string | null;
+  has_more: boolean;
+  corrected_query: string | null;
+}
+
 // Timeline
 export interface TimelinePreviewMessage {
   id: number;
@@ -451,6 +494,20 @@ export const api = {
   },
   getPrompts: (id: string) =>
     apiFetch<ConversationPromptsResponse>(`/api/conversations/${id}/prompts`),
+  searchConversation: (
+    id: string,
+    q: string,
+    afterLine?: number | null,
+    limit = 50,
+    signal?: AbortSignal,
+  ) => {
+    const params = new URLSearchParams({ q, limit: String(limit) });
+    if (typeof afterLine === "number") params.set("after_line", String(afterLine));
+    return apiFetch<ConversationSearchResponse>(
+      `/api/conversations/${id}/search?${params}`,
+      { signal },
+    );
+  },
   getDailyDates: (days = 30, signal?: AbortSignal) => {
     const tz = new Date().getTimezoneOffset();
     return apiFetch<DailyDate[]>(`/api/daily?days=${days}&tz_offset=${tz}`, { signal });
@@ -464,6 +521,27 @@ export const api = {
     const params = new URLSearchParams({ q, offset: String(offset), limit: String(limit) });
     if (tool) params.set("tool", tool);
     return apiFetch<SearchResult>(`/api/search?${params}`);
+  },
+  searchMessages: (
+    q: string,
+    options: {
+      tool?: string;
+      deviceId?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      signal?: AbortSignal;
+    } = {},
+  ) => {
+    const params = new URLSearchParams({
+      q,
+      limit: String(options.limit ?? 20),
+    });
+    if (options.tool) params.set("tool", options.tool);
+    if (options.deviceId) params.set("device_id", options.deviceId);
+    if (options.cursor) params.set("cursor", options.cursor);
+    return apiFetch<GlobalMessageSearchResponse>(`/api/search/messages?${params}`, {
+      signal: options.signal,
+    });
   },
   register: (email: string, password: string, name?: string, inviteCode?: string) =>
     apiFetch<UserInfo>("/api/auth/register", {

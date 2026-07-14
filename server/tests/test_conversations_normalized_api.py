@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
@@ -14,6 +15,7 @@ from server.api.conversations import (  # noqa: E402
     get_conversation,
     get_conversation_messages,
     get_conversation_prompts,
+    search_conversation_messages,
 )
 
 
@@ -29,6 +31,9 @@ class _Result:
         return self._scalar_value
 
     def scalars(self):
+        return self
+
+    def mappings(self):
         return self
 
     def all(self):
@@ -150,6 +155,50 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("documents.content", str(statement.compile()))
         prompt_sql = str(db.statements[2].compile()).upper()
         self.assertNotIn(" LIMIT ", prompt_sql)
+
+    @patch(
+        "server.api.conversations.suggest_corrected_query",
+        new_callable=AsyncMock,
+    )
+    async def test_search_returns_bounded_normalized_hits_in_line_order(
+        self,
+        correction: AsyncMock,
+    ) -> None:
+        correction.return_value = "stale clean lookup"
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[]),
+            _Result(rows=[
+                {
+                    "id": 9,
+                    "line_number": 22,
+                    "role": "assistant",
+                    "content": "The stale clean lookup is now indexed.",
+                    "timestamp": self.now,
+                    "score": 4.1,
+                    "match_type": "full_text",
+                },
+            ]),
+        ])
+
+        payload = await search_conversation_messages(
+            self.doc_id,
+            q="stale clean lokup",
+            after_line=None,
+            limit=50,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual([row["line_number"] for row in payload["results"]], [22])
+        self.assertEqual(payload["results"][0]["match_type"], "fuzzy")
+        self.assertEqual(payload["corrected_query"], "stale clean lookup")
+        self.assertFalse(payload["has_more"])
+        search_sql = str(db.statements[1].compile())
+        self.assertIn("conversation_messages.document_id", search_sql)
+        self.assertIn("conversation_messages.role IN", search_sql)
+        self.assertNotIn("documents.content", search_sql)
+        self.assertNotIn(" %> ", search_sql)
 
     async def test_metadata_counts_normalized_rows_and_scopes_codex_hierarchy(self) -> None:
         root_thread_id = self.doc.metadata_["session_id"]

@@ -35,6 +35,11 @@ def _run_migrations(conn) -> None:
     except Exception:
         pass  # May not have pgvector installed
 
+    # Required by both document search and the compact conversation spelling
+    # lexicon. Enable it before the fresh-install early return so create_all()
+    # can create trigram-backed model indexes on the first boot.
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+
     tables = insp.get_table_names()
     if "machines" not in tables or "users" not in tables:
         return  # Fresh install — create_all will handle everything
@@ -309,14 +314,6 @@ def _run_migrations(conn) -> None:
               )
         """))
 
-    # pg_trgm extension (required for trigram indexes below)
-    sp = conn.begin_nested()
-    try:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        sp.commit()
-    except Exception:
-        sp.rollback()
-
     # Performance indexes (idempotent). Each runs in its own savepoint so a
     # single failure doesn't abort the whole migration tx.
     for stmt in (
@@ -328,6 +325,18 @@ def _run_migrations(conn) -> None:
         # take ~6s; with it, the same query is <200ms cold.
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_role_ts "
         "ON conversation_messages (role, timestamp DESC) "
+        "WHERE role IN ('user', 'assistant')",
+        # Message-level search is deliberately partial: ordinary searches
+        # cover the human/assistant conversation, while large tool payloads
+        # do not inflate the indexes or dominate fuzzy matches. Existing
+        # production instances create these concurrently before rollout; the
+        # idempotent definitions here cover fresh installs and restores.
+        "CREATE INDEX IF NOT EXISTS idx_conv_msg_content_fts "
+        "ON conversation_messages USING gin "
+        "(to_tsvector('simple', content)) "
+        "WHERE role IN ('user', 'assistant')",
+        "CREATE INDEX IF NOT EXISTS idx_conv_msg_content_trgm "
+        "ON conversation_messages USING gin (content gin_trgm_ops) "
         "WHERE role IN ('user', 'assistant')",
         "CREATE INDEX IF NOT EXISTS idx_documents_tool_synced ON documents (tool_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_synced ON documents (project_id, synced_at DESC)",

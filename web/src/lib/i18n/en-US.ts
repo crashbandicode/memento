@@ -192,6 +192,10 @@ const enUS: Translations = {
     filteredPromptCount: "{visible} of {total} prompts",
     searchPrompts: "Search {count} prompts",
     noMatchingPrompts: "No matching prompts",
+    searchMessages: "Search every message in this conversation",
+    clearSearch: "Clear conversation search",
+    matchingMessages: "{count} matching messages",
+    noMatchingMessages: "No matching messages",
     closePromptNavigator: "Close prompt navigator",
     promptFallback: "Prompt {number}",
     lastActivity: "Last activity",
@@ -228,10 +232,20 @@ const enUS: Translations = {
 
   searchPage: {
     title: "Search",
+    subtitle: "Search every conversation message or synced file",
+    scopeLabel: "Search scope",
+    conversations: "Conversations",
+    files: "Files & notes",
     placeholder: "Search across all AI tool data...",
+    messagePlaceholder: "Search every user and assistant message...",
     allTools: "All Tools",
     results: '{total} results for "{query}"',
     noResults: "No results found",
+    you: "You",
+    assistant: "Assistant",
+    fuzzyMatch: "Fuzzy match",
+    subagentMatch: "Subagent",
+    loadMore: "Load more results",
   },
 
   devices: {

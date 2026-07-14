@@ -208,6 +208,37 @@ class ConversationMessage(Base):
 
 
 # ---------------------------------------------------------------------------
+# Conversation search spelling lexicon
+# ---------------------------------------------------------------------------
+class ConversationSearchTerm(Base):
+    """Compact vocabulary used to correct misspelled message-search tokens.
+
+    Fuzzy matching the 800K+ message bodies directly creates a huge lossy GIN
+    candidate set. Searching unique, bounded terms first and then executing a
+    corrected FTS query keeps the expensive path small and deterministic.
+    """
+
+    __tablename__ = "conversation_search_terms"
+
+    term: Mapped[str] = mapped_column(String(64), primary_key=True)
+    frequency: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_conversation_search_terms_trgm",
+            "term",
+            postgresql_using="gin",
+            postgresql_ops={"term": "gin_trgm_ops"},
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Daily summaries (AI-generated)
 # ---------------------------------------------------------------------------
 class DailySummary(Base):

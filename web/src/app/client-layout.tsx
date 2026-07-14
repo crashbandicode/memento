@@ -10,9 +10,9 @@ import Sidebar from "@/components/layout/Sidebar";
 import Header from "@/components/layout/Header";
 import { AuroraBackdrop } from "@/components/aurora/AuroraBackdrop";
 
-/** Detect the best initial locale: user's saved choice → browser preference → zh-CN default. */
+/** Detect the best initial locale: user's saved choice → browser preference → en-US default. */
 function detectInitialLocale(): Locale {
-  if (typeof window === "undefined") return "zh-CN";
+  if (typeof window === "undefined") return "en-US";
   const saved = localStorage.getItem("dr_locale") as Locale | null;
   if (saved && saved in locales) return saved;
   // Browser preference. navigator.languages is ordered by priority.
@@ -24,7 +24,7 @@ function detectInitialLocale(): Locale {
     if (lower.startsWith("zh")) return "zh-CN";
     if (lower.startsWith("en")) return "en-US";
   }
-  return "zh-CN";
+  return "en-US";
 }
 
 export default function ClientLayout({ children }: { children: React.ReactNode }) {
@@ -32,13 +32,13 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   // translated text cannot hydrate. Restore the saved/browser preference only
   // after hydration; requestAnimationFrame keeps the update out of the effect
   // body and avoids a cascading synchronous render.
-  const [locale, setLocale] = useState<Locale>("zh-CN");
+  const [locale, setLocale] = useState<Locale>("en-US");
   const t = locales[locale].translations;
   const pathname = usePathname();
 
   useEffect(() => {
     const initialLocale = detectInitialLocale();
-    if (initialLocale === "zh-CN") return;
+    if (initialLocale === "en-US") return;
     const frame = requestAnimationFrame(() => setLocale(initialLocale));
     return () => cancelAnimationFrame(frame);
   }, []);

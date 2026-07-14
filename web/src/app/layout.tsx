@@ -11,13 +11,12 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
-// SSR default is zh-CN because Next.js App Router re-asserts this static
-// metadata on every client-side navigation, overriding any document.title we
-// set in a client useEffect. English users' client-side locale hook still
-// rewrites to English on mount — the cost is one frame of Chinese title.
+// Keep the server-rendered language aligned with the app's default locale.
+// A Chinese `lang` attribute around an English UI makes mobile browsers offer
+// to translate the page from Chinese even after the client corrects the locale.
 export const metadata: Metadata = {
-  title: "Memento — AI 编程记忆",
-  description: "统一收纳 Claude Code、Codex、Cursor、Obsidian 等 AI 编码工具的对话、计划与记忆文件,自建托管,跨设备可搜。A shared brain for your AI coding tools — self-hosted, cross-device, searchable.",
+  title: "Memento — Your AI coding memory",
+  description: "A shared brain for your AI coding tools — self-hosted, cross-device, searchable.",
   icons: {
     icon: [
       { url: "/favicon.svg", type: "image/svg+xml" },
@@ -28,7 +27,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh" className="h-full antialiased">
+    <html lang="en" className="h-full antialiased">
       <body className="min-h-full">
         <ClientLayout>{children}</ClientLayout>
       </body>

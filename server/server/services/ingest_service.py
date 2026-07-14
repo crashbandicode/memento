@@ -1605,13 +1605,26 @@ async def _extract_messages(
         is_codex_assistant_mirror_pair,
         is_codex_user_mirror_pair,
     )
+    from .message_search import (
+        MAX_LEXICON_TERMS_PER_INGEST,
+        extract_search_terms,
+        upsert_search_terms,
+    )
 
     search_parts: list[str] = []
     search_bytes = 0
+    search_terms: set[str] = set()
 
     def add_search_text(role: str, value: str) -> None:
         nonlocal search_bytes
-        if role not in ("user", "assistant") or search_bytes >= MAX_SEARCH_TEXT_CHARS:
+        if role not in ("user", "assistant"):
+            return
+        if len(search_terms) < MAX_LEXICON_TERMS_PER_INGEST:
+            remaining_terms = MAX_LEXICON_TERMS_PER_INGEST - len(search_terms)
+            search_terms.update(
+                list(extract_search_terms(value))[:remaining_terms]
+            )
+        if search_bytes >= MAX_SEARCH_TEXT_CHARS:
             return
         remaining = MAX_SEARCH_TEXT_CHARS - search_bytes
         fragment = _bounded_message_text(f"[{role}] {value}\n", min(2_048, remaining))
@@ -1668,6 +1681,7 @@ async def _extract_messages(
         if batch:
             db.add_all(batch)
             await db.flush()
+        await upsert_search_terms(db, search_terms)
         return "".join(search_parts)
 
     # Get current max line number for delta mode
@@ -1947,6 +1961,7 @@ async def _extract_messages(
                 add_search_text("user", clean_first_user)
                 await db.flush()
 
+    await upsert_search_terms(db, search_terms)
     return "".join(search_parts)
 
 

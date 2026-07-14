@@ -27,6 +27,13 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
 )
+from ..services.message_search import (
+    MAX_SEARCH_CONTENT_CHARS,
+    build_message_search_expressions,
+    make_search_snippet,
+    normalize_search_query,
+    suggest_corrected_query,
+)
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -341,6 +348,127 @@ async def get_conversation_messages(
             ],
         }
     return {"total": 0, "offset": offset, "limit": limit, "messages": []}
+
+
+@router.get("/{doc_id}/search")
+async def search_conversation_messages(
+    doc_id: uuid.UUID,
+    q: str = Query(..., min_length=1, max_length=500),
+    after_line: int | None = Query(None, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Search one normalized transcript without loading it into the client.
+
+    Results are chronological so next/previous navigation behaves like an
+    editor search. The existing ``messages?line_number=`` endpoint loads the
+    bounded rendering window when a hit is selected.
+    """
+    mids = await user_machine_ids(db, _user)
+    doc = (
+        await db.execute(
+            select(Document)
+            .options(load_only(Document.id, Document.machine_id))
+            .where(Document.id == doc_id)
+        )
+    ).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404)
+    if mids is not None and doc.machine_id not in mids:
+        raise HTTPException(status_code=404)
+
+    query_text = normalize_search_query(q)
+    if not query_text:
+        return {
+            "query": "",
+            "results": [],
+            "next_after_line": None,
+            "has_more": False,
+            "corrected_query": None,
+        }
+    def search_statement(search_text: str):
+        expressions = build_message_search_expressions(
+            search_text,
+            allow_short_substring=True,
+        )
+        statement = (
+            select(
+                ConversationMessage.id,
+                ConversationMessage.line_number,
+                ConversationMessage.role,
+                func.left(
+                    ConversationMessage.content,
+                    MAX_SEARCH_CONTENT_CHARS,
+                ).label("content"),
+                ConversationMessage.timestamp,
+                expressions.score.label("score"),
+                expressions.match_type.label("match_type"),
+            )
+            .where(
+                ConversationMessage.document_id == doc_id,
+                expressions.predicate,
+            )
+            .order_by(ConversationMessage.line_number, ConversationMessage.id)
+            .limit(limit + 1)
+        )
+        if after_line is not None:
+            statement = statement.where(
+                ConversationMessage.line_number > after_line
+            )
+        return statement
+
+    primary_rows = (
+        await db.execute(search_statement(query_text))
+    ).mappings().all()
+    rows = [dict(row, snippet_query=query_text) for row in primary_rows]
+    corrected_query = await suggest_corrected_query(db, query_text)
+    corrected_count = 0
+    if corrected_query:
+        corrected_rows = (
+            await db.execute(search_statement(corrected_query))
+        ).mappings().all()
+        corrected_count = len(corrected_rows)
+        seen_message_ids = {row["id"] for row in rows}
+        for corrected_row in corrected_rows:
+            if corrected_row["id"] in seen_message_ids:
+                continue
+            row = dict(corrected_row, snippet_query=corrected_query)
+            row["score"] = 1.0 + min(
+                max(float(row["score"] or 0.0) - 3.0, 0.0),
+                0.999999,
+            )
+            row["match_type"] = "fuzzy"
+            rows.append(row)
+    rows.sort(key=lambda row: (row["line_number"], row["id"]))
+    has_more = (
+        len(rows) > limit
+        or len(primary_rows) > limit
+        or corrected_count > limit
+    )
+    page = rows[:limit]
+    return {
+        "query": query_text,
+        "results": [
+            {
+                "id": row["id"],
+                "line_number": row["line_number"],
+                "role": row["role"],
+                "snippet": make_search_snippet(
+                    row["content"], row["snippet_query"]
+                ),
+                "timestamp": (
+                    row["timestamp"].isoformat() if row["timestamp"] else None
+                ),
+                "score": round(float(row["score"] or 0.0), 6),
+                "match_type": row["match_type"],
+            }
+            for row in page
+        ],
+        "next_after_line": page[-1]["line_number"] if has_more and page else None,
+        "has_more": has_more,
+        "corrected_query": corrected_query,
+    }
 
 
 @router.get("/{doc_id}/prompts")
