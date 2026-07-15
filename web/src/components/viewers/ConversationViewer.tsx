@@ -171,6 +171,12 @@ type PairedQuestionResponse = {
   message: ConversationMessage;
 };
 
+type DetachedTail = {
+  offset: number;
+  endOffset: number;
+  messages: ConversationMessage[];
+};
+
 export default function ConversationViewer({
   documentId,
   prompts,
@@ -194,6 +200,7 @@ export default function ConversationViewer({
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
   const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
+  const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
@@ -202,11 +209,22 @@ export default function ConversationViewer({
   const syncingTailRef = useRef(false);
   const latestPromptLineRef = useRef<number | null>(null);
   const promptLinesRef = useRef<number[]>([]);
+  const detachedTailRef = useRef<DetachedTail | null>(null);
   const { t, locale } = useI18n();
+  const updateDetachedTail = useCallback((next: DetachedTail | null) => {
+    detachedTailRef.current = next;
+    setDetachedTail(next);
+  }, []);
+  const visibleMessages = useMemo(
+    () => detachedTail
+      ? mergeMessagesChronologically(messages, detachedTail.messages)
+      : messages,
+    [messages, detachedTail],
+  );
   const { questionIds, questionResponses } = useMemo(() => {
     const ids = new Set<string>();
     const responses = new Map<string, PairedQuestionResponse>();
-    messages.forEach((message) => {
+    visibleMessages.forEach((message) => {
       if (message.interaction?.id) ids.add(message.interaction.id);
       message.tool_calls?.forEach((call) => {
         if (call.interaction?.id) ids.add(call.interaction.id);
@@ -219,7 +237,7 @@ export default function ConversationViewer({
       }
     });
     return { questionIds: ids, questionResponses: responses };
-  }, [messages]);
+  }, [visibleMessages]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -233,11 +251,19 @@ export default function ConversationViewer({
           startOffsetRef.current = res.offset;
           rangeLoadedRef.current = true;
         }
-        setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
-        offsetRef.current = Math.max(
+        let nextMessages = res.messages;
+        let nextOffset = Math.max(
           offsetRef.current,
           res.offset + res.messages.length,
         );
+        const tail = detachedTailRef.current;
+        if (tail && nextOffset >= tail.offset) {
+          nextMessages = mergeMessagesChronologically(nextMessages, tail.messages);
+          nextOffset = Math.max(nextOffset, tail.endOffset);
+          updateDetachedTail(null);
+        }
+        setMessages((prev) => mergeMessagesChronologically(prev, nextMessages));
+        offsetRef.current = nextOffset;
       }
       setHasMore(offsetRef.current < res.total);
       setHasEarlier(startOffsetRef.current > 0);
@@ -293,12 +319,19 @@ export default function ConversationViewer({
           startOffsetRef.current = res.offset;
           offsetRef.current = tailEnd;
           rangeLoadedRef.current = true;
+          setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
+          updateDetachedTail(null);
         } else if (res.offset <= offsetRef.current) {
-          // Extend the contiguous loaded range only when the tail overlaps it.
-          // A disjoint tail remains visible while ordinary paging fills the gap.
           offsetRef.current = Math.max(offsetRef.current, tailEnd);
+          setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
+          updateDetachedTail(null);
+        } else {
+          updateDetachedTail({
+            offset: res.offset,
+            endOffset: tailEnd,
+            messages: res.messages,
+          });
         }
-        setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
       }
       setHasEarlier(startOffsetRef.current > 0);
       setHasMore(offsetRef.current < res.total);
@@ -307,7 +340,7 @@ export default function ConversationViewer({
     } finally {
       syncingTailRef.current = false;
     }
-  }, [documentId]);
+  }, [documentId, updateDetachedTail]);
 
   useEffect(() => {
     setMessages([]);
@@ -316,12 +349,14 @@ export default function ConversationViewer({
     rangeLoadedRef.current = false;
     loadingRef.current = false;
     syncingTailRef.current = false;
+    detachedTailRef.current = null;
     setHasMore(true);
     setHasEarlier(false);
     setKnownTotal(totalMessages);
     setActivePromptLine(null);
     setPendingPromptLine(null);
     setNavigatingPromptLine(null);
+    setDetachedTail(null);
     loadMore({ force: true });
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -360,7 +395,7 @@ export default function ConversationViewer({
       setNavigatingPromptLine(null);
     }, 650);
     return () => window.clearTimeout(timeout);
-  }, [messages, pendingPromptLine]);
+  }, [messages, detachedTail, pendingPromptLine]);
 
   const handleScroll = () => {
     const el = containerRef.current;
@@ -374,6 +409,20 @@ export default function ConversationViewer({
     }
     if (currentLine !== null) {
       setActivePromptLine((previous) => previous === currentLine ? previous : currentLine);
+    }
+    if (detachedTailRef.current) {
+      const marker = el.querySelector<HTMLElement>("[data-message-gap]");
+      if (marker) {
+        const markerBounds = marker.getBoundingClientRect();
+        const containerBounds = el.getBoundingClientRect();
+        if (
+          markerBounds.top <= containerBounds.bottom + 300
+          && markerBounds.bottom >= containerBounds.top - 100
+        ) {
+          loadMore();
+        }
+      }
+      return;
     }
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
       loadMore();
@@ -409,6 +458,7 @@ export default function ConversationViewer({
         );
         let nextMessages = response.messages;
         let contiguousEnd = response.offset + response.messages.length;
+        let nextDetachedTail: DetachedTail | null = null;
         const promptIndex = promptLinesRef.current.indexOf(lineNumber);
         const nextPromptLine = promptIndex >= 0
           ? promptLinesRef.current[promptIndex + 1]
@@ -435,15 +485,22 @@ export default function ConversationViewer({
           && contiguousEnd < response.total
         ) {
           const tail = await api.getLatestMessages(documentId, LIVE_TAIL_SIZE);
-          nextMessages = mergeMessagesChronologically(nextMessages, tail.messages);
           if (tail.offset <= contiguousEnd) {
+            nextMessages = mergeMessagesChronologically(nextMessages, tail.messages);
             contiguousEnd = Math.max(contiguousEnd, tail.offset + tail.messages.length);
+          } else if (tail.messages.length > 0) {
+            nextDetachedTail = {
+              offset: tail.offset,
+              endOffset: tail.offset + tail.messages.length,
+              messages: tail.messages,
+            };
           }
         }
         setKnownTotal(response.total);
         startOffsetRef.current = response.offset;
         offsetRef.current = contiguousEnd;
         rangeLoadedRef.current = true;
+        updateDetachedTail(nextDetachedTail);
         setMessages(nextMessages);
         setHasEarlier(response.offset > 0);
         setHasMore(offsetRef.current < response.total);
@@ -458,11 +515,43 @@ export default function ConversationViewer({
     }
 
     setPendingPromptLine(lineNumber);
-  }, [documentId]);
+  }, [documentId, updateDetachedTail]);
 
   const navigateToPrompt = async (prompt: ConversationPrompt) => {
     setActivePromptLine(prompt.line_number);
     await navigateToLine(prompt.line_number);
+  };
+
+  const renderMessage = (
+    msg: ConversationMessage,
+    idx: number,
+    source: "history" | "tail",
+  ) => {
+    if (
+      msg.interaction_response?.interaction_id
+      && questionIds.has(msg.interaction_response.interaction_id)
+    ) {
+      return null;
+    }
+    const isHumanPrompt = (msg.role || msg.message_type) === "user"
+      && !msg.interaction_response
+      && !msg.content.includes("[Subagent Context]");
+    return (
+      <div
+        key={`${source}-${msg.id}-${idx}`}
+        id={`conversation-line-${msg.line_number}`}
+        data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
+        style={{ scrollMarginTop: 16 }}
+      >
+        <ChatBubble
+          msg={msg}
+          toolId={toolId}
+          locale={locale}
+          t={t}
+          questionResponses={questionResponses}
+        />
+      </div>
+    );
   };
 
   return (
@@ -476,13 +565,13 @@ export default function ConversationViewer({
       <div
         ref={containerRef}
         data-conversation-viewer
-        data-loaded-messages={messages.length}
+        data-loaded-messages={visibleMessages.length}
         data-has-earlier={hasEarlier ? "true" : "false"}
         onScroll={handleScroll}
         className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
       >
         <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 16, textAlign: "center" }}>
-          {fmt(t.conversation.messagesTotal, { total: knownTotal ?? "…", loaded: messages.length })}
+          {fmt(t.conversation.messagesTotal, { total: knownTotal ?? "…", loaded: visibleMessages.length })}
         </div>
 
         <div className="space-y-3 max-w-4xl mx-auto pb-24 xl:pb-8">
@@ -509,33 +598,44 @@ export default function ConversationViewer({
             </div>
           )}
 
-          {messages.map((msg, idx) => {
-            if (
-              msg.interaction_response?.interaction_id
-              && questionIds.has(msg.interaction_response.interaction_id)
-            ) {
-              return null;
-            }
-            const isHumanPrompt = (msg.role || msg.message_type) === "user"
-              && !msg.interaction_response
-              && !msg.content.includes("[Subagent Context]");
-            return (
-              <div
-                key={`${msg.id}-${idx}`}
-                id={`conversation-line-${msg.line_number}`}
-                data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
-                style={{ scrollMarginTop: 16 }}
+          {messages.map((msg, idx) => renderMessage(msg, idx, "history"))}
+
+          {detachedTail && (
+            <div
+              data-message-gap
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "8px 0 12px",
+              }}
+            >
+              <span style={{ height: 1, flex: 1, background: "var(--aurora-border)" }} />
+              <button
+                type="button"
+                onClick={() => void loadMore({ force: true })}
+                disabled={loading}
+                style={{
+                  padding: "7px 11px",
+                  borderRadius: 999,
+                  border: "1px solid var(--aurora-border)",
+                  background: "var(--aurora-chip)",
+                  color: "var(--aurora-fg3)",
+                  fontSize: 11,
+                  cursor: loading ? "wait" : "pointer",
+                }}
               >
-                <ChatBubble
-                  msg={msg}
-                  toolId={toolId}
-                  locale={locale}
-                  t={t}
-                  questionResponses={questionResponses}
-                />
-              </div>
-            );
-          })}
+                {loading
+                  ? t.loading
+                  : fmt(t.conversation.loadMessageGap, {
+                      count: Math.max(0, detachedTail.offset - offsetRef.current),
+                    })}
+              </button>
+              <span style={{ height: 1, flex: 1, background: "var(--aurora-border)" }} />
+            </div>
+          )}
+
+          {detachedTail?.messages.map((msg, idx) => renderMessage(msg, idx, "tail"))}
 
           {artifacts && artifacts.length > 0 && !hasMore && (
             <>

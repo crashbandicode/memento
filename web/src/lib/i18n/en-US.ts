@@ -151,6 +151,7 @@ const enUS: Translations = {
     messagesTotal: "{total} messages total, {loaded} loaded",
     loadingMore: "Loading more messages...",
     loadEarlier: "Load earlier messages",
+    loadMessageGap: "Load next messages ({count} remaining)",
     allLoaded: "All messages loaded",
     thinking: "Thinking",
     showThinking: "Show thinking",

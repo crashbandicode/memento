@@ -157,6 +157,7 @@ const zhCN = {
     messagesTotal: "共 {total} 条消息，已加载 {loaded} 条",
     loadingMore: "加载更多消息...",
     loadEarlier: "加载更早的消息",
+    loadMessageGap: "加载后续消息（剩余 {count} 条）",
     allLoaded: "所有消息已加载",
     thinking: "思考过程",
     showThinking: "展开思考",
