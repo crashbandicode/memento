@@ -3,12 +3,13 @@
 import { useEffect } from "react";
 import { useI18n } from "@/lib/i18n";
 import { Glass } from "@/components/aurora/primitives";
+import { getRememberMePreference, storeAuthToken } from "@/lib/auth-storage";
 
 /**
  * GitHub OAuth landing page. The server redirects here with the JWT in the
  * URL *fragment* (#token=...&next=...) so it never reaches server logs.
  * Store it, then hard-navigate (window.location.replace, NOT router.push)
- * on purpose: AuthProvider lazily initializes its token from localStorage
+ * on purpose: AuthProvider lazily initializes its token from browser storage
  * on first render, so a full reload is what makes it pick the token up.
  */
 export default function AuthCallbackPage() {
@@ -19,7 +20,7 @@ export default function AuthCallbackPage() {
     const token = params.get("token");
     const next = params.get("next");
     if (token) {
-      localStorage.setItem("dr_token", token);
+      storeAuthToken(token, getRememberMePreference());
       // Only allow same-origin relative paths — reject "//host" and "/\host"
       // (browsers normalize backslash to slash, making it protocol-relative).
       window.location.replace(

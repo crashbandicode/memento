@@ -8,11 +8,13 @@ import { useI18n } from "@/lib/i18n";
 import { Icon } from "@/components/aurora/Icon";
 import { Btn, Glass, GhostInput } from "@/components/aurora/primitives";
 import { GithubLoginSection, useGithubEnabled, useOauthErrorMessage } from "../github-login";
+import { getRememberMePreference, setRememberMePreference } from "@/lib/auth-storage";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [totpCode, setTotpCode] = useState("");
+  const [rememberMe, setRememberMe] = useState(getRememberMePreference);
   const [error, setError] = useState("");
   const { login } = useAuth();
   const { t } = useI18n();
@@ -24,7 +26,7 @@ export default function LoginPage() {
     e.preventDefault();
     setError("");
     try {
-      await login(email, password, totpCode);
+      await login(email, password, totpCode, rememberMe);
       // Honor ?next= so visitors landing on a directed share land back on it
       // after authenticating, instead of dropping into the dashboard. Read
       // from window.location instead of useSearchParams() because the latter
@@ -126,6 +128,36 @@ export default function LoginPage() {
             onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
             icon="lock"
           />
+          <label
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 9,
+              color: "var(--aurora-fg3)",
+              fontSize: 12,
+              lineHeight: 1.35,
+              cursor: "pointer",
+              padding: "1px 2px",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={rememberMe}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                setRememberMe(checked);
+                setRememberMePreference(checked);
+              }}
+              style={{ marginTop: 1, accentColor: "var(--aurora-accent)" }}
+            />
+            <span>
+              <strong style={{ color: "var(--aurora-fg2)", fontWeight: 600 }}>
+                {t.auth.rememberMe}
+              </strong>
+              <br />
+              {t.auth.rememberMeHint}
+            </span>
+          </label>
           <Btn type="submit" size="lg" style={{ marginTop: 6, width: "100%", justifyContent: "center" }} iconRight="arrow_right">
             {t.login}
           </Btn>

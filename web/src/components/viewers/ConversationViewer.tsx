@@ -3,6 +3,7 @@
 import {
   memo,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -21,6 +22,7 @@ import {
 import { useI18n, fmt } from "@/lib/i18n";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
+import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
 
 interface Artifact {
   id: string;
@@ -2431,6 +2433,284 @@ function ConversationContextCard({
   );
 }
 
+function markdownCodeBlock(value: string): string {
+  const clean = value.trim();
+  if (!clean) return "";
+  const longestRun = Math.max(0, ...Array.from(clean.matchAll(/`+/g), (match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  const language = /^[\[{]/.test(clean) ? "json" : "";
+  return `${fence}${language}\n${clean}\n${fence}`;
+}
+
+function markdownQuote(label: string, value: string): string {
+  const clean = value.trim();
+  if (!clean) return "";
+  return `> **${label}**\n>\n${clean.split("\n").map((line) => `> ${line}`).join("\n")}`;
+}
+
+function questionInteractionMarkdown(
+  interaction: QuestionInteraction,
+  pairedResponse?: PairedQuestionResponse,
+): string {
+  const response = pairedResponse?.response;
+  const sections = interaction.questions.map((question) => {
+    const answer = response?.answers.find((item) => item.question_id === question.id);
+    const selected = new Set(answer?.selected_option_ids || []);
+    const lines = [`**${question.header || "Question"}:** ${question.prompt}`];
+
+    if (question.options.length > 0) {
+      lines.push(...question.options.map((option) => {
+        const marker = selected.has(option.id) ? "x" : " ";
+        const description = option.description ? ` — ${option.description}` : "";
+        return `- [${marker}] ${option.label}${description}`;
+      }));
+    }
+
+    if (answer?.text && (
+      question.type === "free_text"
+      || answer.selected_option_ids.length === 0
+      || !question.options.some((option) => option.label === answer.text)
+    )) {
+      lines.push(`\n**Answer:** ${answer.text}`);
+    }
+    return lines.join("\n");
+  });
+
+  if (response?.status === "cancelled") sections.push("*Cancelled*");
+  return sections.join("\n\n");
+}
+
+/** Serialize one normalized message, including structured tools/questions. */
+export function conversationMessageMarkdown(
+  msg: ConversationMessage,
+  toolId: string,
+  locale: string,
+  questionResponses: ReadonlyMap<string, PairedQuestionResponse> = new Map(),
+): string {
+  const role = msg.role || msg.message_type || "unknown";
+  const content = cleanTerminalText(msg.content);
+  const roleLabel = role === "user"
+    ? (isSubagentDispatchMessage(msg) ? "Subagent dispatch" : "You")
+    : role === "assistant"
+      ? "Assistant"
+      : role === "tool"
+        ? (msg.tool_name || "Tool result")
+        : "System";
+  const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString(locale) : "";
+  const parts = [`**${roleLabel}**${timestamp ? ` · ${timestamp}` : ""}`];
+
+  const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
+  if (sessionContext) parts.push(markdownQuote("Session context", sessionContext));
+
+  if (msg.interaction_response) {
+    const response = msg.interaction_response;
+    const answerText = response.answers.map((answer) => answer.text).filter(Boolean).join("\n");
+    parts.push(response.status === "cancelled"
+      ? "*Cancelled*"
+      : answerText || response.raw_text || "*Answered*");
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  if (role === "user") {
+    parts.push(content);
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  if (role === "assistant") {
+    const structuredToolCalls = msg.tool_calls || [];
+    const assistantContent = toolId === "cursor"
+      ? stripCursorTransportRedaction(content)
+      : content;
+    const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
+      ? (assistantContent.trim() ? [{ type: "text", content: assistantContent }] : [])
+      : toolId === "cursor"
+        ? splitAssistantContent(content)
+        : (assistantContent ? [{ type: "text", content: assistantContent }] : []);
+    const narrative = legacySegments
+      .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")
+      .map((segment) => segment.content)
+      .join("\n\n")
+      .trim();
+    if (narrative) parts.push(narrative);
+
+    const thinking = cleanTerminalText(msg.thinking?.trim() || "");
+    if (thinking && thinking !== narrative) {
+      parts.push(`<details>\n<summary><strong>Thinking</strong></summary>\n\n${thinking}\n\n</details>`);
+    }
+
+    const toolCalls = structuredToolCalls.length > 0
+      ? structuredToolCalls.map((call) => ({
+          name: call.name,
+          input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
+          interaction: call.interaction,
+        }))
+      : legacySegments
+          .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
+          .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
+    for (const call of toolCalls) {
+      if (call.interaction) {
+        parts.push(questionInteractionMarkdown(
+          call.interaction,
+          questionResponses.get(call.interaction.id),
+        ));
+      } else {
+        parts.push(`**Tool · ${call.name}**${call.input ? `\n\n${markdownCodeBlock(formatToolText(call.input))}` : ""}`);
+      }
+    }
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  if (role === "tool") {
+    if (msg.interaction) {
+      parts.push(questionInteractionMarkdown(
+        msg.interaction,
+        questionResponses.get(msg.interaction.id),
+      ));
+    } else {
+      const toolInput = cleanTerminalText(msg.tool_input ?? "");
+      if (toolInput) parts.push(`**Input**\n\n${markdownCodeBlock(formatToolText(toolInput))}`);
+      const output = cleanToolOutput(content);
+      if (output) parts.push(`**Output**\n\n${markdownCodeBlock(formatToolText(output))}`);
+    }
+    return parts.filter(Boolean).join("\n\n");
+  }
+
+  parts.push(content);
+  return parts.filter(Boolean).join("\n\n");
+}
+
+function MessageCopyMenu({
+  position,
+  status,
+  onCopy,
+  t,
+}: {
+  position: "top" | "bottom";
+  status: ClipboardFormat | "error" | null;
+  onCopy: (format: ClipboardFormat) => Promise<void>;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const statusLabel = status === "rich"
+    ? t.conversation.copiedRichText
+    : status === "markdown"
+      ? t.conversation.copiedMarkdown
+      : status === "error"
+        ? t.conversation.copyFailed
+        : t.conversation.copyMessage;
+  const optionStyle = {
+    display: "flex",
+    width: "100%",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 10px",
+    border: 0,
+    borderRadius: 8,
+    background: "transparent",
+    color: "var(--aurora-fg2)",
+    cursor: "pointer",
+    fontSize: 11.5,
+    whiteSpace: "nowrap",
+  } as const;
+
+  return (
+    <details
+      data-message-copy={position}
+      style={{ position: "relative" }}
+    >
+      <summary
+        aria-label={t.conversation.copyMessage}
+        title={t.conversation.copyMessage}
+        style={{
+          listStyle: "none",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 5,
+          minHeight: 28,
+          padding: "3px 7px",
+          borderRadius: 8,
+          color: status ? "var(--aurora-accent)" : "var(--aurora-fg4)",
+          background: "color-mix(in srgb, var(--aurora-surface-solid) 72%, transparent)",
+          border: "1px solid color-mix(in srgb, var(--aurora-border) 72%, transparent)",
+          cursor: "pointer",
+          fontSize: 10.5,
+          userSelect: "none",
+        }}
+      >
+        <Icon name="copy" size={12} />
+        {status && <span>{statusLabel}</span>}
+      </summary>
+      <div
+        role="menu"
+        style={{
+          position: "absolute",
+          right: 0,
+          ...(position === "top"
+            ? { top: "calc(100% + 4px)" }
+            : { bottom: "calc(100% + 4px)" }),
+          zIndex: 30,
+          minWidth: 150,
+          padding: 5,
+          borderRadius: 11,
+          border: "1px solid var(--aurora-border)",
+          background: "var(--aurora-surface-solid)",
+          boxShadow: "0 12px 30px rgba(15,23,42,0.16)",
+        }}
+      >
+        {(["rich", "markdown"] as const).map((format) => (
+          <button
+            key={format}
+            type="button"
+            role="menuitem"
+            data-copy-format={format}
+            onClick={(event) => {
+              event.currentTarget.closest("details")?.removeAttribute("open");
+              void onCopy(format);
+            }}
+            style={optionStyle}
+          >
+            <Icon name={format === "rich" ? "copy" : "file_text"} size={13} />
+            {format === "rich" ? t.conversation.copyRichText : t.conversation.copyMarkdown}
+          </button>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function MessageCopyFrame({
+  markdown,
+  children,
+  t,
+}: {
+  markdown: string;
+  children: ReactNode;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
+  const resetTimer = useRef<number | null>(null);
+  const copy = async (format: ClipboardFormat) => {
+    try {
+      const actualFormat = await copyMarkdownToClipboard(markdown, format);
+      setStatus(actualFormat);
+    } catch {
+      setStatus("error");
+    }
+    if (resetTimer.current) window.clearTimeout(resetTimer.current);
+    resetTimer.current = window.setTimeout(() => setStatus(null), 2_000);
+  };
+  return (
+    <div data-message-copy-frame style={{ minWidth: 0, position: "relative" }}>
+      <div style={{ position: "absolute", zIndex: 20, top: 0, right: 34 }}>
+        <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} />
+      </div>
+      {children}
+      <div style={{ display: "flex", justifyContent: "flex-end", minHeight: 28, marginTop: 3, paddingRight: 2 }}>
+        <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
+      </div>
+    </div>
+  );
+}
+
 export const ChatBubble = memo(function ChatBubble({
   msg,
   toolId = "",
@@ -2460,9 +2740,16 @@ export const ChatBubble = memo(function ChatBubble({
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   const [expanded, setExpanded] = useState(false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const messageMarkdown = useMemo(
+    () => conversationMessageMarkdown(msg, toolId, locale, questionResponses),
+    [locale, msg, questionResponses, toolId],
+  );
+  const withCopyControls = (node: ReactNode) => (
+    <MessageCopyFrame markdown={messageMarkdown} t={t}>{node}</MessageCopyFrame>
+  );
 
   if (msg.interaction_response) {
-    return <QuestionResponseCard response={msg.interaction_response} t={t} />;
+    return withCopyControls(<QuestionResponseCard response={msg.interaction_response} t={t} />);
   }
 
   // User — right aligned, violet gradient.
@@ -2476,7 +2763,7 @@ export const ChatBubble = memo(function ChatBubble({
     if (isSubagentDispatch) {
       const isLong = content.length > 300;
       const displayContent = isLong && !expanded ? content.slice(0, 300) + "..." : content;
-      return (
+      return withCopyControls(
         <div style={{ display: "flex", justifyContent: "center", margin: "6px 0" }}>
           <div
             style={{
@@ -2537,7 +2824,7 @@ export const ChatBubble = memo(function ChatBubble({
 
     const isLong = content.length > 500;
     const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
-    return (
+    return withCopyControls(
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0 }}>
           {showContext && sessionContext && (
@@ -2652,7 +2939,7 @@ export const ChatBubble = memo(function ChatBubble({
     const visibleToolCalls = showTools ? toolCalls : [];
     if (!hasNarrative && visibleToolCalls.length === 0) return null;
 
-    return (
+    return withCopyControls(
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0, padding: hasNarrative ? "3px 2px 8px" : "0 0 4px" }}>
           {hasNarrative && (
@@ -2783,7 +3070,7 @@ export const ChatBubble = memo(function ChatBubble({
   if (role === "tool") {
     if (!showTools) return null;
     if (msg.interaction) {
-      return (
+      return withCopyControls(
         <QuestionInteractionCard
           interaction={msg.interaction}
           pairedResponse={questionResponses.get(msg.interaction.id)}
@@ -2791,17 +3078,19 @@ export const ChatBubble = memo(function ChatBubble({
         />
       );
     }
-    return <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />;
+    return withCopyControls(
+      <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />,
+    );
   }
 
   if (isSessionContextMessage(msg)) {
     if (!showContext) return null;
-    return <ConversationContextCard content={content} t={t} />;
+    return withCopyControls(<ConversationContextCard content={content} t={t} />);
   }
 
   // Other system notices remain compact and centered.
   if (!showContext) return null;
-  return (
+  return withCopyControls(
     <div style={{ display: "flex", justifyContent: "center" }}>
       <div
         style={{

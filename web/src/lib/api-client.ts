@@ -16,7 +16,7 @@ export function getApiBase(): string {
 // Keep for import compat — but always call getApiBase() instead
 export const API_BASE = "";
 
-/** Authenticated fetch — wraps native fetch with JWT from localStorage. */
+/** Authenticated fetch — wraps native fetch with the remembered/session JWT. */
 export function authFetch(url: string, init?: RequestInit): Promise<Response> {
   const token = _getToken();
   const headers: Record<string, string> = {
@@ -28,7 +28,7 @@ export function authFetch(url: string, init?: RequestInit): Promise<Response> {
   return fetch(url, { ...init, headers }).then((res) => {
     if (res.status === 401 && typeof window !== "undefined") {
       const onAuthPage = window.location.pathname.startsWith("/auth/");
-      localStorage.removeItem("dr_token");
+      clearStoredAuthToken();
       if (!onAuthPage) {
         window.location.href = "/auth/login";
       }
@@ -42,8 +42,7 @@ interface FetchOptions extends RequestInit {
 }
 
 function _getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("dr_token");
+  return getStoredAuthToken();
 }
 
 // In-flight GET deduplication: if the same URL is requested while a previous
@@ -131,7 +130,7 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
       if (res.status === 401 && typeof window !== "undefined" && !isPublic) {
         const onAuthPage = window.location.pathname.startsWith("/auth/");
         const onLanding = window.location.pathname === "/" || window.location.pathname === "/splash";
-        localStorage.removeItem("dr_token");
+        clearStoredAuthToken();
         if (!onAuthPage && !onLanding) window.location.href = "/auth/login";
         throw new Error("Unauthorized");
       }
@@ -769,3 +768,4 @@ export const api = {
     return apiFetch<TimelineResponse>(`/api/projects/${projectId}/timeline?${params}`);
   },
 };
+import { clearStoredAuthToken, getStoredAuthToken } from "./auth-storage";

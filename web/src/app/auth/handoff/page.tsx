@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { storeAuthToken } from "@/lib/auth-storage";
 
 // Token hand-off target for the Memento desktop app. The desktop client
 // already authenticated the user (in-app register/login), mints a fresh
 // web JWT, and loads this page with `#token=<JWT>` in the URL hash. We
-// persist it the same way the normal login flow does (localStorage
-// `dr_token`) and then do a FULL navigation to /app — a hard reload so
-// AuthProvider re-mounts and lazy-inits its token from localStorage
+// persist it as a remembered session and then do a FULL navigation to /app —
+// a hard reload so AuthProvider re-mounts and lazy-inits its token
 // (a client-side router push would keep the stale null-token provider
 // and bounce straight back to /auth/login).
 //
@@ -30,7 +30,8 @@ export default function HandoffPage() {
       return;
     }
     try {
-      localStorage.setItem("dr_token", token);
+      storeAuthToken(token, true);
+      sessionStorage.removeItem("memento_skip_restore");
     } catch {
       queueMicrotask(() => setFailed(true));
       return;

@@ -3,12 +3,18 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { api, UserInfo } from "./api-client";
+import {
+  clearStoredAuthToken,
+  getStoredAuthToken,
+  replaceStoredAuthToken,
+  storeAuthToken,
+} from "./auth-storage";
 
 interface AuthState {
   user: UserInfo | null;
   token: string | null;
   loading: boolean;
-  login: (email: string, password: string, totpCode?: string) => Promise<void>;
+  login: (email: string, password: string, totpCode?: string, rememberMe?: boolean) => Promise<void>;
   register: (email: string, password: string, name?: string, inviteCode?: string) => Promise<UserInfo>;
   logout: () => void;
   refreshMe: () => Promise<UserInfo | null>;
@@ -18,8 +24,8 @@ interface AuthState {
 const AuthContext = createContext<AuthState | null>(null);
 
 /** Routes that don't require authentication — landing, splash, and auth pages.
- *  /auth/desktop does its own token check (it reads dr_token straight from
- *  localStorage): AuthProvider must not bounce it to /auth/login mid-handoff. */
+ *  /auth/desktop does its own token check: AuthProvider must not bounce it to
+ *  /auth/login mid-handoff. */
 const PUBLIC_PATHS = [
   "/",
   "/splash",
@@ -43,6 +49,7 @@ function maybePostTokenToDesktop(collectorToken: string | null | undefined) {
       sessionStorage.setItem("memento_embed", "1");
     }
     if (sessionStorage.getItem("memento_embed") !== "1") return;
+    sessionStorage.removeItem("memento_skip_restore");
     if (window.parent && window.parent !== window) {
       // targetOrigin "*": the parent is the desktop's tauri:// custom
       // protocol whose origin we can't reliably know — token also lives
@@ -60,11 +67,11 @@ function maybePostTokenToDesktop(collectorToken: string | null | undefined) {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
-  // Lazy-init token from localStorage — avoids setState-in-effect rule and
+  // Lazy-init token from the selected storage tier — avoids setState-in-effect rule and
   // also means first render already has the token (no flash of logged-out UI).
   const [token, setToken] = useState<string | null>(() => {
     if (typeof window === "undefined") return null;
-    return localStorage.getItem("dr_token");
+    return getStoredAuthToken();
   });
   // Keep the server and browser's hydration render identical. The mount
   // effect resolves this immediately when no token exists, or after /me when
@@ -101,14 +108,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         api.refreshToken(token)
           .then((res) => {
             if (res.access_token && res.access_token !== token) {
-              localStorage.setItem("dr_token", res.access_token);
+              replaceStoredAuthToken(res.access_token);
               setToken(res.access_token);
             }
           })
           .catch(() => { /* keep the original token; /me already validated it */ });
       })
       .catch(() => {
-        localStorage.removeItem("dr_token");
+        clearStoredAuthToken();
         setToken(null);
       })
       .finally(() => setLoading(false));
@@ -126,7 +133,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       api.refreshToken(token)
         .then((res) => {
           if (res.access_token && res.access_token !== token) {
-            localStorage.setItem("dr_token", res.access_token);
+            replaceStoredAuthToken(res.access_token);
             setToken(res.access_token);
           }
         })
@@ -134,6 +141,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }, 12 * 60 * 60 * 1000);
     return () => clearInterval(id);
   }, [token]);
+
+  // A desktop update can replace the embedded WebView profile while the
+  // native config (and its durable collector identity) survives. If the
+  // iframe ever lands on login without a JWT, ask the trusted parent shell to
+  // mint a fresh handoff. Explicit logout sets a session-only suppression flag
+  // so this recovery never fights a user who intentionally signed out.
+  useEffect(() => {
+    if (loading || token || pathname !== "/auth/login" || window.parent === window) return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const embedded = params.get("embed") === "memento"
+        || sessionStorage.getItem("memento_embed") === "1";
+      if (!embedded || sessionStorage.getItem("memento_skip_restore") === "1") return;
+      window.parent.postMessage({ type: "memento:restore-session" }, "*");
+    } catch {
+      // Parent messaging/storage unavailable — leave the ordinary login form.
+    }
+  }, [loading, token, pathname]);
 
   // Redirect to login if not authenticated and not on a public page.
   // /s/<token> is a share URL — recipient has no account, must stay public.
@@ -149,10 +174,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [loading, token, pathname, router]);
 
-  const login = async (email: string, password: string, totpCode?: string) => {
+  const login = async (email: string, password: string, totpCode?: string, rememberMe = true) => {
     const res = await api.login(email, password, totpCode);
     setToken(res.access_token);
-    localStorage.setItem("dr_token", res.access_token);
+    storeAuthToken(res.access_token, rememberMe);
     const me = await api.getMe(res.access_token);
     setUser(me);
     // Desktop hand-off: when the web is loaded inside the Memento
@@ -170,7 +195,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = () => {
     setUser(null);
     setToken(null);
-    localStorage.removeItem("dr_token");
+    clearStoredAuthToken();
+    try {
+      if (sessionStorage.getItem("memento_embed") === "1") {
+        sessionStorage.setItem("memento_skip_restore", "1");
+      }
+    } catch { /* noop */ }
     router.replace("/auth/login");
   };
 

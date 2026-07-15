@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { api, DeviceSummary } from "./api-client";
+import { getStoredAuthToken } from "./auth-storage";
 
 type Device = DeviceSummary;
 
@@ -30,7 +31,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     // Only fetch if logged in
-    const token = localStorage.getItem("dr_token");
+    const token = getStoredAuthToken();
     if (token) {
       api.getDevices()
         .then((nextDevices) => {

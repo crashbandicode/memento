@@ -60,6 +60,9 @@ let state = {
   // The framed web app reports route changes because its cross-origin URL is
   // unreadable from this shell. Used to preserve context across Reload.
   dashboardPath: "/app",
+  // Last embedded-session recovery request. A short cooldown prevents a
+  // broken handoff from bouncing between login and handoff pages.
+  dashboardRestoreLastAt: 0,
   // A github_login (system-browser OAuth + 127.0.0.1 loopback) is running.
   // The login page's button can be clicked again before the Rust side
   // resolves; a second run would open a second browser window and bind a
@@ -126,7 +129,7 @@ function deriveWebUrl(apiUrl) {
 // Pick the URL to load the dashboard iframe at.
 //
 // The collector token in state.config survives app updates; the WebView's
-// localStorage (where the web app keeps its JWT under "dr_token") does NOT —
+// browser storage (where the web app keeps its JWT) does NOT —
 // an update/reinstall wipes it. So we mint a fresh web JWT from the durable
 // collector token on every dashboard open and hand it to the web app via
 // /auth/handoff, which stores it and navigates on to `next` itself. Minting
@@ -249,6 +252,29 @@ async function reloadDashboardFrame() {
   } finally {
     state.dashboardMinting = false;
   }
+}
+
+// Recover an embedded session that reached /auth/login after an updater
+// restart, WebView profile reset, or expired browser JWT. The durable
+// collector identity remains in native config, so the parent can mint a new
+// short-lived JWT without saving a password or bypassing TOTP.
+async function restoreDashboardSession() {
+  const apiUrl = (state.config?.server_url || "").trim();
+  const token = (state.config?.server_token || "").trim();
+  if (!apiUrl || !token) return;
+
+  const now = Date.now();
+  if (now - state.dashboardRestoreLastAt < 5_000) return;
+  state.dashboardRestoreLastAt = now;
+
+  // A login page can report the missing session while the startup handoff is
+  // still completing. Queue behind that one navigation instead of racing it.
+  const deadline = now + 25_000;
+  while (state.dashboardMinting && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (state.dashboardMinting) return;
+  await reloadDashboardFrame();
 }
 
 document.getElementById("dashboardReload")?.addEventListener("click", () => {
@@ -612,7 +638,7 @@ async function adoptCollectorToken(token, { refreshDashboard = false } = {}) {
 }
 
 // ─── Messages from the embedded dashboard ─────────────────────────
-// Three things the framed web app asks of us, all origin-guarded against the
+// Four things the framed web app asks of us, all origin-guarded against the
 // configured web origin (deriveWebUrl maps the saved API base to it):
 //
 //   memento:token         — the user logged in / registered *inside* the
@@ -627,9 +653,16 @@ async function adoptCollectorToken(token, { refreshDashboard = false } = {}) {
 //                           token back (see src-tauri/src/auth.rs).
 //   memento:navigation    — its current same-origin route, reported because
 //                           the parent cannot read a cross-origin iframe URL.
+//   memento:restore-session — browser JWT is missing; recover it from the
+//                             native identity that survives app updates.
 window.addEventListener("message", async (evt) => {
   const data = evt.data;
-  if (!data || !["memento:token", "memento:github-login", "memento:navigation"].includes(data.type)) return;
+  if (!data || ![
+    "memento:token",
+    "memento:github-login",
+    "memento:navigation",
+    "memento:restore-session",
+  ].includes(data.type)) return;
   const apiUrl = (state.config?.server_url || "").trim();
   if (!apiUrl) return;
   // Origin guard: only accept messages from the configured web origin. This
@@ -652,6 +685,15 @@ window.addEventListener("message", async (evt) => {
     state.dashboardPath = normalizeDashboardPath(data.path, deriveWebUrl(apiUrl));
     const urlEl = document.getElementById("dashboardUrl");
     if (urlEl) urlEl.textContent = `${deriveWebUrl(apiUrl)}${state.dashboardPath}`;
+    return;
+  }
+
+  if (data.type === "memento:restore-session") {
+    try {
+      await restoreDashboardSession();
+    } catch (e) {
+      console.warn("embedded session restore:", e);
+    }
     return;
   }
 

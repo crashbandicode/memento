@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { getApiBase } from "@/lib/api-client";
+import { getStoredAuthToken } from "@/lib/auth-storage";
 import { useI18n } from "@/lib/i18n";
 import { Btn, Glass, Chip } from "@/components/aurora/primitives";
 import { Icon } from "@/components/aurora/Icon";
@@ -109,7 +110,7 @@ function shareFetch(url: string): Promise<Response> {
   // (which preserves the share URL so the visitor returns here after login).
   const headers: Record<string, string> = {};
   if (typeof window !== "undefined") {
-    const token = localStorage.getItem("dr_token");
+    const token = getStoredAuthToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
   return fetch(url, { headers });

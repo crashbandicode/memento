@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { getApiBase } from "./api-client";
+import { getStoredAuthToken } from "./auth-storage";
 
 export interface SSEEvent {
   type: string;
@@ -35,7 +36,7 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
 
     function connect() {
       const base = getApiBase();
-      const token = localStorage.getItem("dr_token");
+      const token = getStoredAuthToken();
       if (!token) return; // Not logged in — don't connect SSE
       es = new EventSource(`${base}/api/events/stream?token=${encodeURIComponent(token)}`);
 

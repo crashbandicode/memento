@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth-context";
 import { getApiBase, authFetch } from "@/lib/api-client";
+import { getStoredAuthToken } from "@/lib/auth-storage";
 import { Icon, ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
 // Read version from package.json so the sidebar footer tracks releases
 // automatically — no more "v0.1.0 forever" when actual builds are 0.2.x.
@@ -28,7 +29,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
   const [devices, setDevices] = useState<SidebarDevice[]>([]);
 
   useEffect(() => {
-    const token = localStorage.getItem("dr_token");
+    const token = getStoredAuthToken();
     if (!token) return;
     authFetch(`${getApiBase()}/api/hierarchy/devices`)
       .then((r) => r.json())

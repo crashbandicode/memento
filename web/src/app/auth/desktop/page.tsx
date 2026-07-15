@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import { Glass } from "@/components/aurora/primitives";
 import { api } from "@/lib/api-client";
+import { getStoredAuthToken } from "@/lib/auth-storage";
 
 /**
  * Desktop OAuth loopback bridge — the tail of the native GitHub sign-in flow.
@@ -52,7 +53,7 @@ export default function AuthDesktopPage() {
     // /auth/callback just wrote this on its way here.
     let jwt: string | null = null;
     try {
-      jwt = localStorage.getItem("dr_token");
+      jwt = getStoredAuthToken();
     } catch {
       /* storage blocked — treated as missing below */
     }
