@@ -23,6 +23,7 @@ import { useI18n, fmt } from "@/lib/i18n";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
+import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
 
 interface Artifact {
   id: string;
@@ -2687,7 +2688,10 @@ function MessageCopyFrame({
   t: ReturnType<typeof useI18n>["t"];
 }) {
   const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const showBottomCopy = useOverflowsVisibleScrollport(contentRef);
   const resetTimer = useRef<number | null>(null);
+
   const copy = async (format: ClipboardFormat) => {
     try {
       const actualFormat = await copyMarkdownToClipboard(markdown, format);
@@ -2699,14 +2703,22 @@ function MessageCopyFrame({
     resetTimer.current = window.setTimeout(() => setStatus(null), 2_000);
   };
   return (
-    <div data-message-copy-frame style={{ minWidth: 0, position: "relative" }}>
+    <div
+      data-message-copy-frame
+      data-copy-bottom-needed={showBottomCopy ? "true" : "false"}
+      style={{ minWidth: 0, position: "relative" }}
+    >
       <div style={{ position: "absolute", zIndex: 20, top: 0, right: 34 }}>
         <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} />
       </div>
-      {children}
-      <div style={{ display: "flex", justifyContent: "flex-end", minHeight: 28, marginTop: 3, paddingRight: 2 }}>
-        <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
+      <div ref={contentRef} data-message-copy-content style={{ minWidth: 0 }}>
+        {children}
       </div>
+      {showBottomCopy && (
+        <div style={{ display: "flex", justifyContent: "flex-end", minHeight: 28, marginTop: 3, paddingRight: 2 }}>
+          <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
+        </div>
+      )}
     </div>
   );
 }
