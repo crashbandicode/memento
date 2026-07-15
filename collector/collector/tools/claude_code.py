@@ -39,9 +39,6 @@ class ClaudeCodeTool(BaseTool):
         if project_hash not in self._project_path_cache:
             project_dir = self.root_path / "projects" / project_hash
             result = _extract_cwd_from_jsonl(project_dir)
-            if not result:
-                from .cursor import _resolve_hash_to_path
-                result = _resolve_hash_to_path(project_hash)
             self._project_path_cache[project_hash] = result
         return self._project_path_cache[project_hash]
 
@@ -86,14 +83,15 @@ class ClaudeCodeTool(BaseTool):
                 recursive=True,
                 description="Session conversation transcripts",
             ),
-            # Sub-agent metadata
+            # Sub-agent metadata is state that describes a sibling transcript;
+            # it is not itself a conversation.
             WatchPath(
                 path=root / "projects",
                 pattern="**/*.meta.json",
-                category=Category.CONVERSATION,
+                category=Category.STATE,
                 content_type=ContentType.JSON,
                 recursive=True,
-                description="Sub-agent metadata (type, description)",
+                description="Sub-agent state metadata (type, description)",
             ),
             # Project memory
             WatchPath(
@@ -190,7 +188,7 @@ class ClaudeCodeTool(BaseTool):
             if abs_path.suffix == ".json" and abs_path.stem.endswith(".meta"):
                 return FileClassification(
                     tool_name=self.name,
-                    category=Category.CONVERSATION,
+                    category=Category.STATE,
                     content_type=ContentType.JSON,
                     sync_strategy=SyncStrategy.FULL,
                     relative_path=rel_str,

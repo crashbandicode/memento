@@ -121,6 +121,23 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
 }
 
 
+def normalize_ingest_category(
+    tool_id: str,
+    category: str,
+    relative_path: str,
+) -> str:
+    """Correct legacy collector classifications at the trust boundary."""
+    normalized_path = (relative_path or "").replace("\\", "/").lower()
+    if (
+        tool_id == "claude_code"
+        and category == "conversation"
+        and "/subagents/" in f"/{normalized_path.lstrip('/')}"
+        and normalized_path.endswith(".meta.json")
+    ):
+        return "state"
+    return category
+
+
 def _conversation_search_index_needs_refresh(
     *,
     is_new_document: bool,
@@ -1225,6 +1242,7 @@ async def ingest_file(
 ) -> Document:
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
+    category = normalize_ingest_category(tool_id, category, relative_path)
     received_at = datetime.now(timezone.utc)
     source_modified_at = bounded_source_timestamp(timestamp, received_at) or received_at
     stable_source_identity = cursor_session_id(tool_id, category, metadata)
