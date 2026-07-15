@@ -177,6 +177,11 @@ type DetachedTail = {
   messages: ConversationMessage[];
 };
 
+type PendingNavigation = {
+  lineNumber: number;
+  behavior: ScrollBehavior;
+};
+
 export default function ConversationViewer({
   documentId,
   prompts,
@@ -198,8 +203,9 @@ export default function ConversationViewer({
   const [hasEarlier, setHasEarlier] = useState(false);
   const [knownTotal, setKnownTotal] = useState(totalMessages);
   const [activePromptLine, setActivePromptLine] = useState<number | null>(null);
-  const [pendingPromptLine, setPendingPromptLine] = useState<number | null>(null);
+  const [pendingNavigation, setPendingNavigation] = useState<PendingNavigation | null>(null);
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
+  const [latestAgentLoading, setLatestAgentLoading] = useState(false);
   const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
@@ -354,8 +360,9 @@ export default function ConversationViewer({
     setHasEarlier(false);
     setKnownTotal(totalMessages);
     setActivePromptLine(null);
-    setPendingPromptLine(null);
+    setPendingNavigation(null);
     setNavigatingPromptLine(null);
+    setLatestAgentLoading(false);
     setDetachedTail(null);
     loadMore({ force: true });
   }, [documentId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -382,20 +389,30 @@ export default function ConversationViewer({
   }, [prompts]);
 
   useEffect(() => {
-    if (pendingPromptLine === null) return;
-    const target = document.getElementById(`conversation-line-${pendingPromptLine}`);
+    if (pendingNavigation === null) return;
+    const target = document.getElementById(`conversation-line-${pendingNavigation.lineNumber}`);
     if (!target) {
-      setPendingPromptLine(null);
+      setPendingNavigation(null);
       setNavigatingPromptLine(null);
       return;
     }
-    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    const container = containerRef.current;
+    if (pendingNavigation.behavior === "instant" && container) {
+      const targetTop = target.getBoundingClientRect().top;
+      const containerTop = container.getBoundingClientRect().top;
+      container.scrollTo({
+        top: container.scrollTop + targetTop - containerTop - 16,
+        behavior: "instant",
+      });
+    } else {
+      target.scrollIntoView({ behavior: pendingNavigation.behavior, block: "start" });
+    }
     const timeout = window.setTimeout(() => {
-      setPendingPromptLine(null);
+      setPendingNavigation(null);
       setNavigatingPromptLine(null);
-    }, 650);
+    }, pendingNavigation.behavior === "smooth" ? 650 : 100);
     return () => window.clearTimeout(timeout);
-  }, [messages, detachedTail, pendingPromptLine]);
+  }, [messages, detachedTail, pendingNavigation]);
 
   const handleScroll = () => {
     const el = containerRef.current;
@@ -429,8 +446,12 @@ export default function ConversationViewer({
     }
   };
 
-  const navigateToLine = useCallback(async (lineNumber: number) => {
+  const navigateToLine = useCallback(async (
+    lineNumber: number,
+    loadPromptTurn = false,
+  ) => {
     const anchorId = `conversation-line-${lineNumber}`;
+    let loadedTargetWindow = false;
     setNavigatingPromptLine(lineNumber);
     if (!document.getElementById(anchorId) && loadingRef.current) {
       await new Promise<void>((resolve) => {
@@ -447,6 +468,7 @@ export default function ConversationViewer({
       }
     }
     if (!document.getElementById(anchorId)) {
+      loadedTargetWindow = true;
       loadingRef.current = true;
       setLoading(true);
       try {
@@ -460,11 +482,13 @@ export default function ConversationViewer({
         let contiguousEnd = response.offset + response.messages.length;
         let nextDetachedTail: DetachedTail | null = null;
         const promptIndex = promptLinesRef.current.indexOf(lineNumber);
-        const nextPromptLine = promptIndex >= 0
+        const nextPromptLine = loadPromptTurn && promptIndex >= 0
           ? promptLinesRef.current[promptIndex + 1]
           : undefined;
         while (
-          nextMessages.length < PROMPT_JUMP_MAX_WINDOW_SIZE
+          loadPromptTurn
+          && promptIndex >= 0
+          && nextMessages.length < PROMPT_JUMP_MAX_WINDOW_SIZE
           && contiguousEnd < response.total
           && (
             nextPromptLine === undefined
@@ -481,7 +505,8 @@ export default function ConversationViewer({
           contiguousEnd = page.offset + page.messages.length;
         }
         if (
-          lineNumber === latestPromptLineRef.current
+          loadPromptTurn
+          && lineNumber === latestPromptLineRef.current
           && contiguousEnd < response.total
         ) {
           const tail = await api.getLatestMessages(documentId, LIVE_TAIL_SIZE);
@@ -514,12 +539,40 @@ export default function ConversationViewer({
       }
     }
 
-    setPendingPromptLine(lineNumber);
+    const target = document.getElementById(anchorId);
+    const container = containerRef.current;
+    const targetIsDistant = Boolean(
+      target
+      && container
+      && Math.abs(
+        target.getBoundingClientRect().top - container.getBoundingClientRect().top,
+      ) > container.clientHeight * 2,
+    );
+    setPendingNavigation({
+      lineNumber,
+      behavior: loadedTargetWindow || targetIsDistant ? "instant" : "smooth",
+    });
   }, [documentId, updateDetachedTail]);
 
   const navigateToPrompt = async (prompt: ConversationPrompt) => {
     setActivePromptLine(prompt.line_number);
-    await navigateToLine(prompt.line_number);
+    await navigateToLine(prompt.line_number, true);
+  };
+
+  const navigateToLatestAgent = async (): Promise<boolean> => {
+    if (latestAgentLoading) return false;
+    setLatestAgentLoading(true);
+    try {
+      const target = await api.getLatestAgentMessage(documentId);
+      if (target.line_number === null) return false;
+      await navigateToLine(target.line_number);
+      return true;
+    } catch (error) {
+      console.error("Failed to find latest agent message:", error);
+      return false;
+    } finally {
+      setLatestAgentLoading(false);
+    }
   };
 
   const renderMessage = (
@@ -677,9 +730,11 @@ export default function ConversationViewer({
         prompts={prompts}
         activeLine={activePromptLine}
         loadingLine={navigatingPromptLine}
+        latestAgentLoading={latestAgentLoading}
         label={t.conversation.promptNavigator}
         loadingLabel={t.loading}
         onSelect={navigateToPrompt}
+        onLatestAgent={navigateToLatestAgent}
       />
     </div>
   );
@@ -982,16 +1037,20 @@ function PromptNavigator({
   prompts,
   activeLine,
   loadingLine,
+  latestAgentLoading,
   label,
   loadingLabel,
   onSelect,
+  onLatestAgent,
 }: {
   prompts: ConversationPrompt[];
   activeLine: number | null;
   loadingLine: number | null;
+  latestAgentLoading: boolean;
   label: string;
   loadingLabel: string;
   onSelect: (prompt: ConversationPrompt) => void | Promise<void>;
+  onLatestAgent: () => Promise<boolean>;
 }) {
   const { t: translations } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -1016,6 +1075,7 @@ function PromptNavigator({
     ? promptItems.filter(({ snippet }) => snippet.toLocaleLowerCase().includes(normalizedQuery))
     : promptItems;
   const activeIndex = prompts.findIndex((prompt) => prompt.line_number === activeLine);
+  const navigationBusy = loadingLine !== null || latestAgentLoading;
 
   useEffect(() => {
     if (!mobileOpen) return;
@@ -1066,8 +1126,6 @@ function PromptNavigator({
       first.focus();
     }
   };
-
-  if (prompts.length === 0) return null;
 
   return (
     <>
@@ -1138,7 +1196,7 @@ function PromptNavigator({
               data-prompt-item={prompt.line_number}
               title={snippet}
               onClick={() => onSelect(prompt)}
-              disabled={loadingLine !== null}
+              disabled={navigationBusy}
               aria-busy={isLoading}
               style={{
                 width: "100%",
@@ -1159,8 +1217,8 @@ function PromptNavigator({
                     : "var(--aurora-border)",
                 color: active ? "var(--aurora-accent)" : "var(--aurora-fg3)",
                 textAlign: "left",
-                cursor: loadingLine !== null ? "wait" : "pointer",
-                opacity: loadingLine !== null && !isLoading ? 0.55 : 1,
+                cursor: navigationBusy ? "wait" : "pointer",
+                opacity: navigationBusy && !isLoading ? 0.55 : 1,
               }}
             >
               {expanded ? (
@@ -1209,6 +1267,46 @@ function PromptNavigator({
           );
         })}
         </div>
+        <div
+          style={{
+            padding: expanded ? "7px" : "5px",
+            borderTop: "1px solid var(--aurora-border)",
+            flex: "0 0 auto",
+          }}
+        >
+          <button
+            type="button"
+            data-latest-agent-message
+            title={translations.conversation.latestAgentMessage}
+            aria-label={translations.conversation.latestAgentMessage}
+            aria-busy={latestAgentLoading}
+            disabled={navigationBusy}
+            onClick={() => void onLatestAgent()}
+            style={{
+              width: "100%",
+              minHeight: expanded ? 34 : 18,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: expanded ? "flex-start" : "center",
+              gap: 8,
+              padding: expanded ? "6px 8px" : 0,
+              border: 0,
+              borderRadius: 8,
+              background: "color-mix(in srgb, var(--aurora-success) 9%, transparent)",
+              color: "var(--aurora-success)",
+              cursor: navigationBusy ? "wait" : "pointer",
+              fontSize: 10.5,
+              fontWeight: 650,
+            }}
+          >
+            <Icon
+              name={latestAgentLoading ? "refresh" : "arrow_down"}
+              size={11}
+              className={latestAgentLoading ? "animate-spin" : undefined}
+            />
+            {expanded && <span>{translations.conversation.latestAgentMessage}</span>}
+          </button>
+        </div>
       </aside>
 
       <button
@@ -1219,8 +1317,8 @@ function PromptNavigator({
         aria-haspopup="dialog"
         aria-expanded={mobileOpen}
         aria-controls="mobile-prompt-navigator"
-        aria-busy={loadingLine !== null}
-        disabled={loadingLine !== null}
+        aria-busy={navigationBusy}
+        disabled={navigationBusy}
         onClick={() => setMobileOpen(true)}
         style={{
           position: "fixed",
@@ -1238,7 +1336,7 @@ function PromptNavigator({
           color: "var(--aurora-fg1)",
           boxShadow: "0 12px 32px -12px rgba(15,23,42,0.38)",
           backdropFilter: "blur(18px)",
-          cursor: loadingLine !== null ? "wait" : "pointer",
+          cursor: navigationBusy ? "wait" : "pointer",
         }}
       >
         <span
@@ -1255,9 +1353,9 @@ function PromptNavigator({
           }}
         >
           <Icon
-            name={loadingLine !== null ? "refresh" : "message"}
+            name={navigationBusy ? "refresh" : "message"}
             size={13}
-            className={loadingLine !== null ? "animate-spin" : undefined}
+            className={navigationBusy ? "animate-spin" : undefined}
           />
         </span>
         <span
@@ -1270,7 +1368,7 @@ function PromptNavigator({
             fontWeight: 650,
           }}
         >
-          {loadingLine !== null ? loadingLabel : label}
+          {navigationBusy ? loadingLabel : label}
         </span>
         <span
           style={{
@@ -1283,7 +1381,7 @@ function PromptNavigator({
             fontVariantNumeric: "tabular-nums",
           }}
         >
-          {activeIndex >= 0 ? activeIndex + 1 : 1}/{prompts.length}
+          {prompts.length === 0 ? 0 : activeIndex >= 0 ? activeIndex + 1 : 1}/{prompts.length}
         </span>
       </button>
 
@@ -1448,6 +1546,39 @@ function PromptNavigator({
                   }}
                 />
               </label>
+              <button
+                type="button"
+                data-mobile-latest-agent-message
+                aria-busy={latestAgentLoading}
+                disabled={navigationBusy}
+                onClick={async () => {
+                  if (await onLatestAgent()) closeMobileSheet();
+                }}
+                style={{
+                  width: "100%",
+                  minHeight: 42,
+                  marginTop: 8,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  padding: "8px 11px",
+                  border: "1px solid color-mix(in srgb, var(--aurora-success) 22%, var(--aurora-border))",
+                  borderRadius: 12,
+                  background: "color-mix(in srgb, var(--aurora-success) 8%, var(--aurora-chip))",
+                  color: "var(--aurora-success)",
+                  cursor: navigationBusy ? "wait" : "pointer",
+                  fontSize: 12,
+                  fontWeight: 650,
+                }}
+              >
+                <Icon
+                  name={latestAgentLoading ? "refresh" : "sparkles"}
+                  size={14}
+                  className={latestAgentLoading ? "animate-spin" : undefined}
+                />
+                <span>{latestAgentLoading ? loadingLabel : translations.conversation.latestAgentMessage}</span>
+                {!latestAgentLoading && <Icon name="arrow_down" size={13} style={{ marginLeft: "auto" }} />}
+              </button>
             </div>
 
             <div
@@ -1477,7 +1608,7 @@ function PromptNavigator({
                       data-mobile-prompt-item={prompt.line_number}
                       aria-current={active ? "true" : undefined}
                       aria-busy={isLoading}
-                      disabled={loadingLine !== null}
+                      disabled={navigationBusy}
                       onClick={async () => {
                         await onSelect(prompt);
                         if (dialogRef.current) closeMobileSheet();
@@ -1499,8 +1630,8 @@ function PromptNavigator({
                           : "transparent",
                         color: active ? "var(--aurora-accent)" : "var(--aurora-fg2)",
                         textAlign: "left",
-                        cursor: loadingLine !== null ? "wait" : "pointer",
-                        opacity: loadingLine !== null && !isLoading ? 0.5 : 1,
+                        cursor: navigationBusy ? "wait" : "pointer",
+                        opacity: navigationBusy && !isLoading ? 0.5 : 1,
                         contentVisibility: "auto",
                         containIntrinsicSize: "54px",
                       }}

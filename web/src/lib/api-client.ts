@@ -114,7 +114,9 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
 
   const base = getApiBase();
   const method = (init.method || "GET").toUpperCase();
-  const cacheKey = method === "GET" ? `${base}${path}` : null;
+  const cacheKey = method === "GET" && init.cache !== "no-store"
+    ? `${base}${path}`
+    : null;
 
   if (cacheKey) {
     const hit = getCached<T>(cacheKey);
@@ -358,6 +360,10 @@ export interface MessagesResponse {
   offset: number;
   limit: number;
   messages: ConversationMessage[];
+}
+
+export interface LatestAgentMessageResponse {
+  line_number: number | null;
 }
 
 export interface ConversationPrompt {
@@ -624,6 +630,11 @@ export const api = {
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
   getLatestMessages: (id: string, limit = 200) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?tail=true&limit=${limit}`),
+  getLatestAgentMessage: (id: string) =>
+    apiFetch<LatestAgentMessageResponse>(
+      `/api/conversations/${id}/latest-agent-message`,
+      { cache: "no-store" },
+    ),
   getMessagesAround: (id: string, lineNumber: number, contextBefore = 0, limit = 50) => {
     const params = new URLSearchParams({
       line_number: String(lineNumber),

@@ -58,6 +58,29 @@ def _stored_interaction(metadata: object, key: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+async def _get_conversation_identity(
+    db: AsyncSession,
+    user: User,
+    doc_id: uuid.UUID,
+) -> Document:
+    """Return the minimal authorized document shape used by message APIs."""
+    mids = await user_machine_ids(db, user)
+    doc = (
+        await db.execute(
+            select(Document)
+            .options(load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+            ))
+            .where(Document.id == doc_id)
+        )
+    ).scalar_one_or_none()
+    if not doc or (mids is not None and doc.machine_id not in mids):
+        raise HTTPException(status_code=404)
+    return doc
+
+
 @router.get("/{doc_id}")
 async def get_conversation(
     doc_id: uuid.UUID,
@@ -249,22 +272,7 @@ async def get_conversation_messages(
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Get paginated, human-readable conversation messages."""
-    mids = await user_machine_ids(db, _user)
-
-    result = await db.execute(
-        select(Document)
-        .options(load_only(
-            Document.id,
-            Document.machine_id,
-            Document.tool_id,
-        ))
-        .where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404)
-    if mids is not None and doc.machine_id not in mids:
-        raise HTTPException(status_code=404)
+    doc = await _get_conversation_identity(db, _user, doc_id)
 
     # Prefer normalized rows. They are indexed by document and line number,
     # preserve the viewer fields, and avoid reparsing the raw transcript for
@@ -370,6 +378,59 @@ async def get_conversation_messages(
     return {"total": 0, "offset": offset, "limit": limit, "messages": []}
 
 
+@router.get("/{doc_id}/latest-agent-message")
+async def get_latest_agent_message(
+    doc_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Return the latest assistant line without loading a transcript window."""
+    doc = await _get_conversation_identity(db, _user, doc_id)
+    latest_line = (
+        await db.execute(
+            select(ConversationMessage.line_number)
+            .where(
+                ConversationMessage.document_id == doc_id,
+                func.coalesce(
+                    ConversationMessage.role,
+                    ConversationMessage.message_type,
+                ) == "assistant",
+            )
+            .order_by(
+                ConversationMessage.line_number.desc(),
+                ConversationMessage.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest_line is not None:
+        return {"line_number": latest_line}
+
+    normalized_count = (
+        await db.execute(
+            select(func.count()).where(ConversationMessage.document_id == doc_id)
+        )
+    ).scalar() or 0
+    if normalized_count > 0:
+        return {"line_number": None}
+
+    raw_content = (
+        await db.execute(select(Document.content).where(Document.id == doc_id))
+    ).scalar_one_or_none()
+    if not raw_content:
+        return {"line_number": None}
+    messages = parse_conversation(raw_content, doc.tool_id)
+    latest_line = next(
+        (
+            index
+            for index in range(len(messages), 0, -1)
+            if messages[index - 1].role == "assistant"
+        ),
+        None,
+    )
+    return {"line_number": latest_line}
+
+
 @router.get("/{doc_id}/search")
 async def search_conversation_messages(
     doc_id: uuid.UUID,
@@ -385,18 +446,7 @@ async def search_conversation_messages(
     editor search. The existing ``messages?line_number=`` endpoint loads the
     bounded rendering window when a hit is selected.
     """
-    mids = await user_machine_ids(db, _user)
-    doc = (
-        await db.execute(
-            select(Document)
-            .options(load_only(Document.id, Document.machine_id))
-            .where(Document.id == doc_id)
-        )
-    ).scalar_one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404)
-    if mids is not None and doc.machine_id not in mids:
-        raise HTTPException(status_code=404)
+    await _get_conversation_identity(db, _user, doc_id)
 
     query_text = normalize_search_query(q)
     if not query_text:
@@ -498,22 +548,7 @@ async def get_conversation_prompts(
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Return a lightweight outline of every meaningful human prompt."""
-    mids = await user_machine_ids(db, _user)
-
-    result = await db.execute(
-        select(Document)
-        .options(load_only(
-            Document.id,
-            Document.machine_id,
-            Document.tool_id,
-        ))
-        .where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404)
-    if mids is not None and doc.machine_id not in mids:
-        raise HTTPException(status_code=404)
+    doc = await _get_conversation_identity(db, _user, doc_id)
 
     normalized_count = (
         await db.execute(

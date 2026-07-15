@@ -199,6 +199,7 @@ const enUS: Translations = {
     lowActivity: "Low activity",
     lowActivityHint: "Empty, one-sided, or very short threads are tucked away here.",
     promptNavigator: "Prompt navigator",
+    latestAgentMessage: "Latest agent message",
     promptCount: "{count} prompts",
     filteredPromptCount: "{visible} of {total} prompts",
     searchPrompts: "Search {count} prompts",

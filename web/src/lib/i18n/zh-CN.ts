@@ -205,6 +205,7 @@ const zhCN = {
     lowActivity: "低活动对话",
     lowActivityHint: "空白、单向或非常短的对话收纳在这里。",
     promptNavigator: "提示词导航",
+    latestAgentMessage: "最新助手消息",
     promptCount: "共 {count} 条提示词",
     filteredPromptCount: "显示 {visible} / {total} 条提示词",
     searchPrompts: "搜索 {count} 条提示词",

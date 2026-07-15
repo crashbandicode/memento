@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.conversations import (  # noqa: E402
     get_conversation,
+    get_latest_agent_message,
     get_conversation_messages,
     get_conversation_prompts,
     search_conversation_messages,
@@ -163,6 +164,26 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         message_sql = str(db.statements[2].compile())
         self.assertIn("OFFSET", message_sql.upper())
         self.assertNotIn("documents.content", message_sql)
+
+    async def test_latest_agent_message_uses_indexed_assistant_line(self) -> None:
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=4298),
+        ])
+
+        payload = await get_latest_agent_message(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload, {"line_number": 4298})
+        self.assertEqual(len(db.statements), 2)
+        latest_sql = str(db.statements[1].compile()).upper()
+        self.assertIn("COALESCE", latest_sql)
+        self.assertIn("ORDER BY", latest_sql)
+        self.assertIn("DESC", latest_sql)
+        self.assertNotIn("DOCUMENTS.CONTENT", latest_sql)
 
     async def test_prompts_prefer_normalized_rows(self) -> None:
         db = _Db([
