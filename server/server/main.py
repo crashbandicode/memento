@@ -14,6 +14,7 @@ from .config import settings
 from .db.models import Base
 from .db.session import engine
 from .logging_filters import install_sensitive_query_filter
+from .services.conversation_identity import CURSOR_SESSION_UNIQUE_INDEX_SQL
 from .services.device_service import DeviceOwnershipError
 
 
@@ -345,6 +346,11 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_documents_tool_synced ON documents (tool_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_synced ON documents (project_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_category ON documents (project_id, category)",
+        # Cursor can relocate one stable thread from empty-window to its real
+        # project, or promote a nested subagent transcript to a root path.
+        # The server upserts these by the verified session UUID; enforce that
+        # invariant in PostgreSQL as the final concurrent-writer guard.
+        CURSOR_SESSION_UNIQUE_INDEX_SQL,
         "CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_path_trgm ON documents USING gin (relative_path gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_content_trgm ON documents USING gin (content gin_trgm_ops)",

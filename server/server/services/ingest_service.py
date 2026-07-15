@@ -29,6 +29,11 @@ from .history_recovery import (
     recovered_occurrence_anchors,
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
+from .conversation_identity import (
+    cursor_session_id,
+    select_canonical_cursor_document,
+    should_relocate_cursor_document,
+)
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
@@ -1118,11 +1123,33 @@ def _scoped_sync_state_select(
     return statement
 
 
+def _scoped_cursor_identity_select(
+    session_id: str,
+    machine_id: str | None,
+    user_id: str | None,
+):
+    """Select all same-device aliases for one verified Cursor session UUID."""
+    statement = select(Document).where(
+        Document.tool_id == "cursor",
+        Document.category == "conversation",
+        Document.machine_id == machine_id,
+        Document.metadata_["session_id"].astext == session_id,
+    )
+    if user_id is not None:
+        statement = statement.where(
+            Document.machine_id.in_(
+                select(Machine.id).where(Machine.user_id == user_id)
+            )
+        )
+    return statement
+
+
 def _source_lock_id(
     machine_id: str | None,
     user_id: str | None,
     tool_id: str,
     relative_path: str,
+    source_identity: str | None = None,
 ) -> int:
     """Return a stable signed 64-bit advisory-lock key for one source."""
     owner = (
@@ -1130,8 +1157,13 @@ def _source_lock_id(
         if machine_id is not None
         else f"user:{user_id or 'legacy'}"
     )
+    source_key = (
+        f"identity:{source_identity}"
+        if source_identity is not None
+        else f"path:{relative_path}"
+    )
     identity = json.dumps(
-        [owner, tool_id, relative_path],
+        [owner, tool_id, source_key],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -1146,6 +1178,7 @@ async def _lock_ingest_source(
     user_id: str | None,
     tool_id: str,
     relative_path: str,
+    source_identity: str | None = None,
 ) -> None:
     """Serialize all direct and spooled writers until their transaction ends."""
     await db.execute(
@@ -1156,6 +1189,7 @@ async def _lock_ingest_source(
                 user_id,
                 tool_id,
                 relative_path,
+                source_identity,
             )
         },
     )
@@ -1188,12 +1222,14 @@ async def ingest_file(
     metadata = dict(metadata or {})
     received_at = datetime.now(timezone.utc)
     source_modified_at = bounded_source_timestamp(timestamp, received_at) or received_at
+    stable_source_identity = cursor_session_id(tool_id, category, metadata)
     await _lock_ingest_source(
         db,
         machine_id=machine_id,
         user_id=user_id,
         tool_id=tool_id,
         relative_path=relative_path,
+        source_identity=stable_source_identity,
     )
     # Fast-path dedup: if this exact (tool_id, relative_path, content_hash,
     # offset) was already ingested, skip everything. Common in multi-collector
@@ -1213,7 +1249,7 @@ async def ingest_file(
             )
         )
     ).scalar_one_or_none()
-    doc = (
+    path_doc = (
         await db.execute(
             _scoped_document_select(
                 tool_id,
@@ -1223,6 +1259,39 @@ async def ingest_file(
             ).with_for_update()
         )
     ).scalar_one_or_none()
+    doc = path_doc
+    if stable_source_identity is not None:
+        identity_documents = (
+            await db.execute(
+                _scoped_cursor_identity_select(
+                    stable_source_identity,
+                    machine_id,
+                    user_id,
+                ).with_for_update()
+            )
+        ).scalars().all()
+        if identity_documents:
+            doc = select_canonical_cursor_document(
+                identity_documents,
+                stable_source_identity,
+            )
+    identity_path_conflict = (
+        path_doc is not None
+        and doc is not None
+        and path_doc.id != doc.id
+    )
+    identity_relocation = (
+        stable_source_identity is not None
+        and doc is not None
+        and not identity_path_conflict
+        and should_relocate_cursor_document(
+            session_id=stable_source_identity,
+            current_path=doc.relative_path,
+            incoming_path=relative_path,
+            current_modified_at=doc.source_modified_at,
+            incoming_modified_at=source_modified_at,
+        )
+    )
     # Repair timestamps accepted before source-clock bounding was introduced.
     # Leaving a future value in place would make later valid FULL snapshots
     # look stale indefinitely, even though new incoming times are bounded.
@@ -1248,6 +1317,7 @@ async def ingest_file(
         and doc.content_hash == content_hash
         and sync_row.last_hash == content_hash
         and sync_row.last_offset == offset
+        and not identity_relocation
     ):
         # Touch last_synced_at so dashboards know we still see this file,
         # but skip all the actual ingestion work + the post-ingest task.
@@ -1283,7 +1353,12 @@ async def ingest_file(
                 expected_offset=expected_offset,
             )
 
-    if mode == "full" and doc is not None and doc.content_hash == content_hash:
+    if (
+        mode == "full"
+        and doc is not None
+        and doc.content_hash == content_hash
+        and not identity_relocation
+    ):
         pointer_is_current = _stored_source_is_current(
             doc,
             content_hash,
@@ -1492,6 +1567,8 @@ async def ingest_file(
         db.add(doc)
     else:
         # Update existing document
+        if identity_relocation:
+            doc.relative_path = relative_path
         preserve_externalized_delta = _is_externalized_delta_update(
             doc,
             mode=mode,
