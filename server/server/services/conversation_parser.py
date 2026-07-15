@@ -42,6 +42,10 @@ class NormalizedMessage:
     # conversation events and must not be collapsed merely because their text
     # and wall-clock second happen to match.
     source_id: str = ""
+    # Codex emits a stable turn ID separately from the per-transport source
+    # ID.  Preserve it so interrupted and restarted attempts remain distinct
+    # even when their prompt text and timestamps are identical.
+    source_turn_id: str = ""
     # Internal signal for delta ingestion: the iterator already observed and
     # collapsed the adjacent Codex response/event transport pair in this
     # payload, so it must not be reconciled against an older database tail.
@@ -612,6 +616,14 @@ def parse_conversation_object(
                         else msg_type
                     ),
                     source_id=str(payload.get("id") or ""),
+                    source_turn_id=_coerce_text(
+                        _as_mapping(
+                            payload.get(
+                                "internal_chat_message_metadata_passthrough"
+                            )
+                        ).get("turn_id")
+                        or payload.get("turn_id")
+                    ),
                 )
             return None
 
@@ -636,6 +648,7 @@ def parse_conversation_object(
                         source_id=str(
                             payload.get("client_id") or payload.get("id") or ""
                         ),
+                        source_turn_id=_coerce_text(payload.get("turn_id")),
                     )
                 return None
             # Agent message — intermediate commentary in new Codex, sole reply in old Codex.
@@ -664,6 +677,26 @@ def parse_conversation_object(
                         source_id=str(payload.get("turn_id") or ""),
                     )
                 return None
+            if event_type == "turn_aborted":
+                turn_id = _bounded_interaction_text(payload.get("turn_id"), 512)
+                reason = _bounded_interaction_text(payload.get("reason"), 120)
+                duration_ms = payload.get("duration_ms")
+                details: list[str] = []
+                if reason:
+                    details.append(f"Reason: {reason}")
+                if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
+                    details.append(f"Elapsed: {duration_ms / 1000:g}s")
+                return NormalizedMessage(
+                    role="system",
+                    content=(
+                        "Turn interrupted"
+                        + (f" · {' · '.join(details)}" if details else "")
+                    ),
+                    timestamp=timestamp,
+                    raw_type="turn_aborted",
+                    source_id=f"{turn_id}:aborted" if turn_id else "",
+                    source_turn_id=turn_id,
+                )
             return None
 
         return None  # Skip session_meta, turn_context, etc.
@@ -1826,7 +1859,8 @@ def is_codex_user_mirror_pair(
     The records are paired structurally, not by a coarse timestamp/content
     fingerprint.  ``response_item`` can include attachment annotations that
     are absent from the following ``user_message``, so a prefix relationship
-    is accepted, but only for the known cross-type pair within 250 ms.
+    is accepted, but only for the known cross-type pair within one second.
+    Older Codex builds occasionally wrote the event copy 300-850 ms later.
     """
     if {first_type, second_type} != {"response_item", "user_message"}:
         return False
@@ -1834,7 +1868,7 @@ def is_codex_user_mirror_pair(
     second_time = _message_timestamp(second_timestamp)
     if first_time is None or second_time is None:
         return False
-    if abs((second_time - first_time).total_seconds()) > 0.250:
+    if abs((second_time - first_time).total_seconds()) > 1.0:
         return False
     left = (first_content or "").strip()
     right = (second_content or "").strip()
@@ -1908,8 +1942,9 @@ def iter_conversation_messages(
         return
 
     seen_source_ids: set[str] = set()
-    pending_codex_user: tuple[int, NormalizedMessage] | None = None
+    pending_codex_user: tuple[int, NormalizedMessage, str] | None = None
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
+    current_codex_turn_id = ""
     pending_questions = {
         _coerce_text(interaction.get("id")): interaction
         for interaction in (initial_question_interactions or [])
@@ -1928,6 +1963,16 @@ def iter_conversation_messages(
     for record_index, source_object in enumerate(
         _iter_decoded_json_objects(raw_content)
     ):
+        if tool_id == "codex":
+            source_payload = _as_mapping(source_object.get("payload"))
+            if source_object.get("type") == "event_msg":
+                event_type = source_payload.get("type")
+                event_turn_id = _coerce_text(source_payload.get("turn_id"))
+                if event_type == "task_started" and event_turn_id:
+                    current_codex_turn_id = event_turn_id
+                elif event_type in {"task_complete", "turn_aborted"}:
+                    current_codex_turn_id = ""
+
         message = parse_conversation_object(source_object, tool_id)
 
         if message is not None:
@@ -1990,7 +2035,9 @@ def iter_conversation_messages(
                 pending = pending_codex_user[1]
                 if should_emit(pending):
                     yield pending
-            pending_codex_user = (record_index, message)
+            turn_id = message.source_turn_id or current_codex_turn_id
+            message.source_turn_id = turn_id
+            pending_codex_user = (record_index, message, turn_id)
             continue
 
         is_codex_event_user = (
@@ -2006,7 +2053,7 @@ def iter_conversation_messages(
                 if should_emit(pending):
                     yield pending
             if pending_codex_user is not None:
-                pending_index, pending = pending_codex_user
+                pending_index, pending, pending_turn_id = pending_codex_user
                 if not (
                     record_index - pending_index <= 2
                     and is_codex_user_mirror_pair(
@@ -2022,7 +2069,14 @@ def iter_conversation_messages(
                         yield pending
                 else:
                     message.source_paired = True
+                    message.source_turn_id = (
+                        pending_turn_id
+                        or message.source_turn_id
+                        or current_codex_turn_id
+                    )
                 pending_codex_user = None
+            if not message.source_turn_id:
+                message.source_turn_id = current_codex_turn_id
             if should_emit(message):
                 yield message
             continue

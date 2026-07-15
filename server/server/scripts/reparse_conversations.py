@@ -44,7 +44,7 @@ from server.services.history_recovery import (
 )
 
 
-PARSER_REVISION = "cursor-semantic-tools-v3"
+PARSER_REVISION = "codex-interruption-boundaries-v4"
 SUPPORTED_TOOLS = ("codex", "claude_code", "cursor")
 COPY_BATCH_SIZE = 2_000
 SOURCE_READ_SLACK_BYTES = 1

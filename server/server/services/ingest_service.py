@@ -327,6 +327,11 @@ def _conversation_message_metadata(normalized) -> dict:
             str(normalized.source_id),
             256,
         )
+    if normalized.source_turn_id:
+        meta["source_turn_id"] = _bounded_message_text(
+            str(normalized.source_turn_id),
+            256,
+        )
     return meta
 
 

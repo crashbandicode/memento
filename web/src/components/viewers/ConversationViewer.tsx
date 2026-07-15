@@ -3095,6 +3095,64 @@ export const ChatBubble = memo(function ChatBubble({
     );
   }
 
+  if (msg.raw_type === "turn_aborted") {
+    if (!showContext) return null;
+    return withCopyControls(
+      <div
+        data-turn-interrupted
+        role="separator"
+        aria-label={content}
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(18px, 1fr) auto minmax(18px, 1fr)",
+          alignItems: "center",
+          gap: 10,
+          padding: "5px 2px",
+        }}
+      >
+        <span aria-hidden="true" style={{ height: 1, background: "color-mix(in srgb, #F97316 24%, var(--aurora-border))" }} />
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexWrap: "wrap",
+            gap: 7,
+            minWidth: 0,
+            maxWidth: "min(82vw, 620px)",
+            padding: "6px 11px",
+            borderRadius: 999,
+            border: "1px solid color-mix(in srgb, #F97316 26%, var(--aurora-border))",
+            background: "color-mix(in srgb, #F97316 7%, var(--aurora-surface-solid))",
+            color: "color-mix(in srgb, #C2410C 82%, var(--aurora-fg2))",
+            fontSize: 11.5,
+            lineHeight: 1.35,
+            textAlign: "center",
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 7,
+              height: 7,
+              flex: "0 0 auto",
+              borderRadius: 999,
+              background: "#F97316",
+              boxShadow: "0 0 0 3px color-mix(in srgb, #F97316 13%, transparent)",
+            }}
+          />
+          <span style={{ fontWeight: 650, overflowWrap: "anywhere" }}>{content}</span>
+          {msg.timestamp && (
+            <span style={{ color: "var(--aurora-fg4)", whiteSpace: "nowrap" }}>
+              {new Date(msg.timestamp).toLocaleString(locale)}
+            </span>
+          )}
+        </div>
+        <span aria-hidden="true" style={{ height: 1, background: "color-mix(in srgb, #F97316 24%, var(--aurora-border))" }} />
+      </div>,
+    );
+  }
+
   if (isSessionContextMessage(msg)) {
     if (!showContext) return null;
     return withCopyControls(<ConversationContextCard content={content} t={t} />);

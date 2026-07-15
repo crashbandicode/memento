@@ -529,6 +529,193 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(messages[0].raw_type, "user_message")
         self.assertEqual(messages[0].source_id, "prompt-1")
 
+    def test_codex_legacy_cross_transport_delay_still_pairs(self) -> None:
+        rows = [
+            {
+                "type": "response_item",
+                "timestamp": "2026-06-24T21:02:26.016Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Keep going"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-06-24T21:02:26.848Z",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "legacy-prompt",
+                    "message": "Keep going",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].source_id, "legacy-prompt")
+
+    def test_codex_aborted_turn_replay_preserves_both_prompt_attempts(self) -> None:
+        def response(turn_id: str, timestamp: str) -> dict:
+            return {
+                "type": "response_item",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Delegate it"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                    },
+                },
+            }
+
+        def event(client_id: str, timestamp: str) -> dict:
+            return {
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "user_message",
+                    "client_id": client_id,
+                    "message": "Delegate it",
+                },
+            }
+
+        rows = [
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-a"},
+            },
+            response("turn-a", "2026-07-09T23:49:09.112Z"),
+            event("prompt-a", "2026-07-09T23:49:09.112Z"),
+            {
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "turn-a"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-b"},
+            },
+            response("turn-b", "2026-07-09T23:49:09.113Z"),
+            event("prompt-b", "2026-07-09T23:49:09.113Z"),
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(
+            [(message.role, message.raw_type) for message in messages],
+            [
+                ("user", "user_message"),
+                ("system", "turn_aborted"),
+                ("user", "user_message"),
+            ],
+        )
+        self.assertEqual(
+            [message.source_id for message in messages if message.role == "user"],
+            ["prompt-a", "prompt-b"],
+        )
+        self.assertEqual(messages[0].source_turn_id, "turn-a")
+        self.assertEqual(messages[2].source_turn_id, "turn-b")
+
+    def test_codex_aborted_different_prompt_keeps_both_turns(self) -> None:
+        rows = [
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-a"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-09T23:49:09.112Z",
+                "payload": {
+                    "type": "user_message",
+                    "turn_id": "turn-a",
+                    "client_id": "prompt-a",
+                    "message": "First request",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "turn-a"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-b"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-09T23:49:09.113Z",
+                "payload": {
+                    "type": "user_message",
+                    "turn_id": "turn-b",
+                    "client_id": "prompt-b",
+                    "message": "Different request",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(
+            [message.content for message in messages if message.role == "user"],
+            ["First request", "Different request"],
+        )
+        self.assertEqual(messages[1].raw_type, "turn_aborted")
+
+    def test_codex_delta_preserves_interruption_boundary(self) -> None:
+        rows = [
+            {
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "turn-a"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-b"},
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-09T23:49:09.113Z",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "prompt-b",
+                    "message": "Delegate it",
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].raw_type, "turn_aborted")
+        self.assertEqual(messages[0].source_turn_id, "turn-a")
+        self.assertEqual(messages[1].source_turn_id, "turn-b")
+
+    def test_codex_interruption_marker_keeps_reason_and_elapsed_time(self) -> None:
+        raw = json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-07-13T14:52:15.097Z",
+            "payload": {
+                "type": "turn_aborted",
+                "turn_id": "turn-a",
+                "reason": "interrupted",
+                "duration_ms": 6444,
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].role, "system")
+        self.assertEqual(messages[0].raw_type, "turn_aborted")
+        self.assertEqual(
+            messages[0].content,
+            "Turn interrupted · Reason: interrupted · Elapsed: 6.444s",
+        )
+
     def test_codex_attachment_suffix_still_pairs_with_event_prompt(self) -> None:
         rows = [
             {
