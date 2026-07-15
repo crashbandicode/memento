@@ -336,6 +336,11 @@ export interface ConversationToolCall {
   interaction?: QuestionInteraction;
 }
 
+export interface ConversationAttachment {
+  type: "image" | "file";
+  name: string;
+}
+
 export interface ConversationMessage {
   id: number;
   line_number: number;
@@ -344,6 +349,7 @@ export interface ConversationMessage {
   content: string;
   thinking?: string | null;
   session_context?: string | null;
+  attachments?: ConversationAttachment[];
   tool_name?: string;
   tool_input?: string;
   tool_calls?: ConversationToolCall[];

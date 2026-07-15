@@ -14,6 +14,7 @@ from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_parser import (
     count_conversation_messages,
+    normalize_message_attachments,
     normalize_tool_calls,
     parse_conversation,
 )
@@ -49,6 +50,13 @@ def _stored_tool_calls(metadata: object) -> list[dict[str, object]]:
     if not isinstance(metadata, dict):
         return []
     return normalize_tool_calls(metadata.get("tool_calls"))
+
+
+def _stored_attachments(metadata: object) -> list[dict[str, str]]:
+    """Read the same bounded attachment shape used by raw-content parsing."""
+    if not isinstance(metadata, dict):
+        return []
+    return normalize_message_attachments(metadata.get("attachments"))
 
 
 def _stored_interaction(metadata: object, key: str) -> dict | None:
@@ -327,6 +335,7 @@ async def get_conversation_messages(
                     "session_context": (m.metadata_ or {}).get(
                         "session_context", ""
                     ),
+                    "attachments": _stored_attachments(m.metadata_),
                     "tool_calls": _stored_tool_calls(m.metadata_),
                     "interaction": _stored_interaction(m.metadata_, "interaction"),
                     "interaction_response": _stored_interaction(
@@ -366,6 +375,7 @@ async def get_conversation_messages(
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
                     "session_context": m.session_context,
+                    "attachments": normalize_message_attachments(m.attachments),
                     "tool_calls": _parsed_tool_calls(m),
                     "interaction": m.interaction,
                     "interaction_response": m.interaction_response,

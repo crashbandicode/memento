@@ -307,7 +307,11 @@ def _bounded_message_text(value: str, limit: int) -> str:
 
 def _conversation_message_metadata(normalized) -> dict:
     """Build the bounded metadata persisted beside normalized text."""
-    from .conversation_parser import normalize_tool_calls, strip_terminal_sequences
+    from .conversation_parser import (
+        normalize_message_attachments,
+        normalize_tool_calls,
+        strip_terminal_sequences,
+    )
 
     meta: dict = {}
     if normalized.thinking:
@@ -332,6 +336,9 @@ def _conversation_message_metadata(normalized) -> dict:
             ),
             MAX_STORED_AUXILIARY_CHARS,
         )
+    attachments = normalize_message_attachments(normalized.attachments)
+    if attachments:
+        meta["attachments"] = attachments
     tool_calls = normalize_tool_calls(normalized.tool_calls)
     if tool_calls:
         meta["tool_calls"] = tool_calls
@@ -380,7 +387,11 @@ def iter_stored_conversation_messages(
         full_clean_content = strip_terminal_sequences(normalized.content).replace(
             "\x00", ""
         )
-        if not full_clean_content.strip() and not normalized.tool_calls:
+        if (
+            not full_clean_content.strip()
+            and not normalized.tool_calls
+            and not normalized.attachments
+        ):
             continue
         clean_content = _bounded_message_text(
             full_clean_content,

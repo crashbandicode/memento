@@ -1145,6 +1145,70 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.timestamp, "2026-06-26T12:35:00-04:00")
         self.assertIn("Potentially Relevant Websearch Results", msg.session_context)
 
+    def test_cursor_image_attachments_do_not_block_prompt_or_timestamp(self) -> None:
+        content = (
+            "[Image] [Image]\n"
+            "<image_files>\n"
+            "The following images were provided by the user:\n"
+            "1. C:\\Users\\intpa\\.cursor\\assets\\first-image.png\n"
+            "2. /home/intpa/.cursor/assets/second-image.jpg\n"
+            "</image_files>\n"
+            "<timestamp>Monday, Jun 29, 2026, 4:30 PM (UTC-4)</timestamp>\n"
+            "<user_query>Why did this fail?</user_query>"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Why did this fail?")
+        self.assertEqual(msg.timestamp, "2026-06-29T16:30:00-04:00")
+        self.assertEqual(
+            msg.attachments,
+            [
+                {"type": "image", "name": "first-image.png"},
+                {"type": "image", "name": "second-image.jpg"},
+            ],
+        )
+        self.assertNotIn("image_files", msg.session_context)
+
+    def test_cursor_literal_image_files_markup_in_prompt_is_preserved(self) -> None:
+        content = "Explain how <image_files> markup works in Cursor."
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, content)
+        self.assertEqual(msg.attachments, [])
+
+    def test_cursor_image_marker_without_path_does_not_block_timestamp(self) -> None:
+        content = (
+            "[Image]\n"
+            "<timestamp>Tuesday, Jun 23, 2026, 2:43 PM (UTC-4)</timestamp>\n"
+            "<user_query>Check the screenshot.</user_query>"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.content, "Check the screenshot.")
+        self.assertEqual(msg.timestamp, "2026-06-23T14:43:00-04:00")
+        self.assertEqual(msg.attachments, [{"type": "image", "name": "Image 1"}])
+
     def test_cursor_plugin_context_is_separated_from_prompt(self) -> None:
         content = (
             '<plugin_info kind="matched_installed">\n'

@@ -107,6 +107,25 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertEqual(stats.prompts_seen, 3)
         self.assertEqual(stats.prompts_exported, 1)
 
+    def test_attachment_metadata_is_exported_without_host_paths(self) -> None:
+        items = [
+            message(
+                1,
+                "user",
+                "What is shown here?",
+                metadata={
+                    "attachments": [
+                        {"type": "image", "name": "screen.png"},
+                    ],
+                },
+            ),
+        ]
+
+        text, _stats = self.render(items)
+
+        self.assertIn("**Attachments:** Image: `screen.png`", text)
+        self.assertNotIn("C:\\Users", text)
+
     def test_date_filter_uses_prompt_date_not_response_date(self) -> None:
         items = [
             message(1, "user", "Keep this", day=2),

@@ -292,6 +292,22 @@ def _write_interaction(
     _write(writer)
 
 
+def _write_attachments(writer: TextIO, value: object) -> None:
+    """Render bounded attachment presentation metadata without host paths."""
+    if not isinstance(value, list) or not value:
+        return
+    labels: list[str] = []
+    for item in value[:32]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "Attachment").replace("`", "'")
+        kind = str(item.get("type") or "file").strip().title()
+        labels.append(f"{kind}: `{name}`")
+    if labels:
+        _write(writer, f"**Attachments:** {', '.join(labels)}")
+        _write(writer)
+
+
 def _write_tool(
     writer: TextIO,
     name: str,
@@ -341,6 +357,7 @@ def _write_message(
     session_context = str(metadata.get("session_context") or "").strip()
     if session_context and options.include_session_context:
         _write_details(writer, "Session context", session_context)
+    _write_attachments(writer, metadata.get("attachments"))
 
     if role == "assistant":
         content = message.content.strip()
@@ -468,6 +485,7 @@ async def write_conversation_markdown(
             session_context = str(message.metadata.get("session_context") or "").strip()
             if session_context and options.include_session_context:
                 _write_details(writer, "Session context", session_context)
+            _write_attachments(writer, message.metadata.get("attachments"))
             _write(writer, message.content.strip())
             _write(writer)
             messages_exported += 1

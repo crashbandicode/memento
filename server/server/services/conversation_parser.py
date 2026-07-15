@@ -25,6 +25,10 @@ class NormalizedMessage:
     tool_input: str = ""  # Tool input/command
     thinking: str = ""  # Optional thinking/reasoning text kept separate from final response
     session_context: str = ""  # Injected context kept separate from human text
+    attachments: list[dict[str, str]] = field(default_factory=list)
+    # Attachment references emitted by the source tool.  Only presentation
+    # metadata (type and basename) is retained; host-specific absolute paths
+    # are transport details and must not leak into the human prompt.
     tool_calls: list[dict[str, object]] = field(default_factory=list)
     # Structured assistant tool calls. Each item has bounded ``name`` and
     # serialized ``input`` strings while the message itself remains one row.
@@ -107,11 +111,24 @@ _CURSOR_SESSION_CONTEXT_PREFIX_RE = re.compile(
     r"\A\s*<(?:external_links|plugin_info|uploaded_documents)(?:\s|>)",
     re.IGNORECASE,
 )
+_CURSOR_IMAGE_FILES_ENVELOPE_RE = re.compile(
+    r"\A\s*(?P<markers>(?:\[Image\]\s*)*)<image_files\b[^>]*>"
+    r"(?P<body>[\s\S]*?)</image_files>\s*",
+    re.IGNORECASE,
+)
+_CURSOR_IMAGE_PATH_RE = re.compile(
+    r"(?m)^\s*\d+\.\s+(?P<path>[^\r\n]+?)\s*$"
+)
+_CURSOR_IMAGE_MARKERS_RE = re.compile(
+    r"\A\s*(?P<markers>(?:\[Image\]\s*)+)(?=<(?:timestamp|user_query)\b)",
+    re.IGNORECASE,
+)
 
 _MAX_STRUCTURED_TOOL_CALLS = 32
 _MAX_STRUCTURED_TOOL_NAME_BYTES = 256
 _MAX_STRUCTURED_TOOL_INPUT_BYTES = 64 * 1024
 _MAX_STRUCTURED_TOOL_CALL_BYTES = 128 * 1024
+_MAX_MESSAGE_ATTACHMENTS = 32
 _TOOL_INPUT_TRUNCATION_MARKER = "\n\n[... tool input truncated by Memento ...]"
 _CODEX_ASSISTANT_TRANSPORT_PRIORITY = {
     "agent_message": 3,
@@ -185,7 +202,37 @@ def _parse_cursor_envelope_timestamp(value: str) -> str | None:
     return parsed.replace(tzinfo=tz).isoformat()
 
 
-def split_cursor_user_payload(content: str) -> tuple[str, str, str]:
+@dataclass(frozen=True)
+class CursorUserPayload:
+    content: str
+    timestamp: str = ""
+    session_context: str = ""
+    attachments: tuple[dict[str, str], ...] = ()
+
+
+def _cursor_attachment_name(path: str) -> str:
+    """Return a bounded basename for a Cursor attachment path."""
+    name = re.split(r"[\\/]", path.strip().strip('"'))[-1].strip()
+    return name[:255] or "Image"
+
+
+def normalize_message_attachments(value: object) -> list[dict[str, str]]:
+    """Return bounded, presentation-safe attachment metadata."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in value[:_MAX_MESSAGE_ATTACHMENTS]:
+        if not isinstance(item, dict):
+            continue
+        attachment_type = str(item.get("type") or "file").strip().lower()
+        if attachment_type not in {"image", "file"}:
+            attachment_type = "file"
+        name = _cursor_attachment_name(str(item.get("name") or "Attachment"))
+        normalized.append({"type": attachment_type, "name": name})
+    return normalized
+
+
+def parse_cursor_user_payload(content: str) -> CursorUserPayload:
     """Separate Cursor's leading context, timestamp, and human prompt.
 
     Only balanced, leading envelopes with names observed in Cursor exports are
@@ -194,17 +241,63 @@ def split_cursor_user_payload(content: str) -> tuple[str, str, str]:
     original = content or ""
     text = original
     context_parts: list[str] = []
+    attachments: list[dict[str, str]] = []
     while True:
         context_match = _CURSOR_SESSION_CONTEXT_RE.match(text)
-        if context_match is None:
-            break
-        context_parts.append(context_match.group(0).strip())
-        text = text[context_match.end():]
+        if context_match is not None:
+            context_parts.append(context_match.group(0).strip())
+            text = text[context_match.end():]
+            continue
+        image_match = _CURSOR_IMAGE_FILES_ENVELOPE_RE.match(text)
+        if image_match is not None:
+            paths = [
+                match.group("path")
+                for match in _CURSOR_IMAGE_PATH_RE.finditer(
+                    image_match.group("body")
+                )
+            ]
+            if paths:
+                attachments.extend(
+                    {
+                        "type": "image",
+                        "name": _cursor_attachment_name(path),
+                    }
+                    for path in paths[:32]
+                )
+            else:
+                marker_count = len(
+                    re.findall(r"\[Image\]", image_match.group("markers"), re.I)
+                )
+                attachments.extend(
+                    {"type": "image", "name": f"Image {index + 1}"}
+                    for index in range(max(1, marker_count))
+                )
+            text = text[image_match.end():]
+            continue
+        marker_match = _CURSOR_IMAGE_MARKERS_RE.match(text)
+        if marker_match is not None:
+            marker_count = len(
+                re.findall(r"\[Image\]", marker_match.group("markers"), re.I)
+            )
+            attachments.extend(
+                {"type": "image", "name": f"Image {index + 1}"}
+                for index in range(marker_count)
+            )
+            text = text[marker_match.end():]
+            continue
+        break
 
     timestamp_match = _CURSOR_TIMESTAMP_ENVELOPE_RE.match(text)
     if timestamp_match is None:
-        prompt = text.strip() if context_parts else text
-        return prompt, "", "\n\n".join(context_parts)
+        prompt = text.strip() if context_parts or attachments else text
+        query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(prompt)
+        if query_match is not None:
+            prompt = query_match.group("content").strip()
+        return CursorUserPayload(
+            content=prompt,
+            session_context="\n\n".join(context_parts),
+            attachments=tuple(attachments),
+        )
 
     parsed_timestamp = _parse_cursor_envelope_timestamp(
         timestamp_match.group("value")
@@ -212,14 +305,29 @@ def split_cursor_user_payload(content: str) -> tuple[str, str, str]:
     # Treat the tag as Cursor metadata only when its value has the exact
     # shape emitted by Cursor. A malformed leading tag may be user text.
     if parsed_timestamp is None:
-        prompt = text.strip() if context_parts else original
-        return prompt, "", "\n\n".join(context_parts)
+        prompt = text.strip() if context_parts or attachments else original
+        return CursorUserPayload(
+            content=prompt,
+            session_context="\n\n".join(context_parts),
+            attachments=tuple(attachments),
+        )
     text = text[timestamp_match.end():]
 
     query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(text)
     if query_match is not None:
         text = query_match.group("content")
-    return text.strip(), parsed_timestamp, "\n\n".join(context_parts)
+    return CursorUserPayload(
+        content=text.strip(),
+        timestamp=parsed_timestamp,
+        session_context="\n\n".join(context_parts),
+        attachments=tuple(attachments),
+    )
+
+
+def split_cursor_user_payload(content: str) -> tuple[str, str, str]:
+    """Compatibility tuple for callers that do not render attachments."""
+    payload = parse_cursor_user_payload(content)
+    return payload.content, payload.timestamp, payload.session_context
 
 
 def has_cursor_session_context_prefix(content: str | None) -> bool:
@@ -229,8 +337,14 @@ def has_cursor_session_context_prefix(content: str | None) -> bool:
 
 def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
     """Return Cursor's human prompt and optional envelope timestamp."""
-    normalized, timestamp, _context = split_cursor_user_payload(content)
-    return normalized, timestamp
+    payload = parse_cursor_user_payload(content)
+    if not (
+        payload.timestamp
+        or payload.session_context
+        or payload.attachments
+    ):
+        return content, ""
+    return payload.content, payload.timestamp
 
 
 def _codex_uuid(value: object) -> str | None:
@@ -853,10 +967,13 @@ def parse_conversation_object(
         else:
             content = _extract_content(raw_content)
         session_context = ""
+        attachments: tuple[dict[str, str], ...] = ()
         if role == "user":
-            content, envelope_timestamp, session_context = split_cursor_user_payload(
-                content
-            )
+            payload = parse_cursor_user_payload(content)
+            content = payload.content
+            envelope_timestamp = payload.timestamp
+            session_context = payload.session_context
+            attachments = payload.attachments
             if not envelope_timestamp:
                 # Older Cursor records can carry only the outer query wrapper.
                 # Match the whole payload so literal tags within a prompt are
@@ -875,7 +992,9 @@ def parse_conversation_object(
                     raw_type="cursor_context",
                     source_id=source_id,
                 )
-        if role in ("user", "assistant") and (content.strip() or tool_calls):
+        if role in ("user", "assistant") and (
+            content.strip() or tool_calls or attachments
+        ):
             # Skip tool_result/tool_use noise
             if not tool_calls and (
                 content.startswith("[Tool:") or content.startswith("[Result]")
@@ -884,6 +1003,7 @@ def parse_conversation_object(
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
                 session_context=session_context,
+                attachments=list(attachments),
                 tool_calls=tool_calls, timestamp=timestamp,
                 raw_type=msg_type or role, source_id=source_id,
             )

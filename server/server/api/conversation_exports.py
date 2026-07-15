@@ -321,6 +321,8 @@ async def _message_stream(
             metadata["tool_input"] = message.tool_input
         if message.session_context:
             metadata["session_context"] = message.session_context
+        if message.attachments:
+            metadata["attachments"] = message.attachments
         if message.tool_calls:
             metadata["tool_calls"] = message.tool_calls
         if message.interaction:

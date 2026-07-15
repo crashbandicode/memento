@@ -2434,6 +2434,65 @@ function ConversationContextCard({
   );
 }
 
+function MessageAttachments({
+  attachments,
+  t,
+}: {
+  attachments: NonNullable<ConversationMessage["attachments"]>;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <div
+      data-message-attachments
+      style={{
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: 7,
+        marginBottom: 8,
+        padding: "9px 11px",
+        borderRadius: 11,
+        border: "1px solid color-mix(in srgb, var(--aurora-accent) 18%, var(--aurora-border))",
+        background: "color-mix(in srgb, var(--aurora-accent) 4%, var(--aurora-surface-solid))",
+      }}
+    >
+      <span style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        color: "var(--aurora-fg3)",
+        fontSize: 10.5,
+        fontWeight: 650,
+      }}>
+        <Icon name="file_text" size={13} />
+        {t.conversation.attachments}
+      </span>
+      {attachments.map((attachment, index) => (
+        <span
+          key={`${attachment.type}-${attachment.name}-${index}`}
+          title={attachment.name}
+          style={{
+            maxWidth: "min(100%, 340px)",
+            padding: "4px 8px",
+            borderRadius: 999,
+            background: "var(--aurora-chip)",
+            color: "var(--aurora-fg2)",
+            fontSize: 10.5,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {attachment.type === "image"
+            ? `${t.conversation.imageAttachment} ${index + 1}`
+            : attachment.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function markdownCodeBlock(value: string): string {
   const clean = value.trim();
   if (!clean) return "";
@@ -2502,6 +2561,13 @@ export function conversationMessageMarkdown(
 
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   if (sessionContext) parts.push(markdownQuote("Session context", sessionContext));
+  if (msg.attachments?.length) {
+    const labels = msg.attachments.map((attachment) => {
+      const kind = attachment.type === "image" ? "Image" : "File";
+      return `${kind}: \`${attachment.name.replaceAll("`", "'")}\``;
+    });
+    parts.push(`**Attachments:** ${labels.join(", ")}`);
+  }
 
   if (msg.interaction_response) {
     const response = msg.interaction_response;
@@ -2750,6 +2816,12 @@ export const ChatBubble = memo(function ChatBubble({
   const toolInput = cleanTerminalText(msg.tool_input ?? "");
   const thinking = cleanTerminalText(msg.thinking?.trim() || "");
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
+  const attachments = msg.attachments || [];
+  const messageTime = msg.timestamp
+    ? new Date(msg.timestamp).toLocaleString(locale)
+    : toolId === "cursor"
+      ? t.conversation.timeUnavailable
+      : "";
   const [expanded, setExpanded] = useState(false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const messageMarkdown = useMemo(
@@ -2844,6 +2916,7 @@ export const ChatBubble = memo(function ChatBubble({
               <ConversationContextCard content={sessionContext} t={t} />
             </div>
           )}
+          <MessageAttachments attachments={attachments} t={t} />
           <div style={{ display: "flex", gap: 8, marginBottom: 5, alignItems: "center", padding: "0 4px" }}>
             <span
               aria-hidden="true"
@@ -2863,9 +2936,9 @@ export const ChatBubble = memo(function ChatBubble({
               Y
             </span>
             <span style={{ fontSize: 10.5, fontWeight: 600, color: "var(--aurora-accent)" }}>You</span>
-            {msg.timestamp && (
+            {messageTime && (
               <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
-                {new Date(msg.timestamp).toLocaleString(locale)}
+                {messageTime}
               </span>
             )}
           </div>
@@ -2983,9 +3056,9 @@ export const ChatBubble = memo(function ChatBubble({
                   A
                 </span>
                 <span style={{ fontSize: 10.5, fontWeight: 600, color: "#10B981" }}>Assistant</span>
-                {msg.timestamp && (
+                {messageTime && (
                   <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
-                    {new Date(msg.timestamp).toLocaleString(locale)}
+                    {messageTime}
                   </span>
                 )}
               </div>

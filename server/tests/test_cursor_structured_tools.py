@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.conversations import (  # noqa: E402
     _parsed_tool_calls,
+    _stored_attachments,
     _stored_tool_calls,
 )
 from server.services.conversation_parser import NormalizedMessage  # noqa: E402
@@ -25,6 +26,9 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
             role="assistant",
             content="I will inspect it.",
             thinking="separate reasoning",
+            attachments=[
+                {"type": "image", "name": "screenshot.png"},
+            ],
             tool_calls=[
                 {"name": "Read", "input": '{"path":"/tmp/input.json"}'},
                 {
@@ -64,6 +68,10 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         self.assertEqual(metadata["thinking"], "separate reasoning")
         self.assertEqual(metadata["interaction"], message.interaction)
         self.assertEqual(metadata["interaction_response"], message.interaction_response)
+        self.assertEqual(
+            _stored_attachments(metadata),
+            [{"type": "image", "name": "screenshot.png"}],
+        )
         parsed_calls = _parsed_tool_calls(message)
         stored_calls = _stored_tool_calls(metadata)
         self.assertEqual(stored_calls, parsed_calls)
