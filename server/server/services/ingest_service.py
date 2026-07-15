@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, select, text, update
@@ -22,6 +23,11 @@ from ..db.models import (
     Tool,
 )
 from ..tool_catalog import tool_display_name
+from .history_recovery import (
+    UserOccurrence,
+    partition_recovered_occurrences,
+    recovered_occurrence_anchors,
+)
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
 
 # Set of background tasks — prevents GC from collecting them before completion
@@ -507,6 +513,209 @@ def _history_line_number(index: int) -> int:
     if not 0 <= index < MAX_USER_HISTORY_ENTRIES:
         raise ValueError("history index is outside the bounded range")
     return -MAX_USER_HISTORY_ENTRIES + index
+
+
+async def _open_conversation_line_range(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    anchor: int,
+    count: int,
+    current_max: int | None = None,
+) -> int:
+    """Open a collision-free positive line range and return the new maximum."""
+    if current_max is None:
+        current_max = (
+            await db.execute(
+                select(func.max(ConversationMessage.line_number)).where(
+                    ConversationMessage.document_id == document_id,
+                    ConversationMessage.line_number >= 1,
+                )
+            )
+        ).scalar() or 0
+    if anchor <= current_max:
+        await db.execute(
+            update(ConversationMessage)
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.line_number >= anchor,
+            )
+            .values(line_number=-ConversationMessage.line_number)
+            .execution_options(synchronize_session=False)
+        )
+        await db.execute(
+            update(ConversationMessage)
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.line_number >= -current_max,
+                ConversationMessage.line_number <= -anchor,
+            )
+            .values(line_number=-ConversationMessage.line_number + count)
+            .execution_options(synchronize_session=False)
+        )
+    return current_max + count
+
+
+async def _reconcile_recovered_history_rows(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+) -> tuple[int, int]:
+    """Remove recovered/source duplicates and place true gaps chronologically.
+
+    Negative line numbers were originally chosen only to avoid uniqueness
+    collisions. Every reader orders by line number and line-jump APIs reject
+    negatives, so they are not a valid presentation order. Surviving history
+    rows are inserted before the next timestamped source event while source
+    order remains otherwise unchanged.
+    """
+    history_rows = (
+        await db.execute(
+            select(ConversationMessage)
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.message_type == "history_user_message",
+            )
+            .order_by(
+                ConversationMessage.timestamp,
+                ConversationMessage.line_number,
+                ConversationMessage.id,
+            )
+        )
+    ).scalars().all()
+    if not history_rows:
+        return 0, 0
+
+    source_user_rows = (
+        await db.execute(
+            select(
+                ConversationMessage.id,
+                ConversationMessage.content,
+                ConversationMessage.timestamp,
+                ConversationMessage.line_number,
+            ).where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.role == "user",
+                ConversationMessage.message_type.is_distinct_from(
+                    "history_user_message"
+                ),
+            )
+        )
+    ).all()
+    matched, missing = partition_recovered_occurrences(
+        [
+            UserOccurrence(
+                key=row.id,
+                content=row.content,
+                timestamp=row.timestamp,
+                line_number=row.line_number,
+            )
+            for row in source_user_rows
+        ],
+        [
+            UserOccurrence(
+                key=row.id,
+                content=row.content,
+                timestamp=row.timestamp,
+                line_number=row.line_number,
+            )
+            for row in history_rows
+        ],
+    )
+    history_by_id = {row.id: row for row in history_rows}
+    for occurrence in matched:
+        await db.delete(history_by_id[occurrence.key])
+    if matched:
+        await db.flush()
+
+    pending = [
+        history_by_id[occurrence.key]
+        for occurrence in missing
+        if history_by_id[occurrence.key].line_number < 1
+    ]
+    if not pending:
+        return len(matched), 0
+
+    source_timeline_rows = (
+        await db.execute(
+            select(
+                ConversationMessage.id,
+                ConversationMessage.content,
+                ConversationMessage.timestamp,
+                ConversationMessage.line_number,
+            )
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.line_number >= 1,
+                ConversationMessage.message_type.is_distinct_from(
+                    "history_user_message"
+                ),
+            )
+            .order_by(ConversationMessage.line_number)
+        )
+    ).all()
+    timeline = [
+        UserOccurrence(
+            key=row.id,
+            content=row.content,
+            timestamp=row.timestamp,
+            line_number=row.line_number,
+        )
+        for row in source_timeline_rows
+    ]
+    pending_occurrences = [
+        UserOccurrence(
+            key=row.id,
+            content=row.content,
+            timestamp=row.timestamp,
+            line_number=row.line_number,
+        )
+        for row in pending
+    ]
+    anchors = recovered_occurrence_anchors(timeline, pending_occurrences)
+    max_line = (
+        await db.execute(
+            select(func.max(ConversationMessage.line_number)).where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.line_number >= 1,
+            )
+        )
+    ).scalar() or 0
+
+    # Move unplaced history rows below the range produced by temporarily
+    # negating positive rows. This makes each range shift collision-free under
+    # the document/line unique index.
+    temporary_start = -(max_line + len(pending) + 1)
+    for index, row in enumerate(pending):
+        row.line_number = temporary_start + index
+    await db.flush()
+
+    from collections import defaultdict
+
+    groups: dict[int, list[ConversationMessage]] = defaultdict(list)
+    for row in pending:
+        groups[anchors[row.id]].append(row)
+    current_max = max_line
+    for anchor in sorted(groups, reverse=True):
+        rows = sorted(
+            groups[anchor],
+            key=lambda row: (
+                row.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+                str((row.metadata_ or {}).get("source_id") or ""),
+                row.id,
+            ),
+        )
+        count = len(rows)
+        current_max = await _open_conversation_line_range(
+            db,
+            document_id,
+            anchor=anchor,
+            count=count,
+            current_max=current_max,
+        )
+        for index, row in enumerate(rows):
+            row.line_number = anchor + index
+        await db.flush()
+    return len(matched), len(pending)
 
 
 # Re-sanitize patterns (defense-in-depth)
@@ -1932,42 +2141,51 @@ async def _extract_messages(
 
             codex_normalizer = normalize_codex_user_payload
         # history.jsonl is append-only within a session, so its per-session
-        # ordinal is a stable source identity.  Retain a timestamp/content
-        # multiset only as a compatibility bridge for rows ingested before
-        # source IDs were persisted.  A plain set of content incorrectly
-        # discarded valid repeated prompts and reused negative line numbers
-        # on later DELTA uploads.
-        from collections import Counter
-
-        existing = await db.execute(
+        # ordinal is a stable source identity. Rollout events are written after
+        # submission, however, so exact timestamp-second equality produces
+        # duplicates. Reconcile identical content one-to-one within the bounded
+        # transport-delay window; this preserves genuinely repeated prompts.
+        source_users = await db.execute(
             select(
+                ConversationMessage.id,
                 ConversationMessage.content,
                 ConversationMessage.timestamp,
-                ConversationMessage.metadata_,
                 ConversationMessage.line_number,
             ).where(
                 ConversationMessage.document_id == doc.id,
                 ConversationMessage.role == "user",
-            )
+                ConversationMessage.message_type.is_distinct_from(
+                    "history_user_message"
+                ),
+            ).order_by(ConversationMessage.line_number)
         )
-        existing_rows = existing.all()
-        existing_identities = Counter(
-            (
-                row.content,
-                int(row.timestamp.timestamp()) if row.timestamp else None,
+        source_occurrences = [
+            UserOccurrence(
+                key=row.id,
+                content=row.content,
+                timestamp=row.timestamp,
+                line_number=row.line_number,
             )
-            for row in existing_rows
-        )
+            for row in source_users.all()
+        ]
+        existing_history = (
+            await db.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.message_type == "history_user_message",
+                )
+            )
+        ).scalars().all()
         existing_source_ids = {
             str((row.metadata_ or {}).get("source_id"))
-            for row in existing_rows
+            for row in existing_history
             if (row.metadata_ or {}).get("source_id")
         }
         used_history_lines = {
-            row.line_number for row in existing_rows if row.line_number < 0
+            row.line_number for row in existing_history if row.line_number < 0
         }
-        injected = 0
-        next_free_history_index = 0
+        prepared_history: list[tuple[int, str, datetime | None, str]] = []
         for history_index, entry in enumerate(user_history):
             text = entry.get("text", "").strip()
             if codex_normalizer is not None:
@@ -1990,14 +2208,27 @@ async def _extract_messages(
             source_id = f"codex-history:{history_index}"
             if source_id in existing_source_ids:
                 continue
-            identity = (
-                clean_history,
-                int(ts.timestamp()) if ts is not None else None,
+            prepared_history.append(
+                (history_index, clean_history, ts, source_id)
             )
-            if existing_identities[identity] > 0:
-                existing_identities[identity] -= 1
-                continue
 
+        _, missing_history = partition_recovered_occurrences(
+            source_occurrences,
+            [
+                UserOccurrence(
+                    key=history_index,
+                    content=content,
+                    timestamp=ts,
+                )
+                for history_index, content, ts, _ in prepared_history
+            ],
+        )
+        missing_indexes = {int(row.key) for row in missing_history}
+        injected = 0
+        next_free_history_index = 0
+        for history_index, clean_history, ts, source_id in prepared_history:
+            if history_index not in missing_indexes:
+                continue
             preferred_line = _history_line_number(history_index)
             if preferred_line in used_history_lines:
                 while (
@@ -2029,6 +2260,7 @@ async def _extract_messages(
             injected += 1
         if injected:
             await db.flush()
+        await _reconcile_recovered_history_rows(db, doc.id)
     elif not user_history:
         # Fallback: first_user_message from state_5.sqlite
         first_user_msg = (first_user_message or "").strip()
@@ -2054,10 +2286,34 @@ async def _extract_messages(
                     first_user_msg.replace("\x00", ""),
                     MAX_STORED_MESSAGE_CHARS,
                 )
+                first_non_system, max_line = (
+                    await db.execute(
+                        select(
+                            func.min(ConversationMessage.line_number).filter(
+                                ConversationMessage.role.is_distinct_from(
+                                    "system"
+                                )
+                            ),
+                            func.max(ConversationMessage.line_number),
+                        ).where(
+                            ConversationMessage.document_id == doc.id,
+                            ConversationMessage.line_number >= 1,
+                        )
+                    )
+                ).one()
+                max_line = max_line or 0
+                anchor = first_non_system or max_line + 1
+                await _open_conversation_line_range(
+                    db,
+                    doc.id,
+                    anchor=anchor,
+                    count=1,
+                    current_max=max_line,
+                )
                 db.add(
                     ConversationMessage(
                         document_id=doc.id,
-                        line_number=0,
+                        line_number=anchor,
                         message_type="first_user_message",
                         role="user",
                         content=clean_first_user,

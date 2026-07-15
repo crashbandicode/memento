@@ -37,6 +37,11 @@ from server.services.ingest_service import (
     iter_stored_conversation_messages,
 )
 from server.services.large_content_store import read_large_content
+from server.services.history_recovery import (
+    UserOccurrence,
+    partition_recovered_occurrences,
+    recovered_occurrence_anchors,
+)
 
 
 PARSER_REVISION = "codex-tools-v2"
@@ -627,6 +632,247 @@ async def status(run_id: uuid.UUID) -> dict:
         await conn.close()
 
 
+async def _open_reparse_line_range(
+    conn: asyncpg.Connection,
+    document_id: uuid.UUID,
+    *,
+    anchor: int,
+    count: int,
+    current_max: int,
+) -> int:
+    """Open a positive line range during atomic reparse cutover."""
+    if anchor <= current_max:
+        await conn.execute(
+            """
+            UPDATE conversation_messages
+            SET line_number=-line_number
+            WHERE document_id=$1 AND line_number >= $2
+            """,
+            document_id,
+            anchor,
+        )
+        await conn.execute(
+            """
+            UPDATE conversation_messages
+            SET line_number=-line_number + $4
+            WHERE document_id=$1
+              AND line_number BETWEEN $2 AND $3
+            """,
+            document_id,
+            -current_max,
+            -anchor,
+            count,
+        )
+    return current_max + count
+
+
+async def _restore_recovered_history(
+    conn: asyncpg.Connection,
+    run_id: uuid.UUID,
+) -> int:
+    """Restore only history prompts absent from freshly parsed rollout rows."""
+    history_rows = await conn.fetch(
+        """
+        SELECT s.*
+        FROM reparse_special_messages s
+        JOIN conversation_reparse_manifest m
+          ON m.run_id=$1 AND m.document_id=s.document_id
+        WHERE m.status='staged'
+          AND s.message_type='history_user_message'
+        ORDER BY s.document_id, s.timestamp, s.line_number, s.id
+        """,
+        run_id,
+    )
+    by_document: dict[uuid.UUID, list[asyncpg.Record]] = {}
+    for row in history_rows:
+        by_document.setdefault(row["document_id"], []).append(row)
+
+    restored = 0
+    for document_id, recovered_rows in by_document.items():
+        source_user_rows = await conn.fetch(
+            """
+            SELECT id, content, timestamp, line_number
+            FROM conversation_messages
+            WHERE document_id=$1 AND role='user'
+              AND message_type IS DISTINCT FROM 'history_user_message'
+            ORDER BY line_number
+            """,
+            document_id,
+        )
+        _, missing = partition_recovered_occurrences(
+            [
+                UserOccurrence(
+                    key=row["id"],
+                    content=row["content"],
+                    timestamp=row["timestamp"],
+                    line_number=row["line_number"],
+                )
+                for row in source_user_rows
+            ],
+            [
+                UserOccurrence(
+                    key=row["id"],
+                    content=row["content"],
+                    timestamp=row["timestamp"],
+                    line_number=row["line_number"],
+                )
+                for row in recovered_rows
+            ],
+        )
+        if not missing:
+            continue
+
+        timeline_rows = await conn.fetch(
+            """
+            SELECT id, content, timestamp, line_number
+            FROM conversation_messages
+            WHERE document_id=$1 AND line_number >= 1
+              AND message_type IS DISTINCT FROM 'history_user_message'
+            ORDER BY line_number
+            """,
+            document_id,
+        )
+        anchors = recovered_occurrence_anchors(
+            [
+                UserOccurrence(
+                    key=row["id"],
+                    content=row["content"],
+                    timestamp=row["timestamp"],
+                    line_number=row["line_number"],
+                )
+                for row in timeline_rows
+            ],
+            missing,
+        )
+        max_line = max(
+            (row["line_number"] for row in timeline_rows),
+            default=0,
+        )
+        recovered_by_id = {row["id"]: row for row in recovered_rows}
+        temporary_start = -(max_line + len(missing) + 1)
+        for index, occurrence in enumerate(missing):
+            await conn.execute(
+                """
+                INSERT INTO conversation_messages (
+                    id, document_id, line_number, message_type, role,
+                    content, metadata, timestamp, created_at
+                )
+                SELECT id, document_id, $2, message_type, role,
+                       content, metadata, timestamp, created_at
+                FROM reparse_special_messages
+                WHERE id=$1
+                """,
+                occurrence.key,
+                temporary_start + index,
+            )
+
+        groups: dict[int, list[asyncpg.Record]] = {}
+        for occurrence in missing:
+            groups.setdefault(anchors[occurrence.key], []).append(
+                recovered_by_id[occurrence.key]
+            )
+        current_max = max_line
+        for anchor in sorted(groups, reverse=True):
+            rows = sorted(
+                groups[anchor],
+                key=lambda row: (
+                    row["timestamp"].timestamp()
+                    if row["timestamp"] is not None
+                    else float("inf"),
+                    row["id"],
+                ),
+            )
+            count = len(rows)
+            current_max = await _open_reparse_line_range(
+                conn,
+                document_id,
+                anchor=anchor,
+                count=count,
+                current_max=current_max,
+            )
+            for index, row in enumerate(rows):
+                await conn.execute(
+                    """
+                    UPDATE conversation_messages
+                    SET line_number=$2
+                    WHERE id=$1
+                    """,
+                    row["id"],
+                    anchor + index,
+                )
+        restored += len(missing)
+    return restored
+
+
+async def _restore_first_user_messages(
+    conn: asyncpg.Connection,
+    run_id: uuid.UUID,
+) -> int:
+    """Restore sparse-source user fallbacks at a reader-addressable line."""
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT ON (s.document_id) s.*
+        FROM reparse_special_messages s
+        JOIN conversation_reparse_manifest m
+          ON m.run_id=$1 AND m.document_id=s.document_id
+        WHERE m.status='staged'
+          AND s.message_type='first_user_message'
+        ORDER BY s.document_id, s.line_number, s.id
+        """,
+        run_id,
+    )
+    restored = 0
+    for row in rows:
+        document_id = row["document_id"]
+        has_user = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM conversation_messages
+                WHERE document_id=$1 AND role='user'
+            )
+            """,
+            document_id,
+        )
+        if has_user:
+            continue
+        placement = await conn.fetchrow(
+            """
+            SELECT min(line_number) FILTER (
+                       WHERE role IS DISTINCT FROM 'system'
+                   ) AS first_non_system,
+                   coalesce(max(line_number), 0) AS max_line
+            FROM conversation_messages
+            WHERE document_id=$1 AND line_number >= 1
+            """,
+            document_id,
+        )
+        max_line = placement["max_line"]
+        anchor = placement["first_non_system"] or max_line + 1
+        await _open_reparse_line_range(
+            conn,
+            document_id,
+            anchor=anchor,
+            count=1,
+            current_max=max_line,
+        )
+        await conn.execute(
+            """
+            INSERT INTO conversation_messages (
+                id, document_id, line_number, message_type, role,
+                content, metadata, timestamp, created_at
+            )
+            SELECT id, document_id, $2, message_type, role,
+                   content, metadata, timestamp, created_at
+            FROM reparse_special_messages
+            WHERE id=$1
+            """,
+            row["id"],
+            anchor,
+        )
+        restored += 1
+    return restored
+
+
 async def cutover(
     run_id: uuid.UUID,
     *,
@@ -770,86 +1016,8 @@ async def cutover(
                 """,
                 run_id,
             )
-            restored_history = await conn.fetchval(
-                """
-                WITH ranked_history AS (
-                    SELECT s.*,
-                           row_number() OVER (
-                               PARTITION BY document_id, content,
-                                            date_trunc('second', timestamp)
-                               ORDER BY line_number, id
-                           ) AS identity_ordinal
-                    FROM reparse_special_messages s
-                    WHERE message_type='history_user_message'
-                ), parsed_counts AS (
-                    SELECT document_id, content,
-                           date_trunc('second', timestamp) AS timestamp_bucket,
-                           count(*) AS parsed_count
-                    FROM conversation_messages
-                    WHERE role='user'
-                      AND document_id IN (
-                          SELECT document_id
-                          FROM conversation_reparse_manifest
-                          WHERE run_id=$1 AND status='staged'
-                      )
-                    GROUP BY document_id, content,
-                             date_trunc('second', timestamp)
-                ), added AS (
-                    INSERT INTO conversation_messages (
-                        document_id, line_number, message_type, role,
-                        content, metadata, timestamp, created_at
-                    )
-                    SELECT h.document_id, h.line_number, h.message_type, h.role,
-                           h.content, h.metadata, h.timestamp, h.created_at
-                    FROM ranked_history h
-                    LEFT JOIN parsed_counts p
-                      ON p.document_id=h.document_id
-                     AND p.content=h.content
-                     AND p.timestamp_bucket IS NOT DISTINCT FROM
-                         date_trunc('second', h.timestamp)
-                    WHERE h.identity_ordinal > coalesce(p.parsed_count, 0)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_messages current
-                          WHERE current.document_id=h.document_id
-                            AND current.metadata->>'source_id' IS NOT NULL
-                            AND current.metadata->>'source_id'=
-                                h.metadata->>'source_id'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_messages current
-                          WHERE current.document_id=h.document_id
-                            AND current.line_number=h.line_number
-                      )
-                    RETURNING 1
-                ) SELECT count(*) FROM added
-                """,
-                run_id,
-            )
-            restored_first = await conn.fetchval(
-                """
-                WITH added AS (
-                    INSERT INTO conversation_messages (
-                        document_id, line_number, message_type, role,
-                        content, metadata, timestamp, created_at
-                    )
-                    SELECT s.document_id, s.line_number, s.message_type, s.role,
-                           s.content, s.metadata, s.timestamp, s.created_at
-                    FROM reparse_special_messages s
-                    WHERE s.message_type='first_user_message'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_messages current
-                          WHERE current.document_id=s.document_id
-                            AND current.role='user'
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM conversation_messages current
-                          WHERE current.document_id=s.document_id
-                            AND current.line_number=s.line_number
-                      )
-                    RETURNING 1
-                ) SELECT count(*) FROM added
-                """
-            )
+            restored_history = await _restore_recovered_history(conn, run_id)
+            restored_first = await _restore_first_user_messages(conn, run_id)
             invalidated_embeddings = await conn.fetchval(
                 """
                 WITH removed AS (
