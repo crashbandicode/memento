@@ -71,6 +71,7 @@ from ..db.models import (
     KnowledgeEntity, KnowledgeObservation, KnowledgeRelation, Machine,
     Project, ShareLink, Tool, User,
 )
+from ..tool_catalog import tool_display_name
 
 logger = logging.getLogger("memento.import")
 
@@ -225,16 +226,6 @@ def _parse_date(v: Any) -> date | None:
 async def _ensure_tools(db: AsyncSession, tool_ids: set[str]) -> None:
     """Lazily INSERT-OR-NOTHING tool rows the destination doesn't have.
     Mirrors the ingest_service.ensure_tool pattern but bulk-style."""
-    # Display name fallback table mirrors ingest_service.TOOL_DISPLAY_NAMES.
-    DEFAULTS = {
-        "claude_code": "Claude Code",
-        "openclaw": "OpenClaw",
-        "codex": "Codex",
-        "antigravity": "Antigravity",
-        "obsidian": "Obsidian",
-        "cursor": "Cursor",
-        "hermes": "Hermes",
-    }
     if not tool_ids:
         return
     existing = (await db.execute(
@@ -244,7 +235,7 @@ async def _ensure_tools(db: AsyncSession, tool_ids: set[str]) -> None:
     for tid in missing:
         await db.execute(
             pg_insert(Tool)
-            .values(id=tid, display_name=DEFAULTS.get(tid, tid.replace("_", " ").title()))
+            .values(id=tid, display_name=tool_display_name(tid))
             .on_conflict_do_nothing(index_elements=[Tool.id])
         )
 

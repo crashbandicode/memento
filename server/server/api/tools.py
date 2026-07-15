@@ -11,6 +11,7 @@ from sqlalchemy.orm import load_only
 from ..db.models import Document, Machine, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..tool_catalog import tool_display_name
 from ..services.conversation_activity import (
     conversation_list_timestamp_expression,
     effective_conversation_activity,
@@ -126,13 +127,6 @@ async def list_tools(
     ]
 
 
-TOOL_DISPLAY_NAMES = {
-    "claude_code": "Claude Code", "openclaw": "OpenClaw", "codex": "Codex",
-    "antigravity": "Antigravity", "obsidian": "Obsidian", "cursor": "Cursor",
-    "windsurf": "Windsurf", "vscode": "VS Code", "hermes": "Hermes",
-}
-
-
 @router.get("/{tool_id}")
 async def get_tool(
     tool_id: str,
@@ -147,7 +141,7 @@ async def get_tool(
 
     if not tool:
         return {
-            "id": tool_id, "display_name": TOOL_DISPLAY_NAMES.get(tool_id, tool_id),
+            "id": tool_id, "display_name": tool_display_name(tool_id),
             "total_files": 0, "total_size_bytes": 0, "last_sync_at": None, "categories": {},
         }
 

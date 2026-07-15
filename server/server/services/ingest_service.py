@@ -21,6 +21,7 @@ from ..db.models import (
     SyncState,
     Tool,
 )
+from ..tool_catalog import tool_display_name
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
 
 # Set of background tasks — prevents GC from collecting them before completion
@@ -53,17 +54,6 @@ def _get_ingest_semaphore() -> asyncio.Semaphore:
         _ingest_semaphore = _asyncio.Semaphore(24)
     return _ingest_semaphore
 
-
-# Known tool display names
-TOOL_DISPLAY_NAMES = {
-    "claude_code": "Claude Code",
-    "openclaw": "OpenClaw",
-    "codex": "Codex",
-    "antigravity": "Antigravity",
-    "obsidian": "Obsidian",
-    "cursor": "Cursor",
-    "hermes": "Hermes",
-}
 
 MAX_STORED_MESSAGE_CHARS = 256 * 1024
 MAX_STORED_AUXILIARY_CHARS = 128 * 1024
@@ -748,7 +738,7 @@ async def ensure_tool(db: AsyncSession, tool_id: str) -> Tool:
     if tool is None:
         tool = Tool(
             id=tool_id,
-            display_name=TOOL_DISPLAY_NAMES.get(tool_id, tool_id),
+            display_name=tool_display_name(tool_id),
         )
         db.add(tool)
         await db.flush()

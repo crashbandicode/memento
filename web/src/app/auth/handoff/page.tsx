@@ -26,13 +26,13 @@ export default function HandoffPage() {
       next && next.startsWith("/") && !/^\/[/\\]/.test(next) ? next : "/app";
 
     if (!token) {
-      setFailed(true);
+      queueMicrotask(() => setFailed(true));
       return;
     }
     try {
       localStorage.setItem("dr_token", token);
     } catch {
-      setFailed(true);
+      queueMicrotask(() => setFailed(true));
       return;
     }
     // Drop the token from the address bar before navigating away.
