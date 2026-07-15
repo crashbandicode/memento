@@ -112,7 +112,9 @@ class ConversationParserTests(unittest.TestCase):
 
         messages = parse_conversation(raw, "cursor")
 
-        interaction = messages[0].tool_calls[0]["interaction"]
+        self.assertEqual(messages[0].role, "tool")
+        interaction = messages[0].interaction
+        assert interaction is not None
         self.assertEqual(interaction["questions"][0]["type"], "multi_select")
         response = messages[1].interaction_response
         assert response is not None
@@ -288,7 +290,9 @@ class ConversationParserTests(unittest.TestCase):
             },
         })
         question = list(iter_conversation_messages(cursor_question_raw, "cursor"))[0]
-        interaction = question.tool_calls[0]["interaction"]
+        self.assertEqual(question.role, "tool")
+        interaction = question.interaction
+        assert interaction is not None
 
         cursor_response_raw = json.dumps({
             "role": "user",
@@ -1270,8 +1274,70 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertEqual(total, 3)
         self.assertEqual(len(page), 1)
-        self.assertEqual(page[0].content, "")
-        self.assertEqual(page[0].tool_calls[0]["name"], "Read")
+        self.assertEqual(page[0].role, "tool")
+        self.assertEqual(page[0].raw_type, "tool_call")
+        self.assertEqual(page[0].tool_name, "Read")
+        self.assertIn("results.jsonl", page[0].tool_input)
+
+    def test_cursor_composite_assistant_record_expands_to_semantic_rows(self) -> None:
+        raw = json.dumps({
+            "role": "assistant",
+            "timestamp": "2026-07-15T10:00:00Z",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "I will inspect both files."},
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"path": "/tmp/one.py"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Shell",
+                        "input": {"command": "python -m pytest"},
+                    },
+                ],
+            },
+        })
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(
+            [(message.role, message.raw_type) for message in messages],
+            [
+                ("assistant", "assistant"),
+                ("tool", "tool_call"),
+                ("tool", "tool_call"),
+            ],
+        )
+        self.assertEqual(messages[0].content, "I will inspect both files.")
+        self.assertEqual(
+            [message.tool_name for message in messages[1:]],
+            ["Read", "Shell"],
+        )
+        self.assertTrue(all(message.timestamp for message in messages))
+        self.assertFalse(any(message.tool_calls for message in messages))
+
+    def test_cursor_tool_result_block_expands_without_a_fake_user_row(self) -> None:
+        raw = json.dumps({
+            "role": "user",
+            "timestamp": "2026-07-15T10:00:01Z",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "cursor-call-1",
+                    "content": "command completed",
+                }],
+            },
+        })
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].role, "tool")
+        self.assertEqual(messages[0].raw_type, "tool_output")
+        self.assertEqual(messages[0].tool_call_id, "cursor-call-1")
+        self.assertEqual(messages[0].content, "command completed")
 
     def test_cursor_malformed_tool_fields_are_safe_and_calls_are_bounded(self) -> None:
         calls = [

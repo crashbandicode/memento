@@ -812,19 +812,7 @@ def parse_conversation_object(
             raw_content = message.get("content", "")
         else:
             raw_content = message
-        source_id = str(
-            obj.get("id")
-            or obj.get("uuid")
-            or obj.get("bubbleId")
-            or (
-                message.get("id")
-                or message.get("uuid")
-                or message.get("bubbleId")
-                if isinstance(message, dict)
-                else ""
-            )
-            or ""
-        )
+        source_id = _cursor_source_id(obj, message)
         thinking = _extract_thinking_parts(raw_content)
         tool_calls: list[dict[str, str]] = []
         if role == "assistant":
@@ -1408,6 +1396,172 @@ def _extract_cursor_assistant_content(
     return prose, normalize_tool_calls(raw_calls)
 
 
+def _cursor_source_id(obj: dict, message: object) -> str:
+    """Return Cursor's stable bubble identity when an export provides one."""
+    message_mapping = _as_mapping(message)
+    return str(
+        obj.get("id")
+        or obj.get("uuid")
+        or obj.get("bubbleId")
+        or message_mapping.get("id")
+        or message_mapping.get("uuid")
+        or message_mapping.get("bubbleId")
+        or ""
+    )
+
+
+def _cursor_part_source_id(source_id: str, part_type: str, index: int) -> str:
+    """Keep child identities unique when one Cursor bubble expands to rows."""
+    if not source_id:
+        return ""
+    return f"{source_id}:{part_type}:{index}"
+
+
+def _parse_cursor_record_messages(obj: object) -> list[NormalizedMessage]:
+    """Expand one composite Cursor record into ordered semantic messages.
+
+    Cursor stores visible assistant prose and multiple tool invocations in one
+    ``message.content`` array.  The normalized store is message-oriented, so a
+    one-record/one-row parser turns tool-only bubbles into empty assistant rows
+    and hides every invocation in assistant metadata.  Split only records that
+    contain structured tool blocks; ordinary user/assistant records continue
+    through the compatibility parser unchanged.
+    """
+    if not isinstance(obj, dict):
+        return []
+    message = obj.get("message")
+    message_mapping = _as_mapping(message)
+    content = message_mapping.get("content") if message_mapping else message
+    if not isinstance(content, list) or not any(
+        isinstance(item, dict)
+        and item.get("type") in ("tool_use", "toolCall", "tool_result", "toolResult")
+        for item in content
+    ):
+        parsed = parse_conversation_object(obj, "cursor")
+        return [parsed] if parsed is not None else []
+
+    timestamp = _coerce_text(obj.get("timestamp"))
+    source_id = _cursor_source_id(obj, message)
+    messages: list[NormalizedMessage] = []
+    text_items: list[object] = []
+    text_start = 0
+
+    def flush_text() -> None:
+        nonlocal text_items
+        if not text_items:
+            return
+        text_obj = dict(obj)
+        text_message = dict(message_mapping)
+        text_message["content"] = text_items
+        text_obj["message"] = text_message
+        parsed = parse_conversation_object(text_obj, "cursor")
+        if parsed is not None:
+            parsed.source_id = _cursor_part_source_id(
+                source_id,
+                "text",
+                text_start,
+            )
+            messages.append(parsed)
+        text_items = []
+
+    for index, item in enumerate(content):
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if item_type not in ("tool_use", "toolCall", "tool_result", "toolResult"):
+            if not text_items:
+                text_start = index
+            text_items.append(item)
+            continue
+
+        flush_text()
+        if item_type in ("tool_use", "toolCall"):
+            normalized_calls = normalize_tool_calls([item])
+            if not normalized_calls:
+                continue
+            call = normalized_calls[0]
+            tool_name = _coerce_text(call.get("name")) or "Tool"
+            messages.append(NormalizedMessage(
+                role="tool",
+                content=f"[{tool_name}]",
+                tool_name=tool_name,
+                tool_input=_coerce_text(call.get("input")),
+                interaction=(
+                    call.get("interaction")
+                    if isinstance(call.get("interaction"), dict)
+                    else None
+                ),
+                tool_call_id=_bounded_interaction_text(
+                    item.get("id") or item.get("call_id"),
+                    512,
+                ),
+                timestamp=timestamp,
+                raw_type="tool_call",
+                source_id=_cursor_part_source_id(source_id, "tool_call", index),
+            ))
+            continue
+
+        result = _extract_tool_result_details([item])
+        if result is None:
+            continue
+        result_content, tool_call_id = result
+        messages.append(NormalizedMessage(
+            role="tool",
+            content=result_content or "(tool returned no textual output)",
+            tool_name="Tool result",
+            tool_call_id=tool_call_id,
+            timestamp=timestamp,
+            raw_type="tool_output",
+            source_id=_cursor_part_source_id(source_id, "tool_output", index),
+        ))
+
+    flush_text()
+    return messages
+
+
+def _iter_cursor_conversation_messages(
+    raw_content: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
+) -> Iterator[NormalizedMessage]:
+    """Yield Cursor semantic rows while linking interactive answers."""
+    seen_source_ids: set[str] = set()
+    pending_question: tuple[int, dict[str, object]] | None = None
+    for interaction in reversed(initial_question_interactions or []):
+        if isinstance(interaction, dict) and interaction.get("source") == "cursor":
+            pending_question = (-1, interaction)
+            break
+
+    for record_index, source_object in enumerate(
+        _iter_decoded_json_objects(raw_content)
+    ):
+        if (
+            pending_question is not None
+            and record_index - pending_question[0] > CURSOR_QUESTION_RESPONSE_WINDOW
+        ):
+            pending_question = None
+
+        for message in _parse_cursor_record_messages(source_object):
+            if message.role == "user" and pending_question is not None:
+                _pending_index, interaction = pending_question
+                message.interaction_response = build_question_response(
+                    interaction,
+                    message.content,
+                )
+                pending_question = None
+
+            if message.interaction is not None:
+                interaction_id = _coerce_text(message.interaction.get("id"))
+                if not interaction_id:
+                    interaction_id = f"cursor:{record_index}:question"
+                    message.interaction["id"] = interaction_id
+                pending_question = (record_index, message.interaction)
+
+            if message.source_id:
+                if message.source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(message.source_id)
+            yield message
+
+
 def _extract_content(content) -> str:
     """Extract text from content that could be string, list, or dict.
 
@@ -1746,6 +1900,12 @@ def iter_conversation_messages(
     if tool_id == "hermes":
         yield from _parse_hermes_session(raw_content, 0, None)
         return
+    if tool_id == "cursor":
+        yield from _iter_cursor_conversation_messages(
+            raw_content,
+            initial_question_interactions=initial_question_interactions,
+        )
+        return
 
     seen_source_ids: set[str] = set()
     pending_codex_user: tuple[int, NormalizedMessage] | None = None
@@ -1755,11 +1915,6 @@ def iter_conversation_messages(
         for interaction in (initial_question_interactions or [])
         if isinstance(interaction, dict) and interaction.get("id")
     }
-    pending_cursor_question: tuple[int, dict[str, object]] | None = None
-    for interaction in reversed(initial_question_interactions or []):
-        if isinstance(interaction, dict) and interaction.get("source") == "cursor":
-            pending_cursor_question = (-1, interaction)
-            break
 
     def should_emit(message: NormalizedMessage) -> bool:
         if not message.source_id:
@@ -1775,13 +1930,6 @@ def iter_conversation_messages(
     ):
         message = parse_conversation_object(source_object, tool_id)
 
-        if (
-            pending_cursor_question is not None
-            and record_index - pending_cursor_question[0]
-            > CURSOR_QUESTION_RESPONSE_WINDOW
-        ):
-            pending_cursor_question = None
-
         if message is not None:
             if message.tool_call_id and message.tool_call_id in pending_questions:
                 interaction = pending_questions.pop(message.tool_call_id)
@@ -1790,18 +1938,6 @@ def iter_conversation_messages(
                     message.content,
                 )
                 message.tool_name = "Question response"
-
-            if (
-                tool_id == "cursor"
-                and message.role == "user"
-                and pending_cursor_question is not None
-            ):
-                _pending_index, interaction = pending_cursor_question
-                message.interaction_response = build_question_response(
-                    interaction,
-                    message.content,
-                )
-                pending_cursor_question = None
 
             if message.interaction is not None:
                 interaction_id = _coerce_text(message.interaction.get("id"))
@@ -1819,8 +1955,6 @@ def iter_conversation_messages(
                     interaction_id = f"{tool_id}:{record_index}:question"
                     interaction["id"] = interaction_id
                 pending_questions[interaction_id] = interaction
-                if tool_id == "cursor":
-                    pending_cursor_question = (record_index, interaction)
 
         if (
             pending_codex_user is not None
