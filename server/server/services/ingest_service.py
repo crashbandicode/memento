@@ -8,7 +8,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -108,6 +108,40 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "title_is_manual",
     "title_source",
 }
+
+
+def _conversation_search_index_needs_refresh(
+    *,
+    is_new_document: bool,
+    mode: str,
+    new_search_text: str,
+    previous_title: str | None,
+    current_title: str | None,
+) -> bool:
+    """Return whether this ingest changed indexed conversation text."""
+    return (
+        is_new_document
+        or mode != "delta"
+        or bool(new_search_text)
+        or previous_title != current_title
+    )
+
+
+async def _record_tool_sync(
+    db: AsyncSession,
+    tool: Tool,
+    synced_at: datetime,
+    *,
+    is_new_document: bool,
+) -> None:
+    """Update hot-path tool stats without recounting every document."""
+    tool.last_sync_at = synced_at
+    if is_new_document:
+        await db.execute(
+            update(Tool)
+            .where(Tool.id == tool.id)
+            .values(total_files=func.coalesce(Tool.total_files, 0) + 1)
+        )
 
 
 class DeltaBaseMismatch(RuntimeError):
@@ -990,6 +1024,7 @@ async def ingest_file(
             observed_at,
         )
     is_new_document = doc is None
+    previous_title = doc.title if doc is not None else None
     previous_embedding_content_hash: str | None = None
     logical_file_size = _logical_document_file_size(
         mode=mode,
@@ -1360,20 +1395,24 @@ async def ingest_file(
         except Exception:
             pass
 
-    # Update tool stats
-    tool.last_sync_at = now
-    count_result = await db.execute(
-        select(Document.id).where(Document.tool_id == tool_id)
+    # Existing-document appends dominate live sync. Updating the timestamp is
+    # sufficient for those; only a new document changes the count, and that
+    # increment is atomic across concurrent collectors.
+    await _record_tool_sync(
+        db,
+        tool,
+        now,
+        is_new_document=is_new_document,
     )
-    tool.total_files = len(count_result.all())
 
     # Extract conversation messages into conversation_messages table
     # For DELTA mode, only parse new content; for FULL mode, re-parse all
     conversation_search_text = ""
+    refresh_content_tsv = category != "conversation"
     if category == "conversation" and (
         content_type == "jsonl" or (content_type == "json" and tool_id == "hermes")
     ):
-        await _extract_messages(
+        new_conversation_search_text = await _extract_messages(
             db,
             doc,
             content,
@@ -1384,29 +1423,37 @@ async def ingest_file(
         from .conversation_activity import refresh_document_activity_at
 
         await refresh_document_activity_at(db, doc)
-        # Build FTS from bounded normalized rows, never from a multi-hundred-
-        # megabyte raw transcript. Ordering newest-first ensures a DELTA keeps
-        # recent prompts searchable without loading every historical row.
-        latest_search_rows = (
-            (
-                await db.execute(
-                    select(_func.left(ConversationMessage.content, 2_048))
-                    .where(
-                        ConversationMessage.document_id == doc.id,
-                        ConversationMessage.role.in_(("user", "assistant")),
-                    )
-                    .order_by(ConversationMessage.line_number.desc())
-                    .limit(200)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        conversation_search_text = _bounded_message_text(
-            "\n".join(row for row in reversed(latest_search_rows) if row),
-            MAX_SEARCH_TEXT_CHARS,
-        )
         title = await _apply_friendly_conversation_title(db, doc) or title
+        refresh_content_tsv = _conversation_search_index_needs_refresh(
+            is_new_document=is_new_document,
+            mode=mode,
+            new_search_text=new_conversation_search_text,
+            previous_title=previous_title,
+            current_title=doc.title,
+        )
+        if refresh_content_tsv:
+            # Build FTS from bounded normalized rows, never from a multi-
+            # hundred-megabyte transcript. Tool-only DELTAs leave the indexed
+            # user/assistant text unchanged and skip both this read and write.
+            latest_search_rows = (
+                (
+                    await db.execute(
+                        select(_func.left(ConversationMessage.content, 2_048))
+                        .where(
+                            ConversationMessage.document_id == doc.id,
+                            ConversationMessage.role.in_(("user", "assistant")),
+                        )
+                        .order_by(ConversationMessage.line_number.desc())
+                        .limit(200)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            conversation_search_text = _bounded_message_text(
+                "\n".join(row for row in reversed(latest_search_rows) if row),
+                MAX_SEARCH_TEXT_CHARS,
+            )
 
     if category in _EMBEDDING_CATEGORIES:
         from .embedding_service import document_embedding_input
@@ -1434,12 +1481,13 @@ async def ingest_file(
         searchable_content = conversation_search_text
     else:
         searchable_content = (doc.content or "")[:MAX_SEARCH_TEXT_CHARS]
-    tsv_input = _tok(f"{doc.title or ''} {searchable_content}")
-    await db.execute(
-        _update(Document)
-        .where(Document.id == doc.id)
-        .values(content_tsv=_func.to_tsvector("simple", tsv_input))
-    )
+    if refresh_content_tsv:
+        tsv_input = _tok(f"{doc.title or ''} {searchable_content}")
+        await db.execute(
+            _update(Document)
+            .where(Document.id == doc.id)
+            .values(content_tsv=_func.to_tsvector("simple", tsv_input))
+        )
 
     # Update sync state
     await _update_sync_state(
@@ -1490,10 +1538,10 @@ async def ingest_file(
         import asyncio
 
         try:
-            # Large direct/multipart uploads must obey the same durable quiet
-            # window as chunked spool ingestion. Small uploads retain the
-            # lightweight in-process path used by development installs that do
-            # not run Celery.
+            # Configured direct/multipart conversations obey the same durable
+            # quiet window as chunked spool ingestion. Deployments without
+            # Celery can keep a positive size threshold so small uploads retain
+            # the lightweight in-process development path.
             from ..tasks.post_ingest import (
                 initial_post_ingest_countdown,
                 process_document_post_ingest,
@@ -1607,9 +1655,21 @@ async def _run_post_ingest_inner(
                 )
                 return
 
-            # Knowledge graph extraction
+            # Knowledge graph extraction. Do not even open the graph path when
+            # the deployment has no provider credential; this is a normal
+            # self-hosted configuration, not a failed extraction to retry.
             try:
-                from .graph_service import extract_knowledge_from_document
+                from .graph_service import (
+                    extract_knowledge_from_document,
+                    knowledge_provider_configured,
+                )
+
+                if not knowledge_provider_configured():
+                    logger.debug(
+                        "Graph extraction disabled for %s: no provider configured",
+                        relative_path,
+                    )
+                    return
 
                 count = await extract_knowledge_from_document(db, doc)
                 await db.commit()

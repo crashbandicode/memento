@@ -34,8 +34,8 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(value, maximum))
 
 
-# Large, actively-written transcripts otherwise re-run a full CPU-heavy BGE-M3
-# pass after every append. Keep the setting deliberately bounded: shorter than
+# Actively-written transcripts otherwise re-run a full CPU-heavy BGE-M3 pass
+# after every append. Keep the quiet period deliberately bounded: shorter than
 # two minutes does not debounce normal agent turns, while longer than five makes
 # semantic search feel broken after an agent stops.
 POST_INGEST_QUIET_SECONDS = _bounded_env_int(
@@ -44,10 +44,10 @@ POST_INGEST_QUIET_SECONDS = _bounded_env_int(
     _MIN_QUIET_SECONDS,
     _MAX_QUIET_SECONDS,
 )
-LARGE_CONVERSATION_BYTES = _bounded_env_int(
+CONVERSATION_QUIET_WINDOW_MIN_BYTES = _bounded_env_int(
     "MEMENTO_POST_INGEST_LARGE_CONVERSATION_BYTES",
     4 * 1024 * 1024,
-    1024 * 1024,
+    0,
     1024 * 1024 * 1024,
 )
 
@@ -64,8 +64,11 @@ class _DocumentState:
 
 
 def initial_post_ingest_countdown(category: str, file_size_bytes: int) -> int | None:
-    """Delay obviously-large conversations without delaying their ingest commit."""
-    if category == "conversation" and file_size_bytes >= LARGE_CONVERSATION_BYTES:
+    """Delay configured conversations without delaying their ingest commit."""
+    if (
+        category == "conversation"
+        and file_size_bytes >= CONVERSATION_QUIET_WINDOW_MIN_BYTES
+    ):
         return POST_INGEST_QUIET_SECONDS
     return None
 
@@ -77,7 +80,7 @@ def _quiet_seconds_remaining(
 ) -> int:
     if (
         state.category != "conversation"
-        or state.file_size_bytes < LARGE_CONVERSATION_BYTES
+        or state.file_size_bytes < CONVERSATION_QUIET_WINDOW_MIN_BYTES
         or state.synced_at is None
     ):
         return 0

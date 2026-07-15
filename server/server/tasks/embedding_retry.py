@@ -22,7 +22,10 @@ from ..services.embedding_service import (
     generate_document_embeddings,
 )
 from .celery_app import celery_app
-from .post_ingest import LARGE_CONVERSATION_BYTES, POST_INGEST_QUIET_SECONDS
+from .post_ingest import (
+    CONVERSATION_QUIET_WINDOW_MIN_BYTES,
+    POST_INGEST_QUIET_SECONDS,
+)
 
 logger = logging.getLogger("embedding_retry")
 
@@ -64,7 +67,8 @@ async def _run_locked() -> dict:
                     # same quiet window, preserving eventual recovery.
                     or_(
                         Document.category != "conversation",
-                        Document.file_size_bytes < LARGE_CONVERSATION_BYTES,
+                        Document.file_size_bytes
+                        < CONVERSATION_QUIET_WINDOW_MIN_BYTES,
                         Document.synced_at.is_(None),
                         Document.synced_at <= quiet_before,
                     ),

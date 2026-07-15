@@ -11,6 +11,11 @@ from server.db.models import Document
 from server.services import embedding_service, graph_service, ingest_service
 
 
+@pytest.fixture(autouse=True)
+def _configured_knowledge_provider(monkeypatch) -> None:
+    monkeypatch.setattr(graph_service, "knowledge_provider_configured", lambda: True)
+
+
 class _DocumentStub:
     def __init__(
         self,
@@ -227,3 +232,48 @@ async def test_post_ingest_uses_scalar_label_when_embedding_raises_expired(
     assert session.rollback_count == 1
     assert "Embedding skipped for sessions/thread.jsonl" in caplog.text
     assert "greenlet_spawn has not been called" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_ingest_skips_graph_work_without_provider(monkeypatch) -> None:
+    document_id = uuid4()
+    initial = _DocumentStub(document_id, "sessions/thread.jsonl")
+    refreshed = _DocumentStub(document_id, "sessions/thread.jsonl")
+    session = _SessionStub(initial, refreshed)
+    _install_session(monkeypatch, session)
+
+    async def _embed(_db, _doc) -> int:
+        return 0
+
+    async def _unexpected(*_args) -> int:
+        pytest.fail("graph extraction ran without a configured provider")
+
+    monkeypatch.setattr(embedding_service, "generate_document_embeddings", _embed)
+    monkeypatch.setattr(graph_service, "knowledge_provider_configured", lambda: False)
+    monkeypatch.setattr(graph_service, "extract_knowledge_from_document", _unexpected)
+
+    await ingest_service._run_post_ingest_inner(
+        document_id,
+        "codex",
+        "conversation",
+    )
+
+    assert session.get_calls == [(Document, document_id, True)]
+    assert session.commit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_graph_extraction_without_provider_does_not_touch_database(
+    monkeypatch,
+) -> None:
+    class _FailingSession:
+        async def execute(self, _statement):
+            pytest.fail("graph extraction queried the database without a provider")
+
+    monkeypatch.setattr(graph_service, "knowledge_provider_configured", lambda: False)
+    doc = _DocumentStub(uuid4(), "sessions/thread.jsonl")
+
+    assert await graph_service.extract_knowledge_from_document(
+        _FailingSession(),
+        doc,
+    ) == 0

@@ -374,15 +374,12 @@ class CodexTool(BaseTool):
         if parts[0] == "vendor_imports":
             return None
 
-        # models_cache.json — useful for tracking model availability
+        # Codex rewrites models_cache.json frequently while it is running. It
+        # contains only model-availability metadata, not user configuration or
+        # conversation history, so live-syncing it creates needless full-file
+        # uploads and server ingest transactions.
         if rel_str == "models_cache.json":
-            return FileClassification(
-                tool_name=self.name,
-                category=Category.CONFIG,
-                content_type=ContentType.JSON,
-                sync_strategy=SyncStrategy.FULL,
-                relative_path=rel_str,
-            )
+            return None
 
         return None
 

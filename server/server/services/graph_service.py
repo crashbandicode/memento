@@ -36,6 +36,16 @@ _EXTRACTION_TEMPLATE = (
 )
 
 
+def knowledge_provider_configured() -> bool:
+    """Return whether graph extraction has a usable LLM credential."""
+    return bool(
+        os.environ.get("MEMENTO_AI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("MEMENTO_ANTHROPIC_API_KEY")
+    )
+
+
 async def _call_llm(prompt: str) -> dict | None:
     """Call LLM for entity extraction via OpenAI-compatible API. Returns parsed JSON or None."""
     # Use existing MEMENTO_AI_* config
@@ -127,6 +137,12 @@ async def extract_knowledge_from_document(
       * 'ok'      — extraction completed (zero entities is still 'ok' —
         the LLM saw the doc and decided there's nothing graph-worthy).
     """
+    # Do this before any document, message, or graph query. A deployment that
+    # intentionally has no LLM credential should not turn every live transcript
+    # append into no-op graph bookkeeping and retry traffic.
+    if not knowledge_provider_configured():
+        return 0
+
     if doc.category not in ("conversation", "memory", "learning", "plan"):
         doc.knowledge_status = "skipped"
         return 0

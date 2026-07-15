@@ -22,7 +22,10 @@ from sqlalchemy import select
 
 from ..db.models import Document
 from ..db.session import async_session_factory
-from ..services.graph_service import extract_knowledge_from_document
+from ..services.graph_service import (
+    extract_knowledge_from_document,
+    knowledge_provider_configured,
+)
 from .celery_app import celery_app
 
 logger = logging.getLogger("knowledge_retry")
@@ -35,6 +38,9 @@ BATCH_SIZE = 8
 
 
 async def _run() -> dict:
+    if not knowledge_provider_configured():
+        return {"scanned": 0, "retried": 0, "recovered": 0, "disabled": True}
+
     async with async_session_factory() as db:
         docs = (await db.execute(
             select(Document)

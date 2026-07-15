@@ -154,6 +154,38 @@ const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
 const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
 
+type ConversationVisibility = {
+  user: boolean;
+  assistant: boolean;
+  tools: boolean;
+  thinking: boolean;
+  context: boolean;
+};
+
+type ConversationVisibilityKey = keyof ConversationVisibility;
+
+const DEFAULT_CONVERSATION_VISIBILITY: ConversationVisibility = {
+  user: true,
+  assistant: true,
+  tools: true,
+  thinking: true,
+  context: true,
+};
+
+function isSessionContextMessage(msg: ConversationMessage): boolean {
+  const content = cleanTerminalText(msg.content);
+  return /(?:^|_)(?:codex|claude|cursor)_context$/i.test(
+    msg.raw_type || msg.message_type || "",
+  ) || /^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)/i.test(content);
+}
+
+function isSubagentDispatchMessage(msg: ConversationMessage): boolean {
+  if ((msg.role || msg.message_type) !== "user") return false;
+  const content = cleanTerminalText(msg.content);
+  return content.startsWith("[Subagent Context]")
+    || content.includes("\n[Subagent Context]");
+}
+
 function mergeMessagesChronologically(
   current: ConversationMessage[],
   incoming: ConversationMessage[],
@@ -207,6 +239,9 @@ export default function ConversationViewer({
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
   const [latestAgentLoading, setLatestAgentLoading] = useState(false);
   const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
+  const [visibility, setVisibility] = useState<ConversationVisibility>(
+    DEFAULT_CONVERSATION_VISIBILITY,
+  );
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
@@ -589,20 +624,44 @@ export default function ConversationViewer({
     const isHumanPrompt = (msg.role || msg.message_type) === "user"
       && !msg.interaction_response
       && !msg.content.includes("[Subagent Context]");
+    const role = msg.role || msg.message_type || "unknown";
+    const messageCategory = role === "user"
+      ? (isSubagentDispatchMessage(msg) ? "context" : "user")
+      : role === "assistant"
+        ? "assistant"
+        : role === "tool"
+          ? "tools"
+          : "context";
+    const hideWholeMessage = (
+      (role === "user" && !isSubagentDispatchMessage(msg) && !visibility.user)
+      || (role === "user" && isSubagentDispatchMessage(msg) && !visibility.context)
+      || (role === "assistant" && !visibility.assistant && !visibility.tools)
+      || (role === "tool" && !visibility.tools)
+      || (role !== "user" && role !== "assistant" && role !== "tool" && !visibility.context)
+    );
     return (
       <div
         key={`${source}-${msg.id}-${idx}`}
         id={`conversation-line-${msg.line_number}`}
         data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
+        data-message-category={messageCategory}
+        data-message-visible={hideWholeMessage ? "false" : "true"}
+        aria-hidden={hideWholeMessage ? "true" : undefined}
         style={{ scrollMarginTop: 16 }}
       >
-        <ChatBubble
-          msg={msg}
-          toolId={toolId}
-          locale={locale}
-          t={t}
-          questionResponses={questionResponses}
-        />
+        {!hideWholeMessage && (
+          <ChatBubble
+            msg={msg}
+            toolId={toolId}
+            locale={locale}
+            t={t}
+            questionResponses={questionResponses}
+            showAssistant={visibility.assistant}
+            showTools={visibility.tools}
+            showThinkingCategory={visibility.thinking}
+            showContext={visibility.context}
+          />
+        )}
       </div>
     );
   };
@@ -613,6 +672,11 @@ export default function ConversationViewer({
         documentId={documentId}
         syncVersion={syncVersion}
         onSelectLine={navigateToLine}
+        t={t}
+      />
+      <ConversationVisibilityControls
+        visibility={visibility}
+        onChange={setVisibility}
         t={t}
       />
       <div
@@ -736,6 +800,157 @@ export default function ConversationViewer({
         onSelect={navigateToPrompt}
         onLatestAgent={navigateToLatestAgent}
       />
+    </div>
+  );
+}
+
+function ConversationVisibilityControls({
+  visibility,
+  onChange,
+  t,
+}: {
+  visibility: ConversationVisibility;
+  onChange: (value: ConversationVisibility) => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [open, setOpen] = useState(false);
+  const hiddenCount = Object.values(visibility).filter((visible) => !visible).length;
+  const options: Array<{
+    key: ConversationVisibilityKey;
+    label: string;
+  }> = [
+    { key: "user", label: t.conversation.displayUserMessages },
+    { key: "assistant", label: t.conversation.displayAgentMessages },
+    { key: "tools", label: t.conversation.displayTools },
+    { key: "thinking", label: t.conversation.displayThinking },
+    { key: "context", label: t.conversation.displayContext },
+  ];
+
+  const toggle = (key: ConversationVisibilityKey) => {
+    onChange({ ...visibility, [key]: !visibility[key] });
+  };
+
+  return (
+    <div
+      data-conversation-visibility-controls
+      style={{
+        position: "relative",
+        zIndex: 8,
+        maxWidth: 896,
+        margin: "0 auto 10px",
+        padding: "0 2px",
+      }}
+    >
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls="conversation-visibility-options"
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          minHeight: 34,
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 7,
+          padding: "6px 11px",
+          borderRadius: 999,
+          border: "1px solid var(--aurora-border)",
+          background: hiddenCount > 0
+            ? "color-mix(in srgb, var(--aurora-accent) 9%, var(--aurora-surface-solid))"
+            : "var(--aurora-surface-solid)",
+          color: hiddenCount > 0 ? "var(--aurora-accent)" : "var(--aurora-fg3)",
+          boxShadow: "0 1px 2px rgba(15,23,42,0.04)",
+          cursor: "pointer",
+          fontSize: 11.5,
+          fontWeight: 650,
+        }}
+      >
+        <Icon name="eye" size={14} />
+        <span>{t.conversation.displayOptions}</span>
+        {hiddenCount > 0 && (
+          <span
+            data-hidden-category-count={hiddenCount}
+            style={{
+              minWidth: 18,
+              height: 18,
+              padding: "0 5px",
+              borderRadius: 999,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "color-mix(in srgb, var(--aurora-accent) 15%, transparent)",
+              fontSize: 10,
+            }}
+          >
+            {hiddenCount}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div
+          id="conversation-visibility-options"
+          role="group"
+          aria-label={t.conversation.displayOptions}
+          style={{
+            marginTop: 7,
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 6,
+            padding: 8,
+            borderRadius: 13,
+            border: "1px solid var(--aurora-border)",
+            background: "color-mix(in srgb, var(--aurora-surface-solid) 96%, transparent)",
+            boxShadow: "0 8px 24px rgba(15,23,42,0.08)",
+          }}
+        >
+          {options.map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              data-visibility-category={option.key}
+              aria-pressed={visibility[option.key]}
+              onClick={() => toggle(option.key)}
+              style={{
+                minHeight: 32,
+                padding: "6px 10px",
+                borderRadius: 999,
+                border: visibility[option.key]
+                  ? "1px solid color-mix(in srgb, var(--aurora-accent) 30%, var(--aurora-border))"
+                  : "1px solid var(--aurora-border)",
+                background: visibility[option.key]
+                  ? "color-mix(in srgb, var(--aurora-accent) 10%, var(--aurora-surface-solid))"
+                  : "var(--aurora-chip)",
+                color: visibility[option.key] ? "var(--aurora-accent)" : "var(--aurora-fg4)",
+                cursor: "pointer",
+                fontSize: 11.5,
+                fontWeight: 600,
+                textDecoration: visibility[option.key] ? "none" : "line-through",
+              }}
+            >
+              {option.label}
+            </button>
+          ))}
+          {hiddenCount > 0 && (
+            <button
+              type="button"
+              data-show-all-conversation-categories
+              onClick={() => onChange(DEFAULT_CONVERSATION_VISIBILITY)}
+              style={{
+                minHeight: 32,
+                padding: "6px 10px",
+                border: 0,
+                background: "transparent",
+                color: "var(--aurora-fg3)",
+                cursor: "pointer",
+                fontSize: 11.5,
+                fontWeight: 600,
+              }}
+            >
+              {t.conversation.displayShowAll}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2222,12 +2437,20 @@ export const ChatBubble = memo(function ChatBubble({
   locale,
   t,
   questionResponses = new Map(),
+  showAssistant = true,
+  showTools = true,
+  showThinkingCategory = true,
+  showContext = true,
 }: {
   msg: ConversationMessage;
   toolId?: string;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
   questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
+  showAssistant?: boolean;
+  showTools?: boolean;
+  showThinkingCategory?: boolean;
+  showContext?: boolean;
 }) {
   const role = msg.role || msg.message_type || "unknown";
   const toolName = msg.tool_name ?? "";
@@ -2236,7 +2459,7 @@ export const ChatBubble = memo(function ChatBubble({
   const thinking = cleanTerminalText(msg.thinking?.trim() || "");
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   const [expanded, setExpanded] = useState(false);
-  const [showThinking, setShowThinking] = useState(false);
+  const [thinkingExpanded, setThinkingExpanded] = useState(false);
 
   if (msg.interaction_response) {
     return <QuestionResponseCard response={msg.interaction_response} t={t} />;
@@ -2317,7 +2540,7 @@ export const ChatBubble = memo(function ChatBubble({
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0 }}>
-          {sessionContext && (
+          {showContext && sessionContext && (
             <div style={{ marginBottom: 8 }}>
               <ConversationContextCard content={sessionContext} t={t} />
             </div>
@@ -2419,8 +2642,15 @@ export const ChatBubble = memo(function ChatBubble({
           .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
     const isLong = narrative.length > 500;
     const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
-    const hasSeparateThinking = Boolean(thinking && thinking !== narrative);
-    const hasNarrative = Boolean(narrative || hasSeparateThinking);
+    const hasSeparateThinking = Boolean(
+      showAssistant
+      && showThinkingCategory
+      && thinking
+      && thinking !== narrative,
+    );
+    const hasNarrative = Boolean(showAssistant && (narrative || hasSeparateThinking));
+    const visibleToolCalls = showTools ? toolCalls : [];
+    if (!hasNarrative && visibleToolCalls.length === 0) return null;
 
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
@@ -2473,13 +2703,13 @@ export const ChatBubble = memo(function ChatBubble({
                   boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
                 }}
               >
-                {displayContent && (
+                {showAssistant && displayContent && (
                   <div className="prose prose-sm max-w-none">
                     <MarkdownViewer content={displayContent} />
                   </div>
                 )}
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: displayContent ? 8 : 0 }}>
-                  {isLong && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: showAssistant && displayContent ? 8 : 0 }}>
+                  {showAssistant && isLong && (
                     <button
                       onClick={() => setExpanded(!expanded)}
                       style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
@@ -2489,14 +2719,14 @@ export const ChatBubble = memo(function ChatBubble({
                   )}
                   {hasSeparateThinking && (
                     <button
-                      onClick={() => setShowThinking((value) => !value)}
+                      onClick={() => setThinkingExpanded((value) => !value)}
                       style={{ fontSize: 11, color: "#D97706", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
                     >
-                      {showThinking ? t.conversation.hideThinking : t.conversation.showThinking}
+                      {thinkingExpanded ? t.conversation.hideThinking : t.conversation.showThinking}
                     </button>
                   )}
                 </div>
-                {showThinking && hasSeparateThinking && (
+                {thinkingExpanded && hasSeparateThinking && (
                   <div
                     style={{
                       marginTop: 12,
@@ -2517,13 +2747,14 @@ export const ChatBubble = memo(function ChatBubble({
               </div>
             </>
           )}
-          {toolCalls.length > 0 && (
+          {visibleToolCalls.length > 0 && (
             <div
+              data-assistant-tool-calls
               role="group"
               aria-label="Assistant tool calls"
               style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
             >
-              {toolCalls.map((call, index) => (
+              {visibleToolCalls.map((call, index) => (
                 call.interaction ? (
                   <QuestionInteractionCard
                     key={`${call.name}-${index}`}
@@ -2550,6 +2781,7 @@ export const ChatBubble = memo(function ChatBubble({
   // output stay collapsed until requested, keeping long agent sessions easy
   // to scan while retaining every detail.
   if (role === "tool") {
+    if (!showTools) return null;
     if (msg.interaction) {
       return (
         <QuestionInteractionCard
@@ -2562,14 +2794,13 @@ export const ChatBubble = memo(function ChatBubble({
     return <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />;
   }
 
-  const isSessionContext = /(?:^|_)(?:codex|claude|cursor)_context$/i.test(
-    msg.raw_type || msg.message_type || "",
-  ) || /^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)/i.test(content);
-  if (isSessionContext) {
+  if (isSessionContextMessage(msg)) {
+    if (!showContext) return null;
     return <ConversationContextCard content={content} t={t} />;
   }
 
   // Other system notices remain compact and centered.
+  if (!showContext) return null;
   return (
     <div style={{ display: "flex", justifyContent: "center" }}>
       <div

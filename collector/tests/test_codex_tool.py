@@ -46,6 +46,13 @@ def _write_records(path: Path, records: list[dict], *, prefix: str = "") -> None
     path.write_text(content, encoding="utf-8")
 
 
+def test_models_cache_is_not_live_synced(codex_tool: CodexTool) -> None:
+    path = codex_tool.root_path / "models_cache.json"
+    path.write_text('{"models": []}', encoding="utf-8")
+
+    assert codex_tool.classify_file(path) is None
+
+
 def test_history_cache_refreshes_after_append(codex_tool: CodexTool) -> None:
     history_path = codex_tool.root_path / "history.jsonl"
     history_path.write_text(

@@ -31,28 +31,42 @@ def _state(
         content_hash=content_hash,
         file_size_bytes=file_size_bytes
         if file_size_bytes is not None
-        else post_ingest.LARGE_CONVERSATION_BYTES,
+        else post_ingest.CONVERSATION_QUIET_WINDOW_MIN_BYTES,
         synced_at=synced_at or datetime.now(timezone.utc),
         embedding_status=embedding_status,
         knowledge_status=knowledge_status,
     )
 
 
-def test_large_conversation_dispatch_uses_bounded_quiet_window() -> None:
+def test_configured_conversation_dispatch_uses_bounded_quiet_window() -> None:
     assert 120 <= post_ingest.POST_INGEST_QUIET_SECONDS <= 300
     assert (
         post_ingest.initial_post_ingest_countdown(
-            "conversation", post_ingest.LARGE_CONVERSATION_BYTES
+            "conversation", post_ingest.CONVERSATION_QUIET_WINDOW_MIN_BYTES
         )
         == post_ingest.POST_INGEST_QUIET_SECONDS
     )
     assert post_ingest.initial_post_ingest_countdown("memory", 100_000_000) is None
     assert (
         post_ingest.initial_post_ingest_countdown(
-            "conversation", post_ingest.LARGE_CONVERSATION_BYTES - 1
+            "conversation", post_ingest.CONVERSATION_QUIET_WINDOW_MIN_BYTES - 1
         )
         is None
     )
+
+
+def test_zero_threshold_delays_small_conversations(monkeypatch) -> None:
+    monkeypatch.setattr(
+        post_ingest,
+        "CONVERSATION_QUIET_WINDOW_MIN_BYTES",
+        0,
+    )
+
+    assert (
+        post_ingest.initial_post_ingest_countdown("conversation", 512)
+        == post_ingest.POST_INGEST_QUIET_SECONDS
+    )
+    assert post_ingest.initial_post_ingest_countdown("config", 512) is None
 
 
 def test_delta_uses_cumulative_source_size_for_quiet_classification() -> None:
@@ -74,7 +88,7 @@ def test_delta_uses_cumulative_source_size_for_quiet_classification() -> None:
 async def test_multipart_upload_uses_measured_size_when_reported_size_is_zero(
     monkeypatch,
 ) -> None:
-    payload = b"x" * (post_ingest.LARGE_CONVERSATION_BYTES + 1)
+    payload = b"x" * (post_ingest.CONVERSATION_QUIET_WINDOW_MIN_BYTES + 1)
     captured: dict = {}
     document_id = uuid4()
 
