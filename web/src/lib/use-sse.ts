@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef } from "react";
-import { getApiBase } from "./api-client";
+import { api, getApiBase } from "./api-client";
 import { getStoredAuthToken } from "./auth-storage";
 
 export interface SSEEvent {
@@ -32,37 +32,59 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
 
   useEffect(() => {
     let es: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let connecting = false;
+    let stopped = false;
 
-    function connect() {
+    function scheduleReconnect() {
+      if (stopped) return;
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => void connect(), 5000);
+    }
+
+    async function connect() {
+      if (stopped || connecting) return;
       const base = getApiBase();
       const token = getStoredAuthToken();
       if (!token) return; // Not logged in — don't connect SSE
-      es = new EventSource(`${base}/api/events/stream?token=${encodeURIComponent(token)}`);
+      connecting = true;
+      try {
+        await api.createEventSession(token);
+        if (stopped) return;
+        const next = new EventSource(`${base}/api/events/stream`, {
+          withCredentials: true,
+        });
+        es = next;
 
-      es.addEventListener("file_synced", (e) => {
-        try {
-          const event: SSEEvent = JSON.parse(e.data);
-          onEventRef.current(event);
-        } catch {}
-      });
+        next.addEventListener("file_synced", (e) => {
+          try {
+            const event: SSEEvent = JSON.parse(e.data);
+            onEventRef.current(event);
+          } catch {}
+        });
 
-      es.addEventListener("keepalive", () => {
-        // ignore keepalives
-      });
+        next.addEventListener("keepalive", () => {
+          // ignore keepalives
+        });
 
-      es.onerror = () => {
-        es?.close();
-        // Reconnect after 5 seconds
-        reconnectTimer = setTimeout(connect, 5000);
-      };
+        next.onerror = () => {
+          next.close();
+          if (es === next) es = null;
+          scheduleReconnect();
+        };
+      } catch {
+        scheduleReconnect();
+      } finally {
+        connecting = false;
+      }
     }
 
-    connect();
+    void connect();
 
     return () => {
+      stopped = true;
       es?.close();
-      clearTimeout(reconnectTimer);
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
     };
   }, []);
 }

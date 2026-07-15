@@ -13,7 +13,11 @@ from .api import admin, auth, conversation_exports, conversations, daily, dashbo
 from .config import settings
 from .db.models import Base
 from .db.session import engine
+from .logging_filters import install_sensitive_query_filter
 from .services.device_service import DeviceOwnershipError
+
+
+install_sensitive_query_filter()
 
 
 def _run_migrations(conn) -> None:

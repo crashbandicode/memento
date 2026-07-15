@@ -17,6 +17,9 @@ from ..db.models import User
 from ..db.session import get_db
 
 
+EVENT_STREAM_TOKEN_EXPIRE_MINUTES = 15
+
+
 def is_single_user_allowed(user: User | None) -> bool:
     """Whether ``user`` may access a single-user deployment."""
     return not settings.single_user_mode or bool(user and user.role in {"owner", "admin"})
@@ -36,11 +39,31 @@ def create_access_token(user_id: str, role: str) -> str:
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
+def create_event_stream_token(user_id: str) -> str:
+    """Create a short-lived, scope-limited credential for an SSE cookie."""
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=EVENT_STREAM_TOKEN_EXPIRE_MINUTES
+    )
+    payload = {"sub": user_id, "scope": "events", "exp": expire}
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
 def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
     except JWTError as e:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from e
+
+
+def decode_event_stream_token(token: str) -> dict:
+    """Decode a token that is valid only for the live event stream."""
+    payload = decode_token(token)
+    if payload.get("scope") != "events":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid event stream token",
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------

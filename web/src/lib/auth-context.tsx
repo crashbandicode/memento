@@ -193,6 +193,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = () => {
+    void api.clearEventSession().catch(() => { /* cookie expires shortly */ });
     setUser(null);
     setToken(null);
     clearStoredAuthToken();

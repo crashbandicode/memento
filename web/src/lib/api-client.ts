@@ -708,6 +708,17 @@ export const api = {
   getMe: (token: string) => apiFetch<UserInfo>("/api/auth/me", { token }),
   refreshToken: (token: string) =>
     apiFetch<TokenResponse>("/api/auth/refresh", { method: "POST", token }),
+  createEventSession: (token: string) =>
+    apiFetch<{ ok: boolean }>("/api/events/session", {
+      method: "POST",
+      token,
+      credentials: "include",
+    }),
+  clearEventSession: () =>
+    apiFetch<{ ok: boolean }>("/api/events/session", {
+      method: "DELETE",
+      credentials: "include",
+    }),
   // === Account-level backup/restore ===
   //
   // exportData hits a binary endpoint so we go around apiFetch's
