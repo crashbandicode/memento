@@ -8,11 +8,14 @@ Supported formats:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 
@@ -139,6 +142,18 @@ _CURSOR_REDACTED_TRANSPORT_LINE_RE = re.compile(
     r"(^|\n)[ \t]*\[REDACTED\][ \t]*(?=\n|$)",
     re.IGNORECASE | re.MULTILINE,
 )
+_CLAUDE_QUEUE_MATCH_WINDOW_SECONDS = 24 * 60 * 60
+
+
+class _ClaudeQueueCandidate(Protocol):
+    content: str
+    timestamp: object
+
+
+_ClaudeQueueCandidateT = TypeVar(
+    "_ClaudeQueueCandidateT",
+    bound=_ClaudeQueueCandidate,
+)
 
 
 def normalize_codex_user_payload(content: str) -> tuple[str, str]:
@@ -173,6 +188,51 @@ def is_claude_session_context_record(obj: dict) -> bool:
         obj.get(name) is True
         for name in ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly")
     )
+
+
+def is_claude_queue_user_pair(
+    queue_content: str,
+    queue_timestamp: object,
+    canonical_content: str,
+    canonical_timestamp: object,
+) -> bool:
+    """Return whether a queued Claude prompt later became a user record.
+
+    Claude records a steer when it is submitted and can write the canonical
+    ``user`` row much later, after the active turn finishes. Exact content,
+    source order, and a bounded time window distinguish that transport pair
+    without collapsing legitimately repeated prompts.
+    """
+    queued = (queue_content or "").strip()
+    canonical = (canonical_content or "").strip()
+    if not queued or queued != canonical:
+        return False
+    queued_at = _message_timestamp(queue_timestamp)
+    canonical_at = _message_timestamp(canonical_timestamp)
+    if queued_at is None or canonical_at is None:
+        return True
+    return abs((canonical_at - queued_at).total_seconds()) <= (
+        _CLAUDE_QUEUE_MATCH_WINDOW_SECONDS
+    )
+
+
+def pop_matching_claude_queue_user(
+    queued_by_content: dict[str, list[_ClaudeQueueCandidateT]],
+    canonical_content: str,
+    canonical_timestamp: object,
+) -> _ClaudeQueueCandidateT | None:
+    """Consume one queued occurrence represented by a canonical user row."""
+    content = (canonical_content or "").strip()
+    candidates = queued_by_content.get(content, [])
+    for index, candidate in enumerate(candidates):
+        if is_claude_queue_user_pair(
+            str(getattr(candidate, "content", "")),
+            getattr(candidate, "timestamp", None),
+            content,
+            canonical_timestamp,
+        ):
+            return candidates.pop(index)
+    return None
 
 
 def _parse_cursor_envelope_timestamp(value: str) -> str | None:
@@ -606,7 +666,33 @@ def parse_conversation_object(
                 source_id=source_id,
             )
 
-        # Skip: file-history-snapshot, queue-operation, etc.
+        if msg_type == "queue-operation":
+            operation = _coerce_text(
+                obj.get("operation") or obj.get("op")
+            ).lower()
+            if operation != "enqueue":
+                return None
+            content = _strip_system_tags(_coerce_text(obj.get("content")))
+            if not content:
+                return None
+            queue_identity = "\x1f".join((
+                _coerce_text(obj.get("sessionId") or obj.get("session_id")),
+                timestamp,
+                content,
+            ))
+            queue_source_id = _coerce_text(obj.get("uuid")) or (
+                "claude-queue:"
+                + hashlib.sha256(queue_identity.encode("utf-8")).hexdigest()
+            )
+            return NormalizedMessage(
+                role="user",
+                content=content,
+                timestamp=timestamp,
+                raw_type="queued_user_message",
+                source_id=queue_source_id,
+            )
+
+        # Skip: file-history-snapshot and other transport bookkeeping.
         return None
 
     # --- Codex format ---
@@ -2062,6 +2148,7 @@ def iter_conversation_messages(
         return
 
     seen_source_ids: set[str] = set()
+    pending_claude_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
     pending_codex_user: tuple[int, NormalizedMessage, str] | None = None
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
     current_codex_turn_id = ""
@@ -2094,6 +2181,26 @@ def iter_conversation_messages(
                     current_codex_turn_id = ""
 
         message = parse_conversation_object(source_object, tool_id)
+
+        if (
+            tool_id == "claude_code"
+            and message is not None
+            and message.role == "user"
+            and message.raw_type == "user"
+        ):
+            if pop_matching_claude_queue_user(
+                pending_claude_queue,
+                message.content,
+                message.timestamp,
+            ) is not None:
+                message = None
+
+        if (
+            tool_id == "claude_code"
+            and message is not None
+            and message.raw_type == "queued_user_message"
+        ):
+            pending_claude_queue[message.content.strip()].append(message)
 
         if message is not None:
             if message.tool_call_id and message.tool_call_id in pending_questions:

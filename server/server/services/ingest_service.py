@@ -2027,6 +2027,7 @@ async def _extract_messages(
         codex_assistant_transport_priority,
         is_codex_assistant_mirror_pair,
         is_codex_user_mirror_pair,
+        pop_matching_claude_queue_user,
     )
     from .message_search import (
         MAX_LEXICON_TERMS_PER_INGEST,
@@ -2131,6 +2132,7 @@ async def _extract_messages(
     batch: list[ConversationMessage] = []
     batch_bytes = 0
     delta_tail = None
+    queued_claude_users: dict[str, list[ConversationMessage]] = {}
     initial_question_interactions: list[dict[str, object]] = []
     if mode == "delta" and start_line > 1:
         recent_rows = (
@@ -2143,6 +2145,30 @@ async def _extract_messages(
         ).scalars().all()
         delta_tail = recent_rows[0] if recent_rows else None
         initial_question_interactions = _pending_question_interactions(recent_rows)
+        if tool_id == "claude_code":
+            queue_rows = (
+                await db.execute(
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.message_type
+                        == "queued_user_message",
+                    )
+                    .order_by(ConversationMessage.line_number)
+                )
+            ).scalars().all()
+            for queue_row in queue_rows:
+                metadata = (
+                    queue_row.metadata_
+                    if isinstance(queue_row.metadata_, dict)
+                    else {}
+                )
+                if metadata.get("canonical_source_id"):
+                    continue
+                queued_claude_users.setdefault(
+                    (queue_row.content or "").strip(),
+                    [],
+                ).append(queue_row)
 
     # The shared iterator is the single source of truth for semantic identity,
     # pagination, counting, and ingestion.  In particular, it preserves valid
@@ -2152,6 +2178,42 @@ async def _extract_messages(
         tool_id,
         initial_question_interactions=initial_question_interactions,
     ):
+        # Claude persists a steer immediately as a queue enqueue, then may
+        # write the canonical user row in a later collector delta after the
+        # active turn finishes. Retain the submission-time row and mark it as
+        # reconciled instead of appending a duplicate at completion time.
+        if (
+            mode == "delta"
+            and tool_id == "claude_code"
+            and normalized.role == "user"
+            and normalized.raw_type == "user"
+        ):
+            queued_row = pop_matching_claude_queue_user(
+                queued_claude_users,
+                clean_content,
+                ts,
+            )
+            if queued_row is not None:
+                queued_metadata = (
+                    dict(queued_row.metadata_)
+                    if isinstance(queued_row.metadata_, dict)
+                    else {}
+                )
+                canonical_identity = normalized.source_id or (
+                    "claude-user:"
+                    + hashlib.sha256(
+                        "\x1f".join((
+                            normalized.timestamp or "",
+                            clean_content,
+                        )).encode("utf-8")
+                    ).hexdigest()
+                )
+                queued_metadata["canonical_source_id"] = (
+                    _bounded_message_text(canonical_identity, 256)
+                )
+                queued_row.metadata_ = queued_metadata
+                continue
+
         # A filesystem event can split Codex's adjacent response/event
         # transport pair across two DELTA uploads.  If the previous DB row
         # is the pending response copy, promote it to the canonical event

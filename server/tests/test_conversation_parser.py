@@ -16,6 +16,7 @@ from server.services.conversation_parser import (  # noqa: E402
     normalize_cursor_user_payload,
     parse_conversation,
     parse_conversation_line,
+    pop_matching_claude_queue_user,
     strip_terminal_sequences,
 )
 
@@ -874,6 +875,140 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertEqual(count_conversation_messages(distinct, "claude_code"), 2)
         self.assertEqual(count_conversation_messages(replayed, "claude_code"), 1)
+
+    def test_claude_queue_enqueue_preserves_interrupted_human_prompt(self) -> None:
+        raw = json.dumps({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "sessionId": "session-1",
+            "timestamp": "2026-07-15T10:24:58.844Z",
+            "content": "Please check the status of every ingestor",
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].role, "user")
+        self.assertEqual(messages[0].raw_type, "queued_user_message")
+        self.assertEqual(
+            messages[0].content,
+            "Please check the status of every ingestor",
+        )
+        self.assertTrue(messages[0].source_id.startswith("claude-queue:"))
+
+    def test_claude_queue_enqueue_and_canonical_user_are_one_prompt(self) -> None:
+        content = "Roll out all schedulers"
+        raw = "\n".join([
+            json.dumps({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": "session-1",
+                "timestamp": "2026-07-15T21:23:32.904Z",
+                "content": content,
+            }),
+            json.dumps({
+                "type": "queue-operation",
+                "operation": "dequeue",
+                "sessionId": "session-1",
+                "timestamp": "2026-07-15T21:24:00.000Z",
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "canonical-user-1",
+                "timestamp": "2026-07-15T21:24:02.000Z",
+                "message": {"role": "user", "content": content},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "queued_user_message")
+        self.assertEqual(messages[0].content, content)
+
+    def test_claude_repeated_queue_prompts_are_reconciled_one_to_one(self) -> None:
+        content = "keep going"
+        rows = []
+        for index in range(2):
+            rows.append({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": "session-1",
+                "timestamp": f"2026-07-15T21:2{index}:00.000Z",
+                "content": content,
+            })
+        rows.append({
+            "type": "user",
+            "uuid": "canonical-user-1",
+            "timestamp": "2026-07-15T21:22:00.000Z",
+            "message": {"role": "user", "content": content},
+        })
+
+        messages = parse_conversation(
+            "\n".join(json.dumps(row) for row in rows),
+            "claude_code",
+        )
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(
+            [message.raw_type for message in messages],
+            ["queued_user_message", "queued_user_message"],
+        )
+
+    def test_claude_queue_transport_notifications_remain_hidden(self) -> None:
+        raw = json.dumps({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "sessionId": "session-1",
+            "timestamp": "2026-07-15T21:24:00.000Z",
+            "content": (
+                "<task-notification>Background task completed"
+                "</task-notification>"
+            ),
+        })
+
+        self.assertEqual(parse_conversation(raw, "claude_code"), [])
+
+    def test_claude_delta_queue_matches_are_consumed_one_to_one(self) -> None:
+        first = type("QueueRow", (), {
+            "content": "keep going",
+            "timestamp": "2026-07-15T10:00:00Z",
+        })()
+        second = type("QueueRow", (), {
+            "content": "keep going",
+            "timestamp": "2026-07-15T10:01:00Z",
+        })()
+        queued: dict[str, list[object]] = {"keep going": [first, second]}
+
+        self.assertIs(
+            pop_matching_claude_queue_user(
+                queued,
+                "keep going",
+                "2026-07-15T10:02:00Z",
+            ),
+            first,
+        )
+        self.assertIs(
+            pop_matching_claude_queue_user(
+                queued,
+                "keep going",
+                "2026-07-15T10:03:00Z",
+            ),
+            second,
+        )
+        self.assertEqual(queued["keep going"], [])
+
+    def test_claude_delta_queue_match_is_bounded_in_time(self) -> None:
+        row = type("QueueRow", (), {
+            "content": "keep going",
+            "timestamp": "2026-07-13T10:00:00Z",
+        })()
+
+        self.assertIsNone(pop_matching_claude_queue_user(
+            {"keep going": [row]},
+            "keep going",
+            "2026-07-15T10:01:00Z",
+        ))
 
     def test_cursor_preserves_identical_same_second_source_items(self) -> None:
         row = {
