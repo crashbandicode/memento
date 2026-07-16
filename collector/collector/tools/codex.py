@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import TOOL_PATHS
@@ -92,19 +93,68 @@ def _state_db_signature(state_db: Path) -> tuple[object, ...]:
     return tuple(parts)
 
 
+def _thread_info_signature(codex_home: Path) -> tuple[object, ...]:
+    """Track both generated thread state and explicit rename history."""
+    return (
+        *_state_db_signature(codex_home / "state_5.sqlite"),
+        *_history_file_signature(codex_home / "session_index.jsonl"),
+    )
+
+
+def _rename_revision_ms(value: object) -> int:
+    """Convert a Codex session-index timestamp into a stable millisecond clock."""
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int(parsed.timestamp() * 1_000))
+
+
+def _load_explicit_thread_titles(codex_home: Path) -> dict[str, dict]:
+    """Read the append-only title log used by current Codex app builds."""
+    index_path = codex_home / "session_index.jsonl"
+    titles: dict[str, dict] = {}
+    try:
+        with index_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                thread_id = str(record.get("id") or "").strip().lower()
+                title = str(record.get("thread_name") or "").strip()[:500]
+                revision = _rename_revision_ms(record.get("updated_at"))
+                if not thread_id or not title or revision <= 0:
+                    continue
+                previous = titles.get(thread_id)
+                if previous is None or revision >= int(previous["revision"]):
+                    titles[thread_id] = {
+                        "title": title,
+                        "title_kind": "custom",
+                        "revision": revision,
+                    }
+    except OSError:
+        return {}
+    return titles
+
+
 def _load_threads_from_sqlite(
     codex_home: Path,
     *,
     force_refresh: bool = False,
 ) -> dict[str, dict]:
-    """Read thread titles and first_user_message from state_5.sqlite."""
+    """Read thread state and overlay Codex's authoritative rename history."""
     global _thread_info_cache, _thread_info_cache_signature
 
     state_db = codex_home / "state_5.sqlite"
-    if not state_db.exists():
-        return {}
-
-    signature = _state_db_signature(state_db)
+    signature = _thread_info_signature(codex_home)
     with _thread_info_lock:
         if (
             not force_refresh
@@ -114,60 +164,75 @@ def _load_threads_from_sqlite(
             return _thread_info_cache
 
     result: dict[str, dict] = {}
-    try:
-        conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=5)
+    state_read_failed = False
+    if state_db.exists():
         try:
-            columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")
-            }
-            first_message = (
-                "first_user_message" if "first_user_message" in columns else "''"
-            )
-            if "updated_at_ms" in columns:
-                revision = (
-                    "COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000, 0)"
+            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=5)
+            try:
+                columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")
+                }
+                first_message = (
+                    "first_user_message" if "first_user_message" in columns else "''"
                 )
-            elif "updated_at" in columns:
-                revision = "COALESCE(updated_at * 1000, 0)"
-            else:
-                revision = "0"
-            rollout_path = "rollout_path" if "rollout_path" in columns else "''"
-            thread_source = "thread_source" if "thread_source" in columns else "''"
-            agent_path = "agent_path" if "agent_path" in columns else "''"
-            cursor = conn.execute(
-                f"SELECT id, title, {first_message}, {revision}, {rollout_path}, "
-                f"{thread_source}, {agent_path} "
-                "FROM threads"
-            )
-            for row in cursor.fetchall():
-                (
-                    tid,
-                    title,
-                    first_msg,
-                    source_revision,
-                    source_path,
-                    source_kind,
-                    source_agent_path,
-                ) = row
-                if tid:
-                    result[str(tid)] = {
-                        "title": title or "",
-                        "first_user_message": first_msg or "",
-                        "revision": max(0, int(source_revision or 0)),
-                        "rollout_path": source_path or "",
-                        "thread_source": source_kind or "",
-                        "agent_path": source_agent_path or "",
-                    }
-        finally:
-            conn.close()
-    except (OSError, sqlite3.Error, TypeError, ValueError):
-        # A concurrent Codex checkpoint can briefly make the read fail. Keep
-        # the previous complete snapshot instead of treating every row as gone.
-        with _thread_info_lock:
-            return _thread_info_cache or {}
+                if "updated_at_ms" in columns:
+                    revision = (
+                        "COALESCE(NULLIF(updated_at_ms, 0), updated_at * 1000, 0)"
+                    )
+                elif "updated_at" in columns:
+                    revision = "COALESCE(updated_at * 1000, 0)"
+                else:
+                    revision = "0"
+                rollout_path = "rollout_path" if "rollout_path" in columns else "''"
+                thread_source = "thread_source" if "thread_source" in columns else "''"
+                agent_path = "agent_path" if "agent_path" in columns else "''"
+                cursor = conn.execute(
+                    f"SELECT id, title, {first_message}, {revision}, {rollout_path}, "
+                    f"{thread_source}, {agent_path} "
+                    "FROM threads"
+                )
+                for row in cursor.fetchall():
+                    (
+                        tid,
+                        title,
+                        first_msg,
+                        source_revision,
+                        source_path,
+                        source_kind,
+                        source_agent_path,
+                    ) = row
+                    if tid:
+                        result[str(tid)] = {
+                            "title": title or "",
+                            "first_user_message": first_msg or "",
+                            "revision": max(0, int(source_revision or 0)),
+                            "rollout_path": source_path or "",
+                            "thread_source": source_kind or "",
+                            "agent_path": source_agent_path or "",
+                        }
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            # A concurrent Codex checkpoint can briefly make the read fail. Keep
+            # the previous complete snapshot instead of treating every row as gone.
+            state_read_failed = True
+            with _thread_info_lock:
+                result = {
+                    thread_id: dict(info)
+                    for thread_id, info in (_thread_info_cache or {}).items()
+                }
+
+    for thread_id, explicit_title in _load_explicit_thread_titles(codex_home).items():
+        info = result.setdefault(thread_id, {})
+        info.update(explicit_title)
+
     with _thread_info_lock:
         _thread_info_cache = result
-        _thread_info_cache_signature = _state_db_signature(state_db)
+        if not state_read_failed:
+            # Retain the pre-read signature. If either source changed while it
+            # was being read, the next cached call will observe the difference
+            # and reload instead of treating a partial snapshot as current.
+            _thread_info_cache_signature = signature
         return _thread_info_cache
 
 
@@ -424,11 +489,13 @@ class CodexTool(BaseTool):
             first_user_message = str(
                 info.get("first_user_message") or ""
             ).strip()
-            title_kind = (
-                "fallback"
-                if first_user_message and title == first_user_message
-                else "custom"
-            )
+            title_kind = str(info.get("title_kind") or "").strip().lower()
+            if title_kind not in {"custom", "fallback"}:
+                title_kind = (
+                    "fallback"
+                    if first_user_message and title == first_user_message
+                    else "custom"
+                )
             record = {
                 "metadata_type": "codex_thread_title",
                 "tool": self.name,

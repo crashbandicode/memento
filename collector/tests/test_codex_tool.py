@@ -46,6 +46,21 @@ def _write_records(path: Path, records: list[dict], *, prefix: str = "") -> None
     path.write_text(content, encoding="utf-8")
 
 
+def _append_session_title(
+    root: Path,
+    *,
+    thread_id: str,
+    title: str,
+    updated_at: str,
+) -> None:
+    with (root / "session_index.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "id": thread_id,
+            "thread_name": title,
+            "updated_at": updated_at,
+        }) + "\n")
+
+
 def test_models_cache_is_not_live_synced(codex_tool: CodexTool) -> None:
     path = codex_tool.root_path / "models_cache.json"
     path.write_text('{"models": []}', encoding="utf-8")
@@ -190,6 +205,120 @@ def test_state_title_records_refresh_and_include_revision_and_path(
     second = codex_tool.thread_title_records()[ROOT_ID]
     assert second["title"] == "Explicitly renamed"
     assert second["revision"] == 200_456
+
+
+def test_session_index_rename_overrides_newer_state_fallback(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "First prompt")
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="Human-readable rename",
+        updated_at="1970-01-01T00:01:00.1234567Z",
+    )
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert record["title"] == "Human-readable rename"
+    assert record["title_kind"] == "custom"
+    assert record["revision"] == 60_123
+    classification = codex_tool.classify_file(path)
+    assert classification is not None
+    assert classification.metadata["title"] == "Human-readable rename"
+
+
+def test_session_index_latest_rename_wins_and_invalid_rows_are_ignored(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "First prompt")
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="First rename",
+        updated_at="1970-01-01T00:01:00Z",
+    )
+    with (codex_tool.root_path / "session_index.jsonl").open(
+        "a", encoding="utf-8"
+    ) as handle:
+        handle.write("not json\n")
+        handle.write(json.dumps({
+            "id": ROOT_ID,
+            "thread_name": "Missing clock",
+        }) + "\n")
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="Second rename",
+        updated_at="1970-01-01T00:02:00Z",
+    )
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert record["title"] == "Second rename"
+    assert record["revision"] == 120_000
+
+
+def test_session_index_append_invalidates_cached_thread_info(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "First prompt")
+
+    initial = codex_module._load_threads_from_sqlite(codex_tool.root_path)
+    assert initial[ROOT_ID]["title"] == "First prompt"
+
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="Observed without a state DB write",
+        updated_at="1970-01-01T00:03:00Z",
+    )
+    refreshed = codex_module._load_threads_from_sqlite(codex_tool.root_path)
+
+    assert refreshed[ROOT_ID]["title"] == "Observed without a state DB write"
+    assert refreshed[ROOT_ID]["title_kind"] == "custom"
+
+
+def test_session_index_title_equal_to_prompt_remains_explicit(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "First prompt")
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="First prompt",
+        updated_at="1970-01-01T00:04:00Z",
+    )
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert record["title_kind"] == "custom"
+
+
+def test_session_index_can_recover_title_without_state_database(
+    codex_tool: CodexTool,
+) -> None:
+    _append_session_title(
+        codex_tool.root_path,
+        thread_id=ROOT_ID,
+        title="Recovered explicit rename",
+        updated_at="1970-01-01T00:05:00Z",
+    )
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert record["title"] == "Recovered explicit rename"
+    assert record["title_kind"] == "custom"
+    assert record["revision"] == 300_000
+    assert "relative_path" not in record
 
 
 def test_title_equal_to_first_prompt_is_marked_as_fallback(
