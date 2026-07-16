@@ -12,6 +12,8 @@ from ..db.models import Document, Machine, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
+    ConversationActivitySummary,
+    conversation_activity_summaries,
     conversation_list_timestamp_expression,
     effective_conversation_activity,
 )
@@ -143,6 +145,28 @@ def _project_summary(row) -> dict:
         "tool_id": tool_id,
         "source_path": source_path,
     }
+
+
+async def _annotate_conversation_activity(
+    db: AsyncSession,
+    files: list[dict],
+) -> None:
+    """Add the shared low-activity decision to one bounded hierarchy page."""
+    conversation_ids = [
+        uuid.UUID(item["id"])
+        for item in files
+        if item.get("category") == "conversation"
+    ]
+    summaries = await conversation_activity_summaries(db, conversation_ids)
+    for item in files:
+        if item.get("category") != "conversation":
+            continue
+        summary = summaries.get(
+            uuid.UUID(item["id"]),
+            ConversationActivitySummary(),
+        )
+        item["message_count"] = summary.message_count
+        item["is_low_activity"] = summary.is_low_activity
 
 
 def _check_machine_access(machine: Machine | None, user: User) -> Machine | None:
@@ -363,6 +387,7 @@ async def list_device_tool_files(
             offset=offset,
             limit=limit,
         )
+        await _annotate_conversation_activity(db, files)
         return {"total": total, "files": files, "project": project}
 
     # Count directly against the filtered table.  Counting a subquery based
@@ -387,8 +412,10 @@ async def list_device_tool_files(
     )
     rows = result.all()
 
+    files = [_device_file_row(row) for row in rows]
+    await _annotate_conversation_activity(db, files)
     return {
         "total": total,
-        "files": [_device_file_row(row) for row in rows],
+        "files": files,
         "project": project,
     }

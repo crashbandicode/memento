@@ -8,6 +8,8 @@ import { useI18n, fmt } from "@/lib/i18n";
 import { useDevice } from "@/lib/device-context";
 import { ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+import BrowseFileRow from "@/components/conversations/BrowseFileRow";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
 type LoadState = "loading" | "success" | "error";
 
@@ -133,6 +135,8 @@ export default function ToolDetailPage() {
   const visibleProjects = visibleProjectState === "success" ? projects : [];
   const visibleFileState: LoadState = loadedFileKey === fileRequestKey ? fileLoadState : "loading";
   const visibleFiles = visibleFileState === "success" ? files : [];
+  const primaryFiles = visibleFiles.filter((file) => file.category !== "conversation" || !file.is_low_activity);
+  const lowActivityFiles = visibleFiles.filter((file) => file.category === "conversation" && file.is_low_activity);
   const visibleToolState: LoadState = loadedToolKey === projectRequestKey ? toolLoadState : "loading";
 
   if (visibleToolState === "loading") {
@@ -153,6 +157,23 @@ export default function ToolDetailPage() {
   }
 
   const categories = Object.entries(tool.categories);
+  const renderFile = (file: DocumentSummary) => (
+    <BrowseFileRow
+      key={file.id}
+      href={file.category === "conversation" ? `/conversations/${file.id}` : `/documents/${file.id}`}
+      category={file.category}
+      title={file.title || file.relative_path}
+      path={file.relative_path}
+      size={file.category === "conversation" && typeof file.message_count === "number"
+        ? `${file.message_count} msgs`
+        : `${(file.file_size_bytes / 1024).toFixed(1)}KB`}
+      date={new Date(
+        file.category === "conversation" && file.activity_at ? file.activity_at : file.synced_at,
+      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+      subagentCount={file.subagent_count}
+      isSubagentOrphan={file.is_subagent_orphan}
+    />
+  );
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -236,78 +257,43 @@ export default function ToolDetailPage() {
         </div>
 
         <div className="lg:col-span-3">
-          <Glass padding={6} radius={18}>
-            <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--aurora-border)" }}>
-              <SectionLabel style={{ margin: 0 }}>
-                {t.tools.fileList} ({visibleFiles.length})
-              </SectionLabel>
-            </div>
-            {visibleFileState === "loading" ? (
-              <div role="status" aria-live="polite" style={{ textAlign: "center", color: "var(--aurora-fg3)", padding: 48, fontSize: 13 }}>
-                {t.loading}
+          {(visibleFileState !== "success" || primaryFiles.length > 0 || visibleFiles.length === 0) && (
+            <Glass padding={6} radius={18}>
+              <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--aurora-border)" }}>
+                <SectionLabel style={{ margin: 0 }}>
+                  {t.tools.fileList} ({visibleFiles.length})
+                </SectionLabel>
               </div>
-            ) : visibleFileState === "error" ? (
-              <div style={{ textAlign: "center", padding: 40 }}>
-                <div role="alert" style={{ marginBottom: 12 }}>
-                  <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 3px" }}>{t.tools.fileLoadFailed}</p>
-                  {fileLoadError && <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: 0 }}>{fileLoadError}</p>}
+              {visibleFileState === "loading" ? (
+                <div role="status" aria-live="polite" style={{ textAlign: "center", color: "var(--aurora-fg3)", padding: 48, fontSize: 13 }}>
+                  {t.loading}
                 </div>
-                <Btn size="sm" variant="glass" icon="refresh" onClick={() => setFileRetryToken((token) => token + 1)}>
-                  {t.projectPage.retry}
-                </Btn>
-              </div>
-            ) : visibleFiles.length === 0 ? (
-              <div style={{ textAlign: "center", color: "var(--aurora-fg4)", padding: 48, fontSize: 13 }}>
-                {t.tools.noFiles}
-              </div>
-            ) : (
-              visibleFiles.map((f) => {
-                const href = f.content_type === "jsonl" && f.category === "conversation"
-                  ? `/conversations/${f.id}` : `/documents/${f.id}`;
-                return (
-                  <Link
-                    key={f.id}
-                    href={href}
-                    prefetch={false}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                      textDecoration: "none",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: 32, height: 32, borderRadius: 10, flexShrink: 0,
-                        background: "var(--aurora-accent-soft)", color: "var(--aurora-accent)",
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                      }}
-                    >
-                      <CategoryIcon category={f.category} size={14} />
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 500, color: "var(--aurora-fg1)", letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {f.title || f.relative_path}
-                      </div>
-                      <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {f.relative_path}
-                      </div>
-                    </div>
-                    <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
-                    <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                      {new Date(
-                        f.category === "conversation" && f.activity_at
-                          ? f.activity_at
-                          : f.synced_at,
-                      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                    </span>
-                  </Link>
-                );
-              })
-            )}
-          </Glass>
+              ) : visibleFileState === "error" ? (
+                <div style={{ textAlign: "center", padding: 40 }}>
+                  <div role="alert" style={{ marginBottom: 12 }}>
+                    <p style={{ color: "var(--aurora-fg2)", fontSize: 13, margin: "0 0 3px" }}>{t.tools.fileLoadFailed}</p>
+                    {fileLoadError && <p style={{ color: "var(--aurora-fg4)", fontSize: 11, margin: 0 }}>{fileLoadError}</p>}
+                  </div>
+                  <Btn size="sm" variant="glass" icon="refresh" onClick={() => setFileRetryToken((token) => token + 1)}>
+                    {t.projectPage.retry}
+                  </Btn>
+                </div>
+              ) : visibleFiles.length === 0 ? (
+                <div style={{ textAlign: "center", color: "var(--aurora-fg4)", padding: 48, fontSize: 13 }}>
+                  {t.tools.noFiles}
+                </div>
+              ) : primaryFiles.map(renderFile)}
+            </Glass>
+          )}
+          {visibleFileState === "success" && (
+            <LowActivitySection
+              count={lowActivityFiles.length}
+              title={t.conversation.lowActivity}
+              description={t.conversation.lowActivityHint}
+            >
+              {lowActivityFiles.map(renderFile)}
+            </LowActivitySection>
+          )}
         </div>
       </div>
     </div>

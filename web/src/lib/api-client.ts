@@ -191,6 +191,11 @@ export interface DocumentSummary {
   activity_at?: string | null;
   synced_at: string;
   ai_summary?: string | null;
+  device_name?: string | null;
+  message_count?: number | null;
+  is_low_activity?: boolean | null;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
 }
 
 export interface DocumentDetail {

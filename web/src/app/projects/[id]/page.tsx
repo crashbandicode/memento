@@ -7,8 +7,8 @@ import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
+import BrowseFileRow from "@/components/conversations/BrowseFileRow";
 import LowActivitySection from "@/components/conversations/LowActivitySection";
-import SubagentBadge from "@/components/conversations/SubagentBadge";
 
 interface ProjectDetail {
   id: string;
@@ -133,7 +133,7 @@ export default function ProjectDetailPage() {
         const renderDoc = (d: (typeof docs)[number]) => {
           const href = cat === "conversation" ? `/conversations/${d.id}` : `/documents/${d.id}`;
           return (
-            <DocRow
+            <BrowseFileRow
               key={d.id}
               href={href}
               category={cat}
@@ -182,61 +182,5 @@ export default function ProjectDetailPage() {
         </Glass>
       )}
     </div>
-  );
-}
-
-function DocRow({
-  href, category, title, path, size, date, subagentCount, isSubagentOrphan,
-}: {
-  href: string;
-  category: string;
-  title: string;
-  path: string;
-  size: string;
-  date: string;
-  subagentCount?: number;
-  isSubagentOrphan?: boolean;
-}) {
-  const [h, setH] = useState(false);
-  return (
-    <Link
-      href={href}
-      prefetch={false}
-      onMouseEnter={() => setH(true)}
-      onMouseLeave={() => setH(false)}
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 12,
-        padding: "10px 12px",
-        borderRadius: 12,
-        background: h ? "var(--aurora-chip)" : "transparent",
-        transition: "background .15s",
-        textDecoration: "none",
-      }}
-    >
-      <div
-        style={{
-          width: 32, height: 32, borderRadius: 10, flexShrink: 0,
-          background: "var(--aurora-accent-soft)", color: "var(--aurora-accent)",
-          display: "flex", alignItems: "center", justifyContent: "center",
-        }}
-      >
-        <CategoryIcon category={category} size={14} />
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: "var(--aurora-fg1)", letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {title}
-        </div>
-        <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {path}
-        </div>
-        <div style={{ marginTop: subagentCount ? 5 : 0 }}>
-          <SubagentBadge count={subagentCount} orphan={isSubagentOrphan} />
-        </div>
-      </div>
-      <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{size}</span>
-      <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{date}</span>
-    </Link>
   );
 }

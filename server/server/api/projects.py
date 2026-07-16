@@ -18,9 +18,10 @@ from ..db.models import (
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
+    ConversationActivitySummary,
+    conversation_activity_summaries,
     historical_conversation_activity_query,
     is_low_activity_messages,
-    is_low_activity_summary,
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
@@ -354,29 +355,10 @@ async def get_project(
     docs = docs_result.scalars().all()
 
     conversation_ids = [d.id for d in docs if d.category == "conversation"]
-    activity_by_document: dict[uuid.UUID, tuple[int, bool]] = {}
-    if conversation_ids:
-        activity_rows = await db.execute(
-            select(
-                ConversationMessage.document_id,
-                func.count().label("message_count"),
-                func.count().filter(ConversationMessage.role == "user").label("user_count"),
-                func.count().filter(ConversationMessage.role == "assistant").label("assistant_count"),
-                func.coalesce(
-                    func.sum(func.length(ConversationMessage.content)).filter(
-                        ConversationMessage.role.in_(("user", "assistant"))
-                    ),
-                    0,
-                ).label("human_character_count"),
-            )
-            .where(ConversationMessage.document_id.in_(conversation_ids))
-            .group_by(ConversationMessage.document_id)
-        )
-        for did, total, users, assistants, characters in activity_rows.all():
-            activity_by_document[did] = (
-                total,
-                is_low_activity_summary(users, assistants, characters),
-            )
+    activity_by_document = await conversation_activity_summaries(
+        db,
+        conversation_ids,
+    )
 
     # Categories whose content is small + curated + worth inlining so a
     # single fetch is enough for an AI to "know the project". Conversation
@@ -402,12 +384,12 @@ async def get_project(
             row["activity_at"] = (
                 activity_at.isoformat() if activity_at else None
             )
-            message_count, is_low_activity = activity_by_document.get(
+            activity = activity_by_document.get(
                 d.id,
-                (0, True),
+                ConversationActivitySummary(),
             )
-            row["message_count"] = message_count
-            row["is_low_activity"] = is_low_activity
+            row["message_count"] = activity.message_count
+            row["is_low_activity"] = activity.is_low_activity
             row["subagent_count"] = conversation_hierarchy.subagent_counts.get(
                 d.id,
                 0,

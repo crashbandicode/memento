@@ -60,6 +60,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         self.synced = datetime(2026, 7, 8, 12, tzinfo=timezone.utc)
         self.document = SimpleNamespace(
             id=uuid.uuid4(),
+            tool_id="codex",
             machine_id=None,
             relative_path="sessions/thread.jsonl",
             category="conversation",
@@ -70,11 +71,15 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
             source_modified_at=self.source_modified,
             synced_at=self.synced,
             ai_summary=None,
+            metadata_={},
         )
         self.owner = SimpleNamespace(role="owner")
 
     async def test_tool_files_return_and_order_by_effective_activity(self) -> None:
-        db = _Db([_Result(rows=[self.document])])
+        db = _Db([
+            _Result(rows=[self.document]),
+            _Result(rows=[]),
+        ])
 
         rows = await list_tool_files(
             "codex",
@@ -88,8 +93,59 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rows[0].activity_at, self.activity.isoformat())
         sql = str(db.statements[0].compile())
-        self.assertIn("ORDER BY CASE WHEN", sql)
-        self.assertIn("coalesce(documents.activity_at", sql)
+        self.assertNotIn("documents.content,", sql)
+        self.assertIn("documents.metadata", sql)
+
+    async def test_tool_files_fold_children_and_classify_visible_roots(self) -> None:
+        root_id = uuid.uuid4()
+        child_id = uuid.uuid4()
+        root_thread_id = str(uuid.uuid4())
+        root = SimpleNamespace(
+            **{
+                **self.document.__dict__,
+                "id": root_id,
+                "title": "Root",
+                "metadata_": {
+                    "session_id": root_thread_id,
+                    "thread_id": root_thread_id,
+                    "thread_source": "user",
+                },
+            }
+        )
+        child = SimpleNamespace(
+            **{
+                **self.document.__dict__,
+                "id": child_id,
+                "title": "Child",
+                "activity_at": self.activity.replace(day=16),
+                "metadata_": {
+                    "session_id": str(uuid.uuid4()),
+                    "thread_id": str(uuid.uuid4()),
+                    "thread_source": "subagent",
+                    "root_session_id": root_thread_id,
+                },
+            }
+        )
+        db = _Db([
+            _Result(rows=[root, child]),
+            _Result(rows=[(root_id, 12, 2, 3, 900)]),
+        ])
+
+        rows = await list_tool_files(
+            "codex",
+            category=None,
+            device_id=None,
+            offset=0,
+            limit=50,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual([row.id for row in rows], [str(root_id)])
+        self.assertEqual(rows[0].subagent_count, 1)
+        self.assertEqual(rows[0].message_count, 12)
+        self.assertFalse(rows[0].is_low_activity)
+        self.assertEqual(rows[0].activity_at, child.activity_at.isoformat())
 
     async def test_device_files_return_and_order_by_effective_activity(self) -> None:
         machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)
@@ -109,6 +165,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
             _Result(scalar_value=machine),
             _Result(scalar_value=1),
             _Result(rows=[device_row]),
+            _Result(rows=[]),
         ])
 
         payload = await list_device_tool_files(
@@ -172,6 +229,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
             _Result(rows=[project_row]),
             _Result(scalar_value=341),
             _Result(rows=rows),
+            _Result(rows=[]),
         ])
 
         payload = await list_device_tool_files(
@@ -374,6 +432,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
             _Result(scalar_value=machine),
             _Result(rows=[project_row]),
             _Result(rows=[root_row, child_row]),
+            _Result(rows=[(root_id, 8, 2, 2, 480)]),
         ])
 
         payload = await list_device_tool_files(
@@ -390,6 +449,8 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["total"], 1)
         self.assertEqual([item["id"] for item in payload["files"]], [str(root_id)])
         self.assertEqual(payload["files"][0]["subagent_count"], 1)
+        self.assertEqual(payload["files"][0]["message_count"], 8)
+        self.assertFalse(payload["files"][0]["is_low_activity"])
         self.assertEqual(
             payload["files"][0]["activity_at"],
             child_activity.isoformat(),

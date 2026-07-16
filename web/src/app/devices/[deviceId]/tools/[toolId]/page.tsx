@@ -7,9 +7,24 @@ import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
+import BrowseFileRow from "@/components/conversations/BrowseFileRow";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
 interface ProjectItem { id: string; title: string; slug: string; file_count: number; last_sync: string | null; }
-interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; }
+interface FileItem {
+  id: string;
+  title: string;
+  relative_path: string;
+  category: string;
+  content_type: string;
+  file_size_bytes: number;
+  activity_at?: string | null;
+  synced_at: string;
+  message_count?: number;
+  is_low_activity?: boolean;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+}
 
 export default function DeviceToolPage() {
   const params = useParams();
@@ -50,6 +65,25 @@ export default function DeviceToolPage() {
   }, [deviceId, toolId, activeCategory]);
 
   const toolName = toolId.replace("_", " ");
+  const visibleFiles = files.filter((file) => file.category !== "conversation" || !file.is_low_activity);
+  const lowActivityFiles = files.filter((file) => file.category === "conversation" && file.is_low_activity);
+  const renderFile = (file: FileItem) => (
+    <BrowseFileRow
+      key={file.id}
+      href={file.category === "conversation" ? `/conversations/${file.id}` : `/documents/${file.id}`}
+      category={file.category}
+      title={file.title || file.relative_path}
+      path={file.relative_path}
+      size={file.category === "conversation" && typeof file.message_count === "number"
+        ? `${file.message_count} msgs`
+        : `${(file.file_size_bytes / 1024).toFixed(1)}KB`}
+      date={new Date(
+        file.category === "conversation" && file.activity_at ? file.activity_at : file.synced_at,
+      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+      subagentCount={file.subagent_count}
+      isSubagentOrphan={file.is_subagent_orphan}
+    />
+  );
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -142,64 +176,27 @@ export default function DeviceToolPage() {
         </div>
 
         <div className="lg:col-span-3">
-          <Glass padding={6} radius={18}>
-            <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--aurora-border)" }}>
-              <SectionLabel style={{ margin: 0 }}>
-                {t.tools.fileList} ({files.length})
-              </SectionLabel>
-            </div>
-            {files.length === 0 ? (
-              <div style={{ textAlign: "center", color: "var(--aurora-fg4)", padding: 48, fontSize: 13 }}>
-                {t.tools.noFiles}
+          {(visibleFiles.length > 0 || files.length === 0) && (
+            <Glass padding={6} radius={18}>
+              <div style={{ padding: "12px 14px", borderBottom: "1px solid var(--aurora-border)" }}>
+                <SectionLabel style={{ margin: 0 }}>
+                  {t.tools.fileList} ({files.length})
+                </SectionLabel>
               </div>
-            ) : (
-              files.map((f) => {
-                const href = f.content_type === "jsonl" && f.category === "conversation"
-                  ? `/conversations/${f.id}` : `/documents/${f.id}`;
-                return (
-                  <Link
-                    key={f.id}
-                    href={href}
-                    prefetch={false}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      padding: "10px 12px",
-                      borderRadius: 12,
-                      textDecoration: "none",
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: 32, height: 32, borderRadius: 10, flexShrink: 0,
-                        background: "var(--aurora-accent-soft)", color: "var(--aurora-accent)",
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                      }}
-                    >
-                      <CategoryIcon category={f.category} size={14} />
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 500, color: "var(--aurora-fg1)", letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {f.title || f.relative_path}
-                      </div>
-                      <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {f.relative_path}
-                      </div>
-                    </div>
-                    <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
-                    <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                      {new Date(
-                        f.category === "conversation" && f.activity_at
-                          ? f.activity_at
-                          : f.synced_at,
-                      ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                    </span>
-                  </Link>
-                );
-              })
-            )}
-          </Glass>
+              {files.length === 0 ? (
+                <div style={{ textAlign: "center", color: "var(--aurora-fg4)", padding: 48, fontSize: 13 }}>
+                  {t.tools.noFiles}
+                </div>
+              ) : visibleFiles.map(renderFile)}
+            </Glass>
+          )}
+          <LowActivitySection
+            count={lowActivityFiles.length}
+            title={t.conversation.lowActivity}
+            description={t.conversation.lowActivityHint}
+          >
+            {lowActivityFiles.map(renderFile)}
+          </LowActivitySection>
         </div>
       </div>
     </div>

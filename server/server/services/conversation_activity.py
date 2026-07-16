@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,24 @@ if TYPE_CHECKING:
 
 SHORT_EXCHANGE_CHARACTER_LIMIT = 120
 REAL_ACTIVITY_ROLES = ("user", "assistant")
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationActivitySummary:
+    """Small shared activity projection for every conversation list surface."""
+
+    message_count: int = 0
+    user_count: int = 0
+    assistant_count: int = 0
+    human_character_count: int = 0
+
+    @property
+    def is_low_activity(self) -> bool:
+        return is_low_activity_summary(
+            self.user_count,
+            self.assistant_count,
+            self.human_character_count,
+        )
 
 
 def effective_conversation_activity(
@@ -112,6 +131,51 @@ async def refresh_document_activity_at(
     ).scalar_one_or_none()
     document.activity_at = activity_at
     return activity_at
+
+
+async def conversation_activity_summaries(
+    db: "AsyncSession",
+    document_ids: Iterable[Hashable],
+) -> dict[Hashable, ConversationActivitySummary]:
+    """Return one bounded aggregate query for a page of conversations."""
+    ids = list(dict.fromkeys(document_ids))
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(
+            ConversationMessage.document_id,
+            func.count().label("message_count"),
+            func.count().filter(
+                ConversationMessage.role == "user"
+            ).label("user_count"),
+            func.count().filter(
+                ConversationMessage.role == "assistant"
+            ).label("assistant_count"),
+            func.coalesce(
+                func.sum(func.length(ConversationMessage.content)).filter(
+                    ConversationMessage.role.in_(REAL_ACTIVITY_ROLES)
+                ),
+                0,
+            ).label("human_character_count"),
+        )
+        .where(ConversationMessage.document_id.in_(ids))
+        .group_by(ConversationMessage.document_id)
+    )
+    return {
+        document_id: ConversationActivitySummary(
+            message_count=int(message_count or 0),
+            user_count=int(user_count or 0),
+            assistant_count=int(assistant_count or 0),
+            human_character_count=int(human_character_count or 0),
+        )
+        for (
+            document_id,
+            message_count,
+            user_count,
+            assistant_count,
+            human_character_count,
+        ) in rows.all()
+    }
 
 
 def is_low_activity_summary(

@@ -8,9 +8,23 @@ import { getApiBase, authFetch } from "@/lib/api-client";
 import { mergeProjectFiles } from "@/lib/project-files";
 import { Icon, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, SectionLabel, TopBar } from "@/components/aurora/primitives";
-import SubagentBadge from "@/components/conversations/SubagentBadge";
+import BrowseFileRow from "@/components/conversations/BrowseFileRow";
+import LowActivitySection from "@/components/conversations/LowActivitySection";
 
-interface FileItem { id: string; title: string; relative_path: string; category: string; content_type: string; file_size_bytes: number; activity_at?: string | null; synced_at: string; subagent_count?: number; is_subagent_orphan?: boolean; }
+interface FileItem {
+  id: string;
+  title: string;
+  relative_path: string;
+  category: string;
+  content_type: string;
+  file_size_bytes: number;
+  activity_at?: string | null;
+  synced_at: string;
+  message_count?: number;
+  is_low_activity?: boolean;
+  subagent_count?: number;
+  is_subagent_orphan?: boolean;
+}
 interface ProjectInfo { id: string; slug: string; title: string; tool_id: string; source_path: string | null; }
 interface HierarchyFilesResponse { total: number; files: FileItem[]; project: ProjectInfo | null; }
 
@@ -213,67 +227,54 @@ export default function DeviceToolProjectPage() {
         </Glass>
       )}
 
-      {loadState === "success" && Object.entries(byCategory).map(([cat, catFiles]) => (
-        <div key={cat} style={{ marginBottom: 24 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "8px 4px 12px" }}>
-            <CategoryIcon category={cat} size={14} />
-            <SectionLabel style={{ margin: 0 }}>
-              {(t.category as Record<string, string>)[cat] || cat} <span style={{ textTransform: "none", color: "var(--aurora-fg4)", fontWeight: 400 }}>({catFiles.length})</span>
-            </SectionLabel>
+      {loadState === "success" && Object.entries(byCategory).map(([cat, catFiles]) => {
+        const visibleFiles = cat === "conversation"
+          ? catFiles.filter((file) => !file.is_low_activity)
+          : catFiles;
+        const lowActivityFiles = cat === "conversation"
+          ? catFiles.filter((file) => file.is_low_activity)
+          : [];
+        const renderFile = (file: FileItem) => (
+          <BrowseFileRow
+            key={file.id}
+            href={cat === "conversation" ? `/conversations/${file.id}` : `/documents/${file.id}`}
+            category={cat}
+            title={file.title || file.relative_path.split("/").pop() || ""}
+            path={file.relative_path}
+            size={cat === "conversation" && typeof file.message_count === "number"
+              ? `${file.message_count} msgs`
+              : `${(file.file_size_bytes / 1024).toFixed(1)}KB`}
+            date={new Date(
+              cat === "conversation" && file.activity_at ? file.activity_at : file.synced_at,
+            ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+            subagentCount={file.subagent_count}
+            isSubagentOrphan={file.is_subagent_orphan}
+          />
+        );
+
+        return (
+          <div key={cat} style={{ marginBottom: 24 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "8px 4px 12px" }}>
+              <CategoryIcon category={cat} size={14} />
+              <SectionLabel style={{ margin: 0 }}>
+                {(t.category as Record<string, string>)[cat] || cat} <span style={{ textTransform: "none", color: "var(--aurora-fg4)", fontWeight: 400 }}>({catFiles.length})</span>
+              </SectionLabel>
+            </div>
+            {visibleFiles.length > 0 && (
+              <Glass padding={6} radius={18}>
+                {visibleFiles.map(renderFile)}
+              </Glass>
+            )}
+            <LowActivitySection
+              count={lowActivityFiles.length}
+              title={t.conversation.lowActivity}
+              description={t.conversation.lowActivityHint}
+            >
+              {lowActivityFiles.map(renderFile)}
+            </LowActivitySection>
           </div>
-          <Glass padding={6} radius={18}>
-            {catFiles.map((f) => {
-              const href = f.category === "conversation" ? `/conversations/${f.id}` : `/documents/${f.id}`;
-              return (
-                <Link
-                  key={f.id}
-                  href={href}
-                  prefetch={false}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 12,
-                    padding: "10px 12px",
-                    borderRadius: 12,
-                    textDecoration: "none",
-                  }}
-                >
-                  <div
-                    style={{
-                      width: 32, height: 32, borderRadius: 10, flexShrink: 0,
-                      background: "var(--aurora-accent-soft)", color: "var(--aurora-accent)",
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                    }}
-                  >
-                    <CategoryIcon category={cat} size={14} />
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 500, color: "var(--aurora-fg1)", letterSpacing: "-0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {f.title || f.relative_path.split("/").pop()}
-                    </div>
-                    {Boolean(f.subagent_count) && (
-                      <div style={{ marginTop: 4 }}>
-                        <SubagentBadge count={f.subagent_count} orphan={f.is_subagent_orphan} />
-                      </div>
-                    )}
-                    <div style={{ fontSize: 11, color: "var(--aurora-fg4)", fontFamily: "ui-monospace,monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {f.relative_path}
-                    </div>
-                  </div>
-                  <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>{(f.file_size_bytes / 1024).toFixed(1)}KB</span>
-                  <span style={{ fontSize: 11, color: "var(--aurora-fg4)", flexShrink: 0 }}>
-                    {new Date(
-                      f.category === "conversation" && f.activity_at
-                        ? f.activity_at
-                        : f.synced_at,
-                    ).toLocaleString(dateFmt, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                </Link>
-              );
-            })}
-          </Glass>
-        </div>
-      ))}
+        );
+      })}
 
       {loadState === "success" && total === 0 && (
         <Glass padding={40} radius={20} style={{ textAlign: "center" }}>

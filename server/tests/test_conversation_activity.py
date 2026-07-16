@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_activity import (  # noqa: E402
+    ConversationActivitySummary,
+    conversation_activity_summaries,
     conversation_list_timestamp_expression,
     conversation_activity_at_query,
     effective_conversation_activity,
@@ -179,6 +181,36 @@ class RefreshDocumentActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(document.activity_at, expected)
 
+    async def test_page_summary_uses_one_grouped_query(self) -> None:
+        document_id = "document-id"
+
+        class Result:
+            def all(self):
+                return [(document_id, 7, 1, 2, 240)]
+
+        class Db:
+            def __init__(self):
+                self.statements = []
+
+            async def execute(self, statement):
+                self.statements.append(statement)
+                return Result()
+
+        db = Db()
+        summaries = await conversation_activity_summaries(
+            db,
+            [document_id, document_id],
+        )
+
+        self.assertEqual(
+            summaries[document_id],
+            ConversationActivitySummary(7, 1, 2, 240),
+        )
+        self.assertFalse(summaries[document_id].is_low_activity)
+        self.assertEqual(len(db.statements), 1)
+        sql = str(db.statements[0].compile())
+        self.assertIn("GROUP BY conversation_messages.document_id", sql)
+
 
 class ConversationBrowseActivityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -189,6 +221,7 @@ class ConversationBrowseActivityTests(unittest.TestCase):
     def _document(self, category: str) -> SimpleNamespace:
         return SimpleNamespace(
             id="document-id",
+            tool_id="codex",
             machine_id="machine-id",
             relative_path="sessions/thread.jsonl",
             category=category,
@@ -199,6 +232,7 @@ class ConversationBrowseActivityTests(unittest.TestCase):
             source_modified_at=self.source_modified,
             synced_at=self.synced,
             ai_summary=None,
+            metadata_={},
         )
 
     def _device_row(self, category: str) -> tuple:

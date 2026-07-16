@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -13,8 +15,16 @@ from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..tool_catalog import tool_display_name
 from ..services.conversation_activity import (
+    ConversationActivitySummary,
+    conversation_activity_summaries,
     conversation_list_timestamp_expression,
     effective_conversation_activity,
+)
+from ..services.conversation_hierarchy import (
+    ConversationRef,
+    FOLDABLE_CONVERSATION_TOOLS,
+    build_logical_activity_map,
+    fold_conversation_subagents,
 )
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
@@ -41,18 +51,25 @@ class DocumentSummary(BaseModel):
     synced_at: str
     ai_summary: str | None = None
     device_name: str | None = None
+    message_count: int | None = None
+    is_low_activity: bool | None = None
+    subagent_count: int = 0
+    is_subagent_orphan: bool = False
 
 
 def _document_summary(
     document: Document,
     machine_names: dict[str, str],
+    *,
+    logical_activity: datetime | None = None,
+    activity: ConversationActivitySummary | None = None,
+    subagent_count: int = 0,
+    is_subagent_orphan: bool = False,
 ) -> DocumentSummary:
     activity_at = None
     if document.category == "conversation":
-        effective_timestamp = effective_conversation_activity(
-            document.activity_at,
-            document.source_modified_at,
-            document.synced_at,
+        effective_timestamp = logical_activity or effective_conversation_activity(
+            document.activity_at, document.source_modified_at, document.synced_at
         )
         activity_at = (
             effective_timestamp.isoformat() if effective_timestamp else None
@@ -72,6 +89,10 @@ def _document_summary(
             if document.machine_id
             else None
         ),
+        message_count=(activity.message_count if activity else None),
+        is_low_activity=(activity.is_low_activity if activity else None),
+        subagent_count=subagent_count,
+        is_subagent_orphan=is_subagent_orphan,
     )
 
 
@@ -182,6 +203,7 @@ async def list_tool_files(
         .options(
             load_only(
                 Document.id,
+                Document.tool_id,
                 Document.relative_path,
                 Document.category,
                 Document.content_type,
@@ -192,6 +214,7 @@ async def list_tool_files(
                 Document.synced_at,
                 Document.ai_summary,
                 Document.machine_id,
+                Document.metadata_,
             )
         )
         .where(Document.tool_id == tool_id)
@@ -200,19 +223,69 @@ async def list_tool_files(
         query = query.where(Document.category == category)
     query = _device_filter(query, device_id)
     query = apply_user_filter(query, mids, Document.machine_id)
-    display_timestamp = conversation_list_timestamp_expression(
-        Document.category,
-        Document.activity_at,
-        Document.source_modified_at,
-        Document.synced_at,
-    )
-    query = query.order_by(
-        display_timestamp.desc(),
-        Document.id.desc(),
-    ).offset(offset).limit(limit)
+    hierarchy = None
+    logical_activity_by_document: dict = {}
+    if (
+        tool_id in FOLDABLE_CONVERSATION_TOOLS
+        and category in (None, "conversation")
+    ):
+        all_docs = (await db.execute(query)).scalars().all()
+        conversation_refs = [
+            ConversationRef(
+                document_id=document.id,
+                tool_id=document.tool_id,
+                relative_path=document.relative_path,
+                metadata=document.metadata_ or {},
+                title=document.title,
+                source_modified_at=document.source_modified_at,
+                activity_at=document.activity_at,
+                synced_at=document.synced_at,
+                file_size_bytes=document.file_size_bytes,
+            )
+            for document in all_docs
+            if document.category == "conversation"
+        ]
+        hierarchy = fold_conversation_subagents(conversation_refs)
+        logical_activity_by_document = build_logical_activity_map(
+            hierarchy,
+            conversation_refs,
+        )
+        docs = [
+            document
+            for document in all_docs
+            if document.category != "conversation"
+            or document.id in hierarchy.visible_document_ids
+        ]
+        oldest = datetime.min.replace(tzinfo=timezone.utc)
+        docs.sort(
+            key=lambda document: (
+                (
+                    logical_activity_by_document.get(document.id)
+                    if document.category == "conversation"
+                    else document.synced_at
+                ) or oldest,
+                str(document.id),
+            ),
+            reverse=True,
+        )
+        docs = docs[offset:offset + limit]
+    else:
+        display_timestamp = conversation_list_timestamp_expression(
+            Document.category,
+            Document.activity_at,
+            Document.source_modified_at,
+            Document.synced_at,
+        )
+        query = query.order_by(
+            display_timestamp.desc(),
+            Document.id.desc(),
+        ).offset(offset).limit(limit)
+        docs = (await db.execute(query)).scalars().all()
 
-    result = await db.execute(query)
-    docs = result.scalars().all()
+    activity_by_document = await conversation_activity_summaries(
+        db,
+        [document.id for document in docs if document.category == "conversation"],
+    )
 
     # Get device names
     machine_names: dict[str, str] = {}
@@ -223,4 +296,25 @@ async def list_tool_files(
         )
         machine_names = {str(mid): name for mid, name in m_result.all()}
 
-    return [_document_summary(d, machine_names) for d in docs]
+    return [
+        _document_summary(
+            document,
+            machine_names,
+            logical_activity=logical_activity_by_document.get(document.id),
+            activity=activity_by_document.get(
+                document.id,
+                ConversationActivitySummary(),
+            ) if document.category == "conversation" else None,
+            subagent_count=(
+                hierarchy.subagent_counts.get(document.id, 0)
+                if hierarchy is not None
+                else 0
+            ),
+            is_subagent_orphan=(
+                document.id in hierarchy.orphan_document_ids
+                if hierarchy is not None
+                else False
+            ),
+        )
+        for document in docs
+    ]
