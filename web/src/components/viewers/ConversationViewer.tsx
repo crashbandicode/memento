@@ -6,6 +6,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -156,6 +157,7 @@ const LIVE_TAIL_SIZE = 200;
 const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
 const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
+const LIVE_SCROLL_FOLLOW_THRESHOLD = 72;
 
 type ConversationVisibility = {
   user: boolean;
@@ -217,6 +219,13 @@ type PendingNavigation = {
   behavior: ScrollBehavior;
 };
 
+type ScrollAnchor = {
+  followLatest: boolean;
+  messageId: string | null;
+  offset: number;
+  scrollTop: number;
+};
+
 export default function ConversationViewer({
   documentId,
   prompts,
@@ -254,6 +263,7 @@ export default function ConversationViewer({
   const latestPromptLineRef = useRef<number | null>(null);
   const promptLinesRef = useRef<number[]>([]);
   const detachedTailRef = useRef<DetachedTail | null>(null);
+  const pendingScrollAnchorRef = useRef<ScrollAnchor | null>(null);
   const { t, locale } = useI18n();
   const updateDetachedTail = useCallback((next: DetachedTail | null) => {
     detachedTailRef.current = next;
@@ -283,6 +293,56 @@ export default function ConversationViewer({
     return { questionIds: ids, questionResponses: responses };
   }, [visibleMessages]);
 
+  const preserveScrollForNextRender = useCallback(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const distanceFromBottom = Math.max(
+      0,
+      container.scrollHeight - container.scrollTop - container.clientHeight,
+    );
+    if (distanceFromBottom <= LIVE_SCROLL_FOLLOW_THRESHOLD) {
+      pendingScrollAnchorRef.current = {
+        followLatest: true,
+        messageId: null,
+        offset: 0,
+        scrollTop: container.scrollTop,
+      };
+      return;
+    }
+
+    const containerTop = container.getBoundingClientRect().top;
+    const anchor = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-message-id]"),
+    ).find((element) => element.getBoundingClientRect().bottom > containerTop + 1);
+    pendingScrollAnchorRef.current = {
+      followLatest: false,
+      messageId: anchor?.dataset.messageId ?? null,
+      offset: anchor ? anchor.getBoundingClientRect().top - containerTop : 0,
+      scrollTop: container.scrollTop,
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const anchor = pendingScrollAnchorRef.current;
+    const container = containerRef.current;
+    if (!anchor || !container) return;
+    pendingScrollAnchorRef.current = null;
+    if (anchor.followLatest) {
+      container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      return;
+    }
+
+    const target = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-message-id]"),
+    ).find((element) => element.dataset.messageId === anchor.messageId);
+    if (!target) {
+      container.scrollTop = anchor.scrollTop;
+      return;
+    }
+    const nextOffset = target.getBoundingClientRect().top - container.getBoundingClientRect().top;
+    container.scrollTop += nextOffset - anchor.offset;
+  }, [visibleMessages]);
+
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
     loadingRef.current = true;
@@ -291,6 +351,7 @@ export default function ConversationViewer({
       const res = await api.getMessages(documentId, offsetRef.current, MESSAGE_PAGE_SIZE);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
+        if (rangeLoadedRef.current) preserveScrollForNextRender();
         if (!rangeLoadedRef.current) {
           startOffsetRef.current = res.offset;
           rangeLoadedRef.current = true;
@@ -326,20 +387,15 @@ export default function ConversationViewer({
     const nextLimit = previousStart - nextOffset;
     if (nextLimit <= 0) return;
 
-    const el = containerRef.current;
-    const previousScrollHeight = el?.scrollHeight ?? 0;
     loadingRef.current = true;
     setLoading(true);
     try {
       const res = await api.getMessages(documentId, nextOffset, nextLimit);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
+        preserveScrollForNextRender();
         startOffsetRef.current = res.offset;
         setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
-        window.requestAnimationFrame(() => {
-          if (!el) return;
-          el.scrollTop += el.scrollHeight - previousScrollHeight;
-        });
       }
       setHasEarlier(startOffsetRef.current > 0);
       setHasMore(offsetRef.current < res.total);
@@ -358,6 +414,7 @@ export default function ConversationViewer({
       const res = await api.getLatestMessages(documentId, LIVE_TAIL_SIZE);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
+        if (rangeLoadedRef.current) preserveScrollForNextRender();
         const tailEnd = res.offset + res.messages.length;
         if (!rangeLoadedRef.current) {
           startOffsetRef.current = res.offset;
@@ -384,7 +441,7 @@ export default function ConversationViewer({
     } finally {
       syncingTailRef.current = false;
     }
-  }, [documentId, updateDetachedTail]);
+  }, [documentId, preserveScrollForNextRender, updateDetachedTail]);
 
   useEffect(() => {
     setMessages([]);
@@ -394,6 +451,7 @@ export default function ConversationViewer({
     loadingRef.current = false;
     syncingTailRef.current = false;
     detachedTailRef.current = null;
+    pendingScrollAnchorRef.current = null;
     setHasMore(true);
     setHasEarlier(false);
     setKnownTotal(totalMessages);
@@ -613,11 +671,7 @@ export default function ConversationViewer({
     }
   };
 
-  const renderMessage = (
-    msg: ConversationMessage,
-    idx: number,
-    source: "history" | "tail",
-  ) => {
+  const renderMessage = (msg: ConversationMessage) => {
     if (
       msg.interaction_response?.interaction_id
       && questionIds.has(msg.interaction_response.interaction_id)
@@ -644,8 +698,9 @@ export default function ConversationViewer({
     );
     return (
       <div
-        key={`${source}-${msg.id}-${idx}`}
+        key={String(msg.id)}
         id={`conversation-line-${msg.line_number}`}
+        data-message-id={String(msg.id)}
         data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
         data-message-category={messageCategory}
         data-message-visible={hideWholeMessage ? "false" : "true"}
@@ -718,7 +773,7 @@ export default function ConversationViewer({
             </div>
           )}
 
-          {messages.map((msg, idx) => renderMessage(msg, idx, "history"))}
+          {messages.map(renderMessage)}
 
           {detachedTail && (
             <div
@@ -755,7 +810,7 @@ export default function ConversationViewer({
             </div>
           )}
 
-          {detachedTail?.messages.map((msg, idx) => renderMessage(msg, idx, "tail"))}
+          {detachedTail?.messages.map(renderMessage)}
 
           {artifacts && artifacts.length > 0 && !hasMore && (
             <>

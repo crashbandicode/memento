@@ -40,8 +40,7 @@ export function useConversationPrompts(documentId: string) {
     return () => window.clearTimeout(timer);
   }, [documentId, refresh]);
 
-  useSSE((event) => {
-    if (event.data.document_id !== documentId) return;
+  const scheduleCatchUp = useCallback((delay: number) => {
     if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = null;
@@ -50,8 +49,21 @@ export function useConversationPrompts(documentId: string) {
       invalidateConversationSearch(documentId);
       setSyncVersion((version) => version + 1);
       void refresh();
-    }, 250);
-  });
+    }, delay);
+  }, [documentId, refresh]);
+
+  useSSE(
+    (event) => {
+      if (event.data.document_id !== documentId) return;
+      scheduleCatchUp(250);
+    },
+    {
+      // Mobile browsers may suspend EventSource without firing `error`.
+      // Always reconcile the prompt outline and message tail on resume even
+      // if no replayable SSE event survived the suspension window.
+      onResume: () => scheduleCatchUp(0),
+    },
+  );
 
   useEffect(() => () => {
     if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
