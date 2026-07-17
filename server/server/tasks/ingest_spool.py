@@ -201,25 +201,31 @@ async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
             from .post_ingest import (
                 initial_post_ingest_countdown,
                 process_document_post_ingest,
+                schedule_coalesced_post_ingest,
             )
 
             countdown = initial_post_ingest_countdown(
                 str(meta["category"]),
                 int(doc.file_size_bytes),
             )
-            task_options = {"retry": False}
             if countdown is not None:
-                task_options["countdown"] = countdown
-
-            process_document_post_ingest.apply_async(
-                args=[
+                await schedule_coalesced_post_ingest(
                     document_id,
                     str(doc.tool_id),
                     str(meta["category"]),
                     str(doc.content_hash),
-                ],
-                **task_options,
-            )
+                    countdown=countdown,
+                )
+            else:
+                process_document_post_ingest.apply_async(
+                    args=[
+                        document_id,
+                        str(doc.tool_id),
+                        str(meta["category"]),
+                        str(doc.content_hash),
+                    ],
+                    retry=False,
+                )
         except Exception:
             logger.exception(
                 "Post-ingest follow-up could not be queued for %s", document_id

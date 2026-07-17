@@ -1864,7 +1864,7 @@ async def ingest_file(
             # the lightweight in-process development path.
             from ..tasks.post_ingest import (
                 initial_post_ingest_countdown,
-                process_document_post_ingest,
+                schedule_coalesced_post_ingest,
             )
 
             countdown = initial_post_ingest_countdown(
@@ -1872,15 +1872,12 @@ async def ingest_file(
                 int(doc.file_size_bytes),
             )
             if countdown is not None:
-                process_document_post_ingest.apply_async(
-                    args=[
-                        str(doc.id),
-                        str(doc.tool_id),
-                        category,
-                        str(doc.content_hash),
-                    ],
+                await schedule_coalesced_post_ingest(
+                    doc.id,
+                    str(doc.tool_id),
+                    category,
+                    str(doc.content_hash),
                     countdown=countdown,
-                    retry=False,
                 )
             else:
                 loop = asyncio.get_running_loop()

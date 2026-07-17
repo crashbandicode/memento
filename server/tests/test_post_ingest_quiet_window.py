@@ -373,6 +373,192 @@ def test_celery_task_retries_deferred_work(monkeypatch) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_repeated_ingests_queue_one_coalesced_delivery(monkeypatch) -> None:
+    document_id = uuid4()
+    claims = iter((True, False))
+    revisions: list[str] = []
+    queued: list[dict] = []
+
+    def _claim(_document_id, revision: str, _token: str) -> bool:
+        revisions.append(revision)
+        return next(claims)
+
+    def _apply_async(**kwargs) -> None:
+        queued.append(kwargs)
+
+    monkeypatch.setattr(post_ingest, "_claim_coalesced_schedule", _claim)
+    monkeypatch.setattr(
+        post_ingest.process_document_post_ingest,
+        "apply_async",
+        _apply_async,
+    )
+
+    first = await post_ingest.schedule_coalesced_post_ingest(
+        document_id,
+        "codex",
+        "conversation",
+        "revision-1",
+        countdown=180,
+    )
+    second = await post_ingest.schedule_coalesced_post_ingest(
+        document_id,
+        "codex",
+        "conversation",
+        "revision-2",
+        countdown=180,
+    )
+
+    assert first is True
+    assert second is False
+    assert revisions == ["revision-1", "revision-2"]
+    assert len(queued) == 1
+    assert queued[0]["countdown"] == 180
+    assert queued[0]["retry"] is False
+    assert queued[0]["args"][:4] == [
+        str(document_id),
+        "codex",
+        "conversation",
+        None,
+    ]
+    assert len(queued[0]["args"][4]) == 32
+
+
+@pytest.mark.asyncio
+async def test_failed_celery_send_releases_coalesced_claim(monkeypatch) -> None:
+    document_id = uuid4()
+    released: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(
+        post_ingest,
+        "_claim_coalesced_schedule",
+        lambda *_args: True,
+    )
+
+    def _send_failure(**_kwargs) -> None:
+        raise RuntimeError("broker unavailable")
+
+    def _complete(_document_id, token: str, revision: str | None):
+        released.append((token, revision))
+        return "complete"
+
+    monkeypatch.setattr(
+        post_ingest.process_document_post_ingest,
+        "apply_async",
+        _send_failure,
+    )
+    monkeypatch.setattr(post_ingest, "_complete_coalesced_schedule", _complete)
+
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        await post_ingest.schedule_coalesced_post_ingest(
+            document_id,
+            "codex",
+            "conversation",
+            "revision-1",
+            countdown=180,
+        )
+
+    assert len(released) == 1
+    assert released[0][1] is None
+
+
+def test_stale_coalesced_delivery_avoids_database_work(monkeypatch) -> None:
+    document_id = uuid4()
+
+    monkeypatch.setattr(
+        post_ingest,
+        "_coalesced_token_is_current",
+        lambda *_args: False,
+    )
+
+    async def _unexpected(*_args):
+        pytest.fail("stale coalesced delivery queried PostgreSQL")
+
+    monkeypatch.setattr(post_ingest, "_process_document_post_ingest", _unexpected)
+
+    result = post_ingest.process_document_post_ingest.run(
+        str(document_id),
+        "codex",
+        "conversation",
+        None,
+        "old-token",
+    )
+
+    assert result == {"status": "stale", "document_id": str(document_id)}
+
+
+def test_revision_arriving_during_processing_reuses_delivery(monkeypatch) -> None:
+    document_id = uuid4()
+    completions: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(
+        post_ingest,
+        "_coalesced_token_is_current",
+        lambda *_args: True,
+    )
+
+    async def _processed(_document_id: UUID, _expected_revision: str | None):
+        return {
+            "status": "processed",
+            "document_id": str(document_id),
+            "revision": "revision-1",
+        }
+
+    def _complete(_document_id, token: str, revision: str | None):
+        completions.append((token, revision))
+        return "updated"
+
+    monkeypatch.setattr(post_ingest, "_process_document_post_ingest", _processed)
+    monkeypatch.setattr(post_ingest, "_complete_coalesced_schedule", _complete)
+
+    with pytest.raises(Retry):
+        post_ingest.process_document_post_ingest.run(
+            str(document_id),
+            "codex",
+            "conversation",
+            None,
+            "current-token",
+        )
+
+    assert completions == [("current-token", "revision-1")]
+
+
+def test_coalesced_delivery_releases_matching_revision(monkeypatch) -> None:
+    document_id = uuid4()
+    completions: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(
+        post_ingest,
+        "_coalesced_token_is_current",
+        lambda *_args: True,
+    )
+
+    async def _processed(_document_id: UUID, _expected_revision: str | None):
+        return {
+            "status": "processed",
+            "document_id": str(document_id),
+            "revision": "revision-2",
+        }
+
+    def _complete(_document_id, token: str, revision: str | None):
+        completions.append((token, revision))
+        return "complete"
+
+    monkeypatch.setattr(post_ingest, "_process_document_post_ingest", _processed)
+    monkeypatch.setattr(post_ingest, "_complete_coalesced_schedule", _complete)
+
+    result = post_ingest.process_document_post_ingest.run(
+        str(document_id),
+        "codex",
+        "conversation",
+        None,
+        "current-token",
+    )
+
+    assert result["status"] == "processed"
+    assert completions == [("current-token", "revision-2")]
+
+
 def test_legacy_three_argument_task_retries_deferred_work(monkeypatch) -> None:
     document_id = uuid4()
     observed_revisions: list[str | None] = []

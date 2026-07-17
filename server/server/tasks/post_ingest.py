@@ -9,10 +9,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import ceil
-from uuid import UUID
+from typing import Literal
+from uuid import UUID, uuid4
 
+import redis
 from sqlalchemy import select, text
 
+from ..config import settings
 from ..db.models import Document
 from ..db.session import post_ingest_engine, post_ingest_session_factory
 from ..services.ingest_service import _run_post_ingest_inner
@@ -24,6 +27,35 @@ _SUPPORTED_CATEGORIES = {"conversation", "memory", "learning", "plan", "identity
 _MIN_QUIET_SECONDS = 120
 _MAX_QUIET_SECONDS = 300
 POST_INGEST_CONTENTION_RETRY_SECONDS = 30
+POST_INGEST_COALESCE_RECHECK_SECONDS = 5
+POST_INGEST_COALESCE_TTL_SECONDS = 60 * 60
+_POST_INGEST_COALESCE_PREFIX = "memento:post-ingest:coalesce:v1"
+_redis_client: redis.Redis | None = None
+_redis_client_pid: int | None = None
+
+_CLAIM_COALESCED_SCHEDULE_SCRIPT = """
+local current_token = redis.call('HGET', KEYS[1], 'token')
+redis.call('HSET', KEYS[1], 'revision', ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+if current_token then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'token', ARGV[2])
+return 1
+"""
+
+_COMPLETE_COALESCED_SCHEDULE_SCRIPT = """
+local current_token = redis.call('HGET', KEYS[1], 'token')
+if current_token ~= ARGV[1] then
+    return 0
+end
+local current_revision = redis.call('HGET', KEYS[1], 'revision')
+if ARGV[2] ~= '' and current_revision ~= ARGV[2] then
+    return 2
+end
+redis.call('DEL', KEYS[1])
+return 1
+"""
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -71,6 +103,119 @@ def initial_post_ingest_countdown(category: str, file_size_bytes: int) -> int | 
     ):
         return POST_INGEST_QUIET_SECONDS
     return None
+
+
+def _coalesce_key(document_id: UUID | str) -> str:
+    return f"{_POST_INGEST_COALESCE_PREFIX}:{document_id}"
+
+
+def _get_redis_client() -> redis.Redis:
+    """Return one lazy Redis client per process (safe across Celery forks)."""
+    global _redis_client, _redis_client_pid
+    process_id = os.getpid()
+    if _redis_client is None or _redis_client_pid != process_id:
+        if _redis_client is not None:
+            try:
+                _redis_client.close()
+            except Exception:
+                pass
+        _redis_client = redis.Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        _redis_client_pid = process_id
+    return _redis_client
+
+
+def _claim_coalesced_schedule(
+    document_id: UUID | str,
+    revision: str,
+    token: str,
+) -> bool:
+    result = _get_redis_client().eval(
+        _CLAIM_COALESCED_SCHEDULE_SCRIPT,
+        1,
+        _coalesce_key(document_id),
+        revision,
+        token,
+        POST_INGEST_COALESCE_TTL_SECONDS,
+    )
+    return int(result) == 1
+
+
+def _coalesced_token_is_current(document_id: UUID | str, token: str) -> bool:
+    return _get_redis_client().hget(_coalesce_key(document_id), "token") == token
+
+
+def _complete_coalesced_schedule(
+    document_id: UUID | str,
+    token: str,
+    processed_revision: str | None,
+) -> Literal["stale", "complete", "updated"]:
+    result = int(
+        _get_redis_client().eval(
+            _COMPLETE_COALESCED_SCHEDULE_SCRIPT,
+            1,
+            _coalesce_key(document_id),
+            token,
+            processed_revision or "",
+        )
+    )
+    return {0: "stale", 1: "complete", 2: "updated"}[result]
+
+
+async def schedule_coalesced_post_ingest(
+    document_id: UUID | str,
+    tool_id: str,
+    category: str,
+    revision: str,
+    *,
+    countdown: int,
+) -> bool:
+    """Queue one quiet-window wake-up while updating its latest revision.
+
+    Each ingest refreshes the Redis revision, but only the caller that creates
+    the per-document token sends a Celery message. The one live task retries
+    against ``Document.synced_at`` until the transcript is actually quiet.
+    """
+    token = uuid4().hex
+    try:
+        claimed = await asyncio.to_thread(
+            _claim_coalesced_schedule,
+            document_id,
+            revision,
+            token,
+        )
+    except Exception:
+        # Redis is also the Celery broker. The minute recovery scanner remains
+        # the durable fallback rather than creating an unbounded direct queue.
+        logger.exception("Could not coalesce post-ingest for %s", document_id)
+        return False
+    if not claimed:
+        return False
+
+    try:
+        process_document_post_ingest.apply_async(
+            args=[str(document_id), tool_id, category, None, token],
+            countdown=countdown,
+            retry=False,
+        )
+    except Exception:
+        try:
+            await asyncio.to_thread(
+                _complete_coalesced_schedule,
+                document_id,
+                token,
+                None,
+            )
+        except Exception:
+            logger.exception(
+                "Could not release failed post-ingest claim for %s", document_id
+            )
+        raise
+    return True
 
 
 def _quiet_seconds_remaining(
@@ -194,7 +339,11 @@ async def _process_document_post_ingest(
             state.category,
             effective_revision,
         )
-        return {"status": "processed", "document_id": str(document_id)}
+        return {
+            "status": "processed",
+            "document_id": str(document_id),
+            "revision": effective_revision,
+        }
 
 
 @celery_app.task(
@@ -216,14 +365,44 @@ def process_document_post_ingest(
     tool_id: str,
     category: str,
     expected_revision: str | None = None,
+    coalesce_token: str | None = None,
 ) -> dict:
     del tool_id, category  # Current values are loaded after the revision fence.
     try:
+        if coalesce_token:
+            try:
+                if not _coalesced_token_is_current(document_id, coalesce_token):
+                    return {"status": "stale", "document_id": document_id}
+            except Exception:
+                # PostgreSQL remains authoritative if Redis is briefly
+                # unavailable. The completion attempt below can still clear a
+                # recovered marker; its TTL bounds any orphaned state.
+                logger.warning(
+                    "Could not verify post-ingest token for %s", document_id,
+                    exc_info=True,
+                )
+
         result = asyncio.run(
             _process_document_post_ingest(UUID(document_id), expected_revision)
         )
         if result["status"] == "deferred":
             raise self.retry(countdown=result["countdown"])
+        if coalesce_token:
+            try:
+                completion = _complete_coalesced_schedule(
+                    document_id,
+                    coalesce_token,
+                    result.get("revision") if result["status"] == "processed" else None,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not complete post-ingest token for %s",
+                    document_id,
+                    exc_info=True,
+                )
+            else:
+                if completion == "updated":
+                    raise self.retry(countdown=POST_INGEST_COALESCE_RECHECK_SECONDS)
         return result
     except Exception as exc:
         # Celery's Retry is intentionally raised back to the worker so the

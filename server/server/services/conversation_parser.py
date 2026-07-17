@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol, TypeVar
 from uuid import UUID
 
+import orjson
+
 
 @dataclass
 class NormalizedMessage:
@@ -474,7 +476,7 @@ def extract_codex_session_metadata(raw_content: str) -> dict:
     first = next(iter(_iter_json_objects(raw_content)), None)
     if first is not None:
         try:
-            obj = json.loads(first)
+            obj = orjson.loads(first)
         except (json.JSONDecodeError, TypeError):
             obj = None
         if isinstance(obj, dict) and obj.get("type") == "session_meta":
@@ -497,7 +499,7 @@ def extract_codex_session_metadata(raw_content: str) -> dict:
         if match is None:
             return None
         try:
-            return json.loads(f'"{match.group(1)}"')
+            return orjson.loads(f'"{match.group(1)}"')
         except json.JSONDecodeError:
             return None
 
@@ -547,7 +549,7 @@ def _as_mapping(value: object) -> dict:
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
     """Parse a single JSONL line into a NormalizedMessage, or None if it should be skipped."""
     try:
-        obj = json.loads(raw_line)
+        obj = orjson.loads(raw_line)
     except json.JSONDecodeError:
         return None
 
@@ -909,7 +911,7 @@ def parse_conversation_object(
             msg_dict = None
             if isinstance(raw_msg, str):
                 try:
-                    msg_dict = json.loads(raw_msg)
+                    msg_dict = orjson.loads(raw_msg)
                 except json.JSONDecodeError:
                     try:
                         msg_dict = eval(raw_msg)  # noqa: S307 — OpenClaw uses repr format
@@ -1315,7 +1317,7 @@ def _json_mapping(value: object) -> dict:
     if not isinstance(value, str):
         return {}
     try:
-        parsed = json.loads(value)
+        parsed = orjson.loads(value)
     except (json.JSONDecodeError, TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
@@ -1923,7 +1925,7 @@ def _format_hermes_tool_content(content_str: str) -> str:
     Extract output (parse inner JSON if applicable), prepend error/exit_code notes.
     """
     try:
-        outer = json.loads(content_str)
+        outer = orjson.loads(content_str)
     except (json.JSONDecodeError, TypeError):
         return content_str
     if not isinstance(outer, dict):
@@ -1958,7 +1960,7 @@ def _format_hermes_tool_content(content_str: str) -> str:
 def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> list[NormalizedMessage]:
     """Hermes stores a whole session as a single top-level JSON, not JSONL."""
     try:
-        d = json.loads(raw_content)
+        d = orjson.loads(raw_content)
     except json.JSONDecodeError:
         return []
     if not isinstance(d, dict):
@@ -2017,7 +2019,7 @@ def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> l
 
 def _count_hermes_messages(raw_content: str) -> int:
     try:
-        d = json.loads(raw_content)
+        d = orjson.loads(raw_content)
     except json.JSONDecodeError:
         return 0
     if not isinstance(d, dict):
