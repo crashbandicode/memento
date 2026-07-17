@@ -28,6 +28,7 @@ from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
     ChunkValidationError,
     has_completion_receipt,
+    pending_source_revision_job_id,
     stage_chunk,
 )
 from ..services.thread_metadata_service import apply_codex_thread_title_update
@@ -100,11 +101,14 @@ async def _completed_upload_needs_reprocessing(
     tool_id = meta.get("tool")
     relative_path = meta.get("relative_path")
     expected_hash = meta.get("hash")
-    if not all(isinstance(value, str) and value for value in (
-        tool_id,
-        relative_path,
-        expected_hash,
-    )):
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            tool_id,
+            relative_path,
+            expected_hash,
+        )
+    ):
         return False
 
     row = (
@@ -135,9 +139,7 @@ def _reject_synthetic_metadata_file_upload(
     category_value = str(category or "").strip().lower()
     mode_value = str(mode or "").strip().lower()
     strategy_value = str(sync_strategy or "").strip().lower()
-    path_value = (
-        str(relative_path or "").replace("\\", "/").lstrip("/").casefold()
-    )
+    path_value = str(relative_path or "").replace("\\", "/").lstrip("/").casefold()
     if (
         category_value == "metadata"
         or mode_value == "metadata"
@@ -154,14 +156,156 @@ async def _ingest_with_delta_guard(**kwargs):
     try:
         return await ingest_file(**kwargs)
     except DeltaBaseMismatch as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "delta_base_mismatch",
-                "expected_hash": exc.expected_hash,
-                "expected_offset": exc.expected_offset,
+        raise _delta_mismatch_response(exc) from exc
+
+
+def _delta_mismatch_response(exc: DeltaBaseMismatch) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "delta_base_mismatch",
+            "expected_hash": exc.expected_hash,
+            "expected_offset": exc.expected_offset,
+        },
+    )
+
+
+async def _enqueue_spool_job(job_id: str) -> None:
+    """Best-effort Celery acceleration for an already durable spool job."""
+    try:
+        from ..tasks.ingest_spool import process_spooled_ingest
+
+        await asyncio.to_thread(
+            process_spooled_ingest.apply_async,
+            args=[job_id],
+            queue="ingest",
+            retry=False,
+        )
+    except Exception:
+        logger.exception(
+            "Ready spool job %s could not be queued; recovery will retry",
+            job_id,
+        )
+
+
+async def _stage_delta_behind_pending_revision(
+    *,
+    meta: dict,
+    content_bytes: bytes,
+    user_id: str,
+    device_id: str,
+    device_name: str,
+    device_platform: str,
+) -> IngestResponse | None:
+    """Durably queue a delta whose exact base is awaiting DB commit.
+
+    Returning ``None`` means the mismatch is genuine and the collector should
+    perform its normal full-resync recovery.  A matching durable predecessor
+    keeps the fast synchronous path unchanged while preventing an active large
+    transcript from repeatedly uploading complete snapshots.
+    """
+    base_hash = meta.get("base_hash")
+    base_offset = meta.get("base_offset")
+    if (
+        meta.get("mode", "full") != "delta"
+        or not isinstance(base_hash, str)
+        or not base_hash
+        or not isinstance(base_offset, int)
+        or isinstance(base_offset, bool)
+        or not content_bytes
+    ):
+        return None
+
+    pending_job_id = await asyncio.to_thread(
+        pending_source_revision_job_id,
+        user_id=user_id,
+        device_id=device_id,
+        tool=str(meta.get("tool", "")),
+        relative_path=str(meta.get("relative_path", "")),
+        content_hash=base_hash,
+        offset=base_offset,
+    )
+    if pending_job_id is None:
+        return None
+
+    content_hash = str(meta.get("hash", ""))
+    spool_meta = {
+        **meta,
+        "mode": "delta",
+        "file_size": len(content_bytes),
+        "upload_id": f"deferred-delta/{base_hash}/{content_hash}",
+    }
+    total_chunks = (len(content_bytes) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES
+    staged = None
+    for chunk_index in range(total_chunks):
+        start = chunk_index * MAX_CHUNK_BYTES
+        staged = await asyncio.to_thread(
+            stage_chunk,
+            meta={
+                **spool_meta,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
             },
-        ) from exc
+            chunk_data=content_bytes[start : start + MAX_CHUNK_BYTES],
+            user_id=user_id,
+            device_id=device_id,
+            device_name=device_name,
+            device_platform=device_platform,
+        )
+        if staged.complete and not staged.should_enqueue:
+            break
+
+    if staged is None or not staged.complete:
+        raise RuntimeError("dependent delta was not durably staged")
+    if staged.should_enqueue:
+        await _enqueue_spool_job(staged.job_id)
+        status = "queued"
+        message = f"Delta queued behind pending revision {pending_job_id}"
+    else:
+        status = "completed"
+        message = "Delta was already durably ingested"
+    return IngestResponse(
+        document_id=f"{status}:{staged.job_id}",
+        message=message,
+    )
+
+
+async def _ingest_or_stage_dependent_delta(
+    *,
+    db: AsyncSession,
+    ingest_kwargs: dict,
+    spool_meta: dict,
+    content_bytes: bytes,
+    user_id: str,
+    device_id: str,
+    device_name: str,
+    device_platform: str,
+    success_message: str,
+) -> IngestResponse:
+    try:
+        doc = await ingest_file(**ingest_kwargs)
+    except DeltaBaseMismatch:
+        # Ensure the validated device exists before a durable acknowledgement
+        # can let the background worker race ahead of this request.
+        await db.commit()
+        queued = await _stage_delta_behind_pending_revision(
+            meta=spool_meta,
+            content_bytes=content_bytes,
+            user_id=user_id,
+            device_id=device_id,
+            device_name=device_name,
+            device_platform=device_platform,
+        )
+        if queued is not None:
+            return queued
+        # The predecessor may have committed between the first database read
+        # and the durable queue lookup. Retry once before declaring a genuine
+        # conflict so that this narrow race cannot trigger another FULL upload.
+        try:
+            doc = await ingest_file(**ingest_kwargs)
+        except DeltaBaseMismatch as retry_exc:
+            raise _delta_mismatch_response(retry_exc) from retry_exc
+    return IngestResponse(document_id=str(doc.id), message=success_message)
 
 
 @router.post("/metadata", response_model=IngestMetadataResponse)
@@ -221,28 +365,39 @@ async def ingest_file_endpoint(
         sync_strategy=req.sync_strategy,
         relative_path=req.relative_path,
     )
-    machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
+    machine = await ensure_device(
+        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
+    )
     measured_size = len(req.content.encode("utf-8"))
 
-    doc = await _ingest_with_delta_guard(
+    return await _ingest_or_stage_dependent_delta(
         db=db,
-        tool_id=req.tool,
-        category=req.category,
-        content_type=req.content_type,
-        relative_path=req.relative_path,
-        content=req.content,
-        content_hash=req.hash,
-        file_size=max(max(0, int(req.file_size or 0)), measured_size),
-        mode=req.mode,
-        offset=req.offset,
-        metadata=req.metadata,
-        timestamp=req.timestamp,
-        machine_id=str(machine.id),
+        ingest_kwargs={
+            "db": db,
+            "tool_id": req.tool,
+            "category": req.category,
+            "content_type": req.content_type,
+            "relative_path": req.relative_path,
+            "content": req.content,
+            "content_hash": req.hash,
+            "file_size": max(max(0, int(req.file_size or 0)), measured_size),
+            "mode": req.mode,
+            "offset": req.offset,
+            "metadata": req.metadata,
+            "timestamp": req.timestamp,
+            "machine_id": str(machine.id),
+            "user_id": str(_collector_user.id),
+            "base_hash": req.base_hash,
+            "base_offset": req.base_offset,
+        },
+        spool_meta=req.model_dump(exclude={"content"}),
+        content_bytes=req.content.encode("utf-8"),
         user_id=str(_collector_user.id),
-        base_hash=req.base_hash,
-        base_offset=req.base_offset,
+        device_id=x_device_id,
+        device_name=x_device_name,
+        device_platform=x_device_platform,
+        success_message="Ingested successfully",
     )
-    return IngestResponse(document_id=str(doc.id), message="Ingested successfully")
 
 
 @router.post("/file/upload", response_model=IngestResponse)
@@ -267,27 +422,38 @@ async def ingest_file_upload(
     file_content = (await content.read()).decode("utf-8", errors="replace")
     measured_size = len(file_content.encode("utf-8"))
     reported_size = max(0, int(meta.get("file_size") or 0))
-    machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
-
-    doc = await _ingest_with_delta_guard(
-        db=db,
-        tool_id=meta["tool"],
-        category=meta["category"],
-        content_type=meta["content_type"],
-        relative_path=meta["relative_path"],
-        content=file_content,
-        content_hash=meta["hash"],
-        file_size=max(reported_size, measured_size),
-        mode=meta.get("mode", "full"),
-        offset=meta.get("offset", 0),
-        metadata=meta.get("metadata", {}),
-        timestamp=meta.get("timestamp"),
-        machine_id=str(machine.id),
-        user_id=str(_collector_user.id),
-        base_hash=meta.get("base_hash"),
-        base_offset=meta.get("base_offset"),
+    machine = await ensure_device(
+        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
     )
-    return IngestResponse(document_id=str(doc.id), message="Uploaded successfully")
+
+    return await _ingest_or_stage_dependent_delta(
+        db=db,
+        ingest_kwargs={
+            "db": db,
+            "tool_id": meta["tool"],
+            "category": meta["category"],
+            "content_type": meta["content_type"],
+            "relative_path": meta["relative_path"],
+            "content": file_content,
+            "content_hash": meta["hash"],
+            "file_size": max(reported_size, measured_size),
+            "mode": meta.get("mode", "full"),
+            "offset": meta.get("offset", 0),
+            "metadata": meta.get("metadata", {}),
+            "timestamp": meta.get("timestamp"),
+            "machine_id": str(machine.id),
+            "user_id": str(_collector_user.id),
+            "base_hash": meta.get("base_hash"),
+            "base_offset": meta.get("base_offset"),
+        },
+        spool_meta=meta,
+        content_bytes=file_content.encode("utf-8"),
+        user_id=str(_collector_user.id),
+        device_id=x_device_id,
+        device_name=x_device_name,
+        device_platform=x_device_platform,
+        success_message="Uploaded successfully",
+    )
 
 
 @router.post("/sqlite-rows", response_model=IngestResponse)
@@ -301,7 +467,9 @@ async def ingest_sqlite_rows(
     x_device_platform: str = Header("unknown"),
 ) -> IngestResponse:
     """Ingest exported SQLite rows as JSON."""
-    machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
+    machine = await ensure_device(
+        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
+    )
     content = json.dumps(req.get("rows", []), ensure_ascii=False)
     doc = await ingest_file(
         db=db,
@@ -314,7 +482,10 @@ async def ingest_sqlite_rows(
         file_size=len(content.encode("utf-8")),
         mode="delta" if req.get("last_rowid", 0) > 0 else "full",
         offset=req.get("last_rowid", 0),
-        metadata={"source_table": req.get("source_table"), "db_path": req.get("db_path")},
+        metadata={
+            "source_table": req.get("source_table"),
+            "db_path": req.get("db_path"),
+        },
         machine_id=str(machine.id),
         user_id=str(_collector_user.id),
     )
@@ -336,7 +507,9 @@ async def ingest_file_chunk(
     try:
         meta = json.loads(metadata)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="metadata must be valid JSON") from exc
+        raise HTTPException(
+            status_code=400, detail="metadata must be valid JSON"
+        ) from exc
     if not isinstance(meta, dict):
         raise HTTPException(status_code=400, detail="metadata must be a JSON object")
     _reject_synthetic_metadata_file_upload(
@@ -397,19 +570,7 @@ async def ingest_file_chunk(
     # The ready marker and every chunk are fsynced before this response. Celery
     # is an acceleration path; the periodic recovery task owns enqueueing if
     # Redis is momentarily unavailable here.
-    try:
-        from ..tasks.ingest_spool import process_spooled_ingest
-        await asyncio.to_thread(
-            process_spooled_ingest.apply_async,
-            args=[staged.job_id],
-            queue="ingest",
-            retry=False,
-        )
-    except Exception:
-        logger.exception(
-            "Ready spool job %s could not be queued; recovery will retry",
-            staged.job_id,
-        )
+    await _enqueue_spool_job(staged.job_id)
     return IngestResponse(
         document_id=f"queued:{staged.job_id}",
         message=f"Received {int(meta['total_chunks'])} chunks; durable ingest queued",
@@ -425,28 +586,47 @@ async def ingest_discovery(
 ) -> dict:
     """Receive tool discovery data from a collector."""
     device_id = req.get("device_id", "unknown")
-    machine = await ensure_device(db, device_id, req.get("device_name", ""), req.get("platform", ""), user_id=_collector_user.id)
+    machine = await ensure_device(
+        db,
+        device_id,
+        req.get("device_name", ""),
+        req.get("platform", ""),
+        user_id=_collector_user.id,
+    )
 
     # Clean up paths in discovery data (URL decode, strip \\?\)
     from urllib.parse import unquote
     import re as _re
+
     tools_data = req.get("tools", {})
     for tool_info in tools_data.values():
         if isinstance(tool_info, dict):
             if "root" in tool_info:
-                tool_info["root"] = _re.sub(r"^\\\\?\?\\", "", unquote(tool_info["root"]))
+                tool_info["root"] = _re.sub(
+                    r"^\\\\?\?\\", "", unquote(tool_info["root"])
+                )
             for proj in tool_info.get("projects", []):
                 if "path" in proj:
                     proj["path"] = _re.sub(r"^\\\\?\?\\", "", unquote(proj["path"]))
 
     discovery_content = json.dumps(tools_data, indent=2, ensure_ascii=False)
     await ingest_file(
-        db=db, tool_id="system", category="discovery", content_type="json",
+        db=db,
+        tool_id="system",
+        category="discovery",
+        content_type="json",
         relative_path=f"discovery/{device_id}.json",
-        content=discovery_content, content_hash=f"discovery-{device_id}",
-        file_size=len(discovery_content), mode="full", offset=0,
-        metadata={"device_id": device_id, "device_name": req.get("device_name", ""),
-                  "platform": req.get("platform", ""), "tool_count": len(req.get("tools", {}))},
+        content=discovery_content,
+        content_hash=f"discovery-{device_id}",
+        file_size=len(discovery_content),
+        mode="full",
+        offset=0,
+        metadata={
+            "device_id": device_id,
+            "device_name": req.get("device_name", ""),
+            "platform": req.get("platform", ""),
+            "tool_count": len(req.get("tools", {})),
+        },
         machine_id=str(machine.id),
         user_id=str(_collector_user.id),
     )
@@ -468,7 +648,9 @@ async def heartbeat(
     x_device_platform: str = Header("unknown"),
 ) -> dict:
     """Collector heartbeat — also registers/updates the device."""
-    machine = await ensure_device(db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id)
+    machine = await ensure_device(
+        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
+    )
     return {
         "status": "ok",
         "device_id": str(machine.id),

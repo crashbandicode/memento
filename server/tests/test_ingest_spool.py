@@ -27,6 +27,7 @@ from server.services.ingest_spool import (  # noqa: E402
     mark_job_complete,
     mark_job_blocked,
     mark_job_failed,
+    pending_source_revision_job_id,
     ready_job_ids_in_recovery_order,
     ready_manifest,
     ready_manifest_metadata,
@@ -559,6 +560,86 @@ class IngestSpoolTests(unittest.TestCase):
             root=self.root,
         )
         self.assertEqual(select_ready_source_head(delta_two, self.root)[0], delta_two)
+
+    def test_pending_source_revision_matches_only_a_ready_exact_base(self) -> None:
+        base, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="base",
+                hash="base-hash",
+                offset=100,
+            ),
+            b"a",
+        )
+
+        def find(**overrides) -> str | None:
+            query = {
+                "user_id": "11111111-1111-1111-1111-111111111111",
+                "device_id": "device-1",
+                "tool": "codex",
+                "relative_path": "sessions/thread.jsonl",
+                "content_hash": "base-hash",
+                "offset": 100,
+                "root": self.root,
+            }
+            query.update(overrides)
+            return pending_source_revision_job_id(**query)
+
+        self.assertEqual(find(), base)
+        self.assertIsNone(find(content_hash="other-hash"))
+        self.assertIsNone(find(offset=101))
+        self.assertIsNone(find(device_id="other-device"))
+
+        mark_job_failed(base, error_type="test", attempts=1, root=self.root)
+        self.assertIsNone(find())
+
+    def test_pending_source_revision_rejects_a_superseded_full(self) -> None:
+        older, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="older",
+                hash="older-hash",
+                offset=100,
+                timestamp=1.0,
+            ),
+            b"a",
+        )
+        newer, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="newer",
+                hash="newer-hash",
+                offset=200,
+                timestamp=2.0,
+            ),
+            b"b",
+        )
+
+        query = {
+            "user_id": "11111111-1111-1111-1111-111111111111",
+            "device_id": "device-1",
+            "tool": "codex",
+            "relative_path": "sessions/thread.jsonl",
+            "offset": 100,
+            "root": self.root,
+        }
+        self.assertIsNone(
+            pending_source_revision_job_id(
+                content_hash="older-hash",
+                **query,
+            )
+        )
+        self.assertEqual(
+            pending_source_revision_job_id(
+                content_hash="newer-hash",
+                **{**query, "offset": 200},
+            ),
+            newer,
+        )
+        self.assertNotEqual(older, newer)
 
     def test_failed_newest_full_leaves_older_snapshot_as_fallback(self) -> None:
         older, _ = self._stage(

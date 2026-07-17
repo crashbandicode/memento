@@ -72,6 +72,22 @@ class ChunkIngestApiTests(unittest.TestCase):
     def _stage_in_test_spool(self, **kwargs):
         return durable_stage_chunk(**kwargs, root=self.spool_root)
 
+    @staticmethod
+    def _delta_payload() -> dict:
+        return {
+            "tool": "codex",
+            "category": "conversation",
+            "content_type": "jsonl",
+            "relative_path": "sessions/thread.jsonl",
+            "hash": "next-hash",
+            "mode": "delta",
+            "offset": 20,
+            "file_size": 5,
+            "base_hash": "base-hash",
+            "base_offset": 10,
+            "content": "tail\n",
+        }
+
     def test_final_chunk_is_acknowledged_after_durable_stage_and_enqueued(self) -> None:
         headers = {
             "x-device-id": "device-1",
@@ -80,7 +96,9 @@ class ChunkIngestApiTests(unittest.TestCase):
         }
         with (
             patch.object(ingest_api, "ensure_device", new_callable=AsyncMock),
-            patch.object(ingest_api, "stage_chunk", side_effect=self._stage_in_test_spool),
+            patch.object(
+                ingest_api, "stage_chunk", side_effect=self._stage_in_test_spool
+            ),
             patch(
                 "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
             ) as enqueue,
@@ -199,9 +217,7 @@ class ChunkIngestApiTests(unittest.TestCase):
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
         row = SimpleNamespace(content_hash="hash-1", metadata_={})
         db = SimpleNamespace(
-            execute=AsyncMock(
-                return_value=SimpleNamespace(one_or_none=lambda: row)
-            )
+            execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: row))
         )
 
         needs_reprocessing = asyncio.run(
@@ -224,21 +240,13 @@ class ChunkIngestApiTests(unittest.TestCase):
         self.assertFalse(needs_reprocessing)
 
     def test_guarded_delta_mismatch_returns_resyncable_conflict(self) -> None:
-        payload = {
-            "tool": "codex",
-            "category": "conversation",
-            "content_type": "jsonl",
-            "relative_path": "sessions/thread.jsonl",
-            "hash": "next-hash",
-            "mode": "delta",
-            "offset": 20,
-            "file_size": 5,
-            "base_hash": "base-hash",
-            "base_offset": 10,
-            "content": "tail\n",
-        }
         with (
             patch.object(ingest_api, "ensure_device", new_callable=AsyncMock),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value=None,
+            ),
             patch.object(
                 ingest_api,
                 "ingest_file",
@@ -247,16 +255,164 @@ class ChunkIngestApiTests(unittest.TestCase):
                     expected_hash="server-hash",
                     expected_offset=15,
                 ),
-            ),
+            ) as ingest,
         ):
-            response = self.client.post("/api/ingest/file", json=payload)
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+            )
 
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["detail"], {
-            "code": "delta_base_mismatch",
-            "expected_hash": "server-hash",
-            "expected_offset": 15,
-        })
+        self.assertEqual(
+            response.json()["detail"],
+            {
+                "code": "delta_base_mismatch",
+                "expected_hash": "server-hash",
+                "expected_offset": 15,
+            },
+        )
+        self.assertEqual(ingest.await_count, 2)
+
+    def test_delta_retries_when_pending_base_commits_during_lookup(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        document_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value=None,
+            ),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ingest_api.DeltaBaseMismatch(
+                        expected_hash="server-hash",
+                        expected_offset=5,
+                    ),
+                    SimpleNamespace(id=document_id),
+                ],
+            ) as ingest,
+            patch.object(ingest_api, "stage_chunk") as stage,
+        ):
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+                headers={"x-device-id": "device-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["document_id"], str(document_id))
+        self.assertEqual(ingest.await_count, 2)
+        stage.assert_not_called()
+
+    def test_guarded_delta_waits_behind_durable_pending_base(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        headers = {
+            "x-device-id": "device-1",
+            "x-device-name": "Yoga",
+            "x-device-platform": "Windows",
+        }
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=ingest_api.DeltaBaseMismatch(
+                    expected_hash="server-hash",
+                    expected_offset=5,
+                ),
+            ),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value="b" * 64,
+            ) as find_pending,
+            patch.object(
+                ingest_api,
+                "stage_chunk",
+                side_effect=self._stage_in_test_spool,
+            ),
+            patch(
+                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
+            ) as enqueue,
+        ):
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["document_id"].startswith("queued:"))
+        self.assertIn("pending revision", response.json()["message"])
+        find_pending.assert_called_once_with(
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            tool="codex",
+            relative_path="sessions/thread.jsonl",
+            content_hash="base-hash",
+            offset=10,
+        )
+        enqueue.assert_called_once()
+
+    def test_multipart_guarded_delta_uses_same_pending_base_queue(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        payload = self._delta_payload()
+        content = payload.pop("content")
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=ingest_api.DeltaBaseMismatch(
+                    expected_hash="server-hash",
+                    expected_offset=5,
+                ),
+            ),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value="b" * 64,
+            ),
+            patch.object(
+                ingest_api,
+                "stage_chunk",
+                side_effect=self._stage_in_test_spool,
+            ),
+            patch(
+                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
+            ) as enqueue,
+        ):
+            response = self.client.post(
+                "/api/ingest/file/upload",
+                data={"metadata": json.dumps(payload)},
+                files={"content": ("delta", content.encode(), "text/plain")},
+                headers={"x-device-id": "device-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["document_id"].startswith("queued:"))
+        enqueue.assert_called_once()
 
 
 if __name__ == "__main__":

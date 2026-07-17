@@ -287,7 +287,9 @@ def _validated_chunk_coordinates(
     ):
         raise ChunkValidationError("base_offset must be a non-negative integer")
     if (base_hash is None) != (base_offset is None):
-        raise ChunkValidationError("base_hash and base_offset must be provided together")
+        raise ChunkValidationError(
+            "base_hash and base_offset must be provided together"
+        )
     if not isinstance(meta.get("metadata", {}), dict):
         raise ChunkValidationError("metadata must be an object")
     if isinstance(meta.get("offset", 0), bool):
@@ -646,6 +648,36 @@ def _ready_jobs_for_source(
         if candidate is not None and source_identity(candidate) == identity:
             jobs.append((candidate_id, candidate))
     return jobs
+
+
+def pending_source_revision_job_id(
+    *,
+    user_id: str,
+    device_id: str,
+    tool: str,
+    relative_path: str,
+    content_hash: str,
+    offset: int,
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> str | None:
+    """Return the durable job that will commit a delta's declared base.
+
+    Chunk uploads are acknowledged after fsync and before their Celery job
+    commits PostgreSQL.  A guarded delta can therefore legitimately target a
+    revision that is present in the durable source queue but not in the
+    database yet.  Only non-quarantined ready jobs qualify: a failed revision
+    must still force an authoritative full rebase.
+    """
+    identity: SourceIdentity = (user_id, device_id, tool, relative_path)
+    for job_id, manifest in _ready_jobs_for_source(identity, root):
+        meta = manifest["meta"]
+        if meta.get("hash") == content_hash and int(meta.get("offset", 0)) == int(
+            offset
+        ):
+            head_id, superseded = select_ready_source_head(job_id, root)
+            if head_id is not None and job_id not in superseded:
+                return job_id
+    return None
 
 
 def select_ready_source_head(
