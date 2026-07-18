@@ -163,6 +163,7 @@ export default function ConversationPage() {
         syncVersion={syncVersion}
         toolId={currentMeta?.tool_id}
         totalMessages={currentMeta?.message_count}
+        activeTaskState={currentMeta?.active_task_state}
         artifacts={plans}
       />
       {showExport && (

@@ -66,6 +66,13 @@ def _stored_interaction(metadata: object, key: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _stored_task_state(metadata: object) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("task_state")
+    return value if isinstance(value, dict) else None
+
+
 async def _get_conversation_identity(
     db: AsyncSession,
     user: User,
@@ -127,6 +134,34 @@ async def get_conversation(
         select(func.count()).where(ConversationMessage.document_id == doc_id)
     )
     message_count = count_result.scalar() or 0
+    active_task_state = None
+    if message_count > 0:
+        # Cursor's authoritative current snapshot is intentionally stored at a
+        # stable prefix so ordinary live growth can stay append-only. Fetch it
+        # directly; other tools fall back to their newest transition. This
+        # avoids hydrating hundreds of historical checklist JSON values on
+        # every live conversation metadata refresh.
+        current_task_metadata = (
+            await db.execute(
+                select(ConversationMessage.metadata_)
+                .where(
+                    ConversationMessage.document_id == doc_id,
+                    ConversationMessage.metadata_.op("?")("task_state"),
+                )
+                .order_by(
+                    (
+                        func.jsonb_extract_path_text(
+                            ConversationMessage.metadata_,
+                            "task_state",
+                            "is_current",
+                        ) == "true"
+                    ).desc(),
+                    ConversationMessage.line_number.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        active_task_state = _stored_task_state(current_task_metadata)
     if message_count == 0:
         raw_content = (
             await db.execute(select(Document.content).where(Document.id == doc_id))
@@ -258,6 +293,7 @@ async def get_conversation(
         "title": doc.title,
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
+        "active_task_state": active_task_state,
         "message_count": message_count,
         "subagent_count": len(subagents),
         "is_subagent_orphan": is_subagent_orphan,
@@ -346,6 +382,7 @@ async def get_conversation_messages(
                         m.metadata_,
                         "interaction_response",
                     ),
+                    "task_state": _stored_task_state(m.metadata_),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
                 }
@@ -385,6 +422,7 @@ async def get_conversation_messages(
                     "tool_calls": _parsed_tool_calls(m),
                     "interaction": m.interaction,
                     "interaction_response": m.interaction_response,
+                    "task_state": m.task_state,
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
                 }

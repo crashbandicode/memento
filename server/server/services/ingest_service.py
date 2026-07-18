@@ -373,6 +373,8 @@ def _conversation_message_metadata(normalized) -> dict:
             str(normalized.reasoning_effort),
             MAX_STORED_IDENTITY_CHARS,
         )
+    if normalized.task_state:
+        meta["task_state"] = normalized.task_state
     return meta
 
 
@@ -408,6 +410,7 @@ def iter_stored_conversation_messages(
         )
         if (
             not full_clean_content.strip()
+            and not normalized.thinking.strip()
             and not normalized.tool_calls
             and not normalized.attachments
         ):

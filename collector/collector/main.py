@@ -10,8 +10,13 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 
 from .config import CollectorConfig, SYSTEM, _default_data_dir
+from .cursor_state_export import (
+    CursorStateExporter,
+    enqueue_cursor_state_snapshots,
+)
 from .queue import SyncQueue
 from .sync_client import SyncClient
 from .tools.antigravity import AntigravityTool
@@ -28,6 +33,7 @@ COMMAND_POLL_INTERVAL = 10    # Check server commands every 10s
 AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
+CURSOR_STATE_POLL_INTERVAL = 5  # Keep live state current without hot-looping SQLite
 
 
 def _load_saved_config() -> CollectorConfig:
@@ -109,7 +115,8 @@ def _run_initial_scan(watcher: FileWatcher, logger: logging.Logger) -> None:
 
 
 def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatcher,
-                   sync_client: SyncClient, logger: logging.Logger) -> None:
+                   sync_client: SyncClient, logger: logging.Logger,
+                   on_resync: Callable[[], None] | None = None) -> None:
     """Poll server for pending commands (resync, etc.)."""
     try:
         import httpx
@@ -171,6 +178,8 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
                     continue
                 try:
                     queue.clear_all_state()
+                    if on_resync is not None:
+                        on_resync()
                     try:
                         from .parsers import antigravity_export as _ag
                         _ag._last_hashes.clear()
@@ -349,6 +358,7 @@ def _check_and_update(logger: logging.Logger) -> None:
 
 _ag_export_lock = threading.Lock()
 _codex_metadata_poll_lock = threading.Lock()
+_cursor_state_poll_lock = threading.Lock()
 
 
 def _poll_codex_thread_titles(
@@ -382,6 +392,30 @@ def _poll_codex_thread_titles(
         logger.exception("Codex thread title poll failed")
     finally:
         _codex_metadata_poll_lock.release()
+
+
+def _poll_cursor_state(
+    exporter: CursorStateExporter,
+    queue: SyncQueue,
+    logger: logging.Logger,
+) -> None:
+    """Queue changed Cursor composers from the authoritative live database."""
+    if not _cursor_state_poll_lock.acquire(blocking=False):
+        return
+    try:
+        queued = enqueue_cursor_state_snapshots(exporter, queue)
+        if queued:
+            logger.info("Queued %d Cursor live-state conversation(s)", queued)
+    except Exception:
+        logger.exception("Cursor live-state projection failed")
+    finally:
+        _cursor_state_poll_lock.release()
+
+
+def _invalidate_cursor_state(exporter: CursorStateExporter) -> None:
+    """Reset projector state without racing an in-flight read."""
+    with _cursor_state_poll_lock:
+        exporter.invalidate()
 
 
 def _run_antigravity_export(queue: SyncQueue, logger: logging.Logger) -> None:
@@ -496,9 +530,12 @@ def main() -> None:
 
     # Initialize tools
     codex_tool = CodexTool()
+    cursor_tool = CursorTool()
+    cursor_exporter = CursorStateExporter(cursor_tool)
     tools = [
         ClaudeCodeTool(), OpenClawTool(), codex_tool,
-        AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path), CursorTool(),
+        AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path),
+        cursor_tool,
         HermesTool(),
     ]
     available = [t for t in tools if t.is_available()]
@@ -550,6 +587,13 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    if cursor_tool in available and cursor_tool.state_database_path.is_file():
+        threading.Thread(
+            target=_poll_cursor_state,
+            args=(cursor_exporter, queue, logger),
+            daemon=True,
+        ).start()
+
     # 3. Start file watcher + sync client
     watcher.start()
     sync_client.start()
@@ -572,6 +616,7 @@ def main() -> None:
     last_command_poll = time.time()
     last_update_check = time.time()
     last_codex_metadata_poll = time.time()
+    last_cursor_state_poll = time.time()
 
     try:
         while not shutdown:
@@ -591,7 +636,14 @@ def main() -> None:
             # Poll server commands every 30s
             if now - last_command_poll > COMMAND_POLL_INTERVAL:
                 last_command_poll = now
-                _poll_commands(config, queue, watcher, sync_client, logger)
+                _poll_commands(
+                    config,
+                    queue,
+                    watcher,
+                    sync_client,
+                    logger,
+                    on_resync=lambda: _invalidate_cursor_state(cursor_exporter),
+                )
 
             # Auto-update check every hour
             if config.auto_update_enabled and now - last_update_check > AUTO_UPDATE_INTERVAL:
@@ -606,6 +658,18 @@ def main() -> None:
                 threading.Thread(
                     target=_poll_codex_thread_titles,
                     args=(codex_tool, queue, logger),
+                    daemon=True,
+                ).start()
+
+            if (
+                cursor_tool in available
+                and cursor_tool.state_database_path.is_file()
+                and now - last_cursor_state_poll > CURSOR_STATE_POLL_INTERVAL
+            ):
+                last_cursor_state_poll = now
+                threading.Thread(
+                    target=_poll_cursor_state,
+                    args=(cursor_exporter, queue, logger),
                     daemon=True,
                 ).start()
 

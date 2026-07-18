@@ -17,12 +17,14 @@ import {
   ConversationMessage,
   ConversationPrompt,
   ConversationSearchHit,
+  ConversationTaskState,
   QuestionInteraction,
   QuestionInteractionResponse,
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
+import TaskProgressCard from "./TaskProgressCard";
 import { Icon } from "@/components/aurora/Icon";
 import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
 import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
@@ -233,6 +235,7 @@ export default function ConversationViewer({
   syncVersion,
   toolId,
   totalMessages,
+  activeTaskState,
   artifacts,
 }: {
   documentId: string;
@@ -240,6 +243,7 @@ export default function ConversationViewer({
   syncVersion: number;
   toolId?: string;
   totalMessages?: number;
+  activeTaskState?: ConversationTaskState | null;
   artifacts?: Artifact[];
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -738,6 +742,11 @@ export default function ConversationViewer({
         onChange={setVisibility}
         t={t}
       />
+      {visibility.tools && activeTaskState && activeTaskState.total_count > 0 && (
+        <div className="max-w-4xl mx-auto" style={{ marginBottom: 12 }}>
+          <TaskProgressCard state={activeTaskState} current />
+        </div>
+      )}
       <div
         ref={containerRef}
         data-conversation-viewer
@@ -2162,7 +2171,6 @@ function QuestionInteractionCard({
     <div
       data-question-interaction={interaction.id}
       className="mx-0.5 min-w-0 sm:mx-1"
-      style={{ width: "100%" }}
     >
       {pairedResponse && (
         <span
@@ -2982,6 +2990,25 @@ export const ChatBubble = memo(function ChatBubble({
 
   if (msg.interaction_response) {
     return withCopyControls(<QuestionResponseCard response={msg.interaction_response} t={t} />);
+  }
+
+  // Task-writing tools carry a normalized snapshot in addition to their raw
+  // input. Show the semantic checklist while retaining the original payload
+  // in exports/copy, rather than presenting an opaque JSON tool card.
+  const taskState = msg.task_state;
+  if (role === "tool" && taskState) {
+    if (!showTools) return null;
+    return (
+      <MessageCopyFrame markdown={messageMarkdown} t={t}>
+        {({ top, bottom }) => (
+          <TaskProgressCard
+            state={taskState}
+            headerAction={top}
+            footerAction={bottom}
+          />
+        )}
+      </MessageCopyFrame>
+    );
   }
 
   // User — right aligned, violet gradient.

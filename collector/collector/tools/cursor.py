@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import sqlite3
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
-from ..config import TOOL_PATHS, HOME
+from ..config import TOOL_PATHS
 from .claude_code import _extract_cwd_from_jsonl
+from .base import (
+    BaseTool, Category, ContentType, FileClassification, SyncStrategy, WatchPath,
+)
 
 
 def _load_workspace_storage_map() -> dict[str, str]:
@@ -72,15 +79,86 @@ def _match_hash_to_workspace(project_hash: str, workspaces: dict[str, str]) -> s
             return real_path
 
     return None
-from .base import (
-    BaseTool, Category, ContentType, FileClassification, SyncStrategy, WatchPath,
-)
 
 
 class CursorTool(BaseTool):
 
     _project_path_cache: dict[str, str | None] = {}
     _workspace_map: dict[str, str] | None = None
+
+    def __init__(self, state_database_path: Path | None = None) -> None:
+        self._state_database_path_override = state_database_path
+        self._state_session_ids: frozenset[str] = frozenset()
+        self._state_session_ids_checked_at = 0.0
+
+    @property
+    def state_database_path(self) -> Path:
+        """Return Cursor's authoritative live composer database."""
+        if self._state_database_path_override is not None:
+            return self._state_database_path_override
+        home = Path.home()
+        system = platform.system()
+        if system == "Darwin":
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "Cursor"
+                / "User"
+                / "globalStorage"
+                / "state.vscdb"
+            )
+        if system == "Windows":
+            appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
+            return appdata / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+        return home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+    def authoritative_session_ids(self, *, max_age: float = 2.0) -> frozenset[str]:
+        """Return normal composers backed by Cursor's live state database.
+
+        The file transcript is a sparse compatibility export in recent Cursor
+        releases.  Once a normal composer is present in ``state.vscdb``, the
+        collector's state projector owns that session and the file watcher must
+        not overwrite its richer snapshot with the sparse JSONL source.
+        """
+        now = time.monotonic()
+        if now - self._state_session_ids_checked_at < max_age:
+            return self._state_session_ids
+
+        database = self.state_database_path
+        session_ids: frozenset[str] = frozenset()
+        if database.is_file():
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(
+                    f"{database.resolve().as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=1,
+                )
+                connection.execute("PRAGMA query_only=ON")
+                try:
+                    rows = connection.execute(
+                        "SELECT composerId FROM composerHeaders "
+                        "WHERE COALESCE(isSubagent, 0)=0"
+                    )
+                except sqlite3.OperationalError:
+                    rows = connection.execute("SELECT composerId FROM composerHeaders")
+                session_ids = frozenset(
+                    str(row[0]) for row in rows if row and row[0]
+                )
+            except (OSError, sqlite3.Error):
+                # Keep the last good view during Cursor's brief database swaps.
+                session_ids = self._state_session_ids
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        self._state_session_ids = session_ids
+        self._state_session_ids_checked_at = now
+        return session_ids
+
+    def has_authoritative_state(self, session_id: str) -> bool:
+        return session_id in self.authoritative_session_ids()
 
     def _get_workspace_map(self) -> dict[str, str]:
         if self._workspace_map is None:
@@ -206,23 +284,9 @@ class CursorTool(BaseTool):
         # projects/ — agent transcripts
         if parts and parts[0] == "projects":
             if abs_path.suffix == ".jsonl":
-                dir_hash = parts[1] if len(parts) >= 2 else ""
-                real_path = self._resolve_project_path(dir_hash) if dir_hash else None
-                project_name = real_path.replace("\\", "/").rstrip("/").split("/")[-1] if real_path else dir_hash
-                is_subagent = "subagents" in parts
-                meta: dict = {
-                    "project_hash": project_name,
-                    "session_id": abs_path.stem,
-                    "is_subagent": is_subagent,
-                }
-                if real_path:
-                    meta["project_path"] = real_path
-                return FileClassification(
-                    tool_name=self.name, category=Category.CONVERSATION,
-                    content_type=ContentType.JSONL, sync_strategy=SyncStrategy.DELTA,
-                    relative_path=rel_str,
-                    metadata=meta,
-                )
+                if self.has_authoritative_state(abs_path.stem):
+                    return None
+                return self.classify_transcript_source(abs_path)
             if abs_path.suffix == ".md":
                 return FileClassification(
                     tool_name=self.name, category=Category.MEMORY,
@@ -249,3 +313,45 @@ class CursorTool(BaseTool):
             )
 
         return None
+
+    def classify_transcript_source(
+        self,
+        abs_path: Path,
+    ) -> FileClassification | None:
+        """Classify a transcript path for the state projector.
+
+        This intentionally bypasses ``has_authoritative_state``: the projector
+        reuses the file's stable relative path and project metadata while the
+        generic watcher skips its incomplete contents.
+        """
+        try:
+            rel = abs_path.relative_to(self.root_path)
+        except ValueError:
+            return None
+        parts = rel.parts
+        if not parts or parts[0] != "projects" or abs_path.suffix != ".jsonl":
+            return None
+        rel_str = str(rel).replace("\\", "/")
+        dir_hash = parts[1] if len(parts) >= 2 else ""
+        real_path = self._resolve_project_path(dir_hash) if dir_hash else None
+        project_name = (
+            real_path.replace("\\", "/").rstrip("/").split("/")[-1]
+            if real_path
+            else dir_hash
+        )
+        is_subagent = "subagents" in parts
+        meta: dict = {
+            "project_hash": project_name,
+            "session_id": abs_path.stem,
+            "is_subagent": is_subagent,
+        }
+        if real_path:
+            meta["project_path"] = real_path
+        return FileClassification(
+            tool_name=self.name,
+            category=Category.CONVERSATION,
+            content_type=ContentType.JSONL,
+            sync_strategy=SyncStrategy.FULL,
+            relative_path=rel_str,
+            metadata=meta,
+        )

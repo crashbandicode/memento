@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from sqlalchemy.dialects import postgresql
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
@@ -286,6 +288,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         db = _Db([
             _Result(scalar_value=self.doc),
             _Result(scalar_value=4306),
+            _Result(scalar_value=None),
             _Result(rows=[self.doc, child]),
         ])
 
@@ -298,7 +301,15 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 1)
         self.assertNotIn("documents.content", str(db.statements[0].compile()))
-        hierarchy_statement = db.statements[2]
+        task_statement = db.statements[2]
+        compiled_task = task_statement.compile(dialect=postgresql.dialect())
+        task_sql = str(compiled_task)
+        task_params = compiled_task.params.values()
+        self.assertTrue(any(value == "task_state" for value in task_params))
+        self.assertTrue(any(value == "is_current" for value in task_params))
+        self.assertIn("jsonb_extract_path_text", task_sql)
+        self.assertNotIn(" #>> ", task_sql)
+        hierarchy_statement = db.statements[3]
         hierarchy_sql = str(hierarchy_statement.compile())
         hierarchy_params = hierarchy_statement.compile().params.values()
         self.assertGreaterEqual(hierarchy_sql.count("documents.metadata ->>"), 3)

@@ -230,12 +230,31 @@ export interface ConversationSubagentSummary {
   synced_at?: string | null;
 }
 
+export interface ConversationTask {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "blocked" | "cancelled" | string;
+  active_form?: string;
+}
+
+export interface ConversationTaskState {
+  version: number;
+  source: string;
+  revision: number;
+  is_current?: boolean;
+  completed_count: number;
+  total_count: number;
+  active_task_id?: string;
+  tasks: ConversationTask[];
+}
+
 export interface ConversationMeta {
   id: string;
   tool_id: string;
   title: string | null;
   relative_path: string;
   metadata: Record<string, unknown>;
+  active_task_state?: ConversationTaskState | null;
   message_count: number;
   subagent_count?: number;
   is_subagent_orphan?: boolean;
@@ -362,6 +381,7 @@ export interface ConversationMessage {
   tool_calls?: ConversationToolCall[];
   interaction?: QuestionInteraction | null;
   interaction_response?: QuestionInteractionResponse | null;
+  task_state?: ConversationTaskState | null;
   raw_type?: string;
   metadata?: Record<string, unknown>;
   timestamp: string | null;

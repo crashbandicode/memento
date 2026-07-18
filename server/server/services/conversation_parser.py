@@ -64,6 +64,9 @@ class NormalizedMessage:
     # a source tool does not record them.
     model: str = ""
     reasoning_effort: str = ""
+    # Cross-tool task snapshot captured from Codex update_plan, Claude
+    # TodoWrite/TaskUpdate, or Cursor composer todos.
+    task_state: dict[str, object] | None = None
 
 
 @dataclass
@@ -689,6 +692,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
     message = parse_conversation_object(obj, tool_id)
     if message is not None:
         _attach_assistant_identity(message, identity)
+        TaskStateTracker(tool_id).apply(message)
     return message
 
 
@@ -1178,6 +1182,27 @@ def parse_conversation_object(
     # --- Cursor format: {"role": "user/assistant", "message": {"content": [...]}} ---
     if tool_id == "cursor" or (not msg_type and "message" in obj and "role" in obj):
         role = obj.get("role", "")
+        if msg_type in {
+            "cursor_state_tool",
+            "cursor_state_task",
+            "cursor_state_status",
+        }:
+            content = _extract_content(obj.get("content", ""))
+            tool_name = _coerce_text(obj.get("tool_name") or "Cursor")
+            tool_input = _coerce_text(obj.get("tool_input"))
+            return NormalizedMessage(
+                role="tool",
+                content=content or f"[{tool_name}]",
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_call_id=_bounded_interaction_text(
+                    obj.get("tool_call_id"),
+                    512,
+                ),
+                timestamp=timestamp,
+                raw_type=msg_type,
+                source_id=_cursor_source_id(obj, obj.get("message")),
+            )
         message = obj.get("message", {})
         if isinstance(message, dict):
             raw_content = message.get("content", "")
@@ -1217,7 +1242,7 @@ def parse_conversation_object(
                     source_id=source_id,
                 )
         if role in ("user", "assistant") and (
-            content.strip() or tool_calls or attachments
+            content.strip() or thinking.strip() or tool_calls or attachments
         ):
             # Skip tool_result/tool_use noise
             if not tool_calls and (
@@ -1457,6 +1482,290 @@ def _json_mapping(value: object) -> dict:
     except (json.JSONDecodeError, TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+_MAX_TASKS = 200
+_MAX_TASK_TEXT_CHARS = 4000
+_TASK_CREATED_RE = re.compile(
+    r"Task\s+#(?P<id>[^\s:]+)\s+created\s+successfully(?:\s*:\s*(?P<title>.*))?",
+    re.IGNORECASE,
+)
+_TASK_LIST_LINE_RE = re.compile(
+    r"^#(?P<id>\S+)\s+\[(?P<status>[^\]]+)\]\s+(?P<content>.+)$",
+    re.MULTILINE,
+)
+
+
+def _normalized_task_status(value: object) -> str:
+    status = _coerce_text(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if status in {"complete", "completed", "done", "succeeded", "success"}:
+        return "completed"
+    if status in {"inprogress", "in_progress", "active", "working"}:
+        return "in_progress"
+    if status in {"cancelled", "canceled"}:
+        return "cancelled"
+    if status == "blocked":
+        return "blocked"
+    return "pending"
+
+
+def _normalized_task(
+    value: object,
+    *,
+    index: int,
+    fallback_id: str = "",
+) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    content = _bounded_interaction_text(
+        value.get("content")
+        or value.get("step")
+        or value.get("subject")
+        or value.get("title")
+        or value.get("description"),
+        _MAX_TASK_TEXT_CHARS,
+    )
+    if not content:
+        return None
+    task_id = _bounded_interaction_text(
+        value.get("id")
+        or value.get("taskId")
+        or value.get("task_id")
+        or fallback_id,
+        256,
+    )
+    if not task_id:
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        task_id = f"task-{index + 1}-{digest}"
+    active_form = _bounded_interaction_text(
+        value.get("activeForm") or value.get("active_form"),
+        _MAX_TASK_TEXT_CHARS,
+    )
+    return {
+        "id": task_id,
+        "content": content,
+        "status": _normalized_task_status(value.get("status")),
+        "active_form": active_form,
+    }
+
+
+class TaskStateTracker:
+    """Build immutable task-list snapshots from each tool's native events."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.tasks: dict[str, dict[str, str]] = {}
+        self.order: list[str] = []
+        self.revision = 0
+        self.pending_creates: list[str] = []
+
+    def apply(self, message: NormalizedMessage) -> None:
+        changed = False
+        is_current = False
+
+        if message.role == "tool" and message.tool_name:
+            name = self._normalized_name(message.tool_name)
+            payload = _json_mapping(message.tool_input)
+            changed = self._apply_event(
+                name,
+                payload,
+                source_id=message.tool_call_id,
+            )
+            is_current = bool(payload.get("is_current"))
+            if name in {"toolresult", "taskresult"}:
+                changed = self._apply_result(message.content) or changed
+
+        # Cursor and some Claude releases retain tool uses inside the
+        # assistant content block. They are semantically identical to a
+        # standalone tool row and must participate in the same state machine.
+        for call in message.tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = self._normalized_name(call.get("name"))
+            payload = _json_mapping(call.get("input"))
+            changed = self._apply_event(
+                name,
+                payload,
+                source_id=_coerce_text(call.get("id")),
+            ) or changed
+            is_current = bool(payload.get("is_current")) or is_current
+
+        if not changed:
+            return
+        self.revision += 1
+        tasks = [self.tasks[task_id] for task_id in self.order if task_id in self.tasks]
+        completed_count = sum(task["status"] == "completed" for task in tasks)
+        active = next(
+            (task for task in tasks if task["status"] == "in_progress"),
+            next((task for task in tasks if task["status"] == "pending"), None),
+        )
+        message.task_state = {
+            "version": 1,
+            "source": self.source,
+            "revision": self.revision,
+            "is_current": is_current,
+            "completed_count": completed_count,
+            "total_count": len(tasks),
+            "active_task_id": active["id"] if active else "",
+            "tasks": tasks,
+        }
+
+    @staticmethod
+    def _normalized_name(value: object) -> str:
+        return re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+
+    def _apply_event(
+        self,
+        name: str,
+        payload: dict,
+        *,
+        source_id: str = "",
+    ) -> bool:
+        if not name:
+            return False
+
+        raw_tasks: object = None
+        replace = False
+        if name == "updateplan":
+            raw_tasks = payload.get("plan")
+            replace = True
+        elif name == "todowrite" or name.startswith("taskprogress"):
+            raw_tasks = payload.get("tasks", payload.get("todos"))
+            replace = not bool(payload.get("merge"))
+        elif name == "tasklist" and isinstance(payload.get("tasks"), list):
+            raw_tasks = payload.get("tasks")
+            replace = True
+
+        if isinstance(raw_tasks, list):
+            normalized = [
+                task
+                for index, item in enumerate(raw_tasks[:_MAX_TASKS])
+                if (task := _normalized_task(item, index=index)) is not None
+            ]
+            if replace:
+                self.tasks = {task["id"]: task for task in normalized}
+                self.order = [task["id"] for task in normalized]
+            else:
+                for task in normalized:
+                    if task["id"] not in self.tasks:
+                        self.order.append(task["id"])
+                    self.tasks[task["id"]] = task
+            return bool(normalized) or replace
+        elif name == "taskcreate":
+            explicit_id = _bounded_interaction_text(
+                payload.get("id") or payload.get("taskId") or payload.get("task_id"),
+                256,
+            )
+            fallback_id = explicit_id or source_id or (
+                f"pending-{len(self.pending_creates) + 1}-{len(self.order) + 1}"
+            )
+            task = _normalized_task(
+                payload,
+                index=len(self.order),
+                fallback_id=fallback_id,
+            )
+            if task is not None:
+                if task["id"] not in self.tasks:
+                    self.order.append(task["id"])
+                self.tasks[task["id"]] = task
+                if not explicit_id:
+                    self.pending_creates.append(task["id"])
+                return True
+        elif name == "taskupdate":
+            task_id = _bounded_interaction_text(
+                payload.get("taskId") or payload.get("task_id") or payload.get("id"),
+                256,
+            )
+            existing = self.tasks.get(task_id)
+            if task_id:
+                if existing is None:
+                    existing = {
+                        "id": task_id,
+                        "content": f"Task #{task_id}",
+                        "status": "pending",
+                        "active_form": "",
+                    }
+                    self.tasks[task_id] = existing
+                    self.order.append(task_id)
+                updated = dict(existing)
+                content = _bounded_interaction_text(
+                    payload.get("content")
+                    or payload.get("subject")
+                    or payload.get("description"),
+                    _MAX_TASK_TEXT_CHARS,
+                )
+                if content:
+                    updated["content"] = content
+                if "status" in payload:
+                    updated["status"] = _normalized_task_status(payload.get("status"))
+                active_form = _bounded_interaction_text(
+                    payload.get("activeForm") or payload.get("active_form"),
+                    _MAX_TASK_TEXT_CHARS,
+                )
+                if active_form:
+                    updated["active_form"] = active_form
+                self.tasks[task_id] = updated
+                return True
+        elif name == "taskstop":
+            task_id = _bounded_interaction_text(
+                payload.get("taskId") or payload.get("task_id") or payload.get("id"),
+                256,
+            )
+            if task_id and task_id in self.tasks:
+                self.tasks[task_id] = {
+                    **self.tasks[task_id],
+                    "status": "cancelled",
+                }
+                return True
+        return False
+
+    def _apply_result(self, content: str) -> bool:
+        changed = False
+        created = _TASK_CREATED_RE.search(content)
+        if created and self.pending_creates:
+            provisional_id = self.pending_creates.pop(0)
+            actual_id = _bounded_interaction_text(created.group("id"), 256)
+            task = self.tasks.pop(provisional_id, None)
+            if task is not None and actual_id:
+                task = {**task, "id": actual_id}
+                title = _bounded_interaction_text(
+                    created.group("title"),
+                    _MAX_TASK_TEXT_CHARS,
+                )
+                if title:
+                    task["content"] = title
+                self.tasks[actual_id] = task
+                self.order = [
+                    actual_id if task_id == provisional_id else task_id
+                    for task_id in self.order
+                ]
+                changed = True
+
+        listed = [
+            task
+            for index, match in enumerate(_TASK_LIST_LINE_RE.finditer(content))
+            if (task := _normalized_task(
+                {
+                    "id": match.group("id"),
+                    "status": match.group("status"),
+                    "content": match.group("content"),
+                },
+                index=index,
+            )) is not None
+        ][:_MAX_TASKS]
+        if listed:
+            existing_active_forms = {
+                task_id: task.get("active_form", "")
+                for task_id, task in self.tasks.items()
+            }
+            for task in listed:
+                if active_form := existing_active_forms.get(task["id"]):
+                    task["active_form"] = active_form
+            self.tasks = {task["id"]: task for task in listed}
+            self.order = [task["id"] for task in listed]
+            self.pending_creates.clear()
+            changed = True
+        return changed
 
 
 def _bounded_interaction_text(value: object, limit: int) -> str:
@@ -1902,6 +2211,7 @@ def _iter_cursor_conversation_messages(
 ) -> Iterator[NormalizedMessage]:
     """Yield Cursor semantic rows while linking interactive answers."""
     identity = assistant_identity or AssistantIdentityState()
+    task_tracker = TaskStateTracker("cursor")
     seen_source_ids: set[str] = set()
     pending_question: tuple[int, dict[str, object]] | None = None
     for interaction in reversed(initial_question_interactions or []):
@@ -1940,6 +2250,7 @@ def _iter_cursor_conversation_messages(
                 if message.source_id in seen_source_ids:
                     continue
                 seen_source_ids.add(message.source_id)
+            task_tracker.apply(message)
             yield message
 
 
@@ -2310,6 +2621,7 @@ def iter_conversation_messages(
     pending_codex_user: tuple[int, NormalizedMessage, str] | None = None
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
     current_codex_turn_id = ""
+    task_tracker = TaskStateTracker(tool_id)
     pending_questions = {
         _coerce_text(interaction.get("id")): interaction
         for interaction in (initial_question_interactions or [])
@@ -2318,11 +2630,13 @@ def iter_conversation_messages(
 
     def should_emit(message: NormalizedMessage) -> bool:
         if not message.source_id:
+            task_tracker.apply(message)
             return True
         source_key = f"{tool_id}:{message.source_id}"
         if source_key in seen_source_ids:
             return False
         seen_source_ids.add(source_key)
+        task_tracker.apply(message)
         return True
 
     for record_index, source_object in enumerate(
