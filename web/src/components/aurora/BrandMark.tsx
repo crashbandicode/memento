@@ -1,11 +1,15 @@
 /**
- * Brand marks for each tool — reconstructed from public logo geometry.
+ * Brand marks for each tool. Prefer bundled official vector components and
+ * keep small custom marks only for products without one in react-icons.
  * Rendered in 24x24 viewBox. Either:
  *   - colored=true  → brand color
  *   - inverted=true → white (for dark gradient tiles)
  *   - default       → currentColor monochrome
  */
 import type { CSSProperties } from "react";
+import type { IconType } from "react-icons";
+import { SiClaude, SiObsidian, SiOpenai, SiWindsurf } from "react-icons/si";
+import { VscVscode } from "react-icons/vsc";
 
 export const BRAND_COLORS: Record<string, string> = {
   claude_code: "#D97757",
@@ -45,9 +49,15 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
     </g>
   ),
   cursor: (fill) => (
-    <g fill={fill}>
-      <path d="M4.5 3.2 20.8 12 12 15.2 8.7 21 4.5 3.2z" opacity="0.95" />
-      <path d="M4.5 3.2 12 15.2 8.7 21 4.5 3.2z" opacity="0.55" />
+    /* Cursor's faceted cube, simplified for legibility at 16-24 px. */
+    <g fill={fill} stroke={fill} strokeWidth="0.35" strokeLinejoin="round">
+      <path d="M12 2.2 3.2 7.3 12 12z" opacity="0.58" />
+      <path d="M12 2.2 20.8 7.3 12 12z" opacity="0.92" />
+      <path d="M3.2 7.3 12 12 3.2 17.2z" opacity="0.82" />
+      <path d="M20.8 7.3 12 12 20.8 17.2z" opacity="0.68" />
+      <path d="M3.2 17.2 12 12 12 21.8z" opacity="0.48" />
+      <path d="M20.8 17.2 12 12 12 21.8z" opacity="0.75" />
+      <path d="M3.2 7.3h17.6L12 12z" opacity="1" />
     </g>
   ),
   windsurf: (fill) => (
@@ -91,6 +101,15 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
   ),
 };
 
+/** Official vector marks available in the bundled react-icons set. */
+const OFFICIAL_MARKS: Partial<Record<BrandId, IconType>> = {
+  claude_code: SiClaude,
+  codex: SiOpenai,
+  obsidian: SiObsidian,
+  windsurf: SiWindsurf,
+  vscode: VscVscode,
+};
+
 export function BrandMark({
   id,
   size = 24,
@@ -113,6 +132,17 @@ export function BrandMark({
     : colored
       ? BRAND_COLORS[brandId] || "currentColor"
       : tint || "currentColor";
+  const OfficialMark = OFFICIAL_MARKS[brandId];
+  if (OfficialMark) {
+    return (
+      <OfficialMark
+        aria-hidden="true"
+        size={size}
+        color={fill}
+        style={{ flexShrink: 0, ...style }}
+      />
+    );
+  }
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" style={{ flexShrink: 0, ...style }}>
       {draw(fill)}

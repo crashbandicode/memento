@@ -33,6 +33,7 @@ class SyncClient:
         queue: SyncQueue,
         config: CollectorConfig,
         full_resync_callback: Callable[[str], None] | None = None,
+        delta_catchup_callback: Callable[[str], None] | None = None,
     ) -> None:
         self._queue = queue
         self._config = config
@@ -42,6 +43,7 @@ class SyncClient:
         self._idle = threading.Event()
         self._idle.set()
         self._full_resync_callback = full_resync_callback
+        self._delta_catchup_callback = delta_catchup_callback
         try:
             from importlib.metadata import version
             collector_version = version("memento-brain-collector")
@@ -142,6 +144,12 @@ class SyncClient:
                             if future.result():
                                 if self._queue.mark_synced(item):
                                     synced += 1
+                                    if (
+                                        item.is_partial
+                                        and item.source_path
+                                        and self._delta_catchup_callback
+                                    ):
+                                        self._delta_catchup_callback(item.source_path)
                             else:
                                 self._queue.mark_failed(item, "upload returned false")
                         except Exception as exc:

@@ -10,6 +10,7 @@ from .base import BaseParser, ParseResult
 # No content size limit — DELTA mode only reads new lines (small).
 # Full resync reads entire file, relying on chunked upload for large files.
 MAX_CONTENT_SIZE = 0  # unlimited
+MAX_JSONL_RECORD_BYTES = 64 * 1024 * 1024
 
 
 class JsonlParser(BaseParser):
@@ -58,6 +59,20 @@ class JsonlParser(BaseParser):
                 if not raw_line:
                     break
                 terminated = raw_line.endswith(b"\n")
+                if not terminated and bounded_end < file_size:
+                    # A bounded backlog window may end in the middle of one
+                    # valid JSONL record. Extend only that record to its
+                    # newline so the queue advances without turning a modest
+                    # tail into a complete multi-hundred-megabyte snapshot.
+                    remaining_record_bytes = MAX_JSONL_RECORD_BYTES - len(raw_line)
+                    if remaining_record_bytes <= 0:
+                        new_offset = line_start
+                        break
+                    raw_line += f.readline(remaining_record_bytes)
+                    terminated = raw_line.endswith(b"\n")
+                    if not terminated and len(raw_line) >= MAX_JSONL_RECORD_BYTES:
+                        new_offset = line_start
+                        break
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
 
                 # A bounded capture can intersect a record that is still

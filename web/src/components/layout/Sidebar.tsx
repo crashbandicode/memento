@@ -46,10 +46,14 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
   const currentToolId = pathParts[4] || "";
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const toggleDevice = (id: string) => setCollapsed((p) => ({ ...p, [id]: !p[id] }));
+  const defaultCollapsed = (id: string) => devices.length > 1 && id !== currentDeviceId;
+  const toggleDevice = (id: string) => setCollapsed((previous) => {
+    const current = id in previous ? previous[id] : defaultCollapsed(id);
+    return { ...previous, [id]: !current };
+  });
   const isCollapsed = (id: string) => {
     if (id in collapsed) return collapsed[id];
-    return devices.length > 1 && id !== currentDeviceId;
+    return defaultCollapsed(id);
   };
 
   const isAdmin = user?.role === "admin" || user?.role === "owner";

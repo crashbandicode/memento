@@ -187,6 +187,8 @@ class FileWatcher:
         self._processing_lock = threading.Lock()
         self._resync_lock = threading.Lock()
         self._resyncing_paths: set[str] = set()
+        self._catchup_lock = threading.Lock()
+        self._catching_up_paths: set[str] = set()
         self._handlers: list[_DebouncedHandler] = []
         self._tool_map: dict[str, BaseTool] = {}  # root_path_str -> tool
 
@@ -309,6 +311,37 @@ class FileWatcher:
         threading.Thread(
             target=run,
             name="memento-delta-resync",
+            daemon=True,
+        ).start()
+
+    def request_delta_catchup(self, source_path: str) -> None:
+        """Queue the next bounded tail after the previous one is acknowledged.
+
+        A transcript can grow by hundreds of megabytes while the collector is
+        offline. Reading that whole append into one Python string multiplies
+        memory during JSON decoding and sanitization. The watcher therefore
+        captures at most one configured delta window at a time; this callback
+        advances the durable chain once the server has accepted that window.
+        """
+        path = Path(source_path)
+        path_key = normalize_path(str(path))
+        with self._catchup_lock:
+            if path_key in self._catching_up_paths or self._stop_event.is_set():
+                return
+            self._catching_up_paths.add(path_key)
+
+        def run() -> None:
+            try:
+                if self._stop_event.is_set() or not path.is_file():
+                    return
+                self._on_file_changed(path)
+            finally:
+                with self._catchup_lock:
+                    self._catching_up_paths.discard(path_key)
+
+        threading.Thread(
+            target=run,
+            name="memento-delta-catchup",
             daemon=True,
         ).start()
 
@@ -445,8 +478,9 @@ class FileWatcher:
         ):
             return
 
-        # Determine read offset for delta sync
+        # Determine the byte-bounded capture window for delta sync.
         read_offset = 0
+        read_end_offset = file_size
         base_hash: str | None = None
         base_offset = 0
         if classification.sync_strategy == SyncStrategy.DELTA and not force_full:
@@ -466,19 +500,13 @@ class FileWatcher:
                 "max_delta_upload_bytes",
                 16 * 1024 * 1024,
             )
-            if (
-                read_offset > 0
-                and file_size - read_offset
-                > max_delta_bytes
-            ):
+            if read_offset > 0 and file_size - read_offset > max_delta_bytes:
+                read_end_offset = read_offset + max_delta_bytes
                 logger.info(
-                    "Delta burst exceeds %d bytes; queueing complete snapshot for %s",
+                    "Delta burst exceeds %d bytes; queueing bounded tail for %s",
                     max_delta_bytes,
                     path,
                 )
-                read_offset = 0
-                base_hash = None
-                base_offset = 0
 
         # Parse (with error protection)
         try:
@@ -504,6 +532,12 @@ class FileWatcher:
                         offset=0,
                         end_offset=file_size,
                     )
+                elif isinstance(parser, JsonlParser):
+                    result = parser.parse(
+                        path,
+                        offset=read_offset,
+                        end_offset=read_end_offset,
+                    )
                 else:
                     result = parser.parse(path, offset=read_offset)
                 parsed_content = result.content
@@ -516,7 +550,7 @@ class FileWatcher:
             logger.debug("Parse error for %s, skipping", path)
             return
 
-        if append_only_snapshot:
+        if append_only_snapshot or read_end_offset < file_size:
             current_hash = _file_hash_revision(
                 path,
                 size=new_offset,

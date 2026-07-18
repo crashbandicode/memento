@@ -162,7 +162,7 @@ class CollectorConfig(BaseSettings):
     # Sync
     large_file_threshold: int = 1_048_576  # 1 MB
     # Guarded append uploads stay synchronous so a base mismatch reaches the
-    # collector immediately. Larger bursts fall back to a complete snapshot.
+    # collector immediately. Larger backlogs are drained in bounded windows.
     max_delta_upload_bytes: int = 16 * 1024 * 1024
     batch_size: int = 20
     sync_interval: float = 0.5  # seconds between sync cycles when queue empty

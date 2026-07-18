@@ -555,6 +555,7 @@ def main() -> None:
         queue,
         config,
         full_resync_callback=watcher.request_full_resync,
+        delta_catchup_callback=watcher.request_delta_catchup,
     )
 
     # Graceful shutdown

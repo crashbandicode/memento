@@ -103,12 +103,12 @@ export function Icon({ name, size = 16, strokeWidth = 1.6, style, ...rest }: Ico
 
 /** Tool id → gradient accent + icon */
 export const TOOL_HUE: Record<string, { h: number; bg: string }> = {
-  claude_code: { h: 22,  bg: "linear-gradient(135deg,#FB923C,#F43F5E)" },
+  claude_code: { h: 18,  bg: "linear-gradient(135deg,#E89576,#C96442)" },
   openclaw:    { h: 280, bg: "linear-gradient(135deg,#C084FC,#7C3AED)" },
-  codex:       { h: 142, bg: "linear-gradient(135deg,#34D399,#10B981)" },
+  codex:       { h: 162, bg: "linear-gradient(135deg,#27343A,#10A37F)" },
   antigravity: { h: 220, bg: "linear-gradient(135deg,#60A5FA,#2563EB)" },
   obsidian:    { h: 260, bg: "linear-gradient(135deg,#A78BFA,#7C3AED)" },
-  cursor:      { h: 190, bg: "linear-gradient(135deg,#22D3EE,#0891B2)" },
+  cursor:      { h: 220, bg: "linear-gradient(135deg,#4B5563,#111827)" },
   windsurf:    { h: 170, bg: "linear-gradient(135deg,#5EEAD4,#0D9488)" },
   vscode:      { h: 240, bg: "linear-gradient(135deg,#818CF8,#4F46E5)" },
   hermes:      { h: 200, bg: "linear-gradient(135deg,#38BDF8,#0EA5E9)" },
@@ -140,6 +140,9 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
   if (skin === "aurora") {
     return (
       <div
+        role="img"
+        aria-label={`${id.replaceAll("_", " ")} tool`}
+        data-tool-glyph={id}
         style={{
           width: size,
           height: size,
@@ -177,6 +180,9 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
   const tint = pad ? brandColor + (theme === "dark" ? "20" : "10") : "transparent";
   return (
     <div
+      role="img"
+      aria-label={`${id.replaceAll("_", " ")} tool`}
+      data-tool-glyph={id}
       style={{
         width: size,
         height: size,

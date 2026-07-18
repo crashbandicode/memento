@@ -440,6 +440,58 @@ def test_large_jsonl_append_queues_only_the_new_guarded_tail(tmp_path: Path) -> 
         queue.close()
 
 
+def test_large_delta_backlog_is_captured_in_bounded_windows(tmp_path: Path) -> None:
+    path = tmp_path / "active-large-session.jsonl"
+    first = json.dumps({"type": "event_msg", "payload": {"text": "first"}}) + "\n"
+    record = json.dumps({
+        "type": "event_msg",
+        "payload": {"text": "x" * 1000},
+    }, separators=(",", ":")) + "\n"
+    path.write_text(first + (record * 40), encoding="utf-8")
+    base_offset = len(first.encode("utf-8"))
+    max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/active-large-session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return "observed-hash", base_offset
+
+        def get_delta_base(self, _tool_name: str, _relative_path: str):
+            return "base-hash", base_offset
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=max_delta_bytes)
+
+    watcher._process_file_changed(path)
+    tail = queue.enqueued[0]
+    assert tail["is_partial"] is True
+    assert tail["base_hash"] == "base-hash"
+    assert tail["base_offset"] == base_offset
+    assert tail["offset"] > base_offset + max_delta_bytes
+    assert tail["offset"] <= base_offset + max_delta_bytes + len(record.encode("utf-8"))
+    assert tail["offset"] < path.stat().st_size
+    assert len(tail["content"].splitlines()) == 8
+    assert len(tail["content"].encode("utf-8")) < path.stat().st_size - base_offset
+
+
 def test_mutation_during_read_defers_without_advancing_source_revision(
     tmp_path: Path,
 ) -> None:
