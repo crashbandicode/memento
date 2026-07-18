@@ -74,9 +74,8 @@ class _DebouncedHandler(FileSystemEventHandler):
         self._callback = callback
         self._debounce = max(0.0, debounce_seconds)
         self._excluded = excluded_patterns
-        self._pending: dict[str, None] = {}
+        self._pending: dict[str, float] = {}
         self._condition = threading.Condition()
-        self._deadline: float | None = None
         self._worker: threading.Thread | None = None
         self._stopped = False
 
@@ -97,9 +96,8 @@ class _DebouncedHandler(FileSystemEventHandler):
         with self._condition:
             if self._stopped:
                 return
-            was_idle = self._deadline is None
-            self._pending[path] = None
-            self._deadline = time.monotonic() + self._debounce
+            was_idle = not self._pending
+            self._pending[path] = time.monotonic() + self._debounce
             if self._worker is None:
                 worker = threading.Thread(
                     target=self._run,
@@ -112,11 +110,10 @@ class _DebouncedHandler(FileSystemEventHandler):
                 except Exception:
                     self._worker = None
                     raise
-            # An active worker is already waiting on an earlier deadline. The
-            # new event only pushes that deadline later, so waking it for every
-            # filesystem notification turns a busy tree into a condition-lock
-            # hot loop. It will observe the extended deadline on its next
-            # scheduled wake. Only an idle worker needs an immediate signal.
+            # Every new deadline is based on the same debounce interval and
+            # therefore cannot precede an already-pending deadline. Wake only
+            # an idle worker; otherwise it will dispatch each path when that
+            # path's own deadline arrives without a condition-notify storm.
             if was_idle:
                 self._condition.notify()
 
@@ -127,18 +124,23 @@ class _DebouncedHandler(FileSystemEventHandler):
                 while True:
                     if self._stopped:
                         return
-                    if self._deadline is None:
+                    if not self._pending:
                         self._condition.wait()
                         continue
 
-                    remaining = self._deadline - time.monotonic()
+                    now = time.monotonic()
+                    remaining = min(self._pending.values()) - now
                     if remaining > 0:
                         self._condition.wait(timeout=remaining)
                         continue
 
-                    paths = list(self._pending)
-                    self._pending.clear()
-                    self._deadline = None
+                    paths = [
+                        path
+                        for path, deadline in self._pending.items()
+                        if deadline <= now
+                    ]
+                    for path in paths:
+                        del self._pending[path]
                     break
 
             for path_str in paths:
@@ -160,7 +162,6 @@ class _DebouncedHandler(FileSystemEventHandler):
         with self._condition:
             self._stopped = True
             self._pending.clear()
-            self._deadline = None
             worker = self._worker
             self._condition.notify_all()
         if worker is not None and worker is not threading.current_thread():

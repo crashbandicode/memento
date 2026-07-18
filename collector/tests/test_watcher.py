@@ -125,6 +125,48 @@ def test_debounce_is_trailing_edge_and_batches_unique_paths(
     assert callbacks[0][1] >= last_event_at + 0.20
 
 
+def test_busy_path_does_not_starve_quiet_path(tmp_path: Path) -> None:
+    """A busy sibling transcript must not hide an unanswered user prompt."""
+    quiet = tmp_path / "waiting-for-user.jsonl"
+    busy = tmp_path / "streaming-agent.jsonl"
+    quiet.write_text("question\n", encoding="utf-8")
+    busy.write_text("tools\n", encoding="utf-8")
+    callbacks: list[Path] = []
+    quiet_delivered = threading.Event()
+    busy_delivered = threading.Event()
+
+    def callback(path: Path) -> None:
+        callbacks.append(path)
+        if path == quiet:
+            quiet_delivered.set()
+        elif path == busy:
+            busy_delivered.set()
+
+    handler = _DebouncedHandler(callback, 0.08, [])
+    handler.on_any_event(_modified(quiet))
+
+    def keep_busy() -> None:
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            handler.on_any_event(_modified(busy))
+            time.sleep(0.02)
+
+    busy_thread = threading.Thread(target=keep_busy)
+    busy_thread.start()
+    try:
+        assert quiet_delivered.wait(0.3)
+        assert busy_thread.is_alive()
+        assert callbacks == [quiet]
+        busy_thread.join(timeout=2)
+        assert not busy_thread.is_alive()
+        assert busy_delivered.wait(1)
+    finally:
+        handler.stop()
+        busy_thread.join(timeout=2)
+
+    assert callbacks == [quiet, busy]
+
+
 def test_callback_exception_does_not_drop_remaining_paths(
     caplog,
     tmp_path: Path,
