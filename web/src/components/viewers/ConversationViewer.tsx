@@ -2804,10 +2804,12 @@ function MessageCopyFrame({
   markdown,
   children,
   t,
+  placement = "edge",
 }: {
   markdown: string;
   children: ReactNode;
   t: ReturnType<typeof useI18n>["t"];
+  placement?: "edge" | "inset";
 }) {
   const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -2828,15 +2830,26 @@ function MessageCopyFrame({
     <div
       data-message-copy-frame
       data-copy-bottom-needed={showBottomCopy ? "true" : "false"}
+      data-copy-placement={placement}
       style={{ minWidth: 0, position: "relative" }}
     >
-      <div style={{ position: "absolute", zIndex: 20, top: 0, right: 34 }}>
+      <div style={{
+        position: "absolute",
+        zIndex: 20,
+        top: placement === "inset" ? 8 : 0,
+        right: placement === "inset" ? 8 : 34,
+      }}>
         <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} />
       </div>
       <div ref={contentRef} data-message-copy-content style={{ minWidth: 0 }}>
         {children}
       </div>
-      {showBottomCopy && (
+      {showBottomCopy && placement === "inset" && (
+        <div style={{ position: "absolute", zIndex: 20, right: 8, bottom: 8 }}>
+          <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
+        </div>
+      )}
+      {showBottomCopy && placement === "edge" && (
         <div style={{ display: "flex", justifyContent: "flex-end", minHeight: 28, marginTop: 3, paddingRight: 2 }}>
           <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
         </div>
@@ -2964,7 +2977,7 @@ export const ChatBubble = memo(function ChatBubble({
 
     const isLong = content.length > 500;
     const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
-    return withCopyControls(
+    return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0 }}>
           {showContext && sessionContext && (
@@ -2998,41 +3011,44 @@ export const ChatBubble = memo(function ChatBubble({
               </span>
             )}
           </div>
-          <div
-            style={{
-              padding: "12px 16px",
-              borderRadius: 12,
-              background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
-              color: "var(--aurora-fg1)",
-              fontSize: 13.5,
-              lineHeight: 1.55,
-              letterSpacing: "-0.005em",
-              wordBreak: "break-word",
-              overflowWrap: "anywhere",
-              border: "1px solid color-mix(in srgb, var(--aurora-accent) 20%, var(--aurora-border))",
-              boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
-            }}
-          >
-            <div className="prose prose-sm max-w-none">
-              <MarkdownViewer content={displayContent} />
+          <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset">
+            <div
+              data-message-copy-surface
+              style={{
+                padding: "12px 50px 12px 16px",
+                borderRadius: 12,
+                background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
+                color: "var(--aurora-fg1)",
+                fontSize: 13.5,
+                lineHeight: 1.55,
+                letterSpacing: "-0.005em",
+                wordBreak: "break-word",
+                overflowWrap: "anywhere",
+                border: "1px solid color-mix(in srgb, var(--aurora-accent) 20%, var(--aurora-border))",
+                boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
+              }}
+            >
+              <div className="prose prose-sm max-w-none">
+                <MarkdownViewer content={displayContent} />
+              </div>
+              {isLong && (
+                <button
+                  onClick={() => setExpanded(!expanded)}
+                  style={{
+                    display: "block",
+                    marginTop: 6,
+                    fontSize: 11,
+                    color: "var(--aurora-accent)",
+                    background: "transparent",
+                    border: 0,
+                    cursor: "pointer",
+                  }}
+                >
+                  {expanded ? t.conversation.collapse : t.conversation.expandAll}
+                </button>
+              )}
             </div>
-            {isLong && (
-              <button
-                onClick={() => setExpanded(!expanded)}
-                style={{
-                  display: "block",
-                  marginTop: 6,
-                  fontSize: 11,
-                  color: "var(--aurora-accent)",
-                  background: "transparent",
-                  border: 0,
-                  cursor: "pointer",
-                }}
-              >
-                {expanded ? t.conversation.collapse : t.conversation.expandAll}
-              </button>
-            )}
-          </div>
+          </MessageCopyFrame>
         </div>
       </div>
     );
@@ -3079,8 +3095,33 @@ export const ChatBubble = memo(function ChatBubble({
     const hasNarrative = Boolean(showAssistant && (narrative || hasSeparateThinking));
     const visibleToolCalls = showTools ? toolCalls : [];
     if (!hasNarrative && visibleToolCalls.length === 0) return null;
+    const toolCallGroup = visibleToolCalls.length > 0 ? (
+      <div
+        data-assistant-tool-calls
+        role="group"
+        aria-label="Assistant tool calls"
+        style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
+      >
+        {visibleToolCalls.map((call, index) => (
+          call.interaction ? (
+            <QuestionInteractionCard
+              key={`${call.name}-${index}`}
+              interaction={call.interaction}
+              pairedResponse={questionResponses.get(call.interaction.id)}
+              t={t}
+            />
+          ) : (
+            <ConversationToolCard
+              key={`${call.name}-${index}`}
+              name={call.name}
+              input={call.input}
+            />
+          )
+        ))}
+      </div>
+    ) : null;
 
-    return withCopyControls(
+    return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0, padding: hasNarrative ? "3px 2px 8px" : "0 0 4px" }}>
           {hasNarrative && (
@@ -3124,88 +3165,68 @@ export const ChatBubble = memo(function ChatBubble({
                   </span>
                 )}
               </div>
-              <div
-                className="px-3 py-3 sm:px-4"
-                style={{
-                  color: "var(--aurora-fg1)",
-                  fontSize: 13.5,
-                  lineHeight: 1.55,
-                  letterSpacing: "-0.005em",
-                  background: "color-mix(in srgb, var(--aurora-chip) 34%, var(--aurora-surface-solid))",
-                  border: "1px solid var(--aurora-border)",
-                  borderRadius: 12,
-                  boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
-                }}
-              >
-                {showAssistant && displayContent && (
-                  <div className="prose prose-sm max-w-none">
-                    <MarkdownViewer content={displayContent} />
-                  </div>
-                )}
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: showAssistant && displayContent ? 8 : 0 }}>
-                  {showAssistant && isLong && (
-                    <button
-                      onClick={() => setExpanded(!expanded)}
-                      style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
-                    >
-                      {expanded ? t.conversation.collapse : t.conversation.expandAll}
-                    </button>
+              <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset">
+                <div
+                  data-message-copy-surface
+                  className="px-3 py-3 sm:px-4"
+                  style={{
+                    paddingRight: 50,
+                    color: "var(--aurora-fg1)",
+                    fontSize: 13.5,
+                    lineHeight: 1.55,
+                    letterSpacing: "-0.005em",
+                    background: "color-mix(in srgb, var(--aurora-chip) 34%, var(--aurora-surface-solid))",
+                    border: "1px solid var(--aurora-border)",
+                    borderRadius: 12,
+                    boxShadow: "0 1px 2px rgba(15,23,42,0.025)",
+                  }}
+                >
+                  {showAssistant && displayContent && (
+                    <div className="prose prose-sm max-w-none">
+                      <MarkdownViewer content={displayContent} />
+                    </div>
                   )}
-                  {hasSeparateThinking && (
-                    <button
-                      onClick={() => setThinkingExpanded((value) => !value)}
-                      style={{ fontSize: 11, color: "#D97706", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: showAssistant && displayContent ? 8 : 0 }}>
+                    {showAssistant && isLong && (
+                      <button
+                        onClick={() => setExpanded(!expanded)}
+                        style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
+                      >
+                        {expanded ? t.conversation.collapse : t.conversation.expandAll}
+                      </button>
+                    )}
+                    {hasSeparateThinking && (
+                      <button
+                        onClick={() => setThinkingExpanded((value) => !value)}
+                        style={{ fontSize: 11, color: "#D97706", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
+                      >
+                        {thinkingExpanded ? t.conversation.hideThinking : t.conversation.showThinking}
+                      </button>
+                    )}
+                  </div>
+                  {thinkingExpanded && hasSeparateThinking && (
+                    <div
+                      style={{
+                        marginTop: 12,
+                        borderRadius: 12,
+                        border: "1px solid var(--aurora-border)",
+                        background: "rgba(251,191,36,0.08)",
+                        padding: "10px 12px",
+                      }}
                     >
-                      {thinkingExpanded ? t.conversation.hideThinking : t.conversation.showThinking}
-                    </button>
+                      <div style={{ marginBottom: 6, fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "#D97706" }}>
+                        {t.conversation.thinking}
+                      </div>
+                      <div className="prose prose-sm max-w-none" style={{ color: "#78350F" }}>
+                        <MarkdownViewer content={thinking} />
+                      </div>
+                    </div>
                   )}
                 </div>
-                {thinkingExpanded && hasSeparateThinking && (
-                  <div
-                    style={{
-                      marginTop: 12,
-                      borderRadius: 12,
-                      border: "1px solid var(--aurora-border)",
-                      background: "rgba(251,191,36,0.08)",
-                      padding: "10px 12px",
-                    }}
-                  >
-                    <div style={{ marginBottom: 6, fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "#D97706" }}>
-                      {t.conversation.thinking}
-                    </div>
-                    <div className="prose prose-sm max-w-none" style={{ color: "#78350F" }}>
-                      <MarkdownViewer content={thinking} />
-                    </div>
-                  </div>
-                )}
-              </div>
+              </MessageCopyFrame>
             </>
           )}
-          {visibleToolCalls.length > 0 && (
-            <div
-              data-assistant-tool-calls
-              role="group"
-              aria-label="Assistant tool calls"
-              style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
-            >
-              {visibleToolCalls.map((call, index) => (
-                call.interaction ? (
-                  <QuestionInteractionCard
-                    key={`${call.name}-${index}`}
-                    interaction={call.interaction}
-                    pairedResponse={questionResponses.get(call.interaction.id)}
-                    t={t}
-                  />
-                ) : (
-                  <ConversationToolCard
-                    key={`${call.name}-${index}`}
-                    name={call.name}
-                    input={call.input}
-                  />
-                )
-              ))}
-            </div>
-          )}
+          {hasNarrative ? toolCallGroup : toolCallGroup && withCopyControls(toolCallGroup)}
         </div>
       </div>
     );
