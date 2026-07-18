@@ -1961,10 +1961,14 @@ function ConversationToolCard({
   name,
   input = "",
   output = "",
+  copyControl,
+  bottomCopyControl,
 }: {
   name: string;
   input?: string;
   output?: string;
+  copyControl?: ReactNode;
+  bottomCopyControl?: ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
   const toolLabel = name || "Tool result";
@@ -1985,75 +1989,119 @@ function ConversationToolCard({
           borderRadius: 10,
           color: "var(--aurora-fg1)",
           maxWidth: "100%",
-          overflow: "hidden",
+          overflow: "visible",
           boxShadow: "0 1px 2px rgba(15,23,42,0.03)",
         }}
       >
-        <button
-          type="button"
-          data-conversation-tool={toolLabel}
-          aria-label={`${toolLabel} tool call`}
-          aria-expanded={expanded}
-          disabled={!hasDetails}
-          onClick={() => hasDetails && setExpanded((value) => !value)}
+        <div
+          data-tool-card-header
           style={{
             width: "100%",
             minHeight: 44,
             display: "flex",
             alignItems: "center",
-            gap: 9,
-            padding: "9px 12px",
-            border: 0,
-            background: "transparent",
-            color: "inherit",
-            cursor: hasDetails ? "pointer" : "default",
-            textAlign: "left",
+            padding: "5px 7px 5px 0",
           }}
         >
-          <Icon name="terminal" size={13} style={{ color: "#F97316", flex: "0 0 auto" }} />
-          <span
-            title={toolLabel}
+          <button
+            type="button"
+            data-conversation-tool={toolLabel}
+            aria-label={`${toolLabel} tool call`}
+            aria-expanded={expanded}
+            disabled={!hasDetails}
+            onClick={() => hasDetails && setExpanded((value) => !value)}
             style={{
-              maxWidth: "min(42%, 220px)",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              fontWeight: 600,
-              fontSize: 12,
-              whiteSpace: "nowrap",
-              flex: "0 1 auto",
+              minWidth: 0,
+              minHeight: 34,
+              display: "flex",
+              flex: "1 1 auto",
+              alignItems: "center",
+              gap: 9,
+              padding: "4px 6px 4px 12px",
+              border: 0,
+              background: "transparent",
+              color: "inherit",
+              cursor: hasDetails ? "pointer" : "default",
+              textAlign: "left",
             }}
           >
-            {toolLabel}
-          </span>
-          {!expanded && preview && (
+            <Icon name="terminal" size={13} style={{ color: "#F97316", flex: "0 0 auto" }} />
             <span
-              title={preview}
+              title={toolLabel}
               style={{
-                minWidth: 0,
+                maxWidth: "min(42%, 220px)",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
+                fontWeight: 600,
+                fontSize: 12,
                 whiteSpace: "nowrap",
-                color: "var(--aurora-fg4)",
-                fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
-                fontSize: 10.5,
+                flex: "0 1 auto",
               }}
             >
-              {preview}
+              {toolLabel}
             </span>
-          )}
-          {hasDetails && (
-            <span style={{ marginLeft: "auto", display: "inline-flex", color: "var(--aurora-fg4)", flex: "0 0 auto" }}>
-              <Icon
-                name="chevron_down"
-                size={13}
+            {!expanded && preview && (
+              <span
+                title={preview}
                 style={{
-                  transform: expanded ? "rotate(180deg)" : "none",
-                  transition: "transform .15s ease",
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: "var(--aurora-fg4)",
+                  fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
+                  fontSize: 10.5,
                 }}
-              />
-            </span>
+              >
+                {preview}
+              </span>
+            )}
+          </button>
+          {(copyControl || hasDetails) && (
+            <div
+              data-tool-card-actions
+              style={{
+                display: "inline-flex",
+                flex: "0 0 auto",
+                alignItems: "center",
+                gap: 3,
+                paddingLeft: 5,
+                borderLeft: "1px solid color-mix(in srgb, var(--aurora-border) 72%, transparent)",
+              }}
+            >
+              {copyControl}
+              {hasDetails && (
+                <button
+                  type="button"
+                  aria-label={expanded ? `Collapse ${toolLabel}` : `Expand ${toolLabel}`}
+                  aria-expanded={expanded}
+                  onClick={() => setExpanded((value) => !value)}
+                  style={{
+                    width: 30,
+                    height: 30,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    border: 0,
+                    borderRadius: 8,
+                    background: "transparent",
+                    color: "var(--aurora-fg4)",
+                    cursor: "pointer",
+                  }}
+                >
+                  <Icon
+                    name="chevron_down"
+                    size={13}
+                    style={{
+                      transform: expanded ? "rotate(180deg)" : "none",
+                      transition: "transform .15s ease",
+                    }}
+                  />
+                </button>
+              )}
+            </div>
           )}
-        </button>
+        </div>
 
         {expanded && hasDetails && (
           <div style={{ borderTop: "1px solid var(--aurora-border)", padding: "11px 12px 12px" }}>
@@ -2061,6 +2109,20 @@ function ConversationToolCard({
             {formattedOutput && (
               <ToolCodeBlock label="Output" value={formattedOutput} topSpacing={Boolean(formattedInput)} />
             )}
+          </div>
+        )}
+        {bottomCopyControl && (
+          <div
+            data-tool-card-footer-actions
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              padding: "6px 7px",
+              borderTop: "1px solid var(--aurora-border)",
+              background: "color-mix(in srgb, var(--aurora-chip) 55%, transparent)",
+            }}
+          >
+            {bottomCopyControl}
           </div>
         )}
       </div>
@@ -2707,11 +2769,13 @@ function MessageCopyMenu({
   status,
   onCopy,
   t,
+  compact = false,
 }: {
   position: "top" | "bottom";
   status: ClipboardFormat | "error" | null;
   onCopy: (format: ClipboardFormat) => Promise<void>;
   t: ReturnType<typeof useI18n>["t"];
+  compact?: boolean;
 }) {
   const statusLabel = status === "rich"
     ? t.conversation.copiedRichText
@@ -2749,18 +2813,24 @@ function MessageCopyMenu({
           alignItems: "center",
           gap: 5,
           minHeight: 28,
-          padding: "3px 7px",
+          minWidth: compact ? 30 : undefined,
+          justifyContent: compact ? "center" : undefined,
+          padding: compact ? "3px" : "3px 7px",
           borderRadius: 8,
           color: status ? "var(--aurora-accent)" : "var(--aurora-fg4)",
-          background: "color-mix(in srgb, var(--aurora-surface-solid) 72%, transparent)",
-          border: "1px solid color-mix(in srgb, var(--aurora-border) 72%, transparent)",
+          background: compact
+            ? "color-mix(in srgb, var(--aurora-chip) 62%, transparent)"
+            : "color-mix(in srgb, var(--aurora-surface-solid) 72%, transparent)",
+          border: compact
+            ? "1px solid transparent"
+            : "1px solid color-mix(in srgb, var(--aurora-border) 72%, transparent)",
           cursor: "pointer",
           fontSize: 10.5,
           userSelect: "none",
         }}
       >
         <Icon name="copy" size={12} />
-        {status && <span>{statusLabel}</span>}
+        {status && !compact && <span>{statusLabel}</span>}
       </summary>
       <div
         role="menu"
@@ -2807,7 +2877,7 @@ function MessageCopyFrame({
   placement = "edge",
 }: {
   markdown: string;
-  children: ReactNode;
+  children: ReactNode | ((controls: { top: ReactNode; bottom: ReactNode | null }) => ReactNode);
   t: ReturnType<typeof useI18n>["t"];
   placement?: "edge" | "inset";
 }) {
@@ -2815,6 +2885,7 @@ function MessageCopyFrame({
   const contentRef = useRef<HTMLDivElement>(null);
   const showBottomCopy = useOverflowsVisibleScrollport(contentRef);
   const resetTimer = useRef<number | null>(null);
+  const usesManagedControls = typeof children === "function";
 
   const copy = async (format: ClipboardFormat) => {
     try {
@@ -2826,30 +2897,38 @@ function MessageCopyFrame({
     if (resetTimer.current) window.clearTimeout(resetTimer.current);
     resetTimer.current = window.setTimeout(() => setStatus(null), 2_000);
   };
+  const topControl = (
+    <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
+  );
+  const bottomControl = showBottomCopy ? (
+    <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
+  ) : null;
   return (
     <div
       data-message-copy-frame
       data-copy-bottom-needed={showBottomCopy ? "true" : "false"}
-      data-copy-placement={placement}
+      data-copy-placement={usesManagedControls ? "managed" : placement}
       style={{ minWidth: 0, position: "relative" }}
     >
-      <div style={{
-        position: "absolute",
-        zIndex: 20,
-        top: placement === "inset" ? 8 : 0,
-        right: placement === "inset" ? 8 : 34,
-      }}>
-        <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} />
-      </div>
+      {!usesManagedControls && (
+        <div style={{
+          position: "absolute",
+          zIndex: 20,
+          top: placement === "inset" ? 8 : 0,
+          right: placement === "inset" ? 8 : 34,
+        }}>
+          {topControl}
+        </div>
+      )}
       <div ref={contentRef} data-message-copy-content style={{ minWidth: 0 }}>
-        {children}
+        {usesManagedControls ? children({ top: topControl, bottom: bottomControl }) : children}
       </div>
-      {showBottomCopy && placement === "inset" && (
+      {showBottomCopy && !usesManagedControls && placement === "inset" && (
         <div style={{ position: "absolute", zIndex: 20, right: 8, bottom: 8 }}>
           <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
         </div>
       )}
-      {showBottomCopy && placement === "edge" && (
+      {showBottomCopy && !usesManagedControls && placement === "edge" && (
         <div style={{ display: "flex", justifyContent: "flex-end", minHeight: 28, marginTop: 3, paddingRight: 2 }}>
           <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
         </div>
@@ -3246,8 +3325,18 @@ export const ChatBubble = memo(function ChatBubble({
         />
       );
     }
-    return withCopyControls(
-      <ConversationToolCard name={toolName || "Tool result"} input={toolInput} output={content} />,
+    return (
+      <MessageCopyFrame markdown={messageMarkdown} t={t}>
+        {({ top, bottom }) => (
+          <ConversationToolCard
+            name={toolName || "Tool result"}
+            input={toolInput}
+            output={content}
+            copyControl={top}
+            bottomCopyControl={bottom}
+          />
+        )}
+      </MessageCopyFrame>
     );
   }
 

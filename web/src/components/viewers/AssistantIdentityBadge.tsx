@@ -1,3 +1,11 @@
+import type { IconType } from "react-icons";
+import {
+  SiAnthropic,
+  SiGooglegemini,
+  SiMeta,
+  SiMistralai,
+  SiOpenai,
+} from "react-icons/si";
 import styles from "./AssistantIdentityBadge.module.css";
 
 interface AssistantIdentityBadgeProps {
@@ -12,6 +20,39 @@ function cleanIdentityValue(value?: string | null): string {
 
 function titleCaseToken(value: string): string {
   return value ? value[0].toUpperCase() + value.slice(1).toLowerCase() : "";
+}
+
+type AssistantModelProvider =
+  | "anthropic"
+  | "openai"
+  | "xai"
+  | "google"
+  | "mistral"
+  | "meta"
+  | "deepseek"
+  | "qwen"
+  | "generic";
+
+interface AssistantProviderIdentity {
+  id: AssistantModelProvider;
+  label: string;
+  icon?: IconType;
+  monogram?: string;
+}
+
+export function assistantModelProvider(value?: string | null): AssistantProviderIdentity {
+  const model = cleanIdentityValue(value).toLowerCase();
+  if (/claude|anthropic/.test(model)) return { id: "anthropic", label: "Anthropic", icon: SiAnthropic };
+  if (/grok|(?:^|[-_/])xai(?:[-_/]|$)/.test(model)) return { id: "xai", label: "xAI", monogram: "xAI" };
+  if (/gemini|google/.test(model)) return { id: "google", label: "Google", icon: SiGooglegemini };
+  if (/mistral|mixtral/.test(model)) return { id: "mistral", label: "Mistral AI", icon: SiMistralai };
+  if (/llama|(?:^|[-_/])meta(?:[-_/]|$)/.test(model)) return { id: "meta", label: "Meta", icon: SiMeta };
+  if (/deepseek/.test(model)) return { id: "deepseek", label: "DeepSeek", monogram: "DS" };
+  if (/qwen|alibaba/.test(model)) return { id: "qwen", label: "Qwen", monogram: "Q" };
+  if (/openai|codex|(?:^|[-_/])gpt(?:[-_/]|$)|^o(?:1|3|4)(?:[-_/]|$)/.test(model)) {
+    return { id: "openai", label: "OpenAI", icon: SiOpenai };
+  }
+  return { id: "generic", label: "AI model" };
 }
 
 export function formatAssistantModelLabel(value?: string | null): string {
@@ -29,6 +70,11 @@ export function formatAssistantModelLabel(value?: string | null): string {
       ? ` ${gpt[2].split("-").map(titleCaseToken).join(" ")}`
       : "";
     return `GPT-${gpt[1]}${variant}`;
+  }
+
+  const branded = /^(grok|gemini|mistral|mixtral|llama|deepseek|qwen)[-_](.+)$/i.exec(model);
+  if (branded) {
+    return `${titleCaseToken(branded[1])} ${branded[2].split(/[-_]/).map(titleCaseToken).join(" ")}`;
   }
 
   return model;
@@ -49,6 +95,7 @@ export default function AssistantIdentityBadge({
   const rawModel = cleanIdentityValue(model);
   const rawEffort = cleanIdentityValue(reasoningEffort);
   const modelLabel = formatAssistantModelLabel(rawModel);
+  const provider = assistantModelProvider(rawModel);
   const effortLabel = formatReasoningEffortLabel(rawEffort);
   const localizedThinkingLabel = cleanIdentityValue(thinkingLabel) || "Thinking";
   if (!modelLabel && !effortLabel) return null;
@@ -68,9 +115,20 @@ export default function AssistantIdentityBadge({
       aria-label={accessibleParts.join(", ")}
       data-assistant-model={rawModel || undefined}
       data-assistant-reasoning={rawEffort || undefined}
+      data-assistant-provider={provider.id}
       title={exactParts.join(" · ")}
     >
-      {modelLabel && <span className={styles.modelMark} aria-hidden="true" />}
+      {modelLabel && (
+        <span className={styles.modelMark} title={provider.label} aria-hidden="true">
+          {provider.icon ? (
+            <provider.icon className={styles.providerIcon} />
+          ) : provider.monogram ? (
+            <span className={styles.providerMonogram}>{provider.monogram}</span>
+          ) : (
+            <span className={styles.genericMark} />
+          )}
+        </span>
+      )}
       {modelLabel && <span className={styles.model}>{modelLabel}</span>}
       {effortLabel && (
         <>
