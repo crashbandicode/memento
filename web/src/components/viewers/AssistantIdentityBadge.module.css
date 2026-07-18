@@ -1,0 +1,79 @@
+.badge {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(100%, 330px);
+  height: 22px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px 0 6px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border));
+  border-radius: 999px;
+  background:
+    linear-gradient(110deg, color-mix(in srgb, #10b981 9%, transparent), transparent 42%),
+    color-mix(in srgb, var(--aurora-accent-soft) 58%, var(--aurora-surface-solid));
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 45%, transparent),
+    0 1px 3px color-mix(in srgb, var(--aurora-accent) 9%, transparent);
+  color: var(--aurora-fg2);
+  font-size: 9.5px;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0.005em;
+  white-space: nowrap;
+}
+
+.modelMark {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, white 75%, transparent);
+  border-radius: 50%;
+  background: conic-gradient(from 210deg, #10b981, #22d3ee, var(--aurora-accent), #10b981);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--aurora-accent) 8%, transparent);
+}
+
+.model {
+  min-width: 0;
+  max-width: 170px;
+  overflow: hidden;
+  color: var(--aurora-fg1);
+  text-overflow: ellipsis;
+}
+
+.divider {
+  width: 1px;
+  height: 10px;
+  flex: 0 0 auto;
+  margin: 0 1px;
+  background: color-mix(in srgb, var(--aurora-fg4) 38%, transparent);
+}
+
+.reasoning {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--aurora-fg3);
+  text-overflow: ellipsis;
+}
+
+.reasoningMark {
+  width: 4px;
+  height: 4px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--aurora-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--aurora-accent) 13%, transparent);
+}
+
+@media (max-width: 480px) {
+  .badge {
+    max-width: 100%;
+  }
+
+  .model {
+    max-width: 125px;
+  }
+}

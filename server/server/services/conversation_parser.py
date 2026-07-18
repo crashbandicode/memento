@@ -59,6 +59,19 @@ class NormalizedMessage:
     # collapsed the adjacent Codex response/event transport pair in this
     # payload, so it must not be reconciled against an older database tail.
     source_paired: bool = False
+    # The model and reasoning selection active for this assistant turn. These
+    # are presentation metadata, not rendered content, and may be absent when
+    # a source tool does not record them.
+    model: str = ""
+    reasoning_effort: str = ""
+
+
+@dataclass
+class AssistantIdentityState:
+    """Mutable model selection carried across incremental transcript chunks."""
+
+    model: str = ""
+    reasoning_effort: str = ""
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -546,6 +559,124 @@ def _as_mapping(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _bounded_identity_text(value: object, limit: int = 128) -> str:
+    """Return a compact, control-free identifier suitable for metadata."""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    clean = strip_terminal_sequences(_coerce_text(value)).replace("\x00", "")
+    return clean.strip()[:limit]
+
+
+def _set_identity_field(
+    state: AssistantIdentityState,
+    payload: dict,
+    keys: tuple[str, ...],
+    attribute: str,
+) -> bool:
+    """Apply the first explicitly present identity field, including clears."""
+    for key in keys:
+        if key in payload:
+            setattr(state, attribute, _bounded_identity_text(payload.get(key)))
+            return True
+    return False
+
+
+def _has_claude_thinking_block(content: object) -> bool:
+    """Return whether a Claude response records extended-thinking use."""
+    return isinstance(content, list) and any(
+        isinstance(item, dict)
+        and item.get("type") in {"thinking", "redacted_thinking"}
+        for item in content
+    )
+
+
+def _update_assistant_identity(
+    state: AssistantIdentityState,
+    obj: object,
+    tool_id: str,
+) -> None:
+    """Advance model/reasoning state from one native transcript record."""
+    if not isinstance(obj, dict):
+        return
+
+    msg_type = _coerce_text(obj.get("type"))
+    if tool_id == "codex" and msg_type == "turn_context":
+        payload = _as_mapping(obj.get("payload"))
+        _set_identity_field(state, payload, ("model",), "model")
+        _set_identity_field(
+            state,
+            payload,
+            ("effort", "reasoning_effort", "reasoningEffort"),
+            "reasoning_effort",
+        )
+        return
+
+    if tool_id == "claude_code":
+        # Claude stores extended-thinking blocks in the immutable transcript,
+        # but its numeric effort level currently lives only in mutable global
+        # settings.  Clear the inferred mode at each new turn, then carry a
+        # directly observed thinking block through that turn's tool loop.
+        if msg_type in {"user", "queue-operation"}:
+            if state.reasoning_effort == "extended":
+                state.reasoning_effort = ""
+            return
+        if msg_type != "assistant":
+            return
+
+        message = _as_mapping(obj.get("message"))
+        _set_identity_field(state, message, ("model",), "model")
+        explicit_effort = _set_identity_field(
+            state,
+            obj,
+            ("effort", "effortLevel", "reasoning_effort", "thinking_level"),
+            "reasoning_effort",
+        )
+        explicit_effort = _set_identity_field(
+            state,
+            message,
+            ("effort", "effortLevel", "reasoning_effort", "thinking_level"),
+            "reasoning_effort",
+        ) or explicit_effort
+        if (
+            not explicit_effort
+            and not state.reasoning_effort
+            and _has_claude_thinking_block(message.get("content"))
+        ):
+            state.reasoning_effort = "extended"
+        return
+
+    # Cursor exports and OpenClaw sessions vary by release. Only consume
+    # explicit scalar identity fields; ordinary message content is ignored.
+    _set_identity_field(
+        state,
+        obj,
+        ("model", "model_id", "modelId"),
+        "model",
+    )
+    _set_identity_field(
+        state,
+        obj,
+        (
+            "reasoning_effort",
+            "reasoningEffort",
+            "thinking_level",
+            "thinkingLevel",
+        ),
+        "reasoning_effort",
+    )
+
+
+def _attach_assistant_identity(
+    message: NormalizedMessage,
+    state: AssistantIdentityState,
+) -> None:
+    """Copy the active model selection onto assistant presentation rows."""
+    if message.role != "assistant":
+        return
+    message.model = state.model
+    message.reasoning_effort = state.reasoning_effort
+
+
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
     """Parse a single JSONL line into a NormalizedMessage, or None if it should be skipped."""
     try:
@@ -553,7 +684,12 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
     except json.JSONDecodeError:
         return None
 
-    return parse_conversation_object(obj, tool_id)
+    identity = AssistantIdentityState()
+    _update_assistant_identity(identity, obj, tool_id)
+    message = parse_conversation_object(obj, tool_id)
+    if message is not None:
+        _attach_assistant_identity(message, identity)
+    return message
 
 
 def parse_conversation_object(
@@ -1762,8 +1898,10 @@ def _iter_cursor_conversation_messages(
     raw_content: str,
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity: AssistantIdentityState | None = None,
 ) -> Iterator[NormalizedMessage]:
     """Yield Cursor semantic rows while linking interactive answers."""
+    identity = assistant_identity or AssistantIdentityState()
     seen_source_ids: set[str] = set()
     pending_question: tuple[int, dict[str, object]] | None = None
     for interaction in reversed(initial_question_interactions or []):
@@ -1774,6 +1912,7 @@ def _iter_cursor_conversation_messages(
     for record_index, source_object in enumerate(
         _iter_decoded_json_objects(raw_content)
     ):
+        _update_assistant_identity(identity, source_object, "cursor")
         if (
             pending_question is not None
             and record_index - pending_question[0] > CURSOR_QUESTION_RESPONSE_WINDOW
@@ -1781,6 +1920,7 @@ def _iter_cursor_conversation_messages(
             pending_question = None
 
         for message in _parse_cursor_record_messages(source_object):
+            _attach_assistant_identity(message, identity)
             if message.role == "user" and pending_question is not None:
                 _pending_index, interaction = pending_question
                 message.interaction_response = build_question_response(
@@ -1957,7 +2097,12 @@ def _format_hermes_tool_content(content_str: str) -> str:
     return "\n\n".join(parts) if parts else content_str
 
 
-def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> list[NormalizedMessage]:
+def _parse_hermes_session(
+    raw_content: str,
+    offset: int,
+    limit: int | None,
+    assistant_identity: AssistantIdentityState | None = None,
+) -> list[NormalizedMessage]:
     """Hermes stores a whole session as a single top-level JSON, not JSONL."""
     try:
         d = orjson.loads(raw_content)
@@ -1965,6 +2110,8 @@ def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> l
         return []
     if not isinstance(d, dict):
         return []
+    identity = assistant_identity or AssistantIdentityState()
+    _update_assistant_identity(identity, d, "hermes")
     msgs = d.get("messages") or []
     timestamp = d.get("last_updated") or d.get("session_start") or ""
 
@@ -1999,6 +2146,7 @@ def _parse_hermes_session(raw_content: str, offset: int, limit: int | None) -> l
             norm = NormalizedMessage(role="user", content=text, timestamp=timestamp)
         elif role == "assistant":
             norm = NormalizedMessage(role="assistant", content=text, timestamp=timestamp)
+            _attach_assistant_identity(norm, identity)
         elif role == "tool":
             tcid = str(m.get("tool_call_id") or "")
             tool_name = tool_name_by_id.get(tcid, "tool")
@@ -2131,6 +2279,7 @@ def iter_conversation_messages(
     tool_id: str,
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity: AssistantIdentityState | None = None,
 ) -> Iterator[NormalizedMessage]:
     """Yield semantic messages once, using identities supplied by each tool.
 
@@ -2139,13 +2288,20 @@ def iter_conversation_messages(
     IDs, so each source item is preserved.  This intentionally avoids any
     role/content/second heuristic: two identical prompts are still two turns.
     """
+    identity = assistant_identity or AssistantIdentityState()
     if tool_id == "hermes":
-        yield from _parse_hermes_session(raw_content, 0, None)
+        yield from _parse_hermes_session(
+            raw_content,
+            0,
+            None,
+            assistant_identity=identity,
+        )
         return
     if tool_id == "cursor":
         yield from _iter_cursor_conversation_messages(
             raw_content,
             initial_question_interactions=initial_question_interactions,
+            assistant_identity=identity,
         )
         return
 
@@ -2172,6 +2328,7 @@ def iter_conversation_messages(
     for record_index, source_object in enumerate(
         _iter_decoded_json_objects(raw_content)
     ):
+        _update_assistant_identity(identity, source_object, tool_id)
         if tool_id == "codex":
             source_payload = _as_mapping(source_object.get("payload"))
             if source_object.get("type") == "event_msg":
@@ -2183,6 +2340,8 @@ def iter_conversation_messages(
                     current_codex_turn_id = ""
 
         message = parse_conversation_object(source_object, tool_id)
+        if message is not None:
+            _attach_assistant_identity(message, identity)
 
         if (
             tool_id == "claude_code"

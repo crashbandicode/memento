@@ -69,6 +69,7 @@ def _get_ingest_semaphore() -> asyncio.Semaphore:
 MAX_STORED_MESSAGE_CHARS = 256 * 1024
 MAX_STORED_AUXILIARY_CHARS = 128 * 1024
 MAX_STORED_TOOL_NAME_CHARS = 256
+MAX_STORED_IDENTITY_CHARS = 128
 MAX_MESSAGE_BATCH_CHARS = 4 * 1024 * 1024
 MAX_SEARCH_TEXT_CHARS = 200 * 1024
 MAX_DOCUMENT_METADATA_BYTES = 256 * 1024
@@ -78,6 +79,8 @@ MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
 STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
 STORED_SOURCE_HASH_KEY = "_stored_source_hash"
 STORED_SOURCE_SIZE_KEY = "_stored_source_size"
+CURRENT_ASSISTANT_MODEL_KEY = "_assistant_model"
+CURRENT_ASSISTANT_REASONING_KEY = "_assistant_reasoning_effort"
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -87,6 +90,8 @@ _ESSENTIAL_METADATA_KEYS = {
     "cascade_id",
     "codex_title_revision",
     "codex_title_revisions",
+    CURRENT_ASSISTANT_MODEL_KEY,
+    CURRENT_ASSISTANT_REASONING_KEY,
     "cwd",
     "first_user_message",
     "forked_from_id",
@@ -113,6 +118,8 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "codex_title_revision",
     "codex_title_revisions",
     "memento_title_source",
+    CURRENT_ASSISTANT_MODEL_KEY,
+    CURRENT_ASSISTANT_REASONING_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
@@ -356,6 +363,16 @@ def _conversation_message_metadata(normalized) -> dict:
             str(normalized.source_turn_id),
             256,
         )
+    if normalized.model:
+        meta["model"] = _bounded_message_text(
+            str(normalized.model),
+            MAX_STORED_IDENTITY_CHARS,
+        )
+    if normalized.reasoning_effort:
+        meta["reasoning_effort"] = _bounded_message_text(
+            str(normalized.reasoning_effort),
+            MAX_STORED_IDENTITY_CHARS,
+        )
     return meta
 
 
@@ -364,6 +381,7 @@ def iter_stored_conversation_messages(
     tool_id: str,
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity=None,
 ):
     """Yield the exact normalized representation persisted during ingest.
 
@@ -381,6 +399,7 @@ def iter_stored_conversation_messages(
         content,
         tool_id,
         initial_question_interactions=initial_question_interactions,
+        assistant_identity=assistant_identity,
     ):
         if normalized.role not in ("user", "assistant", "tool", "system"):
             continue
@@ -411,6 +430,47 @@ def iter_stored_conversation_messages(
             _conversation_message_metadata(normalized),
             timestamp,
         )
+
+
+def _assistant_identity_for_ingest(doc: Document, mode: str):
+    """Seed incremental parsing from the last committed assistant identity."""
+    from .conversation_parser import AssistantIdentityState
+
+    metadata = dict(doc.metadata_ or {})
+    if mode != "delta":
+        return AssistantIdentityState()
+
+    def stored_value(*keys: str) -> str:
+        for key in keys:
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    return AssistantIdentityState(
+        model=stored_value(CURRENT_ASSISTANT_MODEL_KEY, "model"),
+        reasoning_effort=stored_value(
+            CURRENT_ASSISTANT_REASONING_KEY,
+            "reasoning_effort",
+        ),
+    )
+
+
+def _store_assistant_identity(doc: Document, assistant_identity) -> None:
+    """Persist parser state so a later delta can label its assistant rows."""
+    metadata = dict(doc.metadata_ or {})
+    for key, value in (
+        (CURRENT_ASSISTANT_MODEL_KEY, assistant_identity.model),
+        (CURRENT_ASSISTANT_REASONING_KEY, assistant_identity.reasoning_effort),
+    ):
+        if value:
+            metadata[key] = _bounded_message_text(
+                value,
+                MAX_STORED_IDENTITY_CHARS,
+            )
+        else:
+            metadata.pop(key, None)
+    doc.metadata_ = metadata
 
 
 def _pending_question_interactions(
@@ -2125,6 +2185,7 @@ async def _extract_messages(
         start_line = 1
 
     tool_id = doc.tool_id
+    assistant_identity = _assistant_identity_for_ingest(doc, mode)
     line_num = start_line
     batch: list[ConversationMessage] = []
     batch_bytes = 0
@@ -2174,6 +2235,7 @@ async def _extract_messages(
         content,
         tool_id,
         initial_question_interactions=initial_question_interactions,
+        assistant_identity=assistant_identity,
     ):
         # Claude persists a steer immediately as a queue enqueue, then may
         # write the canonical user row in a later collector delta after the
@@ -2297,6 +2359,8 @@ async def _extract_messages(
             await db.flush()
             batch = []
             batch_bytes = 0
+
+    _store_assistant_identity(doc, assistant_identity)
 
     if batch:
         db.add_all(batch)

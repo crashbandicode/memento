@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_parser import (  # noqa: E402
+    AssistantIdentityState,
     count_conversation_messages,
     extract_codex_session_metadata,
     iter_conversation_messages,
@@ -22,6 +23,145 @@ from server.services.conversation_parser import (  # noqa: E402
 
 
 class ConversationParserTests(unittest.TestCase):
+    def test_codex_assistant_identity_tracks_turn_context_switches(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-17T20:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "assistant-1",
+                    "content": [{"type": "output_text", "text": "First"}],
+                },
+            }),
+            json.dumps({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.6", "effort": "medium"},
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-17T20:01:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "assistant-2",
+                    "content": [{"type": "output_text", "text": "Second"}],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(
+            [(message.model, message.reasoning_effort) for message in messages],
+            [("gpt-5.6-sol", "xhigh"), ("gpt-5.6", "medium")],
+        )
+
+    def test_codex_assistant_identity_survives_delta_boundary(self) -> None:
+        identity = AssistantIdentityState()
+        context_delta = json.dumps({
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol", "effort": "high"},
+        })
+        assistant_delta = json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-07-17T20:02:00Z",
+            "payload": {"type": "agent_message", "message": "Continued"},
+        })
+
+        self.assertEqual(
+            list(iter_conversation_messages(
+                context_delta,
+                "codex",
+                assistant_identity=identity,
+            )),
+            [],
+        )
+        messages = list(iter_conversation_messages(
+            assistant_delta,
+            "codex",
+            assistant_identity=identity,
+        ))
+
+        self.assertEqual(identity.model, "gpt-5.6-sol")
+        self.assertEqual(messages[0].model, "gpt-5.6-sol")
+        self.assertEqual(messages[0].reasoning_effort, "high")
+
+    def test_claude_assistant_model_is_preserved(self) -> None:
+        raw = json.dumps({
+            "type": "assistant",
+            "uuid": "assistant-claude-1",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "Done"}],
+            },
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+        isolated = parse_conversation_line(raw, "claude_code")
+
+        self.assertEqual(messages[0].model, "claude-opus-4-8")
+        self.assertEqual(messages[0].reasoning_effort, "")
+        assert isolated is not None
+        self.assertEqual(isolated.model, "claude-opus-4-8")
+
+    def test_claude_thinking_mode_follows_observed_turn_blocks(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "First"},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "thinking-1",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "thinking", "thinking": ""}],
+                },
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "answer-1",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": "First answer"}],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "user-2",
+                "message": {"role": "user", "content": "Second"},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "answer-2",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": "Second answer"}],
+                },
+            }),
+        ])
+
+        assistants = [
+            message for message in parse_conversation(raw, "claude_code")
+            if message.role == "assistant"
+        ]
+
+        self.assertEqual(
+            [message.reasoning_effort for message in assistants],
+            ["extended", ""],
+        )
+
     def test_claude_question_and_tool_response_are_structured(self) -> None:
         raw = "\n".join([
             json.dumps({

@@ -82,6 +82,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             content=f"message {line_number}",
             metadata_={
                 "thinking": "reasoning" if role == "assistant" else None,
+                "model": "gpt-5.6-sol" if role == "assistant" else "",
+                "reasoning_effort": "xhigh" if role == "assistant" else "",
                 "tool_name": "shell" if role == "assistant" else "",
                 "tool_input": "Get-Item" if role == "assistant" else "",
                 "tool_calls": [],
@@ -109,6 +111,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["total"], 2)
         self.assertEqual([item["line_number"] for item in payload["messages"]], [1, 2])
         self.assertEqual(payload["messages"][1]["tool_name"], "shell")
+        self.assertEqual(payload["messages"][1]["model"], "gpt-5.6-sol")
+        self.assertEqual(payload["messages"][1]["reasoning_effort"], "xhigh")
         self.assertEqual(len(db.statements), 3)
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))

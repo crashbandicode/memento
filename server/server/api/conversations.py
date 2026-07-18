@@ -330,6 +330,10 @@ async def get_conversation_messages(
                         (m.metadata_ or {}).get("thinking")
                         if m.metadata_ else None
                     ),
+                    "model": (m.metadata_ or {}).get("model", ""),
+                    "reasoning_effort": (m.metadata_ or {}).get(
+                        "reasoning_effort", ""
+                    ),
                     "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                     "tool_input": (m.metadata_ or {}).get("tool_input", ""),
                     "session_context": (m.metadata_ or {}).get(
@@ -372,6 +376,8 @@ async def get_conversation_messages(
                     "role": m.role,
                     "content": m.content,
                     "thinking": m.thinking or None,
+                    "model": m.model,
+                    "reasoning_effort": m.reasoning_effort,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
                     "session_context": m.session_context,

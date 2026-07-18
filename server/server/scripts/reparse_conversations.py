@@ -44,7 +44,7 @@ from server.services.history_recovery import (
 )
 
 
-PARSER_REVISION = "claude-queued-prompts-v6"
+PARSER_REVISION = "assistant-identity-v2"
 SUPPORTED_TOOLS = ("codex", "claude_code", "cursor")
 COPY_BATCH_SIZE = 2_000
 SOURCE_READ_SLACK_BYTES = 1
@@ -90,6 +90,25 @@ def source_payload_error(
     if actual_hash != expected_hash:
         return "source SHA-256 does not match the document revision"
     return None
+
+
+def cutover_manifest_error(
+    *,
+    eligible: int,
+    staged: int,
+    unverified: int,
+    extra_manifest: int,
+    preserve_unverified: bool,
+) -> str | None:
+    """Validate that cutover accounts for every eligible document exactly."""
+    preserved = unverified if preserve_unverified else 0
+    if staged + preserved == eligible and extra_manifest == 0:
+        return None
+    return (
+        "cutover requires an exact staged document set; "
+        f"eligible={eligible} staged={staged} "
+        f"preserved_unverified={preserved} extra={extra_manifest}"
+    )
 
 
 async def _connect() -> asyncpg.Connection:
@@ -876,9 +895,15 @@ async def _restore_first_user_messages(
 async def cutover(
     run_id: uuid.UUID,
     *,
-    allow_incomplete: bool,
+    preserve_unverified: bool,
 ) -> dict:
-    """Atomically replace normalized rows for an exact, stable staged set."""
+    """Atomically replace normalized rows for an exact, stable staged set.
+
+    When explicitly requested, stable legacy sources that cannot be verified as
+    full raw snapshots are left untouched.  Every other eligible document must
+    still have a staged replacement; errors, deleted sources, and newly added
+    documents remain hard failures.
+    """
     conn = await _connect()
     started = time.perf_counter()
     try:
@@ -926,37 +951,60 @@ async def cutover(
                 run_id,
                 list(SUPPORTED_TOOLS),
             )
-            extra_staged = await conn.fetchval(
+            unverified = await conn.fetchval(
                 """
                 SELECT count(*)
                 FROM conversation_reparse_manifest m
-                LEFT JOIN documents d ON d.id=m.document_id
-                WHERE m.run_id=$1 AND m.status='staged'
-                  AND (
-                    d.id IS NULL OR d.category <> 'conversation'
-                    OR d.tool_id <> ALL($2::text[])
-                  )
+                JOIN documents d ON d.id=m.document_id
+                WHERE m.run_id=$1 AND m.status='incomplete'
+                  AND d.category='conversation'
+                  AND d.tool_id=ANY($2::text[])
                 """,
                 run_id,
                 list(SUPPORTED_TOOLS),
             )
-            if (staged != eligible or extra_staged) and not allow_incomplete:
-                raise RuntimeError(
-                    "cutover requires an exact staged document set; "
-                    f"eligible={eligible} staged={staged} extra={extra_staged}"
-                )
+            extra_manifest = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM conversation_reparse_manifest m
+                LEFT JOIN documents d ON d.id=m.document_id
+                WHERE m.run_id=$1
+                  AND m.status=ANY($2::text[])
+                  AND (
+                    d.id IS NULL OR d.category <> 'conversation'
+                    OR d.tool_id <> ALL($3::text[])
+                  )
+                """,
+                run_id,
+                ['staged', 'incomplete'],
+                list(SUPPORTED_TOOLS),
+            )
+            manifest_error = cutover_manifest_error(
+                eligible=eligible,
+                staged=staged,
+                unverified=unverified,
+                extra_manifest=extra_manifest,
+                preserve_unverified=preserve_unverified,
+            )
+            if manifest_error:
+                raise RuntimeError(manifest_error)
             stale = await conn.fetch(
                 """
                 SELECT d.id
                 FROM documents d
                 JOIN conversation_reparse_manifest m
                   ON m.run_id=$1 AND m.document_id=d.id
-                WHERE m.status='staged'
+                WHERE m.status=ANY($2::text[])
                   AND (m.source_hash <> d.content_hash
                        OR m.source_size <> d.file_size_bytes)
                 LIMIT 10
                 """,
                 run_id,
+                (
+                    ['staged', 'incomplete']
+                    if preserve_unverified
+                    else ['staged']
+                ),
             )
             if stale:
                 raise RuntimeError(
@@ -1058,6 +1106,9 @@ async def cutover(
             "run_id": str(run_id),
             "state": "cutover",
             "documents": staged,
+            "preserved_unverified_documents": (
+                unverified if preserve_unverified else 0
+            ),
             "deleted_rows": deleted,
             "inserted_rows": inserted,
             "restored_history_rows": restored_history,
@@ -1268,7 +1319,16 @@ def main() -> None:
         default=[],
         help="stage only this document (repeatable; intended for guarded retries)",
     )
-    parser.add_argument("--allow-incomplete", action="store_true")
+    parser.add_argument(
+        "--preserve-unverified",
+        "--allow-incomplete",
+        dest="preserve_unverified",
+        action="store_true",
+        help=(
+            "preserve stable legacy documents without a verified raw snapshot; "
+            "all other eligible documents must still be staged"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=25)
     args = parser.parse_args()
     run_id = _parse_run_id(args.run_id)
@@ -1286,7 +1346,10 @@ def main() -> None:
     if args.status:
         asyncio.run(status(run_id))
     elif args.cutover:
-        asyncio.run(cutover(run_id, allow_incomplete=args.allow_incomplete))
+        asyncio.run(cutover(
+            run_id,
+            preserve_unverified=args.preserve_unverified,
+        ))
     else:
         asyncio.run(refresh(run_id, batch_size=args.batch_size))
 

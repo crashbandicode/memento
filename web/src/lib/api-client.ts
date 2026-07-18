@@ -353,6 +353,8 @@ export interface ConversationMessage {
   role: string | null;
   content: string;
   thinking?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
   session_context?: string | null;
   attachments?: ConversationAttachment[];
   tool_name?: string;

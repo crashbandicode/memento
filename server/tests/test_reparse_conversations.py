@@ -4,12 +4,19 @@ import hashlib
 import json
 from types import SimpleNamespace
 
-from server.scripts.reparse_conversations import source_payload_error
+from server.scripts.reparse_conversations import (
+    cutover_manifest_error,
+    source_payload_error,
+)
 from server.services.ingest_service import (
+    CURRENT_ASSISTANT_MODEL_KEY,
+    CURRENT_ASSISTANT_REASONING_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
+    _assistant_identity_for_ingest,
     _set_stored_source_identity,
+    _store_assistant_identity,
     _stored_source_is_current,
     iter_stored_conversation_messages,
 )
@@ -39,6 +46,37 @@ def test_source_payload_requires_exact_size_and_hash() -> None:
         expected_hash="0" * 64,
         expected_size=len(encoded),
     )
+
+
+def test_cutover_can_preserve_only_accounted_unverified_sources() -> None:
+    assert cutover_manifest_error(
+        eligible=923,
+        staged=910,
+        unverified=13,
+        extra_manifest=0,
+        preserve_unverified=True,
+    ) is None
+    assert cutover_manifest_error(
+        eligible=923,
+        staged=910,
+        unverified=13,
+        extra_manifest=0,
+        preserve_unverified=False,
+    ) is not None
+    assert cutover_manifest_error(
+        eligible=923,
+        staged=909,
+        unverified=13,
+        extra_manifest=0,
+        preserve_unverified=True,
+    ) is not None
+    assert cutover_manifest_error(
+        eligible=923,
+        staged=910,
+        unverified=13,
+        extra_manifest=1,
+        preserve_unverified=True,
+    ) is not None
 
 
 def test_stored_source_identity_fences_full_snapshot_revision() -> None:
@@ -96,6 +134,48 @@ def test_reparse_uses_live_storage_projection_for_codex_pairs() -> None:
     assert stored_content == "same prompt"
     assert metadata["source_id"] == "6e0dde7e-81d2-43ea-ae39-f743f14d20ac"
     assert timestamp.isoformat() == "2026-07-13T10:00:00.001000+00:00"
+
+
+def test_reparse_persists_codex_model_and_reasoning_metadata() -> None:
+    content = _jsonl(
+        {
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+        },
+        {
+            "timestamp": "2026-07-17T20:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "id": "assistant-model-test",
+                "content": [{"type": "output_text", "text": "Ready"}],
+            },
+        },
+    )
+
+    rows = list(iter_stored_conversation_messages(content, "codex"))
+
+    assert len(rows) == 1
+    assert rows[0][2]["model"] == "gpt-5.6-sol"
+    assert rows[0][2]["reasoning_effort"] == "xhigh"
+
+
+def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
+    document = SimpleNamespace(metadata_={"unrelated": "preserved"})
+    identity = _assistant_identity_for_ingest(document, "delta")
+    identity.model = "gpt-5.6-sol"
+    identity.reasoning_effort = "high"
+
+    _store_assistant_identity(document, identity)
+    next_delta = _assistant_identity_for_ingest(document, "delta")
+
+    assert next_delta.model == "gpt-5.6-sol"
+    assert next_delta.reasoning_effort == "high"
+    assert document.metadata_["unrelated"] == "preserved"
+    assert document.metadata_[CURRENT_ASSISTANT_MODEL_KEY] == "gpt-5.6-sol"
+    assert document.metadata_[CURRENT_ASSISTANT_REASONING_KEY] == "high"
+    assert _assistant_identity_for_ingest(document, "full").model == ""
 
 
 def test_reparse_preserves_repeated_cursor_source_rows() -> None:

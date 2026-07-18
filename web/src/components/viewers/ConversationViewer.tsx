@@ -21,6 +21,7 @@ import {
   QuestionInteractionResponse,
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
+import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
 import { Icon } from "@/components/aurora/Icon";
 import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
@@ -3090,6 +3091,7 @@ export const ChatBubble = memo(function ChatBubble({
                   gap: 8,
                   marginBottom: 5,
                   alignItems: "center",
+                  flexWrap: "wrap",
                   padding: "0 4px",
                 }}
               >
@@ -3111,6 +3113,11 @@ export const ChatBubble = memo(function ChatBubble({
                   A
                 </span>
                 <span style={{ fontSize: 10.5, fontWeight: 600, color: "#10B981" }}>Assistant</span>
+                <AssistantIdentityBadge
+                  model={msg.model}
+                  reasoningEffort={msg.reasoning_effort}
+                  thinkingLabel={t.conversation.thinking}
+                />
                 {messageTime && (
                   <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
                     {messageTime}
