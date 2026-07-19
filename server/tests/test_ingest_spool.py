@@ -344,6 +344,110 @@ class IngestSpoolTests(unittest.TestCase):
         mark_job_failed(newer, error_type="test", attempts=1, root=self.root)
         self.assertIsNone(superseding_ready_full_job_id(older, self.root))
 
+    def test_contiguous_delta_tail_fast_forwards_to_newest_full(self) -> None:
+        older, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="older-full",
+                hash="older-hash",
+                timestamp=100.0,
+                offset=100,
+                file_size=1,
+            ),
+            b"a",
+        )
+        obsolete_delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="obsolete-delta",
+                mode="delta",
+                hash="obsolete-delta-hash",
+                base_hash="older-hash",
+                base_offset=100,
+                timestamp=150.0,
+                offset=110,
+                file_size=1,
+            ),
+            b"b",
+        )
+        newer, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="newer-full",
+                hash="newer-hash",
+                timestamp=200.0,
+                offset=200,
+                file_size=1,
+            ),
+            b"c",
+        )
+        trailing_delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="trailing-delta",
+                mode="delta",
+                hash="trailing-hash",
+                base_hash="newer-hash",
+                base_offset=200,
+                timestamp=250.0,
+                offset=210,
+                file_size=1,
+            ),
+            b"d",
+        )
+
+        head, cohort = select_ready_source_head(trailing_delta, self.root)
+
+        self.assertEqual(head, newer)
+        self.assertEqual(set(cohort), {older, obsolete_delta})
+
+    def test_non_contiguous_delta_tail_keeps_strict_fifo(self) -> None:
+        older, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="older-full",
+                hash="older-hash",
+                timestamp=100.0,
+                offset=100,
+                file_size=1,
+            ),
+            b"a",
+        )
+        self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="newer-full",
+                hash="newer-hash",
+                timestamp=200.0,
+                offset=200,
+                file_size=1,
+            ),
+            b"b",
+        )
+        broken_delta, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="broken-delta",
+                mode="delta",
+                hash="broken-hash",
+                base_hash="different-hash",
+                base_offset=999,
+                timestamp=250.0,
+                offset=210,
+                file_size=1,
+            ),
+            b"c",
+        )
+
+        self.assertEqual(select_ready_source_head(broken_delta, self.root), (older, ()))
+
     def test_committed_full_supersedes_only_same_or_strictly_older_source(self) -> None:
         now = datetime.now(timezone.utc)
         common = {

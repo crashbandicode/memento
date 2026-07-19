@@ -730,6 +730,46 @@ def select_ready_source_head(
         all_jobs,
         key=lambda item: _source_sequence_rank(item[0], item[1], root),
     )
+
+    # A later deterministic FULL is an authoritative replacement for every
+    # earlier revision, even when the source also has DELTAs. Fast-forward only
+    # when every job after that FULL is a non-failed, hash/offset-contiguous
+    # DELTA chain. Ambiguous or malformed tails retain strict FIFO ordering.
+    # This prevents an offline worker from spending minutes parsing several
+    # obsolete multi-hundred-megabyte FULLs before reaching the newest one.
+    for rebase_index in range(len(ordered) - 1, 0, -1):
+        candidate_id, candidate = ordered[rebase_index]
+        if (root / candidate_id / "failed.json").exists():
+            continue
+        candidate_meta = candidate["meta"]
+        if (
+            candidate_meta.get("mode", "full") != "full"
+            or _full_snapshot_rank(candidate_id, candidate, root) is None
+        ):
+            continue
+
+        previous_hash = str(candidate_meta.get("hash", ""))
+        previous_offset = int(candidate_meta.get("offset", 0))
+        tail_is_contiguous = True
+        for later_id, later in ordered[rebase_index + 1 :]:
+            later_meta = later["meta"]
+            if (
+                (root / later_id / "failed.json").exists()
+                or later_meta.get("mode", "full") != "delta"
+                or later_meta.get("base_hash") != previous_hash
+                or int(later_meta.get("base_offset", -1)) != previous_offset
+            ):
+                tail_is_contiguous = False
+                break
+            previous_hash = str(later_meta.get("hash", ""))
+            previous_offset = int(later_meta.get("offset", 0))
+
+        if tail_is_contiguous:
+            superseded = tuple(
+                sorted(previous_id for previous_id, _ in ordered[:rebase_index])
+            )
+            return candidate_id, superseded
+
     failed_indexes = [
         index
         for index, (candidate_id, _) in enumerate(ordered)
