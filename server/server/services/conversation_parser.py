@@ -1595,6 +1595,135 @@ def _json_mapping(value: object) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+_NESTED_CODEX_UPDATE_PLAN_RE = re.compile(
+    r"\b(?:tools\.)?update_plan\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _balanced_js_value(source: str, start: int) -> str:
+    """Return one balanced JS object/array without evaluating the source."""
+    while start < len(source) and source[start].isspace():
+        start += 1
+    if start >= len(source) or source[start] not in "{[":
+        return ""
+
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    stack: list[str] = []
+    quote = ""
+    escaped = False
+    for index in range(start, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in "}])":
+            if not stack or char != stack.pop():
+                return ""
+            if not stack:
+                return source[start:index + 1]
+    return ""
+
+
+def _simple_js_object_mapping(value: str) -> dict:
+    """Decode Codex's JSON-compatible JS object literals without executing JS.
+
+    Codex emits nested orchestration calls such as
+    ``tools.update_plan({explanation:"...",plan:[...]})``. Their values are
+    JSON strings/arrays but their property names are unquoted. Quote only
+    identifier keys observed outside strings, then use the normal JSON parser.
+    Unsupported single-quoted/template strings fail closed.
+    """
+    out: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(value):
+        char = value[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char in {"'", "`"}:
+            return {}
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(value) and value[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(value) and value[lookahead] in "}]":
+                index += 1
+                continue
+        if char in "{,":
+            out.append(char)
+            index += 1
+            whitespace_start = index
+            while index < len(value) and value[index].isspace():
+                index += 1
+            out.append(value[whitespace_start:index])
+            key_start = index
+            if index < len(value) and (
+                value[index].isalpha() or value[index] in "_$"
+            ):
+                index += 1
+                while index < len(value) and (
+                    value[index].isalnum() or value[index] in "_$"
+                ):
+                    index += 1
+                key_end = index
+                while index < len(value) and value[index].isspace():
+                    index += 1
+                if index < len(value) and value[index] == ":":
+                    out.extend(('"', value[key_start:key_end], '"'))
+                    out.append(value[key_end:index])
+                    out.append(":")
+                    index += 1
+                    continue
+                out.append(value[key_start:index])
+            continue
+        out.append(char)
+        index += 1
+
+    try:
+        parsed = json.loads("".join(out))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _nested_codex_update_plans(tool_name: str, tool_input: str) -> list[dict]:
+    """Extract persisted ``tools.update_plan`` calls nested in Codex exec JS."""
+    compact_name = re.sub(r"[^a-z0-9]", "", tool_name.casefold())
+    if not compact_name.endswith("exec") or not tool_input:
+        return []
+    plans: list[dict] = []
+    for match in _NESTED_CODEX_UPDATE_PLAN_RE.finditer(tool_input):
+        literal = _balanced_js_value(tool_input, match.end())
+        payload = _simple_js_object_mapping(literal) if literal else {}
+        if isinstance(payload.get("plan"), list):
+            plans.append(payload)
+    return plans
+
+
 _MAX_TASKS = 200
 _MAX_TASK_TEXT_CHARS = 4000
 _TASK_CREATED_RE = re.compile(
@@ -1602,9 +1731,17 @@ _TASK_CREATED_RE = re.compile(
     re.IGNORECASE,
 )
 _TASK_LIST_LINE_RE = re.compile(
-    r"^#(?P<id>\S+)\s+\[(?P<status>[^\]]+)\]\s+(?P<content>.+)$",
-    re.MULTILINE,
+    r"^#(?P<id>\S+)\s+\[(?P<status>pending|in[_ -]?progress|active|"
+    r"working|complete|completed|done|succeeded|success|blocked|"
+    r"cancelled|canceled)\]\s+(?P<content>.+)$",
+    re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _is_standalone_task_list_result(content: str) -> bool:
+    """Recognize an unadorned Claude TaskList result across delta boundaries."""
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    return bool(lines) and all(_TASK_LIST_LINE_RE.fullmatch(line) for line in lines)
 
 
 def _normalized_task_status(value: object) -> str:
@@ -1669,6 +1806,7 @@ class TaskStateTracker:
         self.order: list[str] = []
         self.revision = 0
         self.pending_creates: list[str] = []
+        self.pending_task_lists: set[str] = set()
 
     def apply(self, message: NormalizedMessage) -> None:
         changed = False
@@ -1684,7 +1822,37 @@ class TaskStateTracker:
             )
             is_current = bool(payload.get("is_current"))
             if name in {"toolresult", "taskresult"}:
-                changed = self._apply_result(message.content) or changed
+                result_call_id = message.tool_call_id
+                allow_task_list = bool(
+                    result_call_id
+                    and result_call_id in self.pending_task_lists
+                )
+                if result_call_id:
+                    self.pending_task_lists.discard(result_call_id)
+                changed = self._apply_result(
+                    message.content,
+                    allow_task_list=allow_task_list,
+                ) or changed
+            # Current Codex records orchestration tools as JavaScript passed
+            # to one outer ``exec`` call. The desktop client reconstructs its
+            # task widget from nested ``tools.update_plan`` calls, so retain
+            # the same persisted semantics instead of treating the plan as
+            # opaque source text. The extractor is data-only and never evals.
+            for nested_payload in _nested_codex_update_plans(
+                message.tool_name,
+                message.tool_input,
+            ):
+                # The Codex desktop task widget treats every persisted plan
+                # replacement as the current snapshot until a later one is
+                # observed. Multiple historical rows may therefore carry the
+                # marker; the API resolves the newest line deterministically.
+                nested_payload = {**nested_payload, "is_current": True}
+                changed = self._apply_event(
+                    "updateplan",
+                    nested_payload,
+                    source_id=message.tool_call_id,
+                ) or changed
+                is_current = bool(nested_payload.get("is_current")) or is_current
 
         # Cursor and some Claude releases retain tool uses inside the
         # assistant content block. They are semantically identical to a
@@ -1748,6 +1916,13 @@ class TaskStateTracker:
     ) -> bool:
         if not name:
             return False
+
+        # TaskList returns its state in a later generic tool-result row. Keep
+        # the call identity so only that result may replace the current task
+        # snapshot. Arbitrary command/web output can contain Markdown such as
+        # ``#### [Button: Copy]`` and must never be interpreted as a task list.
+        if name == "tasklist" and source_id:
+            self.pending_task_lists.add(source_id)
 
         raw_tasks: object = None
         replace = False
@@ -1844,7 +2019,7 @@ class TaskStateTracker:
                 return True
         return False
 
-    def _apply_result(self, content: str) -> bool:
+    def _apply_result(self, content: str, *, allow_task_list: bool = False) -> bool:
         changed = False
         created = _TASK_CREATED_RE.search(content)
         if created and self.pending_creates:
@@ -1866,18 +2041,23 @@ class TaskStateTracker:
                 ]
                 changed = True
 
-        listed = [
-            task
-            for index, match in enumerate(_TASK_LIST_LINE_RE.finditer(content))
-            if (task := _normalized_task(
-                {
-                    "id": match.group("id"),
-                    "status": match.group("status"),
-                    "content": match.group("content"),
-                },
-                index=index,
-            )) is not None
-        ][:_MAX_TASKS]
+        listed = []
+        if allow_task_list or (
+            self.source == "claude_code"
+            and _is_standalone_task_list_result(content)
+        ):
+            listed = [
+                task
+                for index, match in enumerate(_TASK_LIST_LINE_RE.finditer(content))
+                if (task := _normalized_task(
+                    {
+                        "id": match.group("id"),
+                        "status": match.group("status"),
+                        "content": match.group("content"),
+                    },
+                    index=index,
+                )) is not None
+            ][:_MAX_TASKS]
         if listed:
             existing_active_forms = {
                 task_id: task.get("active_form", "")

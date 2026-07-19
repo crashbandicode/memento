@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from copy import deepcopy
 from contextlib import nullcontext
 from uuid import UUID
 
@@ -33,6 +34,8 @@ from ..services.ingest_spool import (
     ready_job_ids_in_recovery_order,
     ready_manifest,
     ready_job_ids,
+    ready_delta_chain_job_ids,
+    read_ready_job_bytes,
     record_job_attempt,
     select_ready_source_head,
     source_identity,
@@ -62,7 +65,23 @@ def _preflight_full_supersedes(**revision) -> bool:
     )
 
 
-async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
+async def _ingest_ready_job(
+    job_id: str,
+    manifest: dict,
+    *,
+    delta_chain: tuple[tuple[str, dict], ...] = (),
+) -> dict:
+    payload_jobs = delta_chain or ((job_id, manifest),)
+    if len(payload_jobs) > 1:
+        first_meta = payload_jobs[0][1]["meta"]
+        manifest = deepcopy(payload_jobs[-1][1])
+        manifest["meta"] = dict(manifest["meta"])
+        manifest["meta"]["base_hash"] = first_meta.get("base_hash")
+        manifest["meta"]["base_offset"] = first_meta.get("base_offset")
+        manifest["meta"]["file_size"] = sum(
+            int(candidate["meta"]["file_size"])
+            for _, candidate in payload_jobs
+        )
     meta = manifest["meta"]
     user_id = UUID(str(manifest["user_id"]))
     payload_bytes = int(meta["file_size"])
@@ -134,31 +153,44 @@ async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
                 "bytes": payload_bytes,
             }
 
-    manifest, payload_path = assemble_job(job_id, manifest=manifest)
     content_s3_key = None
     content_had_sensitive = False
-    ingest_path = payload_path
-    if externalize_content:
-        sanitized = await asyncio.to_thread(
-            sanitize_content_file,
-            payload_path,
-            payload_path.with_name("sanitized.bin"),
+    if len(payload_jobs) > 1:
+        payload = await asyncio.to_thread(
+            lambda: b"".join(
+                read_ready_job_bytes(
+                    candidate_id,
+                    manifest=candidate_manifest,
+                )[1]
+                for candidate_id, candidate_manifest in payload_jobs
+            )
         )
-        ingest_path = sanitized.path
-        content_had_sensitive = sanitized.had_sensitive
-        content_s3_key = await asyncio.to_thread(
-            store_large_content,
-            ingest_path,
-            user_id=str(user_id),
-            device_id=str(manifest["device_id"]),
-            job_id=job_id,
+        file_content = payload.decode("utf-8", errors="replace")
+        ingested_payload_bytes = len(payload)
+    else:
+        manifest, payload_path = assemble_job(job_id, manifest=manifest)
+        ingest_path = payload_path
+        if externalize_content:
+            sanitized = await asyncio.to_thread(
+                sanitize_content_file,
+                payload_path,
+                payload_path.with_name("sanitized.bin"),
+            )
+            ingest_path = sanitized.path
+            content_had_sensitive = sanitized.had_sensitive
+            content_s3_key = await asyncio.to_thread(
+                store_large_content,
+                ingest_path,
+                user_id=str(user_id),
+                device_id=str(manifest["device_id"]),
+                job_id=job_id,
+            )
+        file_content = await asyncio.to_thread(
+            ingest_path.read_text,
+            encoding="utf-8",
+            errors="replace",
         )
-
-    file_content = await asyncio.to_thread(
-        ingest_path.read_text,
-        encoding="utf-8",
-        errors="replace",
-    )
+        ingested_payload_bytes = ingest_path.stat().st_size
     async with async_session_factory() as db:
         # The compose-wide 120s guard is intentionally short for interactive
         # queries. A serialized, durable 270MB transcript ingest can exceed it.
@@ -174,7 +206,7 @@ async def _ingest_ready_job(job_id: str, manifest: dict) -> dict:
             relative_path=meta["relative_path"],
             content=file_content,
             content_hash=meta["hash"],
-            file_size=payload_path.stat().st_size,
+            file_size=ingested_payload_bytes,
             mode=meta.get("mode", "full"),
             offset=meta.get("offset", 0),
             base_hash=meta.get("base_hash"),
@@ -339,8 +371,31 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                         raise manifest_error
                     if manifest is None:
                         raise ChunkValidationError("spool manifest is unavailable")
-                    result = asyncio.run(_ingest_ready_job(job_id, manifest))
+                    delta_chain_ids = ready_delta_chain_job_ids(job_id)
+                    delta_chain: list[tuple[str, dict]] = []
+                    for candidate_id in delta_chain_ids:
+                        try:
+                            candidate_manifest = ready_manifest(candidate_id)
+                        except Exception:
+                            if candidate_id == job_id:
+                                raise
+                            break
+                        delta_chain.append((candidate_id, candidate_manifest))
+                    result = asyncio.run(
+                        _ingest_ready_job(
+                            job_id,
+                            manifest,
+                            delta_chain=tuple(delta_chain),
+                        )
+                    )
                     document_id = result["document_id"]
+                    coalesced_delta_jobs = 0
+                    for candidate_id, _ in delta_chain[1:]:
+                        if complete_and_remove_job(
+                            candidate_id,
+                            document_id=document_id,
+                        ):
+                            coalesced_delta_jobs += 1
                     removed_cohort = 0
                     blocked_cohort = 0
                     validated_cohort = []
@@ -377,6 +432,7 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                     complete_and_remove_job(job_id, document_id=document_id)
                     result["superseded_spool_jobs"] = removed_cohort
                     result["blocked_rebase_jobs"] = blocked_cohort
+                    result["coalesced_delta_jobs"] = coalesced_delta_jobs
                     if identity is not None:
                         next_job_id = next_ready_source_head(identity)
                 except Exception as exc:

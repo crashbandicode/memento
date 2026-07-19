@@ -34,6 +34,8 @@ DEFAULT_SPOOL_ROOT = Path(
 MAX_CHUNKS = 4096
 MAX_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+MAX_COALESCED_DELTA_BYTES = 16 * 1024 * 1024
+MAX_COALESCED_DELTA_JOBS = 512
 MAX_SPOOL_BYTES = int(
     os.environ.get("MEMENTO_INGEST_SPOOL_MAX_BYTES", 16 * 1024 * 1024 * 1024)
 )
@@ -781,6 +783,77 @@ def next_ready_source_head(
     return select_ready_source_head(jobs[0][0], root)[0]
 
 
+def ready_delta_chain_job_ids(
+    job_id: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+    *,
+    max_payload_bytes: int = MAX_COALESCED_DELTA_BYTES,
+    max_jobs: int = MAX_COALESCED_DELTA_JOBS,
+) -> tuple[str, ...]:
+    """Return a bounded, contiguous DELTA chain beginning at a source head.
+
+    A collector can durably stage hundreds of small append-only revisions while
+    the worker is offline. Applying every revision in its own database
+    transaction repeatedly reparses and reindexes the same conversation. The
+    concatenated bytes of a hash/offset-contiguous chain are exactly the same
+    append as applying each revision separately, so the worker may commit the
+    bounded chain atomically.
+
+    Failed barriers, FULL snapshots, discontinuities, and non-head callers all
+    stop coalescing. The first job is always returned so callers retain the
+    existing one-job behavior when no safe chain exists.
+    """
+    if max_payload_bytes < 1 or max_jobs < 1:
+        raise ValueError("delta coalescing limits must be positive")
+
+    target = ready_manifest_metadata(job_id, root)
+    identity = source_identity(target)
+    head_id, _ = select_ready_source_head(job_id, root)
+    if head_id != job_id or target["meta"].get("mode", "full") != "delta":
+        return (job_id,)
+
+    ordered = sorted(
+        _ready_jobs_for_source(identity, root, include_failed=True),
+        key=lambda item: _source_sequence_rank(item[0], item[1], root),
+    )
+    start = next(
+        (index for index, (candidate_id, _) in enumerate(ordered) if candidate_id == job_id),
+        None,
+    )
+    if start is None:
+        return (job_id,)
+
+    chain: list[str] = []
+    total_payload_bytes = 0
+    previous_hash: str | None = None
+    previous_offset: int | None = None
+    for candidate_id, manifest in ordered[start:]:
+        if (root / candidate_id / "failed.json").exists():
+            break
+        meta = manifest["meta"]
+        if meta.get("mode", "full") != "delta":
+            break
+        payload_bytes = int(meta.get("file_size", 0))
+        if payload_bytes < 0:
+            break
+        if chain and (
+            meta.get("base_hash") != previous_hash
+            or int(meta.get("base_offset", -1)) != previous_offset
+        ):
+            break
+        if chain and total_payload_bytes + payload_bytes > max_payload_bytes:
+            break
+
+        chain.append(candidate_id)
+        total_payload_bytes += payload_bytes
+        previous_hash = str(meta.get("hash", ""))
+        previous_offset = int(meta.get("offset", 0))
+        if len(chain) >= max_jobs:
+            break
+
+    return tuple(chain or (job_id,))
+
+
 def superseding_ready_full_job_id(
     job_id: str,
     root: Path = DEFAULT_SPOOL_ROOT,
@@ -861,6 +934,35 @@ def assemble_job(
     if payload_path.stat().st_size != expected_size:
         raise ChunkValidationError("assembled payload size does not match file_size")
     return manifest, payload_path
+
+
+def read_ready_job_bytes(
+    job_id: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+    *,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Read one already-durable payload without creating an assembled copy.
+
+    Coalesced DELTAs are deliberately bounded in memory. Reading their staged
+    chunks directly avoids running a full spool-capacity scan and fsyncing a
+    redundant ``payload.bin`` for every tiny revision in the chain.
+    """
+    job_dir = _job_dir(job_id, root)
+    manifest = ready_manifest(job_id, root) if manifest is None else manifest
+    if manifest.get("job_id") != job_id:
+        raise ChunkValidationError("spool manifest job id does not match")
+
+    parts: list[bytes] = []
+    for index in range(int(manifest["total_chunks"])):
+        chunk_path = job_dir / f"chunk-{index:06d}.bin"
+        if not chunk_path.is_file() or chunk_path.is_symlink():
+            raise FileNotFoundError(f"spool job {job_id} lost chunk {index}")
+        parts.append(chunk_path.read_bytes())
+    payload = b"".join(parts)
+    if len(payload) != int(manifest["meta"]["file_size"]):
+        raise ChunkValidationError("assembled payload size does not match file_size")
+    return manifest, payload
 
 
 def remove_job(job_id: str, root: Path = DEFAULT_SPOOL_ROOT) -> None:

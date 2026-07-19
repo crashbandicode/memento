@@ -144,6 +144,14 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                     }),
                 },
             },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "search-1",
+                    "output": "#### [Button: Copy]",
+                },
+            },
         ]
         codex = list(iter_conversation_messages(
             "\n".join(json.dumps(record) for record in codex_records),
@@ -152,6 +160,7 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         self.assertEqual(codex[0].task_state["completed_count"], 0)
         self.assertEqual(codex[1].task_state["completed_count"], 1)
         self.assertEqual(codex[1].task_state["active_task_id"], codex[1].task_state["tasks"][1]["id"])
+        self.assertIsNone(codex[2].task_state)
 
         claude_records = [
             {
@@ -199,6 +208,19 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                 },
             },
             {
+                "type": "assistant",
+                "uuid": "list-call-row",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "list-call",
+                        "name": "TaskList",
+                        "input": {},
+                    }],
+                },
+            },
+            {
                 "type": "user",
                 "uuid": "list-result",
                 "message": {
@@ -210,6 +232,21 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                     }],
                 },
             },
+            {
+                "type": "user",
+                "uuid": "unrelated-result",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "search-call",
+                        "content": (
+                            "#### [Button: Copy]\n"
+                            "#1 [internal] load build definition"
+                        ),
+                    }],
+                },
+            },
         ]
         claude = list(iter_conversation_messages(
             "\n".join(json.dumps(record) for record in claude_records),
@@ -217,8 +254,10 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         ))
         self.assertEqual(claude[1].task_state["tasks"][0]["id"], "7")
         self.assertEqual(claude[2].task_state["completed_count"], 1)
-        self.assertEqual(claude[3].task_state["total_count"], 2)
-        self.assertEqual(claude[3].task_state["active_task_id"], "8")
+        self.assertIsNone(claude[3].task_state)
+        self.assertEqual(claude[4].task_state["total_count"], 2)
+        self.assertEqual(claude[4].task_state["active_task_id"], "8")
+        self.assertIsNone(claude[5].task_state)
 
         cursor_record = {
             "role": "assistant",
@@ -242,6 +281,56 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
             "cursor",
         ))
         self.assertEqual(cursor[0].task_state["active_task_id"], "cursor-1")
+
+    def test_codex_exec_extracts_nested_update_plan_without_evaluating_js(self) -> None:
+        records = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "exec-plan-1",
+                    "input": (
+                        'const r = await tools.update_plan({'
+                        'explanation:"Use {bounded, safe} parsing",'
+                        'plan:['
+                        '{step:"Inventory current code",status:"completed"},'
+                        '{step:"Implement page stream",status:"completed"},'
+                        '{step:"Replace archive recheck",status:"in_progress"},'
+                        '{step:"Run validation",status:"pending"},'
+                        '{step:"Run ETL proof",status:"pending"},'
+                        '{step:"Update handoff",status:"pending"},'
+                        ']}); text(r);'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "ordinary-exec",
+                    "input": 'text("tools.update_plan({plan:[not executable]})");',
+                },
+            },
+        ]
+
+        messages = list(iter_conversation_messages(
+            "\n".join(json.dumps(record) for record in records),
+            "codex",
+        ))
+
+        self.assertEqual(messages[0].task_state["total_count"], 6)
+        self.assertEqual(messages[0].task_state["completed_count"], 2)
+        self.assertEqual(
+            messages[0].task_state["active_task_id"],
+            messages[0].task_state["tasks"][2]["id"],
+        )
+        self.assertEqual(
+            messages[0].task_state["tasks"][2]["content"],
+            "Replace archive recheck",
+        )
+        self.assertIsNone(messages[1].task_state)
 
     def test_ingest_metadata_and_both_api_paths_have_the_same_shape(self) -> None:
         message = NormalizedMessage(

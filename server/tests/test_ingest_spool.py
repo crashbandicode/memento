@@ -29,8 +29,10 @@ from server.services.ingest_spool import (  # noqa: E402
     mark_job_failed,
     pending_source_revision_job_id,
     ready_job_ids_in_recovery_order,
+    ready_delta_chain_job_ids,
     ready_manifest,
     ready_manifest_metadata,
+    read_ready_job_bytes,
     ready_job_ids,
     record_job_attempt,
     remove_job,
@@ -217,6 +219,10 @@ class IngestSpoolTests(unittest.TestCase):
         self.assertEqual(manifest["device_id"], "device-1")
         self.assertEqual(manifest["total_chunks"], 2)
         self.assertEqual(manifest["meta"]["relative_path"], "sessions/thread.jsonl")
+
+        direct_manifest, direct_payload = read_ready_job_bytes(job_id, self.root)
+        self.assertEqual(direct_manifest, manifest)
+        self.assertEqual(direct_payload, b"alpha\nbeta\n")
 
         repeated_manifest, repeated_payload_path = assemble_job(job_id, self.root)
         self.assertEqual(repeated_manifest, manifest)
@@ -560,6 +566,108 @@ class IngestSpoolTests(unittest.TestCase):
             root=self.root,
         )
         self.assertEqual(select_ready_source_head(delta_two, self.root)[0], delta_two)
+
+    def test_contiguous_delta_chain_is_bounded_and_head_only(self) -> None:
+        first, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-one",
+                hash="hash-one",
+                mode="delta",
+                base_hash="base",
+                base_offset=0,
+                offset=1,
+                timestamp=1.0,
+            ),
+            b"a",
+        )
+        second, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-two",
+                hash="hash-two",
+                mode="delta",
+                base_hash="hash-one",
+                base_offset=1,
+                offset=3,
+                file_size=2,
+                timestamp=2.0,
+            ),
+            b"bc",
+        )
+        third, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-three",
+                hash="hash-three",
+                mode="delta",
+                base_hash="hash-two",
+                base_offset=3,
+                offset=4,
+                timestamp=3.0,
+            ),
+            b"d",
+        )
+
+        self.assertEqual(
+            ready_delta_chain_job_ids(first, self.root),
+            (first, second, third),
+        )
+        self.assertEqual(
+            ready_delta_chain_job_ids(first, self.root, max_payload_bytes=3),
+            (first, second),
+        )
+        self.assertEqual(
+            ready_delta_chain_job_ids(first, self.root, max_jobs=2),
+            (first, second),
+        )
+        self.assertEqual(
+            ready_delta_chain_job_ids(second, self.root),
+            (second,),
+        )
+
+    def test_delta_chain_stops_at_a_discontinuity_or_failed_barrier(self) -> None:
+        first, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-one",
+                hash="hash-one",
+                mode="delta",
+                base_hash="base",
+                base_offset=0,
+                offset=1,
+                timestamp=1.0,
+            ),
+            b"a",
+        )
+        second, _ = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="delta-two",
+                hash="hash-two",
+                mode="delta",
+                base_hash="wrong-hash",
+                base_offset=1,
+                offset=2,
+                timestamp=2.0,
+            ),
+            b"b",
+        )
+
+        self.assertEqual(
+            ready_delta_chain_job_ids(first, self.root),
+            (first,),
+        )
+        mark_job_failed(second, error_type="test", attempts=1, root=self.root)
+        self.assertEqual(
+            ready_delta_chain_job_ids(first, self.root),
+            (first,),
+        )
 
     def test_pending_source_revision_matches_only_a_ready_exact_base(self) -> None:
         base, _ = self._stage(

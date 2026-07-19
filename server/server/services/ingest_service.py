@@ -1446,6 +1446,21 @@ async def ingest_file(
             setattr(doc, "_memento_ingest_disposition", "idempotent")
             return doc
 
+    if (
+        mode == "delta"
+        and doc is not None
+        and sync_row is not None
+        and sync_row.last_hash == doc.content_hash
+        and int(sync_row.last_offset or 0) >= offset
+    ):
+        # A delayed/replayed append can remain in the durable spool after a
+        # newer contiguous batch commits. It is already represented by the
+        # authoritative committed offset, so treating its older base as a
+        # mismatch creates a retry/quarantine storm instead of making progress.
+        sync_row.last_synced_at = received_at
+        setattr(doc, "_memento_ingest_disposition", "stale_delta")
+        return doc
+
     if mode == "delta" and base_hash is not None:
         expected_hash = sync_row.last_hash if sync_row is not None else None
         expected_offset = int(sync_row.last_offset or 0) if sync_row is not None else 0
@@ -1512,17 +1527,6 @@ async def ingest_file(
         ):
             setattr(doc, "_memento_ingest_disposition", "superseded")
             return doc
-
-    if (
-        mode == "delta"
-        and doc is not None
-        and sync_row is not None
-        and sync_row.last_hash == doc.content_hash
-        and int(sync_row.last_offset or 0) >= offset
-    ):
-        sync_row.last_synced_at = received_at
-        setattr(doc, "_memento_ingest_disposition", "stale_delta")
-        return doc
 
     # Re-sanitize
     content = content.replace("\x00", "")  # PostgreSQL TEXT rejects null bytes

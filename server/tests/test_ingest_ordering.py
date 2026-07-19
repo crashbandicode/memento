@@ -389,6 +389,29 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
+    async def test_delayed_guarded_delta_behind_committed_offset_is_stale(self) -> None:
+        doc = _document(content_hash="current-hash", timestamp=200.0, offset=120)
+        sync = _sync_state(doc, offset=120)
+        db = _OrderedSession(None, sync, doc)
+
+        result = await ingest_file(
+            db,
+            **_ingest_kwargs(
+                doc,
+                content_hash="older-delta-hash",
+                file_size=10,
+                mode="delta",
+                offset=110,
+                base_hash="older-base-hash",
+                base_offset=100,
+                timestamp=150.0,
+            ),
+        )
+
+        self.assertIs(result, doc)
+        self.assertEqual(getattr(doc, "_memento_ingest_disposition"), "stale_delta")
+        self.assertEqual(doc.content_hash, "current-hash")
+
     async def test_guarded_delta_retry_is_idempotent_after_lost_response(self) -> None:
         doc = _document(content_hash="delta-hash", timestamp=200.0, offset=110)
         sync = _sync_state(doc, offset=110)
