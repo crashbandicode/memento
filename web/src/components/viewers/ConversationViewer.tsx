@@ -2960,6 +2960,110 @@ function MessageCopyFrame({
 }
 
 function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
+  if (event.kind === "snapshot") {
+    const agents = [...(event.agents || [])].sort((left, right) => {
+      const rank = { running: 0, failed: 1, interrupted: 2, completed: 3, unknown: 4 };
+      return rank[left.status] - rank[right.status] || left.label.localeCompare(right.label);
+    });
+    const visibleAgents = agents.slice(0, 8);
+    const remainingAgents = agents.slice(8);
+    const renderAgent = (agent: (typeof agents)[number]) => {
+      const status = {
+        running: { label: "Running", color: "#2563EB" },
+        completed: { label: "Completed", color: "#059669" },
+        interrupted: { label: "Interrupted", color: "#D97706" },
+        failed: { label: "Failed", color: "#DC2626" },
+        unknown: { label: "Observed", color: "var(--aurora-fg4)" },
+      }[agent.status];
+      return (
+        <span
+          key={agent.agent_path}
+          title={`${agent.agent_path} · ${status.label}`}
+          style={{
+            display: "inline-flex",
+            minWidth: 0,
+            maxWidth: "100%",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 8px",
+            borderRadius: 999,
+            border: "1px solid var(--aurora-border)",
+            background: "var(--aurora-surface-solid)",
+            color: "var(--aurora-fg2)",
+            fontSize: 10.5,
+            fontWeight: 650,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 7,
+              height: 7,
+              flex: "0 0 auto",
+              borderRadius: 999,
+              background: status.color,
+              boxShadow: `0 0 0 3px color-mix(in srgb, ${status.color} 12%, transparent)`,
+            }}
+          />
+          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {agent.label}
+          </span>
+          <span style={{ color: status.color, fontSize: 9.5 }}>{status.label}</span>
+        </span>
+      );
+    };
+
+    return (
+      <div
+        data-agent-event
+        data-agent-kind="snapshot"
+        style={{
+          display: "grid",
+          gap: 9,
+          maxWidth: "min(100%, 720px)",
+          padding: "10px 12px",
+          border: "1px solid color-mix(in srgb, var(--aurora-accent) 22%, var(--aurora-border))",
+          borderRadius: 14,
+          background: "color-mix(in srgb, var(--aurora-accent) 4%, var(--aurora-surface-solid))",
+          boxShadow: "0 3px 14px rgba(15,23,42,0.04)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--aurora-fg2)" }}>
+          <span
+            aria-hidden="true"
+            style={{
+              width: 27,
+              height: 27,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: 9,
+              color: "var(--aurora-accent)",
+              background: "var(--aurora-accent-soft)",
+            }}
+          >
+            <Icon name="layers" size={14} />
+          </span>
+          <span style={{ fontSize: 11.5, fontWeight: 750, color: "var(--aurora-fg1)" }}>Subagents</span>
+          <span style={{ fontSize: 10, color: "var(--aurora-fg4)" }}>{agents.length} in this snapshot</span>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {visibleAgents.map(renderAgent)}
+        </div>
+        {remainingAgents.length > 0 && (
+          <details>
+            <summary style={{ width: "fit-content", cursor: "pointer", color: "var(--aurora-accent)", fontSize: 10.5, fontWeight: 650 }}>
+              Show {remainingAgents.length} more subagents
+            </summary>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+              {remainingAgents.map(renderAgent)}
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  }
+
   const presentation = {
     started: { action: "started", color: "#2563EB", icon: "plus" as const },
     updated: { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const },
@@ -3013,7 +3117,8 @@ function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
           fontSize: 11.5,
         }}
       >
-        <strong style={{ color: "var(--aurora-fg1)", fontWeight: 750 }}>{event.label}</strong>{" "}
+        <span style={{ color: "var(--aurora-fg4)", fontSize: 9.5, fontWeight: 650, textTransform: "uppercase", letterSpacing: "0.04em" }}>Subagent</span>{" "}
+        <strong style={{ color: "var(--aurora-fg1)", fontWeight: 750 }}>{event.label || "Activity"}</strong>{" "}
         <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
       </span>
     </div>

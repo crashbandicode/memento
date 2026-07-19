@@ -717,7 +717,7 @@ def _agent_activity_label(agent_path: object) -> str:
     path = _bounded_identity_text(agent_path)
     tail = path.rstrip("/").rsplit("/", 1)[-1]
     words = [word for word in re.split(r"[_\-]+", tail) if word]
-    acronyms = {"ai", "api", "cli", "cpu", "db", "etl", "gpu", "rss", "slo", "ui"}
+    acronyms = {"ai", "api", "cli", "cpu", "db", "etl", "gpu", "rca", "rss", "slo", "ui"}
     return " ".join(
         word.upper() if word.casefold() in acronyms else word.title()
         for word in words
@@ -736,6 +736,86 @@ def _normalized_agent_activity_kind(value: object) -> str:
     if kind in {"started", "updated", "completed", "interrupted", "failed"}:
         return kind
     return "updated"
+
+
+def normalize_codex_agent_snapshot(value: object) -> dict[str, object] | None:
+    """Normalize Codex ``list_agents`` output without retaining private text.
+
+    ``list_agents`` is persisted as an ordinary function result even though
+    the desktop client presents it as subagent status chips.  The agent path
+    is the stable, task-oriented identity; generated nicknames and completion
+    payloads are deliberately not inferred from arbitrary tool output.
+    """
+    payload = _json_mapping(value)
+    raw_agents = payload.get("agents")
+    if not isinstance(raw_agents, list):
+        return None
+
+    agents: list[dict[str, str]] = []
+    for raw_agent in raw_agents[:256]:
+        if not isinstance(raw_agent, dict):
+            continue
+        agent_path = _bounded_interaction_text(raw_agent.get("agent_name"), 512)
+        if not agent_path.startswith("/root/"):
+            continue
+        label = _agent_activity_label(agent_path)
+        if not label:
+            continue
+
+        raw_status = raw_agent.get("agent_status", raw_agent.get("status"))
+        if isinstance(raw_status, dict):
+            status_keys = {str(key).strip().casefold() for key in raw_status}
+            if status_keys & {"failed", "error", "errored"}:
+                status = "failed"
+            elif status_keys & {"interrupted", "cancelled", "canceled", "stopped"}:
+                status = "interrupted"
+            elif status_keys & {"completed", "complete", "finished"}:
+                status = "completed"
+            elif status_keys & {"running", "active", "working"}:
+                status = "running"
+            else:
+                status = "unknown"
+        else:
+            normalized = _coerce_text(raw_status).strip().casefold().replace("-", "_")
+            status = {
+                "active": "running",
+                "working": "running",
+                "complete": "completed",
+                "finished": "completed",
+                "cancelled": "interrupted",
+                "canceled": "interrupted",
+                "stopped": "interrupted",
+                "error": "failed",
+                "errored": "failed",
+            }.get(normalized, normalized or "unknown")
+            if status not in {"running", "completed", "interrupted", "failed", "unknown"}:
+                status = "unknown"
+
+        agents.append({
+            "agent_path": agent_path,
+            "label": label,
+            "status": status,
+        })
+
+    if not agents:
+        return None
+    return {
+        "version": 2,
+        "kind": "snapshot",
+        "agents": agents,
+    }
+
+
+def codex_agent_snapshot_summary(snapshot: dict[str, object]) -> str:
+    agents = snapshot.get("agents")
+    safe_agents = agents if isinstance(agents, list) else []
+    running_count = sum(
+        agent.get("status") == "running"
+        for agent in safe_agents
+        if isinstance(agent, dict)
+    )
+    noun = "subagent" if len(safe_agents) == 1 else "subagents"
+    return f"{len(safe_agents)} {noun} · {running_count} running"
 
 
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
@@ -966,6 +1046,20 @@ def parse_conversation_object(
                     payload.get("call_id") or payload.get("id"),
                     512,
                 )
+                agent_snapshot = normalize_codex_agent_snapshot(raw_output)
+                if agent_snapshot is not None:
+                    return NormalizedMessage(
+                        role="tool",
+                        content=codex_agent_snapshot_summary(agent_snapshot),
+                        tool_name="Subagent status",
+                        timestamp=timestamp,
+                        raw_type="agent_event",
+                        source_id=(
+                            f"{tool_call_id}:agents" if tool_call_id else ""
+                        ),
+                        tool_call_id=tool_call_id,
+                        agent_event=agent_snapshot,
+                    )
                 is_question_response = "answers" in _json_mapping(raw_output)
                 return NormalizedMessage(
                     role="tool",

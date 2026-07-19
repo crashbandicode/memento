@@ -391,10 +391,17 @@ export interface ConversationMessage {
 
 export interface ConversationAgentEvent {
   version: number;
-  agent_path: string;
+  agent_path?: string;
   agent_thread_id?: string;
+  label?: string;
+  kind: "started" | "updated" | "completed" | "interrupted" | "failed" | "snapshot";
+  agents?: ConversationAgentStatus[];
+}
+
+export interface ConversationAgentStatus {
+  agent_path: string;
   label: string;
-  kind: "started" | "updated" | "completed" | "interrupted" | "failed";
+  status: "running" | "completed" | "interrupted" | "failed" | "unknown";
 }
 
 export interface MessagesResponse {

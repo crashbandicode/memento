@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import { api, ConversationMeta, ExportDiagnostics } from "@/lib/api-client";
 import { fmt, useI18n } from "@/lib/i18n";
 import ConversationViewer from "@/components/viewers/ConversationViewer";
-import { ToolGlyph } from "@/components/aurora/Icon";
+import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
@@ -49,6 +49,15 @@ export default function ConversationPage() {
   const currentMeta = meta?.id === docId ? meta : null;
   const plans = currentMeta?.related_plans || [];
   const diagnostics = (currentMeta?.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
+  const currentAgentPath = typeof currentMeta?.metadata?.agent_path === "string"
+    ? currentMeta.metadata.agent_path
+    : "";
+  const currentAgentNickname = typeof currentMeta?.metadata?.agent_nickname === "string"
+    ? currentMeta.metadata.agent_nickname
+    : "";
+  const currentAgentLabel = currentAgentPath
+    ? humanizeAgentPath(currentAgentPath)
+    : "";
   const hasDiagnostics = currentMeta?.tool_id === "antigravity" && diagnostics && Object.keys(diagnostics).length > 0;
   const activityTimestamp = currentMeta ? new Date(currentMeta.activity_at || currentMeta.synced_at).toLocaleString(locale, {
     year: "numeric",
@@ -77,6 +86,29 @@ export default function ConversationPage() {
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
               <Chip>{currentMeta.tool_id}</Chip>
               <span>{currentMeta.message_count} {t.conversation.messages}</span>
+              {currentAgentLabel && (
+                <span
+                  title={currentAgentPath}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    padding: "4px 9px",
+                    border: "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))",
+                    borderRadius: 999,
+                    background: "var(--aurora-accent-soft)",
+                    color: "var(--aurora-accent)",
+                    fontSize: 10.5,
+                    fontWeight: 700,
+                  }}
+                >
+                  <Icon name="layers" size={11} />
+                  Subagent · {currentAgentLabel}
+                  {currentAgentNickname && currentAgentNickname.toLocaleLowerCase() !== currentAgentLabel.toLocaleLowerCase() && (
+                    <span style={{ opacity: 0.68, fontWeight: 600 }}>· codename {currentAgentNickname}</span>
+                  )}
+                </span>
+              )}
               <SubagentBadge
                 count={currentMeta.subagent_count}
                 orphan={currentMeta.is_subagent_orphan}
@@ -171,6 +203,18 @@ export default function ConversationPage() {
       )}
     </div>
   );
+}
+
+function humanizeAgentPath(agentPath: string): string {
+  const tail = agentPath.replace(/\/$/, "").split("/").pop() || "Subagent";
+  const acronyms = new Set(["ai", "api", "cli", "cpu", "db", "etl", "gpu", "rca", "rss", "slo", "ui"]);
+  return tail
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((word) => acronyms.has(word.toLocaleLowerCase())
+      ? word.toLocaleUpperCase()
+      : `${word.charAt(0).toLocaleUpperCase()}${word.slice(1)}`)
+    .join(" ");
 }
 
 function DiagChip({ label, value }: { label: string; value: number }) {

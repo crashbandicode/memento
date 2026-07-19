@@ -227,6 +227,70 @@ class ConversationParserTests(unittest.TestCase):
         )
         self.assertNotIn("must-never-render", messages[0].content)
 
+    def test_codex_list_agents_result_is_a_subagent_status_snapshot(self) -> None:
+        raw = json.dumps({
+            "type": "response_item",
+            "timestamp": "2026-07-19T21:42:37Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "list-agents-1",
+                "output": json.dumps({
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {
+                            "agent_name": "/root/pdx_index_scope_rca",
+                            "agent_status": "running",
+                        },
+                        {
+                            "agent_name": "/root/dr_index_fix_review",
+                            "agent_status": {"completed": "private completion text"},
+                        },
+                    ],
+                }),
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "agent_event")
+        self.assertEqual(messages[0].tool_name, "Subagent status")
+        self.assertEqual(messages[0].agent_event["kind"], "snapshot")
+        self.assertEqual(
+            messages[0].agent_event["agents"],
+            [
+                {
+                    "agent_path": "/root/pdx_index_scope_rca",
+                    "label": "Pdx Index Scope RCA",
+                    "status": "running",
+                },
+                {
+                    "agent_path": "/root/dr_index_fix_review",
+                    "label": "Dr Index Fix Review",
+                    "status": "completed",
+                },
+            ],
+        )
+        self.assertNotIn("private completion text", messages[0].content)
+        self.assertNotIn("private completion text", json.dumps(messages[0].agent_event))
+
+    def test_codex_unrelated_agents_json_remains_a_tool_result(self) -> None:
+        raw = json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "ordinary-tool-1",
+                "output": json.dumps({
+                    "agents": [{"name": "sales", "status": "active"}],
+                }),
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(messages[0].raw_type, "tool_output")
+        self.assertIsNone(messages[0].agent_event)
+
     def test_claude_assistant_model_is_preserved(self) -> None:
         raw = json.dumps({
             "type": "assistant",
