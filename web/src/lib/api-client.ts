@@ -374,6 +374,7 @@ export interface ConversationMessage {
   thinking?: string | null;
   model?: string | null;
   reasoning_effort?: string | null;
+  service_tier?: string | null;
   session_context?: string | null;
   attachments?: ConversationAttachment[];
   tool_name?: string;
@@ -382,9 +383,18 @@ export interface ConversationMessage {
   interaction?: QuestionInteraction | null;
   interaction_response?: QuestionInteractionResponse | null;
   task_state?: ConversationTaskState | null;
+  agent_event?: ConversationAgentEvent | null;
   raw_type?: string;
   metadata?: Record<string, unknown>;
   timestamp: string | null;
+}
+
+export interface ConversationAgentEvent {
+  version: number;
+  agent_path: string;
+  agent_thread_id?: string;
+  label: string;
+  kind: "started" | "updated" | "completed" | "interrupted" | "failed";
 }
 
 export interface MessagesResponse {

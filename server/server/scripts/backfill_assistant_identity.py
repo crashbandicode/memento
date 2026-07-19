@@ -65,7 +65,7 @@ def _identity_patch(
     parsed: AssistantIdentityRow,
 ) -> dict[str, str]:
     patch: dict[str, str] = {}
-    for key in ("model", "reasoning_effort"):
+    for key in ("model", "reasoning_effort", "service_tier"):
         value = parsed.metadata.get(key)
         if value and not existing.metadata.get(key):
             patch[key] = str(value)
@@ -215,6 +215,8 @@ async def _apply_updates(
                     ($4::jsonb ? 'model' AND COALESCE(metadata->>'model', '')='')
                     OR ($4::jsonb ? 'reasoning_effort'
                         AND COALESCE(metadata->>'reasoning_effort', '')='')
+                    OR ($4::jsonb ? 'service_tier'
+                        AND COALESCE(metadata->>'service_tier', '')='')
                   )
                 """,
                 document_id,

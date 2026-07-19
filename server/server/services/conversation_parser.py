@@ -64,9 +64,13 @@ class NormalizedMessage:
     # a source tool does not record them.
     model: str = ""
     reasoning_effort: str = ""
+    service_tier: str = ""
     # Cross-tool task snapshot captured from Codex update_plan, Claude
     # TodoWrite/TaskUpdate, or Cursor composer todos.
     task_state: dict[str, object] | None = None
+    # Safe semantic lifecycle metadata from Codex sub_agent_activity events.
+    # The associated encrypted inter-agent payload is intentionally ignored.
+    agent_event: dict[str, object] | None = None
 
 
 @dataclass
@@ -75,6 +79,7 @@ class AssistantIdentityState:
 
     model: str = ""
     reasoning_effort: str = ""
+    service_tier: str = ""
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -603,16 +608,42 @@ def _update_assistant_identity(
         return
 
     msg_type = _coerce_text(obj.get("type"))
-    if tool_id == "codex" and msg_type == "turn_context":
+    if tool_id == "codex":
         payload = _as_mapping(obj.get("payload"))
-        _set_identity_field(state, payload, ("model",), "model")
-        _set_identity_field(
-            state,
-            payload,
-            ("effort", "reasoning_effort", "reasoningEffort"),
-            "reasoning_effort",
-        )
-        return
+        if msg_type == "turn_context":
+            _set_identity_field(state, payload, ("model",), "model")
+            _set_identity_field(
+                state,
+                payload,
+                ("effort", "reasoning_effort", "reasoningEffort"),
+                "reasoning_effort",
+            )
+            _set_identity_field(
+                state,
+                payload,
+                ("service_tier", "serviceTier"),
+                "service_tier",
+            )
+            return
+        if (
+            msg_type == "event_msg"
+            and payload.get("type") in {"thread_settings", "thread_settings_applied"}
+        ):
+            settings = _as_mapping(payload.get("thread_settings"))
+            _set_identity_field(state, settings, ("model",), "model")
+            _set_identity_field(
+                state,
+                settings,
+                ("effort", "reasoning_effort", "reasoningEffort"),
+                "reasoning_effort",
+            )
+            _set_identity_field(
+                state,
+                settings,
+                ("service_tier", "serviceTier"),
+                "service_tier",
+            )
+            return
 
     if tool_id == "claude_code":
         # Claude stores extended-thinking blocks in the immutable transcript,
@@ -678,6 +709,33 @@ def _attach_assistant_identity(
         return
     message.model = state.model
     message.reasoning_effort = state.reasoning_effort
+    message.service_tier = state.service_tier
+
+
+def _agent_activity_label(agent_path: object) -> str:
+    """Turn a stable Codex agent path into a compact human-readable label."""
+    path = _bounded_identity_text(agent_path)
+    tail = path.rstrip("/").rsplit("/", 1)[-1]
+    words = [word for word in re.split(r"[_\-]+", tail) if word]
+    acronyms = {"ai", "api", "cli", "cpu", "db", "etl", "gpu", "rss", "slo", "ui"}
+    return " ".join(
+        word.upper() if word.casefold() in acronyms else word.title()
+        for word in words
+    )
+
+
+def _normalized_agent_activity_kind(value: object) -> str:
+    kind = _coerce_text(value).strip().casefold().replace("-", "_")
+    aliases = {
+        "interacted": "updated",
+        "finished": "completed",
+        "complete": "completed",
+        "stopped": "interrupted",
+    }
+    kind = aliases.get(kind, kind)
+    if kind in {"started", "updated", "completed", "interrupted", "failed"}:
+        return kind
+    return "updated"
 
 
 def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | None:
@@ -926,9 +984,21 @@ def parse_conversation_object(
                     ),
                     tool_call_id=tool_call_id,
                 )
-            # Skip reasoning — AI internal thought process, not a reply
             if p_type == "reasoning":
-                return None
+                # Codex stores the user-visible "Thought for …" summaries
+                # separately from encrypted internal reasoning. Preserve only
+                # the explicit summary and never expose encrypted_content.
+                thinking = _extract_codex_reasoning_summary(payload.get("summary"))
+                if not thinking:
+                    return None
+                return NormalizedMessage(
+                    role="assistant",
+                    content="",
+                    thinking=thinking,
+                    timestamp=timestamp,
+                    raw_type="reasoning",
+                    source_id=str(payload.get("id") or ""),
+                )
             if p_type == "message" and role == "assistant":
                 content = _extract_codex_content(payload.get("content", []))
                 if not content.strip():
@@ -973,6 +1043,32 @@ def parse_conversation_object(
             event_type = payload.get("type", "")
             if event_type == "task_started":
                 return None
+            if event_type == "sub_agent_activity":
+                agent_path = _bounded_interaction_text(payload.get("agent_path"), 512)
+                event_id = _bounded_interaction_text(payload.get("event_id"), 512)
+                thread_id = _bounded_interaction_text(
+                    payload.get("agent_thread_id"),
+                    512,
+                )
+                if not agent_path:
+                    return None
+                kind = _normalized_agent_activity_kind(payload.get("kind"))
+                label = _agent_activity_label(agent_path) or "Subagent"
+                return NormalizedMessage(
+                    role="tool",
+                    content=f"{label} {kind}",
+                    tool_name="Agent activity",
+                    timestamp=timestamp,
+                    raw_type="agent_event",
+                    source_id=event_id or f"{thread_id}:{timestamp}:{kind}",
+                    agent_event={
+                        "version": 1,
+                        "agent_path": agent_path,
+                        "agent_thread_id": thread_id,
+                        "label": label,
+                        "kind": kind,
+                    },
+                )
             # User message — the actual user input in Codex
             if event_type == "user_message":
                 text = _coerce_text(payload.get("message"))
@@ -1437,6 +1533,21 @@ def _extract_thinking_parts(content) -> str:
     return "\n\n".join(parts)
 
 
+def _extract_codex_reasoning_summary(value: object) -> str:
+    """Extract only Codex's explicit user-visible reasoning summaries."""
+    items = value if isinstance(value, list) else [value]
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"summary_text", "text"}:
+            continue
+        text = _coerce_text(item.get("text")).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 def _bounded_tool_text(value: str, limit: int) -> str:
     """Bound structured tool metadata by UTF-8 bytes."""
     clean = strip_terminal_sequences(value).replace("\x00", "")
@@ -1612,7 +1723,21 @@ class TaskStateTracker:
 
     @staticmethod
     def _normalized_name(value: object) -> str:
-        return re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+        compact = re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+        for canonical in (
+            "updateplan",
+            "todowrite",
+            "tasklist",
+            "taskcreate",
+            "taskupdate",
+            "taskstop",
+        ):
+            if compact.endswith(canonical):
+                return canonical
+        progress_index = compact.rfind("taskprogress")
+        if progress_index >= 0:
+            return compact[progress_index:]
+        return compact
 
     def _apply_event(
         self,
@@ -2620,6 +2745,7 @@ def iter_conversation_messages(
     pending_claude_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
     pending_codex_user: tuple[int, NormalizedMessage, str] | None = None
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
+    pending_codex_reasoning: tuple[int, NormalizedMessage] | None = None
     current_codex_turn_id = ""
     task_tracker = TaskStateTracker(tool_id)
     pending_questions = {
@@ -2656,6 +2782,21 @@ def iter_conversation_messages(
         message = parse_conversation_object(source_object, tool_id)
         if message is not None:
             _attach_assistant_identity(message, identity)
+
+        if tool_id == "codex" and message is not None and message.raw_type == "reasoning":
+            if pending_codex_reasoning is not None:
+                _pending_index, pending = pending_codex_reasoning
+                if pending.source_id != message.source_id:
+                    if should_emit(pending):
+                        yield pending
+            pending_codex_reasoning = (record_index, message)
+            continue
+
+        if pending_codex_reasoning is not None:
+            pending = pending_codex_reasoning[1]
+            pending_codex_reasoning = None
+            if should_emit(pending):
+                yield pending
 
         if (
             tool_id == "claude_code"
@@ -2842,6 +2983,10 @@ def iter_conversation_messages(
             yield pending
     if pending_codex_assistant is not None:
         pending = pending_codex_assistant[1]
+        if should_emit(pending):
+            yield pending
+    if pending_codex_reasoning is not None:
+        pending = pending_codex_reasoning[1]
         if should_emit(pending):
             yield pending
 

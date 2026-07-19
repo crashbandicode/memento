@@ -163,6 +163,8 @@ const zhCN = {
     displayUserMessages: "用户提示",
     displayAgentMessages: "助手消息",
     displayTools: "工具",
+    displayTasks: "任务",
+    displayAgents: "代理活动",
     displayThinking: "思考过程",
     displayContext: "上下文",
     displayShowAll: "全部显示",

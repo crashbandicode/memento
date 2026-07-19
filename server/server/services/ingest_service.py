@@ -81,6 +81,7 @@ STORED_SOURCE_HASH_KEY = "_stored_source_hash"
 STORED_SOURCE_SIZE_KEY = "_stored_source_size"
 CURRENT_ASSISTANT_MODEL_KEY = "_assistant_model"
 CURRENT_ASSISTANT_REASONING_KEY = "_assistant_reasoning_effort"
+CURRENT_ASSISTANT_SERVICE_TIER_KEY = "_assistant_service_tier"
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -92,6 +93,7 @@ _ESSENTIAL_METADATA_KEYS = {
     "codex_title_revisions",
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
+    CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     "cwd",
     "first_user_message",
     "forked_from_id",
@@ -120,6 +122,7 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "memento_title_source",
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
+    CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
@@ -373,8 +376,15 @@ def _conversation_message_metadata(normalized) -> dict:
             str(normalized.reasoning_effort),
             MAX_STORED_IDENTITY_CHARS,
         )
+    if normalized.service_tier:
+        meta["service_tier"] = _bounded_message_text(
+            str(normalized.service_tier),
+            MAX_STORED_IDENTITY_CHARS,
+        )
     if normalized.task_state:
         meta["task_state"] = normalized.task_state
+    if normalized.agent_event:
+        meta["agent_event"] = normalized.agent_event
     return meta
 
 
@@ -456,6 +466,10 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
             CURRENT_ASSISTANT_REASONING_KEY,
             "reasoning_effort",
         ),
+        service_tier=stored_value(
+            CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+            "service_tier",
+        ),
     )
 
 
@@ -465,6 +479,7 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
     for key, value in (
         (CURRENT_ASSISTANT_MODEL_KEY, assistant_identity.model),
         (CURRENT_ASSISTANT_REASONING_KEY, assistant_identity.reasoning_effort),
+        (CURRENT_ASSISTANT_SERVICE_TIER_KEY, assistant_identity.service_tier),
     ):
         if value:
             metadata[key] = _bounded_message_text(

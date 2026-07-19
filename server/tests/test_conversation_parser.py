@@ -92,6 +92,141 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(messages[0].model, "gpt-5.6-sol")
         self.assertEqual(messages[0].reasoning_effort, "high")
 
+    def test_codex_thread_settings_preserve_fast_service_tier(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "ultra",
+                        "service_tier": "priority",
+                    },
+                },
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": "2026-07-18T14:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Fast response",
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].model, "gpt-5.6-sol")
+        self.assertEqual(messages[0].reasoning_effort, "ultra")
+        self.assertEqual(messages[0].service_tier, "priority")
+
+    def test_codex_fast_service_tier_survives_delta_boundary(self) -> None:
+        identity = AssistantIdentityState()
+        settings_delta = json.dumps({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings",
+                "thread_settings": {
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "ultra",
+                    "service_tier": "fast",
+                },
+            },
+        })
+        assistant_delta = json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-07-18T14:01:00Z",
+            "payload": {"type": "agent_message", "message": "Continued"},
+        })
+
+        self.assertEqual(
+            list(iter_conversation_messages(
+                settings_delta,
+                "codex",
+                assistant_identity=identity,
+            )),
+            [],
+        )
+        messages = list(iter_conversation_messages(
+            assistant_delta,
+            "codex",
+            assistant_identity=identity,
+        ))
+
+        self.assertEqual(identity.service_tier, "fast")
+        self.assertEqual(messages[0].service_tier, "fast")
+
+    def test_codex_reasoning_summary_keeps_latest_visible_snapshot(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-18T23:26:48Z",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "Planning the probe",
+                    }],
+                    "encrypted_content": "must-never-render",
+                },
+            }),
+            json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-07-18T23:26:59Z",
+                "payload": {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [
+                        {"type": "summary_text", "text": "Planning the probe"},
+                        {"type": "summary_text", "text": "Verifying the result"},
+                    ],
+                    "encrypted_content": "must-never-render",
+                },
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "timestamp": "2026-07-18T23:27:00Z",
+                "payload": {"type": "turn_aborted", "turn_id": "turn-1"},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual([message.raw_type for message in messages], ["reasoning", "turn_aborted"])
+        self.assertEqual(
+            messages[0].thinking,
+            "Planning the probe\n\nVerifying the result",
+        )
+        self.assertNotIn("must-never-render", messages[0].thinking)
+
+    def test_codex_subagent_activity_is_a_safe_semantic_event(self) -> None:
+        raw = json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-07-18T23:14:53Z",
+            "payload": {
+                "type": "sub_agent_activity",
+                "event_id": "agent-event-1",
+                "agent_thread_id": "agent-thread-1",
+                "agent_path": "/root/attr_slo_bounded_archive_fix",
+                "kind": "interacted",
+                "encrypted_content": "must-never-render",
+            },
+        })
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "agent_event")
+        self.assertEqual(messages[0].agent_event["kind"], "updated")
+        self.assertEqual(
+            messages[0].agent_event["label"],
+            "Attr SLO Bounded Archive Fix",
+        )
+        self.assertNotIn("must-never-render", messages[0].content)
+
     def test_claude_assistant_model_is_preserved(self) -> None:
         raw = json.dumps({
             "type": "assistant",

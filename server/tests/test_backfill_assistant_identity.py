@@ -10,19 +10,28 @@ def _row(
     *,
     model: str = "",
     effort: str = "",
+    service_tier: str = "",
 ) -> AssistantIdentityRow:
     metadata = {}
     if model:
         metadata["model"] = model
     if effort:
         metadata["reasoning_effort"] = effort
+    if service_tier:
+        metadata["service_tier"] = service_tier
     return AssistantIdentityRow(line, "agent_message", content, metadata)
 
 
 def test_overlay_uses_exact_line_without_overwriting_existing_identity() -> None:
     existing = [_row(4, "first"), _row(8, "second", model="kept")]
     parsed = [
-        _row(4, "first", model="gpt-5.6-sol", effort="xhigh"),
+        _row(
+            4,
+            "first",
+            model="gpt-5.6-sol",
+            effort="xhigh",
+            service_tier="priority",
+        ),
         _row(8, "second", model="different", effort="high"),
     ]
 
@@ -32,6 +41,7 @@ def test_overlay_uses_exact_line_without_overwriting_existing_identity() -> None
     assert updates[0].metadata_patch == {
         "model": "gpt-5.6-sol",
         "reasoning_effort": "xhigh",
+        "service_tier": "priority",
     }
     assert updates[0].match_kind == "line"
     assert updates[1].metadata_patch == {"reasoning_effort": "high"}

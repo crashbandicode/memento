@@ -1,4 +1,5 @@
 import type { IconType } from "react-icons";
+import { FiZap } from "react-icons/fi";
 import {
   SiAnthropic,
   SiGooglegemini,
@@ -11,8 +12,11 @@ import styles from "./AssistantIdentityBadge.module.css";
 interface AssistantIdentityBadgeProps {
   model?: string | null;
   reasoningEffort?: string | null;
+  serviceTier?: string | null;
   thinkingLabel?: string;
 }
+
+const FAST_SERVICE_TIERS = new Set(["fast", "priority", "priority-processing"]);
 
 function cleanIdentityValue(value?: string | null): string {
   return (value || "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
@@ -87,26 +91,36 @@ export function formatReasoningEffortLabel(value?: string | null): string {
   return titleCaseToken(effort);
 }
 
+export function isFastServiceTier(value?: string | null): boolean {
+  const tier = cleanIdentityValue(value).toLowerCase().replace(/_/g, "-");
+  return FAST_SERVICE_TIERS.has(tier);
+}
+
 export default function AssistantIdentityBadge({
   model,
   reasoningEffort,
+  serviceTier,
   thinkingLabel = "Thinking",
 }: AssistantIdentityBadgeProps) {
   const rawModel = cleanIdentityValue(model);
   const rawEffort = cleanIdentityValue(reasoningEffort);
+  const rawServiceTier = cleanIdentityValue(serviceTier);
   const modelLabel = formatAssistantModelLabel(rawModel);
   const provider = assistantModelProvider(rawModel);
   const effortLabel = formatReasoningEffortLabel(rawEffort);
+  const fastMode = isFastServiceTier(rawServiceTier);
   const localizedThinkingLabel = cleanIdentityValue(thinkingLabel) || "Thinking";
-  if (!modelLabel && !effortLabel) return null;
+  if (!modelLabel && !effortLabel && !fastMode) return null;
 
   const accessibleParts = [
     modelLabel ? `Model ${modelLabel}` : "",
     effortLabel ? `${localizedThinkingLabel} level ${effortLabel}` : "",
+    fastMode ? "Fast mode" : "",
   ].filter(Boolean);
   const exactParts = [
     rawModel ? `Model: ${rawModel}` : "",
     rawEffort ? `${localizedThinkingLabel}: ${rawEffort}` : "",
+    rawServiceTier ? `Service tier: ${rawServiceTier}` : "",
   ].filter(Boolean);
 
   return (
@@ -115,6 +129,7 @@ export default function AssistantIdentityBadge({
       aria-label={accessibleParts.join(", ")}
       data-assistant-model={rawModel || undefined}
       data-assistant-reasoning={rawEffort || undefined}
+      data-assistant-service-tier={rawServiceTier || undefined}
       data-assistant-provider={provider.id}
       title={exactParts.join(" · ")}
     >
@@ -136,6 +151,15 @@ export default function AssistantIdentityBadge({
           <span className={styles.reasoning}>
             <span className={styles.reasoningMark} aria-hidden="true" />
             <span>{localizedThinkingLabel} · {effortLabel}</span>
+          </span>
+        </>
+      )}
+      {fastMode && (
+        <>
+          {(modelLabel || effortLabel) && <span className={styles.divider} aria-hidden="true" />}
+          <span className={styles.serviceTier}>
+            <FiZap aria-hidden="true" />
+            <span>Fast</span>
           </span>
         </>
       )}

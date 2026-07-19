@@ -14,6 +14,7 @@ import {
 import Link from "next/link";
 import {
   api,
+  ConversationAgentEvent,
   ConversationMessage,
   ConversationPrompt,
   ConversationSearchHit,
@@ -166,6 +167,8 @@ type ConversationVisibility = {
   user: boolean;
   assistant: boolean;
   tools: boolean;
+  tasks: boolean;
+  agents: boolean;
   thinking: boolean;
   context: boolean;
 };
@@ -176,6 +179,8 @@ const DEFAULT_CONVERSATION_VISIBILITY: ConversationVisibility = {
   user: true,
   assistant: true,
   tools: true,
+  tasks: true,
+  agents: true,
   thinking: true,
   context: true,
 };
@@ -687,18 +692,22 @@ export default function ConversationViewer({
       && !msg.interaction_response
       && !msg.content.includes("[Subagent Context]");
     const role = msg.role || msg.message_type || "unknown";
+    const isAgentMessage = role === "tool" && Boolean(msg.agent_event);
+    const isTaskMessage = role === "tool" && Boolean(msg.task_state);
     const messageCategory = role === "user"
       ? (isSubagentDispatchMessage(msg) ? "context" : "user")
       : role === "assistant"
         ? "assistant"
         : role === "tool"
-          ? "tools"
+          ? (isAgentMessage ? "agents" : isTaskMessage ? "tasks" : "tools")
           : "context";
     const hideWholeMessage = (
       (role === "user" && !isSubagentDispatchMessage(msg) && !visibility.user)
       || (role === "user" && isSubagentDispatchMessage(msg) && !visibility.context)
-      || (role === "assistant" && !visibility.assistant && !visibility.tools)
-      || (role === "tool" && !visibility.tools)
+      || (role === "assistant" && !visibility.assistant && !visibility.thinking && !visibility.tools)
+      || (role === "tool" && isAgentMessage && !visibility.agents)
+      || (role === "tool" && isTaskMessage && !visibility.tasks)
+      || (role === "tool" && !isAgentMessage && !isTaskMessage && !visibility.tools)
       || (role !== "user" && role !== "assistant" && role !== "tool" && !visibility.context)
     );
     return (
@@ -710,6 +719,7 @@ export default function ConversationViewer({
         data-message-category={messageCategory}
         data-message-visible={hideWholeMessage ? "false" : "true"}
         aria-hidden={hideWholeMessage ? "true" : undefined}
+        hidden={hideWholeMessage}
         style={{ scrollMarginTop: 16 }}
       >
         {!hideWholeMessage && (
@@ -721,6 +731,8 @@ export default function ConversationViewer({
             questionResponses={questionResponses}
             showAssistant={visibility.assistant}
             showTools={visibility.tools}
+            showTasks={visibility.tasks}
+            showAgents={visibility.agents}
             showThinkingCategory={visibility.thinking}
             showContext={visibility.context}
           />
@@ -742,7 +754,7 @@ export default function ConversationViewer({
         onChange={setVisibility}
         t={t}
       />
-      {visibility.tools && activeTaskState && activeTaskState.total_count > 0 && (
+      {visibility.tasks && activeTaskState && activeTaskState.total_count > 0 && (
         <div className="max-w-4xl mx-auto" style={{ marginBottom: 12 }}>
           <TaskProgressCard state={activeTaskState} current />
         </div>
@@ -890,6 +902,8 @@ function ConversationVisibilityControls({
     { key: "user", label: t.conversation.displayUserMessages },
     { key: "assistant", label: t.conversation.displayAgentMessages },
     { key: "tools", label: t.conversation.displayTools },
+    { key: "tasks", label: t.conversation.displayTasks },
+    { key: "agents", label: t.conversation.displayAgents },
     { key: "thinking", label: t.conversation.displayThinking },
     { key: "context", label: t.conversation.displayContext },
   ];
@@ -2945,6 +2959,67 @@ function MessageCopyFrame({
   );
 }
 
+function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
+  const presentation = {
+    started: { action: "started", color: "#2563EB", icon: "plus" as const },
+    updated: { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const },
+    completed: { action: "completed", color: "#059669", icon: "check" as const },
+    interrupted: { action: "interrupted", color: "#D97706", icon: "minus" as const },
+    failed: { action: "failed", color: "#DC2626", icon: "close" as const },
+  }[event.kind] || { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const };
+
+  return (
+    <div
+      data-agent-event
+      data-agent-kind={event.kind}
+      title={event.agent_path}
+      style={{
+        width: "fit-content",
+        maxWidth: "100%",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        minHeight: 34,
+        padding: "6px 10px 6px 7px",
+        border: "1px solid color-mix(in srgb, var(--aurora-accent) 18%, var(--aurora-border))",
+        borderRadius: 999,
+        background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
+        boxShadow: "0 2px 8px rgba(15,23,42,0.035)",
+        color: "var(--aurora-fg2)",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 22,
+          height: 22,
+          flex: "0 0 auto",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: 999,
+          background: `color-mix(in srgb, ${presentation.color} 13%, transparent)`,
+          color: presentation.color,
+        }}
+      >
+        <Icon name={presentation.icon} size={12} strokeWidth={2} />
+      </span>
+      <span
+        style={{
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          fontSize: 11.5,
+        }}
+      >
+        <strong style={{ color: "var(--aurora-fg1)", fontWeight: 750 }}>{event.label}</strong>{" "}
+        <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
+      </span>
+    </div>
+  );
+}
+
 export const ChatBubble = memo(function ChatBubble({
   msg,
   toolId = "",
@@ -2953,6 +3028,8 @@ export const ChatBubble = memo(function ChatBubble({
   questionResponses = new Map(),
   showAssistant = true,
   showTools = true,
+  showTasks = true,
+  showAgents = true,
   showThinkingCategory = true,
   showContext = true,
 }: {
@@ -2963,6 +3040,8 @@ export const ChatBubble = memo(function ChatBubble({
   questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
   showAssistant?: boolean;
   showTools?: boolean;
+  showTasks?: boolean;
+  showAgents?: boolean;
   showThinkingCategory?: boolean;
   showContext?: boolean;
 }) {
@@ -2996,8 +3075,13 @@ export const ChatBubble = memo(function ChatBubble({
   // input. Show the semantic checklist while retaining the original payload
   // in exports/copy, rather than presenting an opaque JSON tool card.
   const taskState = msg.task_state;
+  const agentEvent = msg.agent_event;
+  if (role === "tool" && agentEvent) {
+    if (!showAgents) return null;
+    return <AgentActivityCard event={agentEvent} />;
+  }
   if (role === "tool" && taskState) {
-    if (!showTools) return null;
+    if (!showTasks) return null;
     return (
       <MessageCopyFrame markdown={messageMarkdown} t={t}>
         {({ top, bottom }) => (
@@ -3193,12 +3277,11 @@ export const ChatBubble = memo(function ChatBubble({
     const isLong = narrative.length > 500;
     const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
     const hasSeparateThinking = Boolean(
-      showAssistant
-      && showThinkingCategory
+      showThinkingCategory
       && thinking
-      && thinking !== narrative,
+      && (!showAssistant || thinking !== narrative),
     );
-    const hasNarrative = Boolean(showAssistant && (narrative || hasSeparateThinking));
+    const hasNarrative = Boolean((showAssistant && narrative) || hasSeparateThinking);
     const visibleToolCalls = showTools ? toolCalls : [];
     if (!hasNarrative && visibleToolCalls.length === 0) return null;
     const toolCallGroup = visibleToolCalls.length > 0 ? (
@@ -3263,6 +3346,7 @@ export const ChatBubble = memo(function ChatBubble({
                 <AssistantIdentityBadge
                   model={msg.model}
                   reasoningEffort={msg.reasoning_effort}
+                  serviceTier={msg.service_tier}
                   thinkingLabel={t.conversation.thinking}
                 />
                 {messageTime && (

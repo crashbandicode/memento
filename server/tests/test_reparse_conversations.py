@@ -11,6 +11,7 @@ from server.scripts.reparse_conversations import (
 from server.services.ingest_service import (
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
+    CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
@@ -166,15 +167,18 @@ def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
     identity = _assistant_identity_for_ingest(document, "delta")
     identity.model = "gpt-5.6-sol"
     identity.reasoning_effort = "high"
+    identity.service_tier = "priority"
 
     _store_assistant_identity(document, identity)
     next_delta = _assistant_identity_for_ingest(document, "delta")
 
     assert next_delta.model == "gpt-5.6-sol"
     assert next_delta.reasoning_effort == "high"
+    assert next_delta.service_tier == "priority"
     assert document.metadata_["unrelated"] == "preserved"
     assert document.metadata_[CURRENT_ASSISTANT_MODEL_KEY] == "gpt-5.6-sol"
     assert document.metadata_[CURRENT_ASSISTANT_REASONING_KEY] == "high"
+    assert document.metadata_[CURRENT_ASSISTANT_SERVICE_TIER_KEY] == "priority"
     assert _assistant_identity_for_ingest(document, "full").model == ""
 
 

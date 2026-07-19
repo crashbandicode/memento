@@ -157,6 +157,8 @@ const enUS: Translations = {
     displayUserMessages: "User prompts",
     displayAgentMessages: "Agent messages",
     displayTools: "Tools",
+    displayTasks: "Tasks",
+    displayAgents: "Agent activity",
     displayThinking: "Thinking",
     displayContext: "Context",
     displayShowAll: "Show all",

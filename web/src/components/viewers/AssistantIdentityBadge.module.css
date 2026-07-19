@@ -124,6 +124,20 @@
   text-overflow: ellipsis;
 }
 
+.serviceTier {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #a16207;
+  font-weight: 750;
+}
+
+.serviceTier svg {
+  width: 10px;
+  height: 10px;
+  fill: currentColor;
+}
+
 .reasoningMark {
   width: 4px;
   height: 4px;

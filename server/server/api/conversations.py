@@ -73,6 +73,13 @@ def _stored_task_state(metadata: object) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _stored_agent_event(metadata: object) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("agent_event")
+    return value if isinstance(value, dict) else None
+
+
 async def _get_conversation_identity(
     db: AsyncSession,
     user: User,
@@ -370,6 +377,7 @@ async def get_conversation_messages(
                     "reasoning_effort": (m.metadata_ or {}).get(
                         "reasoning_effort", ""
                     ),
+                    "service_tier": (m.metadata_ or {}).get("service_tier", ""),
                     "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                     "tool_input": (m.metadata_ or {}).get("tool_input", ""),
                     "session_context": (m.metadata_ or {}).get(
@@ -383,6 +391,7 @@ async def get_conversation_messages(
                         "interaction_response",
                     ),
                     "task_state": _stored_task_state(m.metadata_),
+                    "agent_event": _stored_agent_event(m.metadata_),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
                 }
@@ -415,6 +424,7 @@ async def get_conversation_messages(
                     "thinking": m.thinking or None,
                     "model": m.model,
                     "reasoning_effort": m.reasoning_effort,
+                    "service_tier": m.service_tier,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
                     "session_context": m.session_context,
@@ -423,6 +433,7 @@ async def get_conversation_messages(
                     "interaction": m.interaction,
                     "interaction_response": m.interaction_response,
                     "task_state": m.task_state,
+                    "agent_event": m.agent_event,
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
                 }

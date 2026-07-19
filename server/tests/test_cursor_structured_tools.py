@@ -120,7 +120,7 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                 "type": "response_item",
                 "payload": {
                     "type": "function_call",
-                    "name": "update_plan",
+                    "name": "functions.update_plan",
                     "call_id": "plan-1",
                     "arguments": json.dumps({
                         "plan": [
@@ -293,6 +293,13 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                 "active_task_id": "2",
                 "tasks": [],
             },
+            agent_event={
+                "version": 1,
+                "agent_path": "/root/audit_parser",
+                "agent_thread_id": "agent-1",
+                "label": "Audit Parser",
+                "kind": "completed",
+            },
         )
 
         metadata = _conversation_message_metadata(message)
@@ -301,6 +308,7 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         self.assertEqual(metadata["interaction"], message.interaction)
         self.assertEqual(metadata["interaction_response"], message.interaction_response)
         self.assertEqual(metadata["task_state"], message.task_state)
+        self.assertEqual(metadata["agent_event"], message.agent_event)
         self.assertEqual(
             _stored_attachments(metadata),
             [{"type": "image", "name": "screenshot.png"}],
