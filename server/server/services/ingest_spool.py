@@ -121,7 +121,11 @@ def spool_job_lock(
     if not _JOB_ID_RE.fullmatch(job_id):
         raise ChunkValidationError("invalid spool job id")
     with _filesystem_lock(
-        root / f".{job_id}.{purpose}.lock",
+        # Keep advisory bookkeeping out of the hot spool root. Each upload
+        # creates stage/process locks and POSIX lock files intentionally
+        # persist after close; putting thousands beside job directories made
+        # every root scan enumerate historical locks forever.
+        root / ".job-locks" / f".{job_id}.{purpose}.lock",
         blocking=blocking,
     ) as acquired:
         yield acquired

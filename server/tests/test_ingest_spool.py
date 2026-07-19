@@ -38,6 +38,7 @@ from server.services.ingest_spool import (  # noqa: E402
     remove_job,
     select_ready_source_head,
     source_identity,
+    spool_job_lock,
     spool_source_lock,
     stage_chunk,
     superseding_ready_full_job_id,
@@ -61,6 +62,20 @@ class IngestSpoolTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
+
+    def test_job_lock_bookkeeping_is_not_created_in_hot_spool_root(self) -> None:
+        job_id = "a" * 64
+
+        with spool_job_lock(job_id, root=self.root) as acquired:
+            self.assertTrue(acquired)
+
+        self.assertTrue(
+            (self.root / ".job-locks" / f".{job_id}.stage.lock").is_file()
+        )
+        self.assertEqual(
+            [path for path in self.root.iterdir() if path.is_file()],
+            [],
+        )
 
     @staticmethod
     def _meta(chunk_index: int, total_chunks: int, **overrides) -> dict:
@@ -1202,7 +1217,9 @@ class IngestSpoolTests(unittest.TestCase):
         job_dirs = [
             path
             for path in self.root.iterdir()
-            if path.is_dir() and path.name != "completed"
+            if path.is_dir()
+            and path.name != "completed"
+            and not path.name.startswith(".")
         ]
         self.assertEqual(len(job_dirs), 1)
         self.assertEqual(list(job_dirs[0].glob("chunk-*.bin")), [])
