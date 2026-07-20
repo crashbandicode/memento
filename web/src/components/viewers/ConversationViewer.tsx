@@ -19,6 +19,7 @@ import {
   ConversationPrompt,
   ConversationSearchHit,
   ConversationTaskState,
+  ConversationToolCall,
   QuestionInteraction,
   QuestionInteractionResponse,
 } from "@/lib/api-client";
@@ -123,6 +124,41 @@ export function splitAssistantContent(value: string): AssistantContentSegment[] 
   return segments;
 }
 
+type AssistantDisplayToolCall = Pick<ConversationToolCall, "name" | "interaction"> & {
+  input: string;
+};
+
+function assistantDisplayParts(
+  msg: ConversationMessage,
+  toolId: string,
+): { narrative: string; toolCalls: AssistantDisplayToolCall[] } {
+  const content = cleanTerminalText(msg.content);
+  const structuredToolCalls = msg.tool_calls || [];
+  const assistantContent = toolId === "cursor"
+    ? stripCursorTransportRedaction(content)
+    : content;
+  const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
+    ? (assistantContent.trim() ? [{ type: "text", content: assistantContent }] : [])
+    : toolId === "cursor"
+      ? splitAssistantContent(content)
+      : (assistantContent ? [{ type: "text", content: assistantContent }] : []);
+  const narrative = legacySegments
+    .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")
+    .map((segment) => segment.content)
+    .join("\n\n")
+    .trim();
+  const toolCalls = structuredToolCalls.length > 0
+    ? structuredToolCalls.map((call) => ({
+        name: call.name,
+        input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
+        interaction: call.interaction,
+      }))
+    : legacySegments
+        .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
+        .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
+  return { narrative, toolCalls };
+}
+
 function toolPreview(toolName: string, input: string, output: string): string {
   const fallback = (input || output).replace(/\s+/g, " ").trim().slice(0, 240);
   if (!input.trim().startsWith("{")) return fallback;
@@ -216,6 +252,42 @@ type PairedQuestionResponse = {
   message: ConversationMessage;
 };
 
+function messageVisibilityGroups(
+  msg: ConversationMessage,
+  toolId: string,
+  questionResponses: ReadonlyMap<string, PairedQuestionResponse>,
+): ConversationVisibilityKey[] {
+  const role = msg.role || msg.message_type || "unknown";
+  if (msg.interaction_response) return ["user"];
+  if (role === "user") return [isSubagentDispatchMessage(msg) ? "context" : "user"];
+  if (role === "assistant") {
+    const groups = new Set<ConversationVisibilityKey>();
+    const { narrative, toolCalls } = assistantDisplayParts(msg, toolId);
+    if (narrative) groups.add("assistant");
+    if (cleanTerminalText(msg.thinking?.trim() || "")) groups.add("thinking");
+    toolCalls.forEach((call) => {
+      if (!call.interaction) {
+        groups.add("tools");
+        return;
+      }
+      groups.add("assistant");
+      if (questionResponses.has(call.interaction.id)) groups.add("user");
+    });
+    return Array.from(groups);
+  }
+  if (role === "tool") {
+    if (msg.agent_event) return ["agents"];
+    if (msg.task_state) return ["tasks"];
+    if (msg.interaction) {
+      return questionResponses.has(msg.interaction.id)
+        ? ["assistant", "user"]
+        : ["assistant"];
+    }
+    return ["tools"];
+  }
+  return ["context"];
+}
+
 type DetachedTail = {
   offset: number;
   endOffset: number;
@@ -303,7 +375,7 @@ export default function ConversationViewer({
     return { questionIds: ids, questionResponses: responses };
   }, [visibleMessages]);
 
-  const preserveScrollForNextRender = useCallback(() => {
+  const preserveScrollForNextRender = useCallback((nextVisibility?: ConversationVisibility) => {
     const container = containerRef.current;
     if (!container) return;
     const distanceFromBottom = Math.max(
@@ -323,7 +395,12 @@ export default function ConversationViewer({
     const containerTop = container.getBoundingClientRect().top;
     const anchor = Array.from(
       container.querySelectorAll<HTMLElement>("[data-message-id]"),
-    ).find((element) => element.getBoundingClientRect().bottom > containerTop + 1);
+    ).find((element) => {
+      if (element.hidden || element.getBoundingClientRect().bottom <= containerTop + 1) return false;
+      if (!nextVisibility) return true;
+      const groups = (element.dataset.messageGroups || "").split(" ").filter(Boolean) as ConversationVisibilityKey[];
+      return groups.some((group) => nextVisibility[group]);
+    });
     pendingScrollAnchorRef.current = {
       followLatest: false,
       messageId: anchor?.dataset.messageId ?? null,
@@ -351,7 +428,12 @@ export default function ConversationViewer({
     }
     const nextOffset = target.getBoundingClientRect().top - container.getBoundingClientRect().top;
     container.scrollTop += nextOffset - anchor.offset;
-  }, [visibleMessages]);
+  }, [visibleMessages, visibility]);
+
+  const updateVisibility = useCallback((nextVisibility: ConversationVisibility) => {
+    preserveScrollForNextRender(nextVisibility);
+    setVisibility(nextVisibility);
+  }, [preserveScrollForNextRender]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -691,25 +773,9 @@ export default function ConversationViewer({
     const isHumanPrompt = (msg.role || msg.message_type) === "user"
       && !msg.interaction_response
       && !msg.content.includes("[Subagent Context]");
-    const role = msg.role || msg.message_type || "unknown";
-    const isAgentMessage = role === "tool" && Boolean(msg.agent_event);
-    const isTaskMessage = role === "tool" && Boolean(msg.task_state);
-    const messageCategory = role === "user"
-      ? (isSubagentDispatchMessage(msg) ? "context" : "user")
-      : role === "assistant"
-        ? "assistant"
-        : role === "tool"
-          ? (isAgentMessage ? "agents" : isTaskMessage ? "tasks" : "tools")
-          : "context";
-    const hideWholeMessage = (
-      (role === "user" && !isSubagentDispatchMessage(msg) && !visibility.user)
-      || (role === "user" && isSubagentDispatchMessage(msg) && !visibility.context)
-      || (role === "assistant" && !visibility.assistant && !visibility.thinking && !visibility.tools)
-      || (role === "tool" && isAgentMessage && !visibility.agents)
-      || (role === "tool" && isTaskMessage && !visibility.tasks)
-      || (role === "tool" && !isAgentMessage && !isTaskMessage && !visibility.tools)
-      || (role !== "user" && role !== "assistant" && role !== "tool" && !visibility.context)
-    );
+    const visibilityGroups = messageVisibilityGroups(msg, toolId || "", questionResponses);
+    const messageCategory = visibilityGroups[0] || "context";
+    const hideWholeMessage = !visibilityGroups.some((group) => visibility[group]);
     return (
       <div
         key={String(msg.id)}
@@ -717,6 +783,7 @@ export default function ConversationViewer({
         data-message-id={String(msg.id)}
         data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
         data-message-category={messageCategory}
+        data-message-groups={visibilityGroups.join(" ")}
         data-message-visible={hideWholeMessage ? "false" : "true"}
         aria-hidden={hideWholeMessage ? "true" : undefined}
         hidden={hideWholeMessage}
@@ -729,6 +796,7 @@ export default function ConversationViewer({
             locale={locale}
             t={t}
             questionResponses={questionResponses}
+            showUser={visibility.user}
             showAssistant={visibility.assistant}
             showTools={visibility.tools}
             showTasks={visibility.tasks}
@@ -751,7 +819,7 @@ export default function ConversationViewer({
       />
       <ConversationVisibilityControls
         visibility={visibility}
-        onChange={setVisibility}
+        onChange={updateVisibility}
         t={t}
       />
       {visibility.tasks && activeTaskState && activeTaskState.total_count > 0 && (
@@ -2724,20 +2792,7 @@ export function conversationMessageMarkdown(
   }
 
   if (role === "assistant") {
-    const structuredToolCalls = msg.tool_calls || [];
-    const assistantContent = toolId === "cursor"
-      ? stripCursorTransportRedaction(content)
-      : content;
-    const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
-      ? (assistantContent.trim() ? [{ type: "text", content: assistantContent }] : [])
-      : toolId === "cursor"
-        ? splitAssistantContent(content)
-        : (assistantContent ? [{ type: "text", content: assistantContent }] : []);
-    const narrative = legacySegments
-      .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")
-      .map((segment) => segment.content)
-      .join("\n\n")
-      .trim();
+    const { narrative, toolCalls } = assistantDisplayParts(msg, toolId);
     if (narrative) parts.push(narrative);
 
     const thinking = cleanTerminalText(msg.thinking?.trim() || "");
@@ -2745,15 +2800,6 @@ export function conversationMessageMarkdown(
       parts.push(`<details>\n<summary><strong>Thinking</strong></summary>\n\n${thinking}\n\n</details>`);
     }
 
-    const toolCalls = structuredToolCalls.length > 0
-      ? structuredToolCalls.map((call) => ({
-          name: call.name,
-          input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
-          interaction: call.interaction,
-        }))
-      : legacySegments
-          .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
-          .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
     for (const call of toolCalls) {
       if (call.interaction) {
         parts.push(questionInteractionMarkdown(
@@ -3131,6 +3177,7 @@ export const ChatBubble = memo(function ChatBubble({
   locale,
   t,
   questionResponses = new Map(),
+  showUser = true,
   showAssistant = true,
   showTools = true,
   showTasks = true,
@@ -3143,6 +3190,7 @@ export const ChatBubble = memo(function ChatBubble({
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
   questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
+  showUser?: boolean;
   showAssistant?: boolean;
   showTools?: boolean;
   showTasks?: boolean;
@@ -3352,33 +3400,7 @@ export const ChatBubble = memo(function ChatBubble({
   // Assistant — a quiet neutral surface keeps each response visually bounded
   // without competing with the stronger accent used for human prompts.
   if (role === "assistant") {
-    const structuredToolCalls = msg.tool_calls || [];
-    const assistantContent = toolId === "cursor"
-      ? stripCursorTransportRedaction(content)
-      : content;
-    const legacySegments: AssistantContentSegment[] = structuredToolCalls.length > 0
-      ? assistantContent.trim()
-        ? [{ type: "text", content: assistantContent }]
-        : []
-      : toolId === "cursor"
-        ? splitAssistantContent(content)
-        : assistantContent
-          ? [{ type: "text", content: assistantContent }]
-          : [];
-    const narrative = legacySegments
-      .filter((segment): segment is Extract<AssistantContentSegment, { type: "text" }> => segment.type === "text")
-      .map((segment) => segment.content)
-      .join("\n\n")
-      .trim();
-    const toolCalls = structuredToolCalls.length > 0
-      ? structuredToolCalls.map((call) => ({
-          name: call.name,
-          input: typeof call.input === "string" ? call.input : JSON.stringify(call.input),
-          interaction: call.interaction,
-        }))
-      : legacySegments
-          .filter((segment): segment is Extract<AssistantContentSegment, { type: "tool" }> => segment.type === "tool")
-          .map((segment) => ({ name: segment.name, input: segment.input, interaction: undefined }));
+    const { narrative, toolCalls } = assistantDisplayParts(msg, toolId);
     const isLong = narrative.length > 500;
     const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
     const hasSeparateThinking = Boolean(
@@ -3387,7 +3409,11 @@ export const ChatBubble = memo(function ChatBubble({
       && (!showAssistant || thinking !== narrative),
     );
     const hasNarrative = Boolean((showAssistant && narrative) || hasSeparateThinking);
-    const visibleToolCalls = showTools ? toolCalls : [];
+    const visibleToolCalls = toolCalls.filter((call) => (
+      call.interaction
+        ? showAssistant || (showUser && questionResponses.has(call.interaction.id))
+        : showTools
+    ));
     if (!hasNarrative && visibleToolCalls.length === 0) return null;
     const toolCallGroup = visibleToolCalls.length > 0 ? (
       <div
@@ -3398,12 +3424,20 @@ export const ChatBubble = memo(function ChatBubble({
       >
         {visibleToolCalls.map((call, index) => (
           call.interaction ? (
-            <QuestionInteractionCard
-              key={`${call.name}-${index}`}
-              interaction={call.interaction}
-              pairedResponse={questionResponses.get(call.interaction.id)}
-              t={t}
-            />
+            showAssistant ? (
+              <QuestionInteractionCard
+                key={`${call.name}-${index}`}
+                interaction={call.interaction}
+                pairedResponse={showUser ? questionResponses.get(call.interaction.id) : undefined}
+                t={t}
+              />
+            ) : (
+              <QuestionResponseCard
+                key={`${call.name}-${index}`}
+                response={questionResponses.get(call.interaction.id)!.response}
+                t={t}
+              />
+            )
           ) : (
             <ConversationToolCard
               key={`${call.name}-${index}`}
@@ -3531,16 +3565,23 @@ export const ChatBubble = memo(function ChatBubble({
   // output stay collapsed until requested, keeping long agent sessions easy
   // to scan while retaining every detail.
   if (role === "tool") {
-    if (!showTools) return null;
     if (msg.interaction) {
-      return withCopyControls(
-        <QuestionInteractionCard
-          interaction={msg.interaction}
-          pairedResponse={questionResponses.get(msg.interaction.id)}
-          t={t}
-        />
-      );
+      const pairedResponse = questionResponses.get(msg.interaction.id);
+      if (showAssistant) {
+        return withCopyControls(
+          <QuestionInteractionCard
+            interaction={msg.interaction}
+            pairedResponse={showUser ? pairedResponse : undefined}
+            t={t}
+          />
+        );
+      }
+      if (showUser && pairedResponse) {
+        return withCopyControls(<QuestionResponseCard response={pairedResponse.response} t={t} />);
+      }
+      return null;
     }
+    if (!showTools) return null;
     return (
       <MessageCopyFrame markdown={messageMarkdown} t={t}>
         {({ top, bottom }) => (
