@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from collector.sync_client import (  # noqa: E402
     CHUNK_RETRY_BASE_SECONDS,
     CHUNK_UPLOAD_MAX_ATTEMPTS,
     CHUNK_SIZE,
+    MAX_CHUNKED_UPLOAD_BYTES,
     DeltaBaseConflict,
     SyncClient,
 )
@@ -257,6 +258,40 @@ class SyncClientStreamingTests(unittest.TestCase):
             client._pool.shutdown(wait=True)
 
         self.assertEqual(sorted(queue.synced), [1, 2])
+
+    def test_successful_delta_base_schedules_the_next_bounded_window(self) -> None:
+        item = self._item(100)
+        item.sync_strategy = "delta"
+        item.is_partial = False
+        item.source_path = "/tmp/thread.jsonl"
+        queue = _ConcurrentQueue([])
+        requested: list[str] = []
+        client = object.__new__(SyncClient)
+        client._queue = queue
+        client._delta_catchup_callback = requested.append
+        completed: Future[bool] = Future()
+        completed.set_result(True)
+        futures = {completed: item}
+
+        client._reap_completed(futures)
+
+        self.assertEqual(futures, {})
+        self.assertEqual(queue.synced, [item.id])
+        self.assertEqual(requested, [item.source_path])
+
+    def test_legacy_oversized_delta_snapshot_is_rebuilt_in_windows(self) -> None:
+        size = MAX_CHUNKED_UPLOAD_BYTES + 1
+        queue = _FakeQueue(size)
+        client = self._client(queue, _ScriptedHttpClient([]))
+        requested: list[str] = []
+        client._full_resync_callback = requested.append
+        item = self._item(size)
+        item.sync_strategy = "delta"
+        item.source_path = "/tmp/thread.jsonl"
+
+        self.assertFalse(client._upload(item))
+        self.assertEqual(requested, [item.source_path])
+        self.assertEqual(queue.stream.largest_read, 0)
 
     def test_chunked_upload_reads_only_one_chunk_at_a_time(self) -> None:
         total_size = CHUNK_SIZE * 2 + 123

@@ -507,28 +507,30 @@ class FileWatcher:
         read_end_offset = file_size
         base_hash: str | None = None
         base_offset = 0
-        if classification.sync_strategy == SyncStrategy.DELTA and not force_full:
-            base_hash, base_offset = self._queue.get_delta_base(
-                classification.tool_name,
-                classification.relative_path,
-            )
-            if file_size < base_offset:
-                # File was truncated, re-sync from beginning
-                read_offset = 0
-                base_hash = None
-                base_offset = 0
-            else:
-                read_offset = base_offset
+        if classification.sync_strategy == SyncStrategy.DELTA:
             max_delta_bytes = getattr(
                 self._config,
                 "max_delta_upload_bytes",
                 16 * 1024 * 1024,
             )
-            if read_offset > 0 and file_size - read_offset > max_delta_bytes:
+            if not force_full:
+                base_hash, base_offset = self._queue.get_delta_base(
+                    classification.tool_name,
+                    classification.relative_path,
+                )
+                if file_size < base_offset:
+                    # File was truncated, re-sync from beginning.
+                    read_offset = 0
+                    base_hash = None
+                    base_offset = 0
+                else:
+                    read_offset = base_offset
+            if file_size - read_offset > max_delta_bytes:
                 read_end_offset = read_offset + max_delta_bytes
                 logger.info(
-                    "Delta burst exceeds %d bytes; queueing bounded tail for %s",
+                    "Delta backlog exceeds %d bytes; queueing bounded %s for %s",
                     max_delta_bytes,
+                    "base" if read_offset == 0 else "tail",
                     path,
                 )
 
@@ -554,7 +556,7 @@ class FileWatcher:
                     result = parser.parse(
                         path,
                         offset=0,
-                        end_offset=file_size,
+                        end_offset=read_end_offset,
                     )
                 elif isinstance(parser, JsonlParser):
                     result = parser.parse(

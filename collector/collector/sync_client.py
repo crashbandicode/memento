@@ -17,6 +17,7 @@ from .queue import QueueItem, SyncQueue
 logger = logging.getLogger("collector.sync")
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per chunk
+MAX_CHUNKED_UPLOAD_BYTES = 1024 * 1024 * 1024
 CHUNK_UPLOAD_MAX_ATTEMPTS = 4
 CHUNK_RETRY_BASE_SECONDS = 0.5
 CHUNK_RETRY_MAX_SECONDS = 4.0
@@ -170,7 +171,7 @@ class SyncClient:
                     if self._queue.mark_synced(item):
                         synced = True
                         if (
-                            item.is_partial
+                            item.sync_strategy == "delta"
                             and item.source_path
                             and self._delta_catchup_callback
                         ):
@@ -226,6 +227,28 @@ class SyncClient:
                 # rows so an older client cannot create bogus Documents.
                 return self._upload_metadata(item)
             size = item.payload_bytes
+            if size > MAX_CHUNKED_UPLOAD_BYTES:
+                if (
+                    item.sync_strategy == "delta"
+                    and not item.is_partial
+                    and item.source_path
+                    and self._full_resync_callback
+                ):
+                    logger.warning(
+                        "Legacy snapshot exceeds the server's %d-byte upload cap; "
+                        "rebuilding in bounded windows: %s",
+                        MAX_CHUNKED_UPLOAD_BYTES,
+                        item.relative_path,
+                    )
+                    self._full_resync_callback(item.source_path)
+                else:
+                    logger.warning(
+                        "Payload exceeds the server's %d-byte upload cap: %s (%d bytes)",
+                        MAX_CHUNKED_UPLOAD_BYTES,
+                        item.relative_path,
+                        size,
+                    )
+                return False
             if size <= self._config.large_file_threshold:
                 payload["content"] = self._queue.read_payload_text(item)
                 return self._upload_json(payload)
@@ -387,8 +410,9 @@ class SyncClient:
                             retry_reason = f"HTTP {resp.status_code}"
                         else:
                             logger.warning(
-                                "Chunk %d/%d failed permanently (%s) for %s",
+                                "Chunk %d/%d failed permanently (%s: %.200s) for %s",
                                 index + 1, total_chunks, resp.status_code,
+                                resp.text,
                                 payload["relative_path"],
                             )
                             return False

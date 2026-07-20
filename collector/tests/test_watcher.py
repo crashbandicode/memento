@@ -441,7 +441,9 @@ def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(
         queue.close()
 
 
-def test_large_jsonl_append_queues_only_the_new_guarded_tail(tmp_path: Path) -> None:
+def test_large_jsonl_initial_sync_and_backlog_use_bounded_windows(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "large-session.jsonl"
     record = json.dumps({
         "type": "event_msg",
@@ -472,23 +474,67 @@ def test_large_jsonl_append_queues_only_the_new_guarded_tail(tmp_path: Path) -> 
         watcher._process_file_changed(path)
         complete = queue.claim_batch(max_bytes=32 * 1024 * 1024)[0]
         assert complete.is_partial is False
-        assert complete.payload_bytes > 16 * 1024 * 1024
+        assert complete.payload_bytes <= 17 * 1024 * 1024
+        assert 16 * 1024 * 1024 <= complete.offset < base_source_size
+        first_window_offset = complete.offset
         assert queue.mark_synced(complete)
-
-        with path.open("a", encoding="utf-8", newline="\n") as stream:
-            for _ in range(256):
-                stream.write(record + "\n")
 
         watcher._process_file_changed(path)
         tail = queue.claim_batch(max_bytes=32 * 1024 * 1024)[0]
         assert tail.is_partial is True
         assert tail.base_hash == complete.content_hash
-        assert tail.base_offset == base_source_size
-        assert tail.offset == path.stat().st_size
-        assert tail.payload_bytes < 512 * 1024
-        assert len(queue.read_payload_text(tail).splitlines()) == 256
+        assert tail.base_offset == first_window_offset
+        assert tail.offset == base_source_size
+        assert tail.payload_bytes < 4 * 1024 * 1024
     finally:
         queue.close()
+
+
+def test_large_force_full_repair_bootstraps_a_bounded_base(tmp_path: Path) -> None:
+    path = tmp_path / "large-repair.jsonl"
+    record = json.dumps({
+        "type": "event_msg",
+        "payload": {"text": "x" * 1000},
+    }, separators=(",", ":")) + "\n"
+    path.write_text(record * 40, encoding="utf-8")
+    max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/large-repair.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return None, 0
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=max_delta_bytes)
+
+    watcher._process_file_changed(path, force_full=True)
+
+    base = queue.enqueued[0]
+    assert base["is_partial"] is False
+    assert base["base_hash"] is None
+    assert base["base_offset"] == 0
+    assert len(base["content"].splitlines()) == 8
+    assert base["offset"] < path.stat().st_size
+    assert len(base["metadata"]["_queue_force_reprocess_nonce"]) == 32
 
 
 def test_large_delta_backlog_is_captured_in_bounded_windows(tmp_path: Path) -> None:
