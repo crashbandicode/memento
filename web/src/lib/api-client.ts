@@ -217,7 +217,7 @@ export interface DocumentDetail {
 }
 
 export interface ConversationSubagentSummary {
-  id: string;
+  id: string | null;
   session_id: string | null;
   title: string;
   agent_nickname?: string | null;
@@ -228,6 +228,9 @@ export interface ConversationSubagentSummary {
   timestamp?: string | null;
   activity_at?: string | null;
   synced_at?: string | null;
+  document_ready?: boolean;
+  status?: "running" | "completed" | "interrupted" | "failed" | "unknown";
+  last_event_at?: string | null;
 }
 
 export interface ConversationTask {

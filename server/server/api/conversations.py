@@ -27,6 +27,7 @@ from ..services.conversation_hierarchy import (
     effective_conversation_timestamp,
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
+    merge_subagent_event_summaries,
 )
 from ..services.message_search import (
     MAX_SEARCH_CONTENT_CHARS,
@@ -247,6 +248,40 @@ async def get_conversation(
             hierarchy,
             hierarchy_refs,
         ).get(doc.id, [])
+        lifecycle_rows = (
+            await db.execute(
+                select(
+                    ConversationMessage.metadata_,
+                    ConversationMessage.timestamp,
+                )
+                .where(
+                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.metadata_.op("?")("agent_event"),
+                    func.coalesce(
+                        func.jsonb_extract_path_text(
+                            ConversationMessage.metadata_,
+                            "agent_event",
+                            "agent_thread_id",
+                        ),
+                        "",
+                    ) != "",
+                )
+                .order_by(ConversationMessage.line_number)
+            )
+        ).all()
+        lifecycle_events: list[dict] = []
+        for metadata, timestamp in lifecycle_rows:
+            event = _stored_agent_event(metadata)
+            if event is None:
+                continue
+            lifecycle_events.append({
+                **event,
+                "timestamp": timestamp.isoformat() if timestamp else None,
+            })
+        subagents = merge_subagent_event_summaries(
+            subagents,
+            lifecycle_events,
+        )
         is_subagent_orphan = doc.id in hierarchy.orphan_document_ids
 
     # Find related brain artifacts (same session_id)

@@ -348,6 +348,77 @@ def build_subagent_summaries(
     return summaries
 
 
+def merge_subagent_event_summaries(
+    summaries: Iterable[Mapping[str, Any]],
+    events: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge persisted lifecycle events into navigable child summaries.
+
+    A Codex parent records ``sub_agent_activity`` immediately, while a newly
+    forked child can take minutes to upload and normalize because its rollout
+    contains inherited history.  Returning a pending summary from the parent
+    event keeps the task visible during that window.  Once the child document
+    arrives, its real title/nickname/navigation target wins and the lifecycle
+    fields are overlaid without producing a duplicate card.
+    """
+
+    merged = [dict(summary) for summary in summaries]
+    by_thread = {
+        str(summary.get("session_id")): summary
+        for summary in merged
+        if summary.get("session_id")
+    }
+    for item in events:
+        thread_id = str(item.get("agent_thread_id") or "").strip()
+        agent_path = str(item.get("agent_path") or "").strip()
+        if not thread_id or not agent_path:
+            continue
+        kind = str(item.get("kind") or "updated").strip().casefold()
+        status = {
+            "started": "running",
+            "updated": "running",
+            "completed": "completed",
+            "interrupted": "interrupted",
+            "failed": "failed",
+        }.get(kind, "unknown")
+        existing = by_thread.get(thread_id)
+        if existing is None:
+            label = str(item.get("label") or "").strip()
+            if not label:
+                label = " ".join(
+                    agent_path.rstrip("/").rsplit("/", 1)[-1]
+                    .replace("_", " ")
+                    .replace("-", " ")
+                    .split()
+                ) or "Subagent"
+            existing = {
+                "id": None,
+                "session_id": thread_id,
+                "title": label,
+                "agent_nickname": None,
+                "agent_path": agent_path,
+                "agent_depth": None,
+                "parent_thread_id": None,
+                "relative_path": None,
+                "timestamp": item.get("timestamp"),
+                "activity_at": item.get("timestamp"),
+                "synced_at": None,
+                "document_ready": False,
+            }
+            merged.append(existing)
+            by_thread[thread_id] = existing
+        else:
+            existing["document_ready"] = bool(existing.get("id"))
+        existing["status"] = status
+        existing["last_event_at"] = item.get("timestamp")
+
+    for summary in merged:
+        summary.setdefault("document_ready", bool(summary.get("id")))
+        summary.setdefault("status", "unknown")
+        summary.setdefault("last_event_at", None)
+    return merged
+
+
 def build_logical_activity_map(
     hierarchy: ConversationHierarchy,
     conversations: Iterable[ConversationRef],

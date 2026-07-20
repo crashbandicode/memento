@@ -15,6 +15,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     effective_conversation_timestamp,
     fold_codex_subagents,
     fold_conversation_subagents,
+    merge_subagent_event_summaries,
 )
 
 
@@ -340,6 +341,42 @@ class ConversationHierarchyTests(unittest.TestCase):
         summaries = build_subagent_summaries(hierarchy, [root, child])
 
         self.assertEqual(summaries["root"][0]["title"], "search pagination repair")
+
+    def test_lifecycle_event_surfaces_child_before_document_ingest(self) -> None:
+        summaries = merge_subagent_event_summaries([], [{
+            "agent_thread_id": "child-thread",
+            "agent_path": "/root/events_eof_handoff_trace",
+            "label": "Events EOF Handoff Trace",
+            "kind": "started",
+            "timestamp": "2026-07-20T08:39:45+00:00",
+        }])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertIsNone(summaries[0]["id"])
+        self.assertFalse(summaries[0]["document_ready"])
+        self.assertEqual(summaries[0]["session_id"], "child-thread")
+        self.assertEqual(summaries[0]["status"], "running")
+
+    def test_lifecycle_event_enriches_ready_child_without_duplicate(self) -> None:
+        summaries = merge_subagent_event_summaries([{
+            "id": "child-document",
+            "session_id": "child-thread",
+            "title": "events eof handoff trace",
+            "agent_nickname": "Franklin the 2nd",
+            "agent_path": "/root/events_eof_handoff_trace",
+        }], [{
+            "agent_thread_id": "child-thread",
+            "agent_path": "/root/events_eof_handoff_trace",
+            "label": "Events EOF Handoff Trace",
+            "kind": "completed",
+            "timestamp": "2026-07-20T09:02:00+00:00",
+        }])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["id"], "child-document")
+        self.assertTrue(summaries[0]["document_ready"])
+        self.assertEqual(summaries[0]["agent_nickname"], "Franklin the 2nd")
+        self.assertEqual(summaries[0]["status"], "completed")
 
     def test_logical_activity_uses_latest_real_child_turn(self) -> None:
         root = _ref(

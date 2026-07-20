@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { api, ConversationMeta, ExportDiagnostics } from "@/lib/api-client";
 import { fmt, useI18n } from "@/lib/i18n";
@@ -31,19 +31,48 @@ export default function ConversationPage() {
   const docId = params.id as string;
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
   const [showExport, setShowExport] = useState(false);
+  const metaRequestRef = useRef(0);
+  const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
   const { prompts, syncVersion } = useConversationPrompts(docId);
 
-  useEffect(() => {
-    let cancelled = false;
-    api.getConversation(docId)
+  const refreshMeta = useCallback(() => {
+    const request = ++metaRequestRef.current;
+    return api.getConversation(docId)
       .then((nextMeta) => {
-        if (!cancelled) setMeta(nextMeta);
+        if (request === metaRequestRef.current) setMeta(nextMeta);
       })
       .catch((error: unknown) => {
-        if (!cancelled) console.error(error);
+        if (request === metaRequestRef.current) console.error(error);
       });
-    return () => { cancelled = true; };
+  }, [docId]);
+
+  useEffect(() => {
+    void refreshMeta();
+    return () => { metaRequestRef.current += 1; };
+  }, [docId, refreshMeta]);
+
+  useEffect(() => {
+    if (syncVersion === 0 || metaRefreshTimerRef.current !== null) return;
+    metaRefreshTimerRef.current = window.setTimeout(() => {
+      metaRefreshTimerRef.current = null;
+      void refreshMeta();
+    }, 500);
+  }, [refreshMeta, syncVersion]);
+
+  const pendingSubagentCount = meta?.id === docId
+    ? (meta.subagents || []).filter((subagent) => subagent.document_ready === false).length
+    : 0;
+  useEffect(() => {
+    if (pendingSubagentCount === 0) return;
+    const timer = window.setInterval(() => void refreshMeta(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [pendingSubagentCount, refreshMeta]);
+
+  useEffect(() => () => {
+    if (metaRefreshTimerRef.current !== null) {
+      window.clearTimeout(metaRefreshTimerRef.current);
+    }
   }, [docId]);
 
   const currentMeta = meta?.id === docId ? meta : null;

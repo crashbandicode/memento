@@ -3,10 +3,19 @@
 import Link from "next/link";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/aurora/Icon";
-import type { ConversationSubagentSummary } from "@/lib/api-client";
+import { api } from "@/lib/api-client";
+import type { ConversationMessage, ConversationSubagentSummary } from "@/lib/api-client";
 import styles from "./SubagentBadge.module.css";
 
 const DEFAULT_VISIBLE_AGENTS = 80;
+const PREVIEW_MESSAGE_LIMIT = 30;
+
+type PreviewState = {
+  loading: boolean;
+  error: boolean;
+  total: number;
+  messages: ConversationMessage[];
+};
 
 export default function SubagentBadge({
   count,
@@ -21,6 +30,8 @@ export default function SubagentBadge({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
   const panelId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const total = count || subagents.length;
@@ -43,6 +54,7 @@ export default function SubagentBadge({
   }, [open]);
 
   const orderedSubagents = useMemo(() => {
+    if (!matchedSubagentId) return subagents;
     const matched = matchedSubagentId
       ? subagents.find((subagent) => subagent.id === matchedSubagentId)
       : undefined;
@@ -60,6 +72,37 @@ export default function SubagentBadge({
     ));
   }, [orderedSubagents, query]);
   const visibleSubagents = filteredSubagents.slice(0, DEFAULT_VISIBLE_AGENTS);
+
+  const togglePreview = async (subagent: ConversationSubagentSummary) => {
+    const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
+    if (expandedKey === key) {
+      setExpandedKey(null);
+      return;
+    }
+    setExpandedKey(key);
+    if (!subagent.id || previews[key]) return;
+    setPreviews((current) => ({
+      ...current,
+      [key]: { loading: true, error: false, total: 0, messages: [] },
+    }));
+    try {
+      const response = await api.getLatestMessages(subagent.id, PREVIEW_MESSAGE_LIMIT);
+      setPreviews((current) => ({
+        ...current,
+        [key]: {
+          loading: false,
+          error: false,
+          total: response.total,
+          messages: response.messages,
+        },
+      }));
+    } catch {
+      setPreviews((current) => ({
+        ...current,
+        [key]: { loading: false, error: true, total: 0, messages: [] },
+      }));
+    }
+  };
 
   if (!total) return null;
 
@@ -126,30 +169,44 @@ export default function SubagentBadge({
 
             <div className={styles.list}>
               {visibleSubagents.map((subagent) => {
-                const isMatched = subagent.id === matchedSubagentId;
+                const isMatched = Boolean(matchedSubagentId && subagent.id === matchedSubagentId);
+                const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
+                const expanded = expandedKey === key;
+                const preview = previews[key];
                 const hasDistinctNickname = Boolean(
                   subagent.agent_nickname
                   && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
                 );
                 return (
-                  <Link
-                    key={subagent.session_id || subagent.id}
-                    href={`/conversations/${subagent.id}`}
-                    prefetch={false}
-                    className={`${styles.agentLink} ${isMatched ? styles.matched : ""}`}
-                    onClick={() => setOpen(false)}
-                  >
-                    <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
-                    <span className={styles.agentText}>
-                      <span className={styles.agentTitle}>{subagent.title}</span>
-                      <span className={styles.agentMeta}>
-                        Subagent{typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
-                        {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
+                  <div key={key} className={`${styles.agentCard} ${isMatched ? styles.matched : ""}`}>
+                    <button
+                      type="button"
+                      className={styles.agentSummary}
+                      aria-expanded={expanded}
+                      onClick={() => void togglePreview(subagent)}
+                    >
+                      <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
+                      <span className={styles.agentText}>
+                        <span className={styles.agentTitle}>{subagent.title}</span>
+                        <span className={styles.agentMeta}>
+                          <span className={`${styles.statusDot} ${styles[`status_${subagent.status || "unknown"}`]}`} />
+                          {subagent.status && subagent.status !== "unknown" ? subagent.status : "Subagent"}
+                          {typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
+                          {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
+                          {subagent.document_ready === false ? " · transcript syncing" : ""}
+                        </span>
                       </span>
-                    </span>
-                    {isMatched && <span className={styles.matchLabel}>Match</span>}
-                    <Icon name="chevron_right" size={11} />
-                  </Link>
+                      {isMatched && <span className={styles.matchLabel}>Match</span>}
+                      <Icon name={expanded ? "chevron_up" : "chevron_down"} size={11} />
+                    </button>
+                    {expanded && (
+                      <SubagentPreview
+                        subagent={subagent}
+                        preview={preview}
+                        onOpen={() => setOpen(false)}
+                      />
+                    )}
+                  </div>
                 );
               })}
               {visibleSubagents.length === 0 && (
@@ -166,4 +223,86 @@ export default function SubagentBadge({
       )}
     </div>
   );
+}
+
+function SubagentPreview({
+  subagent,
+  preview,
+  onOpen,
+}: {
+  subagent: ConversationSubagentSummary;
+  preview?: PreviewState;
+  onOpen: () => void;
+}) {
+  if (!subagent.id || subagent.document_ready === false) {
+    return (
+      <div className={styles.previewBody}>
+        <div className={styles.previewPending}>
+          <span className={styles.loadingDot} />
+          The task is visible now; its child transcript is still being normalized.
+        </div>
+      </div>
+    );
+  }
+  if (!preview || preview.loading) {
+    return (
+      <div className={styles.previewBody}>
+        <div className={styles.previewPending}><span className={styles.loadingDot} /> Loading recent child activity…</div>
+      </div>
+    );
+  }
+  if (preview.error) {
+    return <div className={styles.previewBody}><div className={styles.previewPending}>Could not load the child preview.</div></div>;
+  }
+
+  const rows = preview.messages
+    .flatMap((message) => {
+      const role = message.role || message.message_type || "activity";
+      const values: Array<{ key: string; kind: string; label: string; content: string }> = [];
+      if (message.thinking?.trim()) {
+        values.push({ key: `${message.id}-thinking`, kind: "thinking", label: "Thought", content: message.thinking.trim() });
+      }
+      if (message.content?.trim()) {
+        values.push({
+          key: `${message.id}-content`,
+          kind: role,
+          label: role === "assistant" ? "Response" : role === "user" ? "Prompt" : message.tool_name || "Tool",
+          content: message.content.trim(),
+        });
+      }
+      return values;
+    })
+    .slice(-8);
+
+  return (
+    <div className={styles.previewBody}>
+      <div className={styles.previewHeader}>
+        <span>Recent activity</span>
+        <span>{preview.total.toLocaleString()} messages in child thread</span>
+      </div>
+      <div className={styles.previewTimeline}>
+        {rows.map((row) => (
+          <div key={row.key} className={`${styles.previewRow} ${styles[`preview_${row.kind}`] || ""}`}>
+            <span className={styles.previewLabel}>{row.label}</span>
+            <span className={styles.previewText}>{compactPreviewText(row.content)}</span>
+          </div>
+        ))}
+        {rows.length === 0 && <div className={styles.previewPending}>No renderable child activity yet.</div>}
+      </div>
+      <Link
+        href={`/conversations/${subagent.id}`}
+        prefetch={false}
+        className={styles.openThread}
+        onClick={onOpen}
+      >
+        Open full subagent thread
+        <Icon name="chevron_right" size={11} />
+      </Link>
+    </div>
+  );
+}
+
+function compactPreviewText(value: string): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  return compact.length > 280 ? `${compact.slice(0, 277)}…` : compact;
 }
