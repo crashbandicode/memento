@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +110,28 @@ class _ScriptedHttpClient:
         return outcome
 
 
+class _ConcurrentQueue:
+    def __init__(self, items: list[QueueItem]) -> None:
+        self.items = list(items)
+        self.synced: list[int] = []
+        self.failed: list[int] = []
+        self.claim_calls = 0
+
+    def claim_batch(self, **_kwargs) -> list[QueueItem]:
+        self.claim_calls += 1
+        return [self.items.pop(0)] if self.items else []
+
+    def mark_synced(self, item: QueueItem) -> bool:
+        self.synced.append(item.id)
+        return True
+
+    def mark_failed(self, item: QueueItem, _error: str) -> None:
+        self.failed.append(item.id)
+
+    def cleanup_synced(self) -> None:
+        return None
+
+
 class SyncClientStreamingTests(unittest.TestCase):
     @staticmethod
     def _item(
@@ -179,6 +203,60 @@ class SyncClientStreamingTests(unittest.TestCase):
                     ))
                     self.assertEqual(payloads[0][0], expected_route)
                     self.assertEqual(payloads[0][1]["timestamp"], expected)
+
+    def test_scheduler_claims_live_work_while_large_upload_is_running(self) -> None:
+        archive = self._item(150 * 1024 * 1024)
+        archive.id = 1
+        archive.relative_path = "archived/large.jsonl"
+        live = self._item(100)
+        live.id = 2
+        live.relative_path = "sessions/active.jsonl"
+        live.sync_strategy = "delta"
+        live.is_partial = True
+        queue = _ConcurrentQueue([archive, live])
+        client = object.__new__(SyncClient)
+        client._queue = queue
+        client._config = SimpleNamespace(
+            batch_size=20,
+            max_concurrent_uploads=2,
+            max_in_flight_bytes=64 * 1024 * 1024,
+            max_delta_upload_bytes=16 * 1024 * 1024,
+            queue_lease_seconds=300,
+            sync_interval=0.01,
+        )
+        client._running = True
+        client._pause_requested = threading.Event()
+        client._idle = threading.Event()
+        client._pool = ThreadPoolExecutor(max_workers=2)
+        client._delta_catchup_callback = None
+        archive_started = threading.Event()
+        release_archive = threading.Event()
+        live_started = threading.Event()
+
+        def upload(item: QueueItem) -> bool:
+            if item.id == archive.id:
+                archive_started.set()
+                return release_archive.wait(timeout=2)
+            live_started.set()
+            return True
+
+        client._upload = upload
+        worker = threading.Thread(target=client._run)
+        worker.start()
+        try:
+            self.assertTrue(archive_started.wait(timeout=1))
+            self.assertTrue(live_started.wait(timeout=1))
+            self.assertFalse(release_archive.is_set())
+        finally:
+            release_archive.set()
+            deadline = time.monotonic() + 1
+            while len(queue.synced) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            client._running = False
+            worker.join(timeout=2)
+            client._pool.shutdown(wait=True)
+
+        self.assertEqual(sorted(queue.synced), [1, 2])
 
     def test_chunked_upload_reads_only_one_chunk_at_a_time(self) -> None:
         total_size = CHUNK_SIZE * 2 + 123

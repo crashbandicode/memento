@@ -445,6 +445,56 @@ class SyncQueueTests(unittest.TestCase):
         self.assertEqual(metadata.sync_strategy, "metadata")
         self.assertEqual(metadata.payload_bytes, 0)
 
+    def test_live_delta_leapfrogs_historical_backlog(self) -> None:
+        self._enqueue("archived/old.jsonl", "old", "old-hash")
+        self._enqueue(
+            "sessions/active.jsonl", "tail", "tail-hash", "delta", True, 20,
+            base_hash="base-hash", base_offset=10,
+            source_path="/tmp/sessions/active.jsonl",
+        )
+
+        first = self.queue.claim_batch(batch_size=1)[0]
+
+        self.assertEqual(first.relative_path, "sessions/active.jsonl")
+        self.assertTrue(first.is_partial)
+
+    def test_live_delta_uses_reserved_lane_during_oversize_upload(self) -> None:
+        self._enqueue("archived/large.jsonl", "x" * 150_000, "large-hash")
+        large = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]
+        self.assertEqual(large.relative_path, "archived/large.jsonl")
+        self._enqueue(
+            "sessions/active.jsonl", "tail", "tail-hash", "delta", True, 20,
+            base_hash="base-hash", base_offset=10,
+            source_path="/tmp/sessions/active.jsonl",
+        )
+
+        live = self.queue.claim_batch(
+            batch_size=1,
+            max_bytes=100_000,
+            live_delta_reserve_bytes=10_000,
+        )[0]
+
+        self.assertEqual(live.relative_path, "sessions/active.jsonl")
+        self.assertTrue(live.is_partial)
+
+    def test_live_delta_reserve_remains_bounded(self) -> None:
+        self._enqueue("archived/large.jsonl", "x" * 150_000, "large-hash")
+        self.queue.claim_batch(batch_size=1, max_bytes=100_000)
+        self._enqueue(
+            "sessions/active.jsonl", "tail" * 3_000, "tail-hash", "delta", True, 20,
+            base_hash="base-hash", base_offset=10,
+            source_path="/tmp/sessions/active.jsonl",
+        )
+
+        self.assertEqual(
+            self.queue.claim_batch(
+                batch_size=1,
+                max_bytes=100_000,
+                live_delta_reserve_bytes=10_000,
+            ),
+            [],
+        )
+
     def test_metadata_priority_preserves_fifo_and_same_path_barrier(self) -> None:
         first_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
         second_id = "019f144c-82d6-70d0-95e8-e01e7b813e99"

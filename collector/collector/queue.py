@@ -730,8 +730,15 @@ class SyncQueue:
     @_rollback_on_error
     def claim_batch(self, batch_size: int = 20,
                     max_bytes: int = 128 * 1024 * 1024,
-                    lease_seconds: int = 300) -> list[QueueItem]:
-        """Atomically lease a FIFO, byte-bounded, metadata-only batch."""
+                    lease_seconds: int = 300,
+                    live_delta_reserve_bytes: int = 16 * 1024 * 1024,
+                    ) -> list[QueueItem]:
+        """Atomically lease a priority-aware, byte-bounded metadata batch.
+
+        Lightweight metadata and guarded tails from files that are actively
+        growing stay responsive while complete historical snapshots drain.
+        Same-path barriers still prevent a tail from overtaking its base.
+        """
         now = time.time()
         selected: list[tuple[Any, ...]] = []
         tokens: dict[int, str] = {}
@@ -775,19 +782,25 @@ class SyncQueue:
                               AND older.status='pending' AND older.id < q.id
                         )
                      )
-                   ORDER BY CASE WHEN q.sync_strategy='metadata' THEN 0 ELSE 1 END,
+                   ORDER BY CASE
+                                WHEN q.sync_strategy='metadata' THEN 0
+                                WHEN q.sync_strategy='delta' AND q.is_partial=1 THEN 1
+                                ELSE 2
+                            END,
                             q.created_at ASC, q.id ASC
                    LIMIT ?""",
                 (now, now, max(batch_size * 8, batch_size)),
             ).fetchall()
 
             total_bytes = in_flight_bytes
+            live_delta_bytes = 0
             selected_paths: set[tuple[str, str]] = set()
             for row in candidates:
                 path_key = (str(row[1]), str(row[4]))
                 if path_key in selected_paths:
                     continue
                 size = max(0, int(row[15] or 0))
+                is_live_delta = str(row[7]) == "delta" and bool(row[8])
                 if len(selected) >= batch_size:
                     break
                 # Metadata-only work has no payload and must remain claimable
@@ -795,10 +808,20 @@ class SyncQueue:
                 # retain the existing FIFO barrier at the first item that does
                 # not fit, so later files cannot leapfrog it.
                 if size > 0 and total_bytes and total_bytes + size > max_bytes:
-                    break
+                    # An oversized historical upload may consume the ordinary
+                    # byte budget by itself. Keep a small, explicit reserve for
+                    # append-only live tails so the second upload worker is not
+                    # left idle while the visible conversation falls behind.
+                    if not (
+                        is_live_delta
+                        and live_delta_bytes + size <= live_delta_reserve_bytes
+                    ):
+                        break
                 selected.append(row)
                 selected_paths.add(path_key)
                 total_bytes += size
+                if is_live_delta:
+                    live_delta_bytes += size
                 # One oversize payload is legal, but no second payload may be
                 # added. Zero-byte metadata selected before it is harmless.
                 if in_flight_bytes == 0 and size > max_bytes:

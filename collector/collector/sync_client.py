@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import BinaryIO, Callable
 
 import httpx
@@ -50,7 +51,6 @@ class SyncClient:
         except Exception:
             collector_version = "dev"
 
-        from concurrent.futures import ThreadPoolExecutor
         self._pool = ThreadPoolExecutor(max_workers=config.max_concurrent_uploads)
         from .tls import SSL_CONTEXT
         self._client = httpx.Client(
@@ -107,74 +107,84 @@ class SyncClient:
             time.sleep(min(remaining, 0.2))
 
     def _run(self) -> None:
-        from concurrent.futures import as_completed
-        backoff = 1.0
-        while self._running:
-            if self._pause_requested.is_set():
-                self._idle.set()
-                time.sleep(0.05)
-                continue
-            self._idle.clear()
-            if self._pause_requested.is_set():
-                self._idle.set()
+        futures: dict[Future[bool], QueueItem] = {}
+        poll_interval = max(0.05, self._config.sync_interval)
+
+        # Keep polling while uploads are in flight. The old batch barrier waited
+        # for a large archive to finish before it even looked for a newly queued
+        # live delta, leaving otherwise available upload capacity unused.
+        while self._running or futures:
+            self._reap_completed(futures)
+
+            if not self._running:
+                if futures:
+                    wait(tuple(futures), timeout=poll_interval,
+                         return_when=FIRST_COMPLETED)
                 continue
 
-            delay = 0.0
-            try:
-                items = self._queue.claim_batch(
-                    batch_size=min(
-                        self._config.batch_size,
-                        self._config.max_concurrent_uploads,
-                    ),
-                    max_bytes=self._config.max_in_flight_bytes,
-                    lease_seconds=self._config.queue_lease_seconds,
-                )
-                if not items:
-                    delay = self._config.sync_interval
-                    backoff = 1.0
+            if self._pause_requested.is_set():
+                if futures:
+                    wait(tuple(futures), timeout=poll_interval,
+                         return_when=FIRST_COMPLETED)
                 else:
-                    futures = {
-                        self._pool.submit(self._upload, item): item
-                        for item in items
-                    }
-                    synced = 0
-                    for future in as_completed(futures):
-                        item = futures[future]
-                        try:
-                            if future.result():
-                                if self._queue.mark_synced(item):
-                                    synced += 1
-                                    if (
-                                        item.is_partial
-                                        and item.source_path
-                                        and self._delta_catchup_callback
-                                    ):
-                                        self._delta_catchup_callback(item.source_path)
-                            else:
-                                self._queue.mark_failed(item, "upload returned false")
-                        except Exception as exc:
-                            logger.exception(
-                                "Upload worker failed for %s/%s",
-                                item.tool_name, item.relative_path,
-                            )
-                            self._queue.mark_failed(item, str(exc))
+                    self._idle.set()
+                    time.sleep(0.05)
+                continue
 
-                    if synced == 0:
-                        delay = min(backoff, 30.0)
-                        backoff = min(backoff * 2, 30.0)
-                    else:
-                        backoff = 1.0
-                    self._queue.cleanup_synced()
+            available_slots = self._config.max_concurrent_uploads - len(futures)
+            if available_slots > 0:
+                try:
+                    items = self._queue.claim_batch(
+                        batch_size=min(self._config.batch_size, available_slots),
+                        max_bytes=self._config.max_in_flight_bytes,
+                        lease_seconds=self._config.queue_lease_seconds,
+                        live_delta_reserve_bytes=self._config.max_delta_upload_bytes,
+                    )
+                except Exception:
+                    logger.exception("Sync worker claim error")
+                    items = []
+                for item in items:
+                    futures[self._pool.submit(self._upload, item)] = item
 
-            except Exception:
-                logger.exception("Sync worker error")
-                delay = min(backoff, 60.0)
-                backoff = min(backoff * 2, 60.0)
-            finally:
+            if futures:
+                self._idle.clear()
+                wait(tuple(futures), timeout=poll_interval,
+                     return_when=FIRST_COMPLETED)
+            else:
                 self._idle.set()
+                self._sleep_interruptibly(poll_interval)
 
-            if delay:
-                self._sleep_interruptibly(delay)
+        self._idle.set()
+
+    def _reap_completed(
+        self,
+        futures: dict[Future[bool], QueueItem],
+    ) -> None:
+        """Acknowledge completed uploads without blocking queue polling."""
+        completed = [future for future in futures if future.done()]
+        synced = False
+        for future in completed:
+            item = futures.pop(future)
+            try:
+                if future.result():
+                    if self._queue.mark_synced(item):
+                        synced = True
+                        if (
+                            item.is_partial
+                            and item.source_path
+                            and self._delta_catchup_callback
+                        ):
+                            self._delta_catchup_callback(item.source_path)
+                else:
+                    self._queue.mark_failed(item, "upload returned false")
+            except Exception as exc:
+                logger.exception(
+                    "Upload worker failed for %s/%s",
+                    item.tool_name, item.relative_path,
+                )
+                self._queue.mark_failed(item, str(exc))
+        if synced:
+            self._queue.cleanup_synced()
 
     def _upload(self, item: QueueItem) -> bool:
         """Upload one leased item without materializing large payloads."""
