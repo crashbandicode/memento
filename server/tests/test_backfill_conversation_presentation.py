@@ -21,6 +21,7 @@ from server.scripts.backfill_conversation_presentation import (  # noqa: E402
     _cursor_repair_document_ids_query,
     _cursor_title_from_messages,
     _embedding_input_changed,
+    _externalized_claude_context_identities,
     _externalized_prefix,
     _has_leading_cursor_timestamp,
     _invalidate_changed_embeddings,
@@ -33,6 +34,43 @@ from server.services.embedding_service import conversation_embedding_content  # 
 
 
 class ConversationPresentationBackfillTests(unittest.TestCase):
+    @patch(
+        "server.scripts.backfill_conversation_presentation."
+        "iter_large_content_lines"
+    )
+    def test_externalized_claude_context_is_streamed_record_by_record(
+        self,
+        iter_lines,
+    ) -> None:
+        iter_lines.return_value = iter(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "isMeta": True,
+                        "timestamp": "2026-07-20T10:00:00Z",
+                        "message": {
+                            "role": "user",
+                            "content": "Injected workspace context",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "timestamp": "2026-07-20T10:00:01Z",
+                        "message": {"role": "assistant", "content": "reply"},
+                    }
+                ),
+            ]
+        )
+
+        identities, records = _externalized_claude_context_identities("raw/x")
+
+        self.assertEqual(records, 1)
+        self.assertEqual(len(identities), 1)
+        iter_lines.assert_called_once_with("raw/x")
+
     def test_agents_message_is_reclassified_idempotently(self) -> None:
         message = SimpleNamespace(
             role="user",

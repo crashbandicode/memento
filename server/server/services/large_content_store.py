@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
 import boto3
@@ -89,6 +90,34 @@ def read_large_content_prefix(
         if close is not None:
             close()
     return payload.decode("utf-8", errors="replace")
+
+
+def iter_large_content_lines(
+    key: str,
+    *,
+    chunk_size: int = 64 * 1024,
+    s3_client=None,
+) -> Iterator[str]:
+    """Stream one private UTF-8 transcript without a whole-object size cap.
+
+    Offline repair jobs only need to inspect one JSONL record at a time.  Using
+    the bounded whole-object reader for that work made a single large, valid
+    transcript abort an otherwise independent corpus repair.  This iterator
+    keeps memory proportional to the largest source line and always closes the
+    underlying response body when iteration ends.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    client = s3_client or _client()
+    response = client.get_object(Bucket=settings.s3_bucket, Key=key)
+    body = response["Body"]
+    try:
+        for line in body.iter_lines(chunk_size=chunk_size, keepends=False):
+            yield line.decode("utf-8", errors="replace")
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
 
 
 def read_large_content(

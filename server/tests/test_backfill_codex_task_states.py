@@ -20,7 +20,79 @@ def _row(row_id: int, document_id: uuid.UUID, line: int, source: str):
     )
 
 
+def _tool_row(
+    row_id: int,
+    document_id: uuid.UUID,
+    line: int,
+    *,
+    tool_id: str,
+    tool_name: str,
+    tool_input: str,
+    content: str = "",
+    message_type: str = "tool_use",
+):
+    return CodexTaskRow(
+        id=row_id,
+        document_id=document_id,
+        line_number=line,
+        tool_id=tool_id,
+        message_type=message_type,
+        content=content,
+        metadata={"tool_name": tool_name, "tool_input": tool_input},
+    )
+
+
 class CodexTaskStateBackfillTests(unittest.TestCase):
+    def test_cursor_todo_rows_use_the_shared_task_tracker(self):
+        document_id = uuid.uuid4()
+        rows = [
+            _tool_row(
+                1,
+                document_id,
+                10,
+                tool_id="cursor",
+                tool_name="TodoWrite",
+                tool_input=(
+                    '{"todos":['
+                    '{"id":"1","content":"Inspect","status":"completed"},'
+                    '{"id":"2","content":"Repair","status":"in_progress"}'
+                    ']}'
+                ),
+            )
+        ]
+
+        updates = plan_task_state_overlays(rows)
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].task_state["source"], "cursor")
+        self.assertEqual(updates[0].task_state["completed_count"], 1)
+        self.assertEqual(updates[0].task_state["total_count"], 2)
+
+    def test_existing_cross_tool_snapshot_is_never_overwritten(self):
+        document_id = uuid.uuid4()
+        row = _tool_row(
+            1,
+            document_id,
+            10,
+            tool_id="claude_code",
+            tool_name="TodoWrite",
+            tool_input=(
+                '{"todos":[{"id":"1","content":"Keep",'
+                '"status":"pending"}]}'
+            ),
+        )
+        persisted = CodexTaskRow(
+            **{
+                **row.__dict__,
+                "metadata": {
+                    **row.metadata,
+                    "task_state": {"version": 1, "source": "claude_code"},
+                },
+            }
+        )
+
+        self.assertEqual(plan_task_state_overlays([persisted]), [])
+
     def test_overlay_projects_six_tasks_and_tracks_later_replacement(self):
         document_id = uuid.uuid4()
         rows = [

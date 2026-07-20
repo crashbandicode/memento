@@ -134,13 +134,16 @@ def _parsed_identity_rows(payload: str, tool_id: str) -> list[AssistantIdentityR
     return rows
 
 
-async def _legacy_candidates(conn: asyncpg.Connection) -> list[uuid.UUID]:
+async def _legacy_candidates(
+    conn: asyncpg.Connection,
+    tool_ids: tuple[str, ...],
+) -> list[uuid.UUID]:
     rows = await conn.fetch(
         """
         SELECT d.id
         FROM documents d
         WHERE d.category='conversation'
-          AND d.tool_id='codex'
+          AND d.tool_id=ANY($1::text[])
           AND EXISTS (
             SELECT 1
             FROM conversation_messages cm
@@ -149,7 +152,8 @@ async def _legacy_candidates(conn: asyncpg.Connection) -> list[uuid.UUID]:
               AND COALESCE(cm.metadata->>'model', '')=''
           )
         ORDER BY d.file_size_bytes, d.id
-        """
+        """,
+        list(tool_ids),
     )
     return [row["id"] for row in rows]
 
@@ -233,6 +237,7 @@ async def run(
     *,
     apply: bool,
     document_ids: list[uuid.UUID] | None = None,
+    tool_ids: tuple[str, ...] = ("codex",),
 ) -> dict[str, Any]:
     conn = await asyncpg.connect(_database_dsn(), command_timeout=1_800)
     summary: dict[str, Any] = {
@@ -246,7 +251,7 @@ async def run(
         "skipped_sources": [],
     }
     try:
-        candidates = document_ids or await _legacy_candidates(conn)
+        candidates = document_ids or await _legacy_candidates(conn, tool_ids)
         for document_id in candidates:
             summary["documents"] += 1
             source = await _source_revision(conn, document_id)
@@ -302,11 +307,25 @@ def main() -> None:
         dest="document_ids",
         help="limit repair to one document (may be repeated)",
     )
+    parser.add_argument(
+        "--tool",
+        action="append",
+        choices=("all", "codex", "claude_code", "cursor"),
+        dest="tools",
+        help="repair one tool (repeatable); defaults to Codex for compatibility",
+    )
     args = parser.parse_args()
+    selected_tools = tuple(args.tools or ("codex",))
+    if "all" in selected_tools:
+        selected_tools = ("codex", "claude_code", "cursor")
     print(
         json.dumps(
             asyncio.run(
-                run(apply=args.apply, document_ids=args.document_ids)
+                    run(
+                        apply=args.apply,
+                        document_ids=args.document_ids,
+                        tool_ids=selected_tools,
+                    )
             ),
             indent=2,
         )

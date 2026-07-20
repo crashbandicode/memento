@@ -49,7 +49,7 @@ from server.services.embedding_service import (
 )
 from server.services.conversation_activity import refresh_document_activity_at
 from server.services.large_content_store import (
-    read_large_content,
+    iter_large_content_lines,
     read_large_content_prefix,
 )
 from server.services.thread_metadata_service import _has_manual_title
@@ -426,13 +426,27 @@ async def _externalized_prefix(key: str) -> str:
         ) from exc
 
 
-async def _externalized_content(key: str) -> str:
+def _externalized_claude_context_identities(
+    key: str,
+) -> tuple[set[tuple[str, str]], int]:
+    identities: set[tuple[str, str]] = set()
+    records = 0
     try:
-        return await asyncio.to_thread(read_large_content, key)
+        for line in iter_large_content_lines(key):
+            line_identities, line_records = _claude_context_identities(line)
+            identities.update(line_identities)
+            records += line_records
     except Exception as exc:
         raise RuntimeError(
-            f"failed to read externalized transcript for context repair: {key}"
+            f"failed to stream externalized transcript for context repair: {key}"
         ) from exc
+    return identities, records
+
+
+async def _externalized_claude_context(
+    key: str,
+) -> tuple[set[tuple[str, str]], int]:
+    return await asyncio.to_thread(_externalized_claude_context_identities, key)
 
 
 def _timestamp_bucket(value) -> str:
@@ -504,9 +518,14 @@ async def _repair_claude_context_batch(
         if has_inline_embedding_content:
             inline_embedding_documents.add(document.id)
         raw_content = document.content or ""
-        if not raw_content and document.content_s3_key:
-            raw_content = await _externalized_content(document.content_s3_key)
-        identities, record_count = _claude_context_identities(raw_content)
+        if raw_content:
+            identities, record_count = _claude_context_identities(raw_content)
+        elif document.content_s3_key:
+            identities, record_count = await _externalized_claude_context(
+                document.content_s3_key
+            )
+        else:
+            identities, record_count = set(), 0
         identities_by_document[document.id] = identities
         stats.scanned_claude_context_records += record_count
 

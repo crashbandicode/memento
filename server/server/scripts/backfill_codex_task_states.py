@@ -1,11 +1,12 @@
-"""Overlay persisted Codex task plans onto existing normalized messages.
+"""Overlay persisted task plans onto existing normalized messages.
 
 Some preserved legacy transcripts cannot be replaced by a full reparse because
-their verified raw blob is older than their normalized history. Codex still
-stores the complete task replacement inside each normalized ``exec`` row as a
-``tools.update_plan`` call. This repair projects only that persisted value into
-``metadata.task_state``. It never inserts, deletes, renumbers, or changes
-message text.
+their verified raw blob is older than their normalized history. Codex stores
+plans inside normalized ``exec`` rows, while Claude Code and Cursor retain
+their native task tool calls. This repair feeds those already-persisted events
+through the shared task tracker and projects only missing
+``metadata.task_state`` values. It never inserts, deletes, renumbers, changes
+message text, or overwrites an existing snapshot.
 
 Dry-run is the default::
 
@@ -34,6 +35,9 @@ class CodexTaskRow:
     document_id: uuid.UUID
     line_number: int
     metadata: dict[str, Any]
+    tool_id: str = "codex"
+    message_type: str | None = None
+    content: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,7 +53,7 @@ def plan_task_state_overlays(
     rows: Iterable[CodexTaskRow],
 ) -> list[CodexTaskUpdate]:
     """Project nested plan replacements while preserving document order."""
-    trackers: dict[uuid.UUID, TaskStateTracker] = {}
+    trackers: dict[tuple[uuid.UUID, str], TaskStateTracker] = {}
     updates: list[CodexTaskUpdate] = []
     for row in sorted(rows, key=lambda item: (item.document_id, item.line_number)):
         metadata = row.metadata
@@ -57,16 +61,24 @@ def plan_task_state_overlays(
         tool_input = str(metadata.get("tool_input") or "")
         message = NormalizedMessage(
             role="tool",
-            content="",
+            content=row.content,
             tool_name=tool_name,
             tool_input=tool_input,
-            tool_call_id=str(metadata.get("tool_call_id") or ""),
+            tool_call_id=str(
+                metadata.get("tool_call_id")
+                or metadata.get("source_id")
+                or ""
+            ),
+            raw_type=row.message_type or "",
         )
-        tracker = trackers.setdefault(row.document_id, TaskStateTracker("codex"))
+        tracker = trackers.setdefault(
+            (row.document_id, row.tool_id),
+            TaskStateTracker(row.tool_id),
+        )
         tracker.apply(message)
         if message.task_state is None:
             continue
-        if metadata.get("task_state") == message.task_state:
+        if metadata.get("task_state") is not None:
             continue
         updates.append(CodexTaskUpdate(
             id=row.id,
@@ -88,30 +100,71 @@ def _metadata_dict(value: Any) -> dict[str, Any]:
 async def _candidate_rows(
     conn: asyncpg.Connection,
     document_ids: list[uuid.UUID] | None,
+    tool_ids: tuple[str, ...],
 ) -> list[CodexTaskRow]:
     rows = await conn.fetch(
         """
-        SELECT cm.id, cm.document_id, cm.line_number, cm.metadata
+        WITH task_documents AS (
+            SELECT DISTINCT cm.document_id
+            FROM conversation_messages cm
+            JOIN documents d ON d.id=cm.document_id
+            WHERE d.category='conversation'
+              AND d.tool_id=ANY($2::text[])
+              AND cm.role='tool'
+              AND (
+                lower(regexp_replace(
+                  COALESCE(cm.metadata->>'tool_name', ''),
+                  '[^a-zA-Z0-9]', '', 'g'
+                )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskstop|taskprogress)$'
+                OR (
+                  lower(regexp_replace(
+                    COALESCE(cm.metadata->>'tool_name', ''),
+                    '[^a-zA-Z0-9]', '', 'g'
+                  )) LIKE '%exec'
+                  AND COALESCE(cm.metadata->>'tool_input', '') ILIKE '%update_plan%'
+                )
+              )
+              AND ($1::uuid[] IS NULL OR cm.document_id=ANY($1::uuid[]))
+        )
+        SELECT cm.id, cm.document_id, cm.line_number, cm.message_type,
+               cm.content, cm.metadata, d.tool_id
         FROM conversation_messages cm
         JOIN documents d ON d.id=cm.document_id
+        JOIN task_documents td ON td.document_id=cm.document_id
         WHERE d.category='conversation'
-          AND d.tool_id='codex'
+          AND d.tool_id=ANY($2::text[])
           AND cm.role='tool'
-          AND lower(regexp_replace(
+          AND (
+            lower(regexp_replace(
+              COALESCE(cm.metadata->>'tool_name', ''),
+              '[^a-zA-Z0-9]', '', 'g'
+            )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskstop|taskprogress)$'
+            OR (
+              lower(regexp_replace(
                 COALESCE(cm.metadata->>'tool_name', ''),
                 '[^a-zA-Z0-9]', '', 'g'
               )) LIKE '%exec'
-          AND COALESCE(cm.metadata->>'tool_input', '') ILIKE '%update_plan%'
+              AND COALESCE(cm.metadata->>'tool_input', '') ILIKE '%update_plan%'
+            )
+            OR (
+              d.tool_id='claude_code'
+              AND cm.message_type IN ('tool_result', 'tool_output')
+            )
+          )
           AND ($1::uuid[] IS NULL OR cm.document_id=ANY($1::uuid[]))
         ORDER BY cm.document_id, cm.line_number
         """,
         document_ids,
+        list(tool_ids),
     )
     return [CodexTaskRow(
         id=int(row["id"]),
         document_id=row["document_id"],
         line_number=int(row["line_number"]),
         metadata=_metadata_dict(row["metadata"]),
+        tool_id=str(row["tool_id"]),
+        message_type=row["message_type"],
+        content=str(row["content"] or ""),
     ) for row in rows]
 
 
@@ -132,6 +185,7 @@ async def _apply_updates(
                   AND document_id=$3
                   AND line_number=$4
                   AND COALESCE(metadata->>'tool_input', '')=$5
+                  AND NOT (metadata ? 'task_state')
                 """,
                 update.id,
                 json.dumps(update.task_state),
@@ -147,10 +201,11 @@ async def run(
     *,
     apply: bool,
     document_ids: list[uuid.UUID] | None = None,
+    tool_ids: tuple[str, ...] = ("codex",),
 ) -> dict[str, Any]:
     conn = await asyncpg.connect(_database_dsn(), command_timeout=1_800)
     try:
-        rows = await _candidate_rows(conn, document_ids)
+        rows = await _candidate_rows(conn, document_ids, tool_ids)
         updates = plan_task_state_overlays(rows)
         documents = {row.document_id for row in rows}
         applied = await _apply_updates(conn, updates) if apply and updates else 0
@@ -158,6 +213,7 @@ async def run(
             "mode": "apply" if apply else "dry-run",
             "candidate_rows": len(rows),
             "documents": len(documents),
+            "tools": sorted({row.tool_id for row in rows}),
             "planned": len(updates),
             "applied": applied,
         }
@@ -179,10 +235,21 @@ def main() -> None:
         dest="document_ids",
         help="limit repair to one document (may be repeated)",
     )
+    parser.add_argument(
+        "--tool",
+        action="append",
+        choices=("all", "codex", "claude_code", "cursor"),
+        dest="tools",
+        help="repair one tool (repeatable); defaults to Codex for compatibility",
+    )
     args = parser.parse_args()
+    selected_tools = tuple(args.tools or ("codex",))
+    if "all" in selected_tools:
+        selected_tools = ("codex", "claude_code", "cursor")
     print(json.dumps(asyncio.run(run(
         apply=args.apply,
         document_ids=args.document_ids,
+        tool_ids=selected_tools,
     )), indent=2))
 
 

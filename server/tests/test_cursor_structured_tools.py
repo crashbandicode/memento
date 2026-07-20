@@ -26,6 +26,66 @@ from server.services.ingest_service import (  # noqa: E402
 
 
 class CursorStructuredToolStorageTests(unittest.TestCase):
+    def test_cursor_state_question_keeps_multiselect_and_inline_answer(self) -> None:
+        record = {
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "question-1",
+            "timestamp": "2026-07-20T12:00:00Z",
+            "tool_name": "ask_question",
+            "tool_input": json.dumps({
+                "questions": [{
+                    "id": "targets",
+                    "prompt": "Which targets?",
+                    "allowMultiple": True,
+                    "options": [
+                        {"id": "api", "label": "API"},
+                        {"id": "web", "label": "Web"},
+                    ],
+                }],
+            }),
+            "content": json.dumps({
+                "answers": [{
+                    "questionId": "targets",
+                    "selectedOptionIds": ["api", "web"],
+                    "freeformText": "",
+                }],
+            }),
+        }
+
+        messages = list(iter_conversation_messages(json.dumps(record), "cursor"))
+
+        self.assertEqual(len(messages), 1)
+        question = messages[0].interaction["questions"][0]
+        self.assertEqual(question["type"], "multi_select")
+        answer = messages[0].interaction_response["answers"][0]
+        self.assertEqual(answer["selected_option_ids"], ["api", "web"])
+
+    def test_cursor_state_todowrite_uses_authoritative_final_todos(self) -> None:
+        record = {
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "todo-result-1",
+            "timestamp": "2026-07-20T12:00:00Z",
+            "tool_name": "todo_write",
+            "tool_input": json.dumps({"merge": True}),
+            "content": json.dumps({
+                "success": True,
+                "finalTodos": [
+                    {"id": "1", "content": "Inspect", "status": "completed"},
+                    {"id": "2", "content": "Repair", "status": "in_progress"},
+                ],
+            }),
+        }
+
+        messages = list(iter_conversation_messages(json.dumps(record), "cursor"))
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].task_state["source"], "cursor")
+        self.assertEqual(messages[0].task_state["completed_count"], 1)
+        self.assertEqual(messages[0].task_state["total_count"], 2)
+        self.assertEqual(messages[0].task_state["active_task_id"], "2")
+
     def test_cursor_state_projection_keeps_thinking_identity_tasks_and_tools(
         self,
     ) -> None:

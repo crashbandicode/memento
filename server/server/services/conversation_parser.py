@@ -1380,18 +1380,35 @@ def parse_conversation_object(
             content = _extract_content(obj.get("content", ""))
             tool_name = _coerce_text(obj.get("tool_name") or "Cursor")
             tool_input = _coerce_text(obj.get("tool_input"))
+            tool_call_id = _bounded_interaction_text(
+                obj.get("tool_call_id") or obj.get("id"),
+                512,
+            )
+            interaction = normalize_question_interaction(
+                tool_name,
+                tool_input,
+                source="cursor",
+                interaction_id=tool_call_id,
+            )
+            interaction_response = None
+            if interaction is not None:
+                response_payload = _json_mapping(content)
+                if "answers" in response_payload or "cancel" in content.casefold():
+                    interaction_response = build_question_response(
+                        interaction,
+                        content,
+                    )
             return NormalizedMessage(
                 role="tool",
                 content=content or f"[{tool_name}]",
                 tool_name=tool_name,
                 tool_input=tool_input,
-                tool_call_id=_bounded_interaction_text(
-                    obj.get("tool_call_id"),
-                    512,
-                ),
+                tool_call_id=tool_call_id,
                 timestamp=timestamp,
                 raw_type=msg_type,
                 source_id=_cursor_source_id(obj, obj.get("message")),
+                interaction=interaction,
+                interaction_response=interaction_response,
             )
         message = obj.get("message", {})
         if isinstance(message, dict):
@@ -1670,7 +1687,7 @@ def _serialize_tool_input(value: object) -> str:
 _QUESTION_TOOL_NAMES = {
     "askquestion",
     "askuserquestion",
-    "request_user_input",
+    "requestuserinput",
 }
 _MAX_INTERACTION_QUESTIONS = 8
 _MAX_INTERACTION_OPTIONS = 12
@@ -1909,6 +1926,24 @@ class TaskStateTracker:
         if message.role == "tool" and message.tool_name:
             name = self._normalized_name(message.tool_name)
             payload = _json_mapping(message.tool_input)
+            # Cursor's state export can retain a TodoWrite result as one
+            # combined row: the input contains only ``merge`` while the
+            # authoritative replacement is returned as ``finalTodos`` in the
+            # row content. Treat that narrow native shape exactly like the
+            # equivalent TodoWrite input so current ingestion and historical
+            # repair share one state transition.
+            if (
+                name == "todowrite"
+                and not isinstance(payload.get("tasks"), list)
+                and not isinstance(payload.get("todos"), list)
+            ):
+                result_payload = _json_mapping(message.content)
+                final_todos = result_payload.get(
+                    "finalTodos",
+                    result_payload.get("final_todos"),
+                )
+                if isinstance(final_todos, list):
+                    payload = {**payload, "todos": final_todos}
             changed = self._apply_event(
                 name,
                 payload,
@@ -2179,7 +2214,12 @@ def normalize_question_interaction(
     interaction_id: object = "",
 ) -> dict[str, object] | None:
     """Normalize interactive-question payloads emitted by supported tools."""
-    if tool_name.strip().casefold() not in _QUESTION_TOOL_NAMES:
+    normalized_tool_name = re.sub(
+        r"[^a-z0-9]",
+        "",
+        tool_name.strip().casefold(),
+    )
+    if normalized_tool_name not in _QUESTION_TOOL_NAMES:
         return None
     payload = _json_mapping(raw_input)
     raw_questions = payload.get("questions")
@@ -2208,6 +2248,7 @@ def normalize_question_interaction(
         )
         multiple = bool(
             raw_question.get("multiSelect")
+            or raw_question.get("allowMultiple")
             or raw_question.get("allow_multiple")
             or raw_question.get("type") == "multi_select"
         )
@@ -2314,7 +2355,28 @@ def build_question_response(
         )
         parsed = raw_output if isinstance(raw_output, dict) else {}
     structured_answers = parsed.get("answers")
-    if not isinstance(structured_answers, dict):
+    if isinstance(structured_answers, list):
+        answers_by_question: dict[str, list[str]] = {}
+        for item in structured_answers:
+            if not isinstance(item, dict):
+                continue
+            question_id = _coerce_text(
+                item.get("questionId") or item.get("question_id") or item.get("id")
+            )
+            if not question_id:
+                continue
+            values = _answer_texts(
+                item.get("selectedOptionIds", item.get("selected_option_ids"))
+            )
+            freeform = _bounded_interaction_text(
+                item.get("freeformText", item.get("freeform_text")),
+                4096,
+            )
+            if freeform:
+                values.append(freeform)
+            answers_by_question[question_id] = values
+        structured_answers = answers_by_question
+    elif not isinstance(structured_answers, dict):
         structured_answers = {}
 
     raw_questions = interaction.get("questions")

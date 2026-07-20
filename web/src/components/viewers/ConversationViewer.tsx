@@ -252,13 +252,22 @@ type PairedQuestionResponse = {
   message: ConversationMessage;
 };
 
+function messageOwnsQuestionResponse(msg: ConversationMessage): boolean {
+  const interactionId = msg.interaction_response?.interaction_id;
+  if (!interactionId) return false;
+  if (msg.interaction?.id === interactionId) return true;
+  return Boolean(
+    msg.tool_calls?.some((call) => call.interaction?.id === interactionId),
+  );
+}
+
 function messageVisibilityGroups(
   msg: ConversationMessage,
   toolId: string,
   questionResponses: ReadonlyMap<string, PairedQuestionResponse>,
 ): ConversationVisibilityKey[] {
   const role = msg.role || msg.message_type || "unknown";
-  if (msg.interaction_response) return ["user"];
+  if (msg.interaction_response && !messageOwnsQuestionResponse(msg)) return ["user"];
   if (role === "user") return [isSubagentDispatchMessage(msg) ? "context" : "user"];
   if (role === "assistant") {
     const groups = new Set<ConversationVisibilityKey>();
@@ -767,6 +776,7 @@ export default function ConversationViewer({
     if (
       msg.interaction_response?.interaction_id
       && questionIds.has(msg.interaction_response.interaction_id)
+      && !messageOwnsQuestionResponse(msg)
     ) {
       return null;
     }
@@ -3220,7 +3230,7 @@ export const ChatBubble = memo(function ChatBubble({
     <MessageCopyFrame markdown={messageMarkdown} t={t}>{node}</MessageCopyFrame>
   );
 
-  if (msg.interaction_response) {
+  if (msg.interaction_response && !messageOwnsQuestionResponse(msg)) {
     return withCopyControls(<QuestionResponseCard response={msg.interaction_response} t={t} />);
   }
 

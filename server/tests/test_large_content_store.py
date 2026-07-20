@@ -24,6 +24,7 @@ from server.services.ingest_service import (  # noqa: E402
     _prepare_document_metadata,
 )
 from server.services.large_content_store import (  # noqa: E402
+    iter_large_content_lines,
     read_large_content_prefix,
     store_large_content,
 )
@@ -71,7 +72,33 @@ class _PrefixS3:
         return {"Body": io.BytesIO(self.payload)}
 
 
+class _StreamingBody(io.BytesIO):
+    def iter_lines(self, *, chunk_size, keepends):
+        self.chunk_size = chunk_size
+        self.keepends = keepends
+        yield from self.read().splitlines(keepends=keepends)
+
+
+class _StreamingS3:
+    def __init__(self, payload: bytes):
+        self.body = _StreamingBody(payload)
+        self.calls = []
+
+    def get_object(self, *, Bucket, Key):
+        self.calls.append((Bucket, Key))
+        return {"Body": self.body}
+
+
 class LargeContentStoreTests(unittest.TestCase):
+    def test_large_content_lines_stream_without_whole_object_limit(self) -> None:
+        client = _StreamingS3(b'{"first": 1}\n{"second": 2}\n')
+
+        lines = list(iter_large_content_lines("raw/thread.txt", s3_client=client))
+
+        self.assertEqual(lines, ['{"first": 1}', '{"second": 2}'])
+        self.assertEqual(client.calls, [(settings.s3_bucket, "raw/thread.txt")])
+        self.assertTrue(client.body.closed)
+
     def test_prefix_read_uses_a_bounded_s3_range(self) -> None:
         client = _PrefixS3(b"abcdef")
 
