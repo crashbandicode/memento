@@ -30,9 +30,9 @@ from .history_recovery import (
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
 from .conversation_identity import (
-    cursor_session_id,
-    select_canonical_cursor_document,
-    should_relocate_cursor_document,
+    conversation_session_id,
+    select_canonical_conversation_document,
+    should_relocate_conversation_document,
 )
 
 # Set of background tasks — prevents GC from collecting them before completion
@@ -1234,18 +1234,23 @@ def _scoped_sync_state_select(
     return statement
 
 
-def _scoped_cursor_identity_select(
+def _scoped_conversation_identity_select(
+    tool_id: str,
     session_id: str,
     machine_id: str | None,
     user_id: str | None,
 ):
-    """Select all same-device aliases for one verified Cursor session UUID."""
+    """Select all same-device aliases for one verified session UUID."""
     statement = select(Document).where(
-        Document.tool_id == "cursor",
+        Document.tool_id == tool_id,
         Document.category == "conversation",
         Document.machine_id == machine_id,
         Document.metadata_["session_id"].astext == session_id,
     )
+    if tool_id == "codex":
+        statement = statement.where(
+            Document.metadata_["thread_id"].astext == session_id,
+        )
     if user_id is not None:
         statement = statement.where(
             Document.machine_id.in_(
@@ -1253,6 +1258,20 @@ def _scoped_cursor_identity_select(
             )
         )
     return statement
+
+
+def _scoped_cursor_identity_select(
+    session_id: str,
+    machine_id: str | None,
+    user_id: str | None,
+):
+    """Backward-compatible Cursor-specific identity selector."""
+    return _scoped_conversation_identity_select(
+        "cursor",
+        session_id,
+        machine_id,
+        user_id,
+    )
 
 
 def _source_lock_id(
@@ -1334,7 +1353,7 @@ async def ingest_file(
     category = normalize_ingest_category(tool_id, category, relative_path)
     received_at = datetime.now(timezone.utc)
     source_modified_at = bounded_source_timestamp(timestamp, received_at) or received_at
-    stable_source_identity = cursor_session_id(tool_id, category, metadata)
+    stable_source_identity = conversation_session_id(tool_id, category, metadata)
     await _lock_ingest_source(
         db,
         machine_id=machine_id,
@@ -1375,7 +1394,8 @@ async def ingest_file(
     if stable_source_identity is not None:
         identity_documents = (
             await db.execute(
-                _scoped_cursor_identity_select(
+                _scoped_conversation_identity_select(
+                    tool_id,
                     stable_source_identity,
                     machine_id,
                     user_id,
@@ -1383,9 +1403,10 @@ async def ingest_file(
             )
         ).scalars().all()
         if identity_documents:
-            doc = select_canonical_cursor_document(
+            doc = select_canonical_conversation_document(
                 identity_documents,
-                stable_source_identity,
+                tool_id=tool_id,
+                session_id=stable_source_identity,
             )
     identity_path_conflict = (
         path_doc is not None
@@ -1396,7 +1417,8 @@ async def ingest_file(
         stable_source_identity is not None
         and doc is not None
         and not identity_path_conflict
-        and should_relocate_cursor_document(
+        and should_relocate_conversation_document(
+            tool_id=tool_id,
             session_id=stable_source_identity,
             current_path=doc.relative_path,
             incoming_path=relative_path,

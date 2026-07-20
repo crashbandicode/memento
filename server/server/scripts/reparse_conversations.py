@@ -44,7 +44,7 @@ from server.services.history_recovery import (
 )
 
 
-PARSER_REVISION = "task-state-v5"
+PARSER_REVISION = "conversation-semantics-v6"
 SUPPORTED_TOOLS = ("codex", "claude_code", "cursor")
 COPY_BATCH_SIZE = 2_000
 SOURCE_READ_SLACK_BYTES = 1
@@ -122,11 +122,18 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
             run_id uuid PRIMARY KEY,
             parser_revision text NOT NULL,
             state text NOT NULL,
+            requested_document_ids uuid[],
             created_at timestamptz NOT NULL DEFAULT now(),
             staged_at timestamptz,
             cutover_at timestamptz,
             refreshed_at timestamptz
         )
+        """
+    )
+    await conn.execute(
+        """
+        ALTER TABLE conversation_reparse_runs
+        ADD COLUMN IF NOT EXISTS requested_document_ids uuid[]
         """
     )
     await conn.execute(
@@ -174,34 +181,46 @@ async def _ensure_tables(conn: asyncpg.Connection) -> None:
 async def _create_or_load_run(
     conn: asyncpg.Connection,
     run_id: uuid.UUID | None,
+    *,
+    requested_document_ids: list[uuid.UUID] | None = None,
 ) -> uuid.UUID:
     await _ensure_tables(conn)
+    requested = (
+        sorted(set(requested_document_ids), key=str)
+        if requested_document_ids is not None
+        else None
+    )
     if run_id is None:
         run_id = uuid.uuid4()
         await conn.execute(
             """
             INSERT INTO conversation_reparse_runs
-                (run_id, parser_revision, state)
-            VALUES ($1, $2, 'staging')
+                (run_id, parser_revision, state, requested_document_ids)
+            VALUES ($1, $2, 'staging', $3)
             """,
             run_id,
             PARSER_REVISION,
+            requested,
         )
         return run_id
 
     row = await conn.fetchrow(
-        "SELECT parser_revision, state FROM conversation_reparse_runs WHERE run_id=$1",
+        """
+        SELECT parser_revision, state, requested_document_ids
+        FROM conversation_reparse_runs WHERE run_id=$1
+        """,
         run_id,
     )
     if row is None:
         await conn.execute(
             """
             INSERT INTO conversation_reparse_runs
-                (run_id, parser_revision, state)
-            VALUES ($1, $2, 'staging')
+                (run_id, parser_revision, state, requested_document_ids)
+            VALUES ($1, $2, 'staging', $3)
             """,
             run_id,
             PARSER_REVISION,
+            requested,
         )
     elif row["parser_revision"] != PARSER_REVISION:
         raise RuntimeError(
@@ -209,6 +228,10 @@ async def _create_or_load_run(
         )
     elif row["state"] == "cutover":
         raise RuntimeError("run has already been cut over")
+    elif list(row["requested_document_ids"] or []) != list(requested or []):
+        raise RuntimeError(
+            "run document scope changed; start a new reparse run"
+        )
     return run_id
 
 
@@ -537,7 +560,11 @@ async def stage(
     conn = await _connect()
     started = time.perf_counter()
     try:
-        run_id = await _create_or_load_run(conn, run_id)
+        run_id = await _create_or_load_run(
+            conn,
+            run_id,
+            requested_document_ids=document_ids,
+        )
         if document_ids is None:
             document_ids = await _document_ids(
                 conn,
@@ -630,18 +657,24 @@ async def status(run_id: uuid.UUID) -> dict:
             """,
             run_id,
         )
-        eligible = await conn.fetchval(
-            """
-            SELECT count(*) FROM documents
-            WHERE category='conversation' AND tool_id=ANY($1::text[])
-            """,
-            list(SUPPORTED_TOOLS),
+        requested_document_ids = list(run["requested_document_ids"] or [])
+        eligible = (
+            len(requested_document_ids)
+            if requested_document_ids
+            else await conn.fetchval(
+                """
+                SELECT count(*) FROM documents
+                WHERE category='conversation' AND tool_id=ANY($1::text[])
+                """,
+                list(SUPPORTED_TOOLS),
+            )
         )
         result = {
             "run_id": str(run_id),
             "state": run["state"],
             "parser_revision": run["parser_revision"],
             "eligible_documents": eligible,
+            "targeted": bool(requested_document_ids),
             "changed_since_stage": changed,
             "manifest": [dict(row) for row in rows],
         }
@@ -920,7 +953,7 @@ async def cutover(
             await conn.execute("SET LOCAL statement_timeout = '15min'")
             run = await conn.fetchrow(
                 """
-                SELECT parser_revision, state
+                SELECT parser_revision, state, requested_document_ids
                 FROM conversation_reparse_runs WHERE run_id=$1 FOR UPDATE
                 """,
                 run_id,
@@ -932,13 +965,31 @@ async def cutover(
             if run["state"] == "cutover":
                 raise RuntimeError("run has already been cut over")
 
-            eligible = await conn.fetchval(
-                """
-                SELECT count(*) FROM documents
-                WHERE category='conversation' AND tool_id=ANY($1::text[])
-                """,
-                list(SUPPORTED_TOOLS),
-            )
+            requested_document_ids = list(run["requested_document_ids"] or [])
+            if requested_document_ids:
+                eligible = len(requested_document_ids)
+                present = await conn.fetchval(
+                    """
+                    SELECT count(*) FROM documents
+                    WHERE id=ANY($1::uuid[])
+                      AND category='conversation'
+                      AND tool_id=ANY($2::text[])
+                    """,
+                    requested_document_ids,
+                    list(SUPPORTED_TOOLS),
+                )
+                if present != eligible:
+                    raise RuntimeError(
+                        "targeted reparse source set changed; start a new run"
+                    )
+            else:
+                eligible = await conn.fetchval(
+                    """
+                    SELECT count(*) FROM documents
+                    WHERE category='conversation' AND tool_id=ANY($1::text[])
+                    """,
+                    list(SUPPORTED_TOOLS),
+                )
             staged = await conn.fetchval(
                 """
                 SELECT count(*)
@@ -973,11 +1024,13 @@ async def cutover(
                   AND (
                     d.id IS NULL OR d.category <> 'conversation'
                     OR d.tool_id <> ALL($3::text[])
+                    OR ($4::uuid[] IS NOT NULL AND m.document_id <> ALL($4::uuid[]))
                   )
                 """,
                 run_id,
                 ['staged', 'incomplete'],
                 list(SUPPORTED_TOOLS),
+                requested_document_ids or None,
             )
             manifest_error = cutover_manifest_error(
                 eligible=eligible,

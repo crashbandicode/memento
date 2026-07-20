@@ -369,7 +369,9 @@ class CodexTool(BaseTool):
         if parts[0] == "sessions" and abs_path.suffix == ".jsonl":
             session_meta = self._read_initial_session_meta(abs_path)
             project_name, project_path = self._extract_cwd_from_meta(session_meta)
-            meta: dict = {"session_name": abs_path.stem}
+            # Emit an explicit false value so restoring an archived thread can
+            # clear the prior state on its stable server-side document.
+            meta: dict = {"session_name": abs_path.stem, "archived": False}
             if project_name:
                 meta["project_hash"] = project_name
             if project_path:

@@ -14,7 +14,10 @@ from .config import settings
 from .db.models import Base
 from .db.session import engine
 from .logging_filters import install_sensitive_query_filter
-from .services.conversation_identity import CURSOR_SESSION_UNIQUE_INDEX_SQL
+from .services.conversation_identity import (
+    CODEX_SESSION_UNIQUE_INDEX_SQL,
+    CURSOR_SESSION_UNIQUE_INDEX_SQL,
+)
 from .services.device_service import DeviceOwnershipError
 
 
@@ -351,6 +354,9 @@ def _run_migrations(conn) -> None:
         # The server upserts these by the verified session UUID; enforce that
         # invariant in PostgreSQL as the final concurrent-writer guard.
         CURSOR_SESSION_UNIQUE_INDEX_SQL,
+        # Codex moves a rollout between sessions/ and archived_sessions/ while
+        # retaining one thread UUID. Keep that move as one logical document.
+        CODEX_SESSION_UNIQUE_INDEX_SQL,
         "CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_path_trgm ON documents USING gin (relative_path gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_content_trgm ON documents USING gin (content gin_trgm_ops)",

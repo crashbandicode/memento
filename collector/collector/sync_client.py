@@ -190,6 +190,11 @@ class SyncClient:
         """Upload one leased item without materializing large payloads."""
         if not self._running or self._pause_requested.is_set():
             return False
+        item_metadata = dict(item.metadata)
+        force_reprocess_nonce = item_metadata.pop(
+            "_queue_force_reprocess_nonce",
+            None,
+        )
         payload = {
             "tool": item.tool_name,
             "category": item.category,
@@ -200,7 +205,7 @@ class SyncClient:
             "offset": item.offset,
             "file_size": item.payload_bytes,
             "sync_strategy": item.sync_strategy,
-            "metadata": item.metadata,
+            "metadata": item_metadata,
             # New queue rows retain the filesystem's source mtime. Rows from
             # pre-v4 queues have no such value and keep the historical enqueue
             # time fallback instead of becoming unreadable after migration.
@@ -234,6 +239,12 @@ class SyncClient:
             ) or size <= CHUNK_SIZE:
                 with self._queue.open_payload(item) as stream:
                     return self._upload_multipart(payload, stream)
+            if force_reprocess_nonce:
+                return self._upload_chunked(
+                    payload,
+                    item,
+                    force_reprocess_nonce=force_reprocess_nonce,
+                )
             return self._upload_chunked(payload, item)
 
         except DeltaBaseConflict:
@@ -307,11 +318,19 @@ class SyncClient:
         )
         return False
 
-    def _upload_chunked(self, payload: dict, item: QueueItem) -> bool:
+    def _upload_chunked(
+        self,
+        payload: dict,
+        item: QueueItem,
+        *,
+        force_reprocess_nonce: str | None = None,
+    ) -> bool:
         """Stream a large spool file in fixed-size chunks."""
         total_size = item.payload_bytes
         total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         upload_id = f"{payload['tool']}/{payload['relative_path']}/{payload['hash'][:8]}"
+        if force_reprocess_nonce:
+            upload_id = f"{upload_id}/repair-{force_reprocess_nonce}"
 
         logger.info(
             "Chunked upload: %s (%d bytes, %d chunks)",

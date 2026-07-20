@@ -292,6 +292,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             _Result(scalar_value=4306),
             _Result(scalar_value=None),
             _Result(rows=[self.doc, child]),
+            _Result(rows=[]),
         ])
 
         payload = await get_conversation(

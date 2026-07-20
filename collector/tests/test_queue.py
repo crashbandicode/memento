@@ -186,6 +186,26 @@ class SyncQueueTests(unittest.TestCase):
         claimed = self.queue.claim_batch(batch_size=1)[0]
         self.assertEqual(claimed.relative_path, "sessions/repair.jsonl")
 
+    def test_server_requested_repair_is_not_starved_by_live_deltas(self) -> None:
+        self._enqueue("sessions/repair.jsonl", "repair", "hash-repair")
+        self._enqueue(
+            "sessions/active.jsonl",
+            "tail",
+            "hash-tail",
+            "delta",
+            True,
+            20,
+            base_hash="hash-base",
+            base_offset=10,
+            source_path="/tmp/sessions/active.jsonl",
+        )
+
+        self.queue.prioritize_file("codex", "sessions/repair.jsonl")
+
+        claimed = self.queue.claim_batch(batch_size=1)[0]
+        self.assertEqual(claimed.relative_path, "sessions/repair.jsonl")
+        self.assertFalse(claimed.is_partial)
+
     def test_delta_rows_remain_fifo_and_one_per_path(self) -> None:
         self._enqueue("history.jsonl", "first", "hash-1", "delta", True, 10)
         self._enqueue("history.jsonl", "second", "hash-2", "delta", True, 20)

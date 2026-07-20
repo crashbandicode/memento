@@ -169,6 +169,7 @@ def test_user_root_identity_and_cwd_use_one_initial_read(
     assert initial_reads == 1
     assert classification.metadata == {
         "session_name": path.stem,
+        "archived": False,
         "project_hash": "demo-project",
         "project_path": r"C:\Users\intpa\projects\demo-project",
         "session_id": ROOT_ID,

@@ -269,6 +269,28 @@ class SyncClientStreamingTests(unittest.TestCase):
         self.assertEqual(queue.stream.largest_read, CHUNK_SIZE)
         self.assertEqual(queue.renewals, 3)
 
+    def test_repair_snapshot_gets_fresh_upload_id_without_leaking_queue_state(
+        self,
+    ) -> None:
+        total_size = CHUNK_SIZE + 1
+        queue = _FakeQueue(total_size)
+        http_client = _ScriptedHttpClient([_Response(), _Response()])
+        client = self._client(queue, http_client)
+        item = self._item(total_size)
+        item.metadata = {
+            "session_id": "thread",
+            "_queue_force_reprocess_nonce": "repair-token",
+        }
+
+        self.assertTrue(client._upload(item))
+        self.assertEqual(len(http_client.calls), 2)
+        for call in http_client.calls:
+            self.assertEqual(
+                call["metadata"]["upload_id"],
+                "codex/thread.jsonl/hash/repair-repair-token",
+            )
+            self.assertEqual(call["metadata"]["metadata"], {"session_id": "thread"})
+
     def test_guarded_delta_uses_synchronous_multipart_and_sends_base(self) -> None:
         size = CHUNK_SIZE + 123
         queue = _FakeQueue(size)

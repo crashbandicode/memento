@@ -156,11 +156,12 @@ _MAX_STRUCTURED_TOOL_INPUT_BYTES = 64 * 1024
 _MAX_STRUCTURED_TOOL_CALL_BYTES = 128 * 1024
 _MAX_MESSAGE_ATTACHMENTS = 32
 _TOOL_INPUT_TRUNCATION_MARKER = "\n\n[... tool input truncated by Memento ...]"
-_CODEX_ASSISTANT_TRANSPORT_PRIORITY = {
+CODEX_ASSISTANT_TRANSPORT_PRIORITY = {
     "agent_message": 3,
     "response_item": 2,
     "task_complete": 1,
 }
+CODEX_ASSISTANT_EXACT_MIRROR_MAX_SECONDS = 12.0
 _CURSOR_REDACTED_TRANSPORT_LINE_RE = re.compile(
     r"(^|\n)[ \t]*\[REDACTED\][ \t]*(?=\n|$)",
     re.IGNORECASE | re.MULTILINE,
@@ -2564,6 +2565,177 @@ def _cursor_part_source_id(source_id: str, part_type: str, index: int) -> str:
     return f"{source_id}:{part_type}:{index}"
 
 
+def _claude_part_source_id(source_id: str, part_type: str, index: int) -> str:
+    """Keep semantic children unique when one Claude record expands to rows."""
+    if not source_id:
+        return ""
+    return f"{source_id}:{part_type}:{index}"
+
+
+def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
+    """Expand one mixed Claude content array without flattening tool blocks.
+
+    Modern Claude transcripts can store prose, thinking, and several tool
+    calls in one source record. A one-record/one-row parser either loses the
+    prose after selecting the first tool call or renders tool JSON inline as
+    assistant text. Split only records containing typed tool blocks; ordinary
+    records keep the long-standing compatibility path.
+    """
+    if not isinstance(obj, dict) or obj.get("type") not in ("user", "assistant"):
+        parsed = parse_conversation_object(obj, "claude_code")
+        return [parsed] if parsed is not None else []
+
+    message = _as_mapping(obj.get("message"))
+    content = message.get("content")
+    if not isinstance(content, list) or not any(
+        isinstance(item, dict)
+        and item.get("type") in ("tool_use", "toolCall", "tool_result", "toolResult")
+        for item in content
+    ):
+        parsed = parse_conversation_object(obj, "claude_code")
+        return [parsed] if parsed is not None else []
+
+    timestamp = _coerce_text(obj.get("timestamp"))
+    source_id = _coerce_text(obj.get("uuid") or obj.get("promptId"))
+    messages: list[NormalizedMessage] = []
+    semantic_items: list[object] = []
+    semantic_start = 0
+
+    def flush_semantic_items() -> None:
+        nonlocal semantic_items
+        if not semantic_items:
+            return
+        semantic_obj = dict(obj)
+        semantic_message = dict(message)
+        semantic_message["content"] = semantic_items
+        semantic_obj["message"] = semantic_message
+        parsed = parse_conversation_object(semantic_obj, "claude_code")
+        if parsed is not None:
+            parsed.source_id = _claude_part_source_id(
+                source_id,
+                "message",
+                semantic_start,
+            )
+            messages.append(parsed)
+        semantic_items = []
+
+    for index, item in enumerate(content):
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if item_type not in ("tool_use", "toolCall", "tool_result", "toolResult"):
+            if not semantic_items:
+                semantic_start = index
+            semantic_items.append(item)
+            continue
+
+        flush_semantic_items()
+        if item_type in ("tool_use", "toolCall"):
+            tool_use = _extract_tool_use([item])
+            if tool_use is None:
+                continue
+            tool_name, tool_input, tool_call_id, interaction = tool_use
+            messages.append(NormalizedMessage(
+                role="tool",
+                content=f"[{tool_name}]",
+                tool_name=tool_name,
+                tool_input=tool_input,
+                timestamp=timestamp,
+                raw_type="tool_use",
+                source_id=_claude_part_source_id(source_id, "tool_use", index),
+                interaction=interaction,
+                tool_call_id=tool_call_id,
+            ))
+            continue
+
+        result = _extract_tool_result_details([item])
+        if result is None:
+            continue
+        result_content, tool_call_id = result
+        messages.append(NormalizedMessage(
+            role="tool",
+            content=result_content or "(tool returned no textual output)",
+            tool_name="Tool result",
+            timestamp=timestamp,
+            raw_type="tool_result",
+            source_id=_claude_part_source_id(source_id, "tool_result", index),
+            tool_call_id=tool_call_id,
+        ))
+
+    flush_semantic_items()
+    return messages
+
+
+def _iter_claude_conversation_messages(
+    raw_content: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity: AssistantIdentityState | None = None,
+) -> Iterator[NormalizedMessage]:
+    """Yield Claude semantic rows with queue and question correlation."""
+    identity = assistant_identity or AssistantIdentityState()
+    task_tracker = TaskStateTracker("claude_code")
+    seen_source_ids: set[str] = set()
+    pending_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
+    pending_questions = {
+        _coerce_text(interaction.get("id")): interaction
+        for interaction in (initial_question_interactions or [])
+        if isinstance(interaction, dict) and interaction.get("id")
+    }
+
+    def should_emit(message: NormalizedMessage) -> bool:
+        if message.source_id:
+            source_key = f"claude_code:{message.source_id}"
+            if source_key in seen_source_ids:
+                return False
+            seen_source_ids.add(source_key)
+        task_tracker.apply(message)
+        return True
+
+    for record_index, source_object in enumerate(
+        _iter_decoded_json_objects(raw_content)
+    ):
+        _update_assistant_identity(identity, source_object, "claude_code")
+        for message in _parse_claude_record_messages(source_object):
+            _attach_assistant_identity(message, identity)
+
+            if message.role == "user" and message.raw_type == "user":
+                if pop_matching_claude_queue_user(
+                    pending_queue,
+                    message.content,
+                    message.timestamp,
+                ) is not None:
+                    continue
+            if message.raw_type == "queued_user_message":
+                pending_queue[message.content.strip()].append(message)
+
+            if message.tool_call_id and message.tool_call_id in pending_questions:
+                interaction = pending_questions.pop(message.tool_call_id)
+                message.interaction_response = build_question_response(
+                    interaction,
+                    message.content,
+                )
+                message.tool_name = "Question response"
+
+            if message.interaction is not None:
+                interaction_id = _coerce_text(message.interaction.get("id"))
+                if not interaction_id:
+                    interaction_id = f"claude_code:{record_index}:question"
+                    message.interaction["id"] = interaction_id
+                pending_questions[interaction_id] = message.interaction
+
+            for call in message.tool_calls:
+                interaction = call.get("interaction")
+                if not isinstance(interaction, dict):
+                    continue
+                interaction_id = _coerce_text(interaction.get("id"))
+                if not interaction_id:
+                    interaction_id = f"claude_code:{record_index}:question"
+                    interaction["id"] = interaction_id
+                pending_questions[interaction_id] = interaction
+
+            if should_emit(message):
+                yield message
+
+
 def _parse_cursor_record_messages(obj: object) -> list[NormalizedMessage]:
     """Expand one composite Cursor record into ordered semantic messages.
 
@@ -3028,22 +3200,31 @@ def is_codex_assistant_mirror_pair(
         {"response_item", "task_complete"},
     ):
         return False
-    first_time = _message_timestamp(first_timestamp)
-    second_time = _message_timestamp(second_timestamp)
-    if first_time is None or second_time is None:
-        return False
-    if abs((second_time - first_time).total_seconds()) > 1.0:
-        return False
     left = (first_content or "").strip()
     right = (second_content or "").strip()
     if not left or not right:
         return False
-    return left == right or left.startswith(right) or right.startswith(left)
+    first_time = _message_timestamp(first_timestamp)
+    second_time = _message_timestamp(second_timestamp)
+    if first_time is None or second_time is None:
+        return False
+    separation = abs((second_time - first_time).total_seconds())
+    if left == right:
+        # Some Codex builds flush the exact event/response transport copy only
+        # after tool accounting completes. Source adjacency plus the known
+        # cross-transport family still identifies one message, even when that
+        # flush is several seconds late.
+        return separation <= CODEX_ASSISTANT_EXACT_MIRROR_MAX_SECONDS
+    # Prefix matching is needed for attachment annotations, but is less
+    # specific than exact equality and therefore retains the tight window.
+    return separation <= 1.0 and (
+        left.startswith(right) or right.startswith(left)
+    )
 
 
 def codex_assistant_transport_priority(raw_type: str | None) -> int:
     """Return the presentation preference for a Codex assistant transport."""
-    return _CODEX_ASSISTANT_TRANSPORT_PRIORITY.get(raw_type or "", 0)
+    return CODEX_ASSISTANT_TRANSPORT_PRIORITY.get(raw_type or "", 0)
 
 
 def iter_conversation_messages(
@@ -3071,6 +3252,13 @@ def iter_conversation_messages(
         return
     if tool_id == "cursor":
         yield from _iter_cursor_conversation_messages(
+            raw_content,
+            initial_question_interactions=initial_question_interactions,
+            assistant_identity=identity,
+        )
+        return
+    if tool_id == "claude_code":
+        yield from _iter_claude_conversation_messages(
             raw_content,
             initial_question_interactions=initial_question_interactions,
             assistant_identity=identity,

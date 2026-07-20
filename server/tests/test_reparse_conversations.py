@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from types import SimpleNamespace
 
+import pytest
+
+from server.scripts import reparse_conversations
 from server.scripts.reparse_conversations import (
+    PARSER_REVISION,
+    _create_or_load_run,
     cutover_manifest_error,
     source_payload_error,
 )
@@ -25,6 +31,77 @@ from server.services.ingest_service import (
 
 def _jsonl(*records: dict) -> str:
     return "\n".join(json.dumps(record) for record in records)
+
+
+class _RunConnection:
+    def __init__(self) -> None:
+        self.rows: dict[uuid.UUID, dict] = {}
+
+    async def execute(self, query: str, *args):
+        if "INSERT INTO conversation_reparse_runs" in query:
+            run_id, revision, requested = args
+            self.rows[run_id] = {
+                "parser_revision": revision,
+                "state": "staging",
+                "requested_document_ids": requested,
+            }
+
+    async def fetchrow(self, query: str, run_id: uuid.UUID):
+        return self.rows.get(run_id)
+
+
+@pytest.mark.asyncio
+async def test_targeted_reparse_run_persists_sorted_exact_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _tables_ready(_conn) -> None:
+        return None
+
+    monkeypatch.setattr(reparse_conversations, "_ensure_tables", _tables_ready)
+    conn = _RunConnection()
+    first = uuid.UUID("00000000-0000-0000-0000-000000000002")
+    second = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+    run_id = await _create_or_load_run(
+        conn,
+        None,
+        requested_document_ids=[first, second, first],
+    )
+
+    assert conn.rows[run_id] == {
+        "parser_revision": PARSER_REVISION,
+        "state": "staging",
+        "requested_document_ids": [second, first],
+    }
+    assert await _create_or_load_run(
+        conn,
+        run_id,
+        requested_document_ids=[first, second],
+    ) == run_id
+
+
+@pytest.mark.asyncio
+async def test_targeted_reparse_run_rejects_scope_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _tables_ready(_conn) -> None:
+        return None
+
+    monkeypatch.setattr(reparse_conversations, "_ensure_tables", _tables_ready)
+    conn = _RunConnection()
+    document_id = uuid.uuid4()
+    run_id = await _create_or_load_run(
+        conn,
+        None,
+        requested_document_ids=[document_id],
+    )
+
+    with pytest.raises(RuntimeError, match="scope changed"):
+        await _create_or_load_run(
+            conn,
+            run_id,
+            requested_document_ids=None,
+        )
 
 
 def test_source_payload_requires_exact_size_and_hash() -> None:

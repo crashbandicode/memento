@@ -315,6 +315,15 @@ type ScrollAnchor = {
   scrollTop: number;
 };
 
+function promptLineAtOrBefore(promptLines: number[], lineNumber: number): number | null {
+  let activeLine: number | null = null;
+  for (const promptLine of promptLines) {
+    if (promptLine > lineNumber) break;
+    activeLine = promptLine;
+  }
+  return activeLine;
+}
+
 export default function ConversationViewer({
   documentId,
   prompts,
@@ -649,6 +658,8 @@ export default function ConversationViewer({
   ) => {
     const anchorId = `conversation-line-${lineNumber}`;
     let loadedTargetWindow = false;
+    const containingPromptLine = promptLineAtOrBefore(promptLinesRef.current, lineNumber);
+    setActivePromptLine(containingPromptLine);
     setNavigatingPromptLine(lineNumber);
     if (!document.getElementById(anchorId) && loadingRef.current) {
       await new Promise<void>((resolve) => {
@@ -1570,6 +1581,7 @@ function PromptNavigator({
               type="button"
               data-prompt-item={prompt.line_number}
               title={snippet}
+              aria-current={active ? "true" : undefined}
               onClick={() => onSelect(prompt)}
               disabled={navigationBusy}
               aria-busy={isLoading}

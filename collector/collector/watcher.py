@@ -6,6 +6,7 @@ import hashlib
 import logging
 import threading
 import time
+import uuid
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable
@@ -26,6 +27,16 @@ from .sanitizer import sanitize_json, sanitize_jsonl, sanitize_text
 from .tools.base import BaseTool, ContentType, SyncStrategy
 
 logger = logging.getLogger("collector.watcher")
+
+# watchdog exposes read-only filesystem activity through ``on_any_event`` on
+# platforms that support it. Opening a transcript, reading it, and closing it
+# without a write cannot change what the collector uploads, so letting those
+# events enter the debounce queue creates needless stat/parse/hash work.
+_NO_CONTENT_CHANGE_EVENT_TYPES = frozenset({
+    "accessed",
+    "opened",
+    "closed_no_write",
+})
 
 
 
@@ -89,7 +100,20 @@ class _DebouncedHandler(FileSystemEventHandler):
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        path = event.src_path
+        event_type = getattr(event, "event_type", "")
+        if event_type in _NO_CONTENT_CHANGE_EVENT_TYPES:
+            return
+
+        # A moved file no longer exists at src_path by the time the debounced
+        # callback runs. Route the destination instead so archive/rename moves
+        # still trigger a real content sync.
+        path = (
+            getattr(event, "dest_path", "")
+            if event_type == "moved"
+            else event.src_path
+        )
+        if not path:
+            return
         if self._is_excluded(path):
             return
 
@@ -593,6 +617,15 @@ class FileWatcher:
             return
         source_modified_at = source_stat.st_mtime
 
+        queue_metadata = dict(classification.metadata)
+        if force_full:
+            # The collector's content hash is deliberately stable for an
+            # unchanged source.  Tag an explicit repair snapshot so the
+            # chunk uploader can give it a fresh upload identity and bypass a
+            # completed server receipt without leaking queue-only state into
+            # the document metadata.
+            queue_metadata["_queue_force_reprocess_nonce"] = uuid.uuid4().hex
+
         self._queue.enqueue(
             tool_name=classification.tool_name,
             category=classification.category.value,
@@ -604,7 +637,7 @@ class FileWatcher:
             sync_strategy=classification.sync_strategy.value,
             is_partial=is_partial,
             offset=new_offset,
-            metadata=classification.metadata,
+            metadata=queue_metadata,
             source_modified_at=source_modified_at,
             base_hash=base_hash if is_partial else None,
             base_offset=base_offset if is_partial else 0,

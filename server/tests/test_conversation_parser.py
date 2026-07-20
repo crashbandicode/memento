@@ -1131,6 +1131,58 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(messages[0].raw_type, "agent_message")
         self.assertEqual(messages[0].content, "Final answer")
 
+    def test_codex_delayed_exact_assistant_transport_is_still_one_message(self) -> None:
+        rows = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T16:45:13.158Z",
+                "payload": {"type": "agent_message", "message": "Final answer"},
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-13T16:45:23.547Z",
+                "payload": {
+                    "type": "message",
+                    "id": "assistant-response-id",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Final answer"}],
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "Final answer")
+
+    def test_codex_delayed_prefix_messages_remain_distinct(self) -> None:
+        rows = [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-07-13T16:45:13.158Z",
+                "payload": {"type": "agent_message", "message": "Final answer"},
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-13T16:45:23.547Z",
+                "payload": {
+                    "type": "message",
+                    "id": "assistant-response-id",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Final answer with additional detail",
+                    }],
+                },
+            },
+        ]
+        raw = "\n".join(json.dumps(row) for row in rows)
+
+        messages = parse_conversation(raw, "codex")
+
+        self.assertEqual(len(messages), 2)
+
     def test_codex_lone_assistant_response_is_not_discarded(self) -> None:
         raw = json.dumps({
             "type": "response_item",
@@ -1486,6 +1538,84 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.raw_type, "tool_use")
         self.assertEqual(msg.tool_name, "Run Terminal Command")
         self.assertIn("Get-ChildItem", msg.tool_input)
+
+    def test_claude_mixed_record_keeps_prose_and_every_tool_in_order(self) -> None:
+        raw = json.dumps({
+            "type": "assistant",
+            "uuid": "claude-mixed-1",
+            "timestamp": "2026-07-07T10:00:00Z",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-1",
+                "content": [
+                    {"type": "text", "text": "I will inspect both files."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-read",
+                        "name": "Read",
+                        "input": {"path": "/tmp/one.py"},
+                    },
+                    {"type": "text", "text": "Now I will compare them."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-shell",
+                        "name": "Shell",
+                        "input": {"command": "diff one.py two.py"},
+                    },
+                ],
+            },
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(
+            [(message.role, message.tool_name) for message in messages],
+            [
+                ("assistant", ""),
+                ("tool", "Read"),
+                ("assistant", ""),
+                ("tool", "Shell"),
+            ],
+        )
+        self.assertEqual(messages[0].content, "I will inspect both files.")
+        self.assertEqual(messages[2].content, "Now I will compare them.")
+        self.assertTrue(all("[Tool:" not in message.content for message in messages))
+        self.assertEqual(len({message.source_id for message in messages}), 4)
+        self.assertEqual(messages[0].model, "claude-opus-4-1")
+
+    def test_claude_mixed_user_record_keeps_each_tool_result(self) -> None:
+        raw = json.dumps({
+            "type": "user",
+            "uuid": "claude-results-1",
+            "timestamp": "2026-07-07T10:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-read",
+                        "content": "first result",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-shell",
+                        "content": "second result",
+                    },
+                ],
+            },
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual([message.role for message in messages], ["tool", "tool"])
+        self.assertEqual(
+            [message.content for message in messages],
+            ["first result", "second result"],
+        )
+        self.assertEqual(
+            [message.tool_call_id for message in messages],
+            ["tool-read", "tool-shell"],
+        )
 
     def test_claude_local_command_is_compact_tool_context(self) -> None:
         raw = json.dumps({

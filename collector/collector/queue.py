@@ -783,6 +783,7 @@ class SyncQueue:
                         )
                      )
                    ORDER BY CASE
+                                WHEN q.created_at <= 0 THEN -1
                                 WHEN q.sync_strategy='metadata' THEN 0
                                 WHEN q.sync_strategy='delta' AND q.is_partial=1 THEN 1
                                 ELSE 2
@@ -1172,7 +1173,14 @@ class SyncQueue:
 
     @_rollback_on_error
     def prioritize_file(self, tool_name: str, relative_path: str) -> int:
-        """Move a server-requested repair ahead of ordinary backlog rows."""
+        """Move a server-requested repair ahead of every ordinary backlog row.
+
+        ``created_at=0`` is an explicit priority marker consumed by
+        ``claim_batch`` before its metadata/live-tail classes. Merely making a
+        full repair older is insufficient because a continuously growing
+        transcript can otherwise keep producing class-1 deltas and starve the
+        class-2 repair forever.
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             cursor = self._conn.execute(

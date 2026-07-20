@@ -33,15 +33,23 @@ _REPAIR_BATCH_SIZE = 2
 _STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
 
 
-def _enqueue_command(device_collector_id: str, action: str) -> int:
+def _enqueue_command(
+    device_collector_id: str,
+    action: str,
+    *,
+    payload: dict | None = None,
+) -> int:
     """Add a command to the queue for a device."""
     global _cmd_counter
     _cmd_counter += 1
-    _command_queue[device_collector_id].append({
+    command = {
         "id": _cmd_counter,
         "action": action,
         "created_at": time.time(),
-    })
+    }
+    if payload:
+        command.update(payload)
+    _command_queue[device_collector_id].append(command)
     return _cmd_counter
 
 
@@ -230,6 +238,7 @@ async def purge_device(
 async def send_command(
     device_db_id: uuid.UUID,
     action: str = "resync",
+    document_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -254,7 +263,34 @@ async def send_command(
                 "UPDATE documents SET metadata = metadata - '_graph_hash' WHERE machine_id = :mid AND metadata ? '_graph_hash'"
             ), {"mid": device_db_id})
 
-    cmd_id = _enqueue_command(machine.collector_token_hash, action)
+    payload: dict | None = None
+    if action == _REPAIR_ACTION and document_id is not None:
+        repair_document = (
+            await db.execute(
+                select(Document.tool_id, Document.relative_path).where(
+                    Document.id == document_id,
+                    Document.machine_id == machine.id,
+                    Document.category == "conversation",
+                    Document.tool_id.in_(("codex", "claude_code", "cursor")),
+                )
+            )
+        ).one_or_none()
+        if repair_document is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        payload = {
+            "paths": [
+                {
+                    "tool_name": repair_document.tool_id,
+                    "relative_path": repair_document.relative_path,
+                }
+            ]
+        }
+
+    cmd_id = _enqueue_command(
+        machine.collector_token_hash,
+        action,
+        payload=payload,
+    )
     return {"status": "queued", "command_id": cmd_id, "action": action, "device": machine.name}
 
 
@@ -347,7 +383,10 @@ async def get_commands(
             machine.collector_version = x_collector_version
 
     commands = _command_queue.get(x_device_id, [])
-    if machine and any(cmd.get("action") == _REPAIR_ACTION for cmd in commands):
+    if machine and any(
+        cmd.get("action") == _REPAIR_ACTION and not cmd.get("paths")
+        for cmd in commands
+    ):
         repair_result = await db.execute(
             select(Document.tool_id, Document.relative_path)
             .where(
@@ -369,6 +408,7 @@ async def get_commands(
         return [
             {**command, "paths": repair_paths}
             if command.get("action") == _REPAIR_ACTION
+            and not command.get("paths")
             else command
             for command in commands
         ]

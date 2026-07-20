@@ -10,7 +10,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from watchdog.events import FileModifiedEvent
+from watchdog.events import (
+    FileClosedNoWriteEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+    FileOpenedEvent,
+)
 
 from collector.parsers.base import ParseResult
 from collector.parsers.jsonl import JsonlParser
@@ -26,6 +31,48 @@ from collector.watcher import FileWatcher, _DebouncedHandler
 
 def _modified(path: Path) -> FileModifiedEvent:
     return FileModifiedEvent(str(path))
+
+
+def test_read_only_events_never_enter_debounce_queue(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+    callbacks: list[Path] = []
+    handler = _DebouncedHandler(callbacks.append, 0, [])
+
+    try:
+        handler.on_any_event(FileOpenedEvent(str(path)))
+        handler.on_any_event(FileClosedNoWriteEvent(str(path)))
+        handler.on_any_event(SimpleNamespace(
+            is_directory=False,
+            event_type="accessed",
+            src_path=str(path),
+        ))
+
+        assert callbacks == []
+        assert handler._pending == {}
+        assert handler._worker is None
+    finally:
+        handler.stop()
+
+
+def test_moved_event_routes_existing_destination(tmp_path: Path) -> None:
+    source = tmp_path / "active.jsonl"
+    destination = tmp_path / "archived.jsonl"
+    destination.write_text("{}\n", encoding="utf-8")
+    callbacks: list[Path] = []
+    called = threading.Event()
+    handler = _DebouncedHandler(
+        lambda changed: (callbacks.append(changed), called.set()),
+        0,
+        [],
+    )
+
+    try:
+        handler.on_any_event(FileMovedEvent(str(source), str(destination)))
+        assert called.wait(2)
+        assert callbacks == [destination]
+    finally:
+        handler.stop()
 
 
 def test_relative_resync_resolves_only_files_below_the_tool_root(tmp_path: Path) -> None:
@@ -326,11 +373,15 @@ def test_delta_processing_uses_guarded_base_and_force_full_fallback(
     assert incremental["base_hash"] == "base-hash"
     assert incremental["base_offset"] == base_offset
     assert incremental["source_path"] == str(path)
+    assert "_queue_force_reprocess_nonce" not in incremental["metadata"]
     assert "first" in complete["content"]
     assert "second" in complete["content"]
     assert complete["is_partial"] is False
     assert complete["base_hash"] is None
     assert complete["base_offset"] == 0
+    repair_nonce = complete["metadata"].get("_queue_force_reprocess_nonce")
+    assert isinstance(repair_nonce, str)
+    assert len(repair_nonce) == 32
 
 
 def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(
