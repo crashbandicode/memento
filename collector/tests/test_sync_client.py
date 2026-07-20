@@ -61,9 +61,13 @@ class _FakeQueue:
 
 
 class _Response:
-    def __init__(self, status_code: int = 200) -> None:
+    def __init__(self, status_code: int = 200, payload: dict | None = None) -> None:
         self.status_code = status_code
         self.text = "response"
+        self.payload = payload or {}
+
+    def json(self) -> dict:
+        return self.payload
 
 
 class _FakeHttpClient:
@@ -97,18 +101,45 @@ class _ScriptedHttpClient:
         if not self.outcomes:
             raise AssertionError("unexpected HTTP call")
         filename, content, content_type = files["content"]
-        self.calls.append({
-            "path": path,
-            "metadata_text": data["metadata"],
-            "metadata": json.loads(data["metadata"]),
-            "filename": filename,
-            "content": content,
-            "content_type": content_type,
-        })
+        self.calls.append(
+            {
+                "path": path,
+                "metadata_text": data["metadata"],
+                "metadata": json.loads(data["metadata"]),
+                "filename": filename,
+                "content": content,
+                "content_type": content_type,
+            }
+        )
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class _CommitHttpClient:
+    def __init__(self, statuses: list[dict]) -> None:
+        self.statuses = list(statuses)
+        self.chunk_calls = 0
+        self.status_calls = 0
+        self.job_id = "a" * 64
+
+    def post(self, path: str, *, data=None, files=None, json=None) -> _Response:
+        if path == "/api/ingest/file/chunk":
+            del data, files, json
+            self.chunk_calls += 1
+            return _Response(
+                payload={"document_id": f"queued:{self.job_id}"},
+            )
+        if path == "/api/ingest/file/chunk/status":
+            del data, files
+            self.status_calls += 1
+            if not self.statuses:
+                raise AssertionError("unexpected status poll")
+            payload = self.statuses.pop(0)
+            self.last_status_request = json
+            return _Response(payload={"job_id": self.job_id, **payload})
+        raise AssertionError(f"unexpected path {path}")
 
 
 class _ConcurrentQueue:
@@ -140,18 +171,30 @@ class SyncClientStreamingTests(unittest.TestCase):
         source_modified_at: float | None = None,
     ) -> QueueItem:
         return QueueItem(
-            id=1, tool_name="codex", category="conversation",
-            content_type="jsonl", relative_path="thread.jsonl", content=None,
-            content_hash="hash", file_size=total_size, sync_strategy="full",
-            is_partial=False, offset=0, metadata={}, created_at=1.0,
+            id=1,
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path="thread.jsonl",
+            content=None,
+            content_hash="hash",
+            file_size=total_size,
+            sync_strategy="full",
+            is_partial=False,
+            offset=0,
+            metadata={},
+            created_at=1.0,
             source_modified_at=source_modified_at,
-            payload_bytes=total_size, lease_token="lease",
+            payload_bytes=total_size,
+            lease_token="lease",
         )
 
     @staticmethod
     def _payload() -> dict:
         return {
-            "tool": "codex", "relative_path": "thread.jsonl", "hash": "hash",
+            "tool": "codex",
+            "relative_path": "thread.jsonl",
+            "hash": "hash",
         }
 
     @staticmethod
@@ -183,15 +226,13 @@ class SyncClientStreamingTests(unittest.TestCase):
                 queue = _FakeQueue(size)
                 client = self._client(queue, _FakeHttpClient())
                 payloads: list[tuple[str, dict]] = []
-                client._upload_json = (
-                    lambda payload: payloads.append(("json", payload)) or True
+                client._upload_json = lambda payload: (
+                    payloads.append(("json", payload)) or True
                 )
-                client._upload_multipart = (
-                    lambda payload, _stream:
+                client._upload_multipart = lambda payload, _stream: (
                     payloads.append(("multipart", payload)) or True
                 )
-                client._upload_chunked = (
-                    lambda payload, _item:
+                client._upload_chunked = lambda payload, _item: (
                     payloads.append(("chunked", payload)) or True
                 )
 
@@ -199,9 +240,11 @@ class SyncClientStreamingTests(unittest.TestCase):
                     source_modified_at=source_modified_at,
                     route=expected_route,
                 ):
-                    self.assertTrue(client._upload(
-                        self._item(size, source_modified_at=source_modified_at),
-                    ))
+                    self.assertTrue(
+                        client._upload(
+                            self._item(size, source_modified_at=source_modified_at),
+                        )
+                    )
                     self.assertEqual(payloads[0][0], expected_route)
                     self.assertEqual(payloads[0][1]["timestamp"], expected)
 
@@ -325,17 +368,58 @@ class SyncClientStreamingTests(unittest.TestCase):
                 "codex/thread.jsonl/hash/repair-repair-token",
             )
             self.assertEqual(call["metadata"]["metadata"], {"session_id": "thread"})
+            self.assertTrue(call["metadata"]["authoritative_rebase"])
+
+    def test_chunked_upload_waits_for_database_commit_before_success(self) -> None:
+        total_size = CHUNK_SIZE + 1
+        queue = _FakeQueue(total_size)
+        http_client = _CommitHttpClient(
+            [
+                {"status": "pending"},
+                {"status": "completed"},
+            ]
+        )
+        client = self._client(queue, http_client)
+        delays: list[float] = []
+        client._sleep_interruptibly = delays.append
+
+        self.assertTrue(client._upload_chunked(self._payload(), self._item(total_size)))
+        self.assertEqual(http_client.chunk_calls, 2)
+        self.assertEqual(http_client.status_calls, 2)
+        self.assertEqual(
+            http_client.last_status_request,
+            {
+                "upload_id": "codex/thread.jsonl/hash",
+                "hash": "hash",
+            },
+        )
+        self.assertEqual(len(delays), 1)
+
+    def test_failed_chunked_delta_becomes_a_resyncable_conflict(self) -> None:
+        total_size = CHUNK_SIZE + 1
+        queue = _FakeQueue(total_size)
+        http_client = _CommitHttpClient(
+            [
+                {"status": "failed", "error_type": "DeltaBaseMismatch"},
+            ]
+        )
+        client = self._client(queue, http_client)
+        payload = self._payload()
+        payload["mode"] = "delta"
+
+        with self.assertRaises(DeltaBaseConflict):
+            client._upload_chunked(payload, self._item(total_size))
 
     def test_guarded_delta_uses_synchronous_multipart_and_sends_base(self) -> None:
         size = CHUNK_SIZE + 123
         queue = _FakeQueue(size)
         client = self._client(queue, _FakeHttpClient())
         routes: list[tuple[str, dict]] = []
-        client._upload_multipart = (
-            lambda payload, _stream: routes.append(("multipart", payload)) or True
+        client._upload_multipart = lambda payload, _stream: (
+            routes.append(("multipart", payload)) or True
         )
-        client._upload_chunked = (
-            lambda payload, _item: routes.append(("chunked", payload)) or True
+        client._upload_chunked = lambda payload, _item: (
+            routes.append(("chunked", payload)) or True
         )
         item = self._item(size)
         item.sync_strategy = "delta"
@@ -382,11 +466,13 @@ class SyncClientStreamingTests(unittest.TestCase):
             "response lost after acceptance",
             request=httpx.Request("POST", "https://example.test/api/ingest/file/chunk"),
         )
-        http_client = _ScriptedHttpClient([
-            response_lost,
-            _Response(200),
-            _Response(200),
-        ])
+        http_client = _ScriptedHttpClient(
+            [
+                response_lost,
+                _Response(200),
+                _Response(200),
+            ]
+        )
         client = self._client(queue, http_client)
         delays: list[float] = []
         client._sleep_interruptibly = delays.append
@@ -397,20 +483,28 @@ class SyncClientStreamingTests(unittest.TestCase):
             [call["metadata"]["chunk_index"] for call in http_client.calls],
             [0, 0, 1],
         )
-        self.assertEqual(http_client.calls[0]["metadata_text"], http_client.calls[1]["metadata_text"])
-        self.assertEqual(http_client.calls[0]["content"], http_client.calls[1]["content"])
-        self.assertEqual(http_client.calls[0]["filename"], http_client.calls[1]["filename"])
+        self.assertEqual(
+            http_client.calls[0]["metadata_text"], http_client.calls[1]["metadata_text"]
+        )
+        self.assertEqual(
+            http_client.calls[0]["content"], http_client.calls[1]["content"]
+        )
+        self.assertEqual(
+            http_client.calls[0]["filename"], http_client.calls[1]["filename"]
+        )
         self.assertEqual(delays, [CHUNK_RETRY_BASE_SECONDS])
         self.assertEqual(queue.renewals, 3)
 
     def test_transient_502_retries_current_chunk(self) -> None:
         total_size = CHUNK_SIZE + 1
         queue = _FakeQueue(total_size)
-        http_client = _ScriptedHttpClient([
-            _Response(502),
-            _Response(200),
-            _Response(200),
-        ])
+        http_client = _ScriptedHttpClient(
+            [
+                _Response(502),
+                _Response(200),
+                _Response(200),
+            ]
+        )
         client = self._client(queue, http_client)
         delays: list[float] = []
         client._sleep_interruptibly = delays.append
@@ -430,7 +524,9 @@ class SyncClientStreamingTests(unittest.TestCase):
         delays: list[float] = []
         client._sleep_interruptibly = delays.append
 
-        self.assertFalse(client._upload_chunked(self._payload(), self._item(total_size)))
+        self.assertFalse(
+            client._upload_chunked(self._payload(), self._item(total_size))
+        )
         self.assertEqual(len(http_client.calls), 1)
         self.assertEqual(http_client.calls[0]["metadata"]["chunk_index"], 0)
         self.assertEqual(delays, [])
@@ -446,7 +542,9 @@ class SyncClientStreamingTests(unittest.TestCase):
         delays: list[float] = []
         client._sleep_interruptibly = delays.append
 
-        self.assertFalse(client._upload_chunked(self._payload(), self._item(total_size)))
+        self.assertFalse(
+            client._upload_chunked(self._payload(), self._item(total_size))
+        )
         self.assertEqual(len(http_client.calls), CHUNK_UPLOAD_MAX_ATTEMPTS)
         self.assertEqual(
             [call["metadata"]["chunk_index"] for call in http_client.calls],
@@ -465,7 +563,9 @@ class SyncClientStreamingTests(unittest.TestCase):
 
         client._sleep_interruptibly = pause_during_backoff
 
-        self.assertFalse(client._upload_chunked(self._payload(), self._item(total_size)))
+        self.assertFalse(
+            client._upload_chunked(self._payload(), self._item(total_size))
+        )
         self.assertEqual(len(http_client.calls), 1)
 
     def test_metadata_upload_is_lightweight_and_hides_queue_state(self) -> None:
@@ -488,9 +588,7 @@ class SyncClientStreamingTests(unittest.TestCase):
         self.assertTrue(client._upload(item))
         self.assertEqual(http_client.path, "/api/ingest/metadata")
         self.assertEqual(http_client.payload["title"], "Renamed")
-        self.assertFalse(any(
-            key.startswith("_queue_") for key in http_client.payload
-        ))
+        self.assertFalse(any(key.startswith("_queue_") for key in http_client.payload))
         self.assertEqual(queue.stream.largest_read, 0)
 
     def test_missing_transcript_metadata_response_remains_retryable(self) -> None:

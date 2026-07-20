@@ -71,6 +71,15 @@ class StagedChunk:
         yield self.complete
 
 
+@dataclass(frozen=True)
+class ChunkCommitStatus:
+    """Authenticated commit state for one deterministic chunk upload."""
+
+    job_id: str
+    status: str
+    error_type: str | None = None
+
+
 def _job_id(meta: dict[str, Any], user_id: str, device_id: str) -> str:
     identity = json.dumps(
         [user_id, device_id, meta.get("upload_id"), meta.get("hash")],
@@ -202,6 +211,49 @@ def has_completion_receipt(
     return _completion_path(_job_id(meta, user_id, device_id), root).is_file()
 
 
+def chunk_commit_status(
+    *,
+    meta: dict[str, Any],
+    user_id: str,
+    device_id: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> ChunkCommitStatus:
+    """Return the durable/committed state of an authenticated upload.
+
+    The collector derives this identifier from the same authenticated upload
+    identity used by ``stage_chunk``.  It can therefore wait for the database
+    commit without keeping the final chunk request open through expensive
+    conversation parsing.
+    """
+    job_id = _job_id(meta, user_id, device_id)
+    if _completion_path(job_id, root).is_file():
+        return ChunkCommitStatus(job_id=job_id, status="completed")
+
+    job_dir = _job_dir(job_id, root)
+    failed_path = job_dir / "failed.json"
+    if failed_path.is_file():
+        error_type = None
+        try:
+            payload = json.loads(failed_path.read_text(encoding="utf-8"))
+            value = payload.get("error_type")
+            if isinstance(value, str) and value:
+                error_type = value[:128]
+        except (OSError, json.JSONDecodeError):
+            pass
+        return ChunkCommitStatus(
+            job_id=job_id,
+            status="failed",
+            error_type=error_type,
+        )
+    if (job_dir / "blocked.json").is_file():
+        return ChunkCommitStatus(job_id=job_id, status="blocked")
+    if (job_dir / "ready").is_file():
+        return ChunkCommitStatus(job_id=job_id, status="pending")
+    if job_dir.is_dir():
+        return ChunkCommitStatus(job_id=job_id, status="receiving")
+    return ChunkCommitStatus(job_id=job_id, status="missing")
+
+
 def _fsync_directory(path: Path) -> None:
     """Persist directory-entry changes on filesystems that support it."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -280,6 +332,13 @@ def _validated_chunk_coordinates(
             raise ChunkValidationError(f"invalid {field} metadata")
     if meta.get("mode", "full") not in ("full", "delta"):
         raise ChunkValidationError("mode must be full or delta")
+    authoritative_rebase = meta.get("authoritative_rebase", False)
+    if not isinstance(authoritative_rebase, bool):
+        raise ChunkValidationError("authoritative_rebase must be a boolean")
+    if authoritative_rebase and meta.get("mode", "full") != "full":
+        raise ChunkValidationError(
+            "only a full snapshot can be an authoritative rebase"
+        )
     base_hash = meta.get("base_hash")
     base_offset = meta.get("base_offset")
     if base_hash is not None and (
@@ -397,6 +456,7 @@ def stage_chunk(
                 "timestamp",
                 "base_hash",
                 "base_offset",
+                "authoritative_rebase",
                 "total_chunks",
             ):
                 if existing_meta.get(field) != meta.get(field):
@@ -861,7 +921,11 @@ def ready_delta_chain_job_ids(
         key=lambda item: _source_sequence_rank(item[0], item[1], root),
     )
     start = next(
-        (index for index, (candidate_id, _) in enumerate(ordered) if candidate_id == job_id),
+        (
+            index
+            for index, (candidate_id, _) in enumerate(ordered)
+            if candidate_id == job_id
+        ),
         None,
     )
     if start is None:

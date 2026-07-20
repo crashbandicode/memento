@@ -32,13 +32,13 @@ logger = logging.getLogger("collector.watcher")
 # platforms that support it. Opening a transcript, reading it, and closing it
 # without a write cannot change what the collector uploads, so letting those
 # events enter the debounce queue creates needless stat/parse/hash work.
-_NO_CONTENT_CHANGE_EVENT_TYPES = frozenset({
-    "accessed",
-    "opened",
-    "closed_no_write",
-})
-
-
+_NO_CONTENT_CHANGE_EVENT_TYPES = frozenset(
+    {
+        "accessed",
+        "opened",
+        "closed_no_write",
+    }
+)
 
 
 _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
@@ -108,9 +108,7 @@ class _DebouncedHandler(FileSystemEventHandler):
         # callback runs. Route the destination instead so archive/rename moves
         # still trigger a real content sync.
         path = (
-            getattr(event, "dest_path", "")
-            if event_type == "moved"
-            else event.src_path
+            getattr(event, "dest_path", "") if event_type == "moved" else event.src_path
         )
         if not path:
             return
@@ -267,12 +265,16 @@ class FileWatcher:
 
                 try:
                     self._observer.schedule(
-                        handler, watch_dir, recursive=True,
+                        handler,
+                        watch_dir,
+                        recursive=True,
                     )
                     self._handlers.append(handler)
                     logger.info(
                         "Watching %s (%s) at %s",
-                        tool.display_name, tool.name, watch_dir,
+                        tool.display_name,
+                        tool.name,
+                        watch_dir,
                     )
                 except OSError as e:
                     logger.error("Cannot watch %s: %s", watch_dir, e)
@@ -303,14 +305,6 @@ class FileWatcher:
                 classification = tool.classify_file(path)
                 if classification is None:
                     return
-                # Force-full means the server explicitly needs the complete
-                # payload even when the local source revision has not changed.
-                # Without clearing this observation, SyncQueue.enqueue treats
-                # the snapshot as an identical no-op and uploads nothing.
-                self._queue.clear_file_state(
-                    classification.tool_name,
-                    classification.relative_path,
-                )
                 for _attempt in range(3):
                     if self._stop_event.is_set() or not path.is_file():
                         return
@@ -327,7 +321,9 @@ class FileWatcher:
                         logger.info("Queued complete resync for %s", path)
                         return
                     time.sleep(0.5)
-                logger.warning("Could not capture a stable complete resync for %s", path)
+                logger.warning(
+                    "Could not capture a stable complete resync for %s", path
+                )
             finally:
                 with self._resync_lock:
                     self._resyncing_paths.discard(path_key)
@@ -375,12 +371,17 @@ class FileWatcher:
         if tool is None or not isinstance(relative_path, str):
             return False
         normalized_relative = relative_path.replace("\\", "/")
-        parts = [part for part in normalized_relative.split("/") if part not in ("", ".")]
+        parts = [
+            part for part in normalized_relative.split("/") if part not in ("", ".")
+        ]
         if not parts or ".." in parts or Path(normalized_relative).is_absolute():
             return False
         root = tool.root_path.resolve()
         source_path = root.joinpath(*parts).resolve()
-        if not path_starts_with(str(source_path), str(root)) or not source_path.is_file():
+        if (
+            not path_starts_with(str(source_path), str(root))
+            or not source_path.is_file()
+        ):
             return False
         self.request_full_resync(str(source_path))
         return True
@@ -435,7 +436,8 @@ class FileWatcher:
                 relative_path=f"conversations/{conv['cascade_id']}.jsonl",
                 content=content,
                 content_hash=conv.get(
-                    "content_hash", f"ag-{hash(content) & 0xFFFFFFFF:08x}",
+                    "content_hash",
+                    f"ag-{hash(content) & 0xFFFFFFFF:08x}",
                 ),
                 file_size=len(content),
                 sync_strategy="full",
@@ -474,6 +476,30 @@ class FileWatcher:
         if classification.sync_strategy == SyncStrategy.POLL:
             return
 
+        if not force_full and classification.sync_strategy == SyncStrategy.DELTA:
+            path_key = normalize_path(str(path))
+            repair_is_being_captured = False
+            resync_lock = getattr(self, "_resync_lock", None)
+            if resync_lock is not None:
+                with resync_lock:
+                    repair_is_being_captured = path_key in self._resyncing_paths
+            has_uncommitted = getattr(
+                self._queue,
+                "has_uncommitted_delta_revision",
+                None,
+            )
+            if repair_is_being_captured or (
+                has_uncommitted is not None
+                and has_uncommitted(
+                    classification.tool_name,
+                    classification.relative_path,
+                )
+            ):
+                # The acknowledgement callback captures the next bounded
+                # window after the current one is committed. Do not build a
+                # speculative tail on a merely pending or leased revision.
+                return
+
         try:
             source_stat = path.stat()
             file_size = source_stat.st_size
@@ -491,7 +517,8 @@ class FileWatcher:
             return
 
         last_hash, _ = self._queue.get_file_state(
-            classification.tool_name, classification.relative_path,
+            classification.tool_name,
+            classification.relative_path,
         )
 
         # For FULL sync, skip if hash unchanged
@@ -542,6 +569,11 @@ class FileWatcher:
                 and classification.sync_strategy == SyncStrategy.DELTA
                 and classification.content_type == ContentType.JSONL
                 and isinstance(parser, JsonlParser)
+            )
+            bounded_append_window = (
+                classification.sync_strategy == SyncStrategy.DELTA
+                and isinstance(parser, JsonlParser)
+                and read_end_offset < file_size
             )
             if parser is None:
                 try:
@@ -606,12 +638,21 @@ class FileWatcher:
             final_stat = path.stat()
         except OSError:
             return
-        if append_only_snapshot:
+        if append_only_snapshot or bounded_append_window:
             same_file = (
                 source_stat.st_dev == final_stat.st_dev
                 and source_stat.st_ino == final_stat.st_ino
             )
-            if not same_file or final_stat.st_size < source_stat.st_size:
+            same_revision = (
+                final_stat.st_size,
+                final_stat.st_mtime_ns,
+            ) == source_revision
+            appended_after_capture = final_stat.st_size > source_stat.st_size
+            if (
+                not same_file
+                or final_stat.st_size < new_offset
+                or not (same_revision or appended_after_capture)
+            ):
                 logger.debug("Source was replaced while processing %s; deferring", path)
                 return
         elif (final_stat.st_size, final_stat.st_mtime_ns) != source_revision:
@@ -701,13 +742,14 @@ class FileWatcher:
             # See main.py AG_EXPORT_INTERVAL for aghistory + vscdb extraction
 
         count = 0
-        for _mtime, path in sorted(candidates.values(), key=lambda item: item[0], reverse=True):
+        for _mtime, path in sorted(
+            candidates.values(), key=lambda item: item[0], reverse=True
+        ):
             if self._stop_event.is_set() or self._scan_cancel_event.is_set():
                 break
             high_water = self._config.queue_high_water_bytes
             while high_water > 0 and self._queue.outstanding_bytes() >= high_water:
-                if (self._stop_event.wait(0.5)
-                        or self._scan_cancel_event.is_set()):
+                if self._stop_event.wait(0.5) or self._scan_cancel_event.is_set():
                     return count
             try:
                 self._on_file_changed(path)

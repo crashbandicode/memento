@@ -341,9 +341,7 @@ def _conversation_message_metadata(normalized) -> dict:
         )
     if normalized.session_context:
         meta["session_context"] = _bounded_message_text(
-            strip_terminal_sequences(normalized.session_context).replace(
-                "\x00", ""
-            ),
+            strip_terminal_sequences(normalized.session_context).replace("\x00", ""),
             MAX_STORED_AUXILIARY_CHARS,
         )
     attachments = normalize_message_attachments(normalized.attachments)
@@ -685,19 +683,23 @@ async def _reconcile_recovered_history_rows(
     order remains otherwise unchanged.
     """
     history_rows = (
-        await db.execute(
-            select(ConversationMessage)
-            .where(
-                ConversationMessage.document_id == document_id,
-                ConversationMessage.message_type == "history_user_message",
-            )
-            .order_by(
-                ConversationMessage.timestamp,
-                ConversationMessage.line_number,
-                ConversationMessage.id,
+        (
+            await db.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.document_id == document_id,
+                    ConversationMessage.message_type == "history_user_message",
+                )
+                .order_by(
+                    ConversationMessage.timestamp,
+                    ConversationMessage.line_number,
+                    ConversationMessage.id,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if not history_rows:
         return 0, 0
 
@@ -1017,8 +1019,7 @@ async def _apply_friendly_conversation_title(
         return doc.title
     if (
         doc.tool_id == "codex"
-        and str(metadata.get("thread_source") or "").strip().lower()
-        == "subagent"
+        and str(metadata.get("thread_source") or "").strip().lower() == "subagent"
     ):
         # A subagent starts with a cloned copy of its root transcript. Its first
         # user row therefore describes the parent task, not this fork. Prefer
@@ -1347,6 +1348,7 @@ async def ingest_file(
     content_had_sensitive: bool = False,
     base_hash: str | None = None,
     base_offset: int | None = None,
+    authoritative_rebase: bool = False,
 ) -> Document:
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
@@ -1393,15 +1395,19 @@ async def ingest_file(
     doc = path_doc
     if stable_source_identity is not None:
         identity_documents = (
-            await db.execute(
-                _scoped_conversation_identity_select(
-                    tool_id,
-                    stable_source_identity,
-                    machine_id,
-                    user_id,
-                ).with_for_update()
+            (
+                await db.execute(
+                    _scoped_conversation_identity_select(
+                        tool_id,
+                        stable_source_identity,
+                        machine_id,
+                        user_id,
+                    ).with_for_update()
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if identity_documents:
             doc = select_canonical_conversation_document(
                 identity_documents,
@@ -1409,9 +1415,7 @@ async def ingest_file(
                 session_id=stable_source_identity,
             )
     identity_path_conflict = (
-        path_doc is not None
-        and doc is not None
-        and path_doc.id != doc.id
+        path_doc is not None and doc is not None and path_doc.id != doc.id
     )
     identity_relocation = (
         stable_source_identity is not None
@@ -1533,7 +1537,12 @@ async def ingest_file(
             setattr(doc, "_memento_ingest_disposition", "idempotent")
             return doc
 
-    if mode == "full" and doc is not None and doc.content_hash != content_hash:
+    if (
+        mode == "full"
+        and doc is not None
+        and doc.content_hash != content_hash
+        and not authoritative_rebase
+    ):
         existing_offset = 0
         if sync_row is not None and sync_row.last_hash == doc.content_hash:
             existing_offset = int(sync_row.last_offset or 0)
@@ -1985,9 +1994,7 @@ async def ingest_file(
                 )
             else:
                 loop = asyncio.get_running_loop()
-                task = loop.create_task(
-                    _run_post_ingest(doc.id, doc.tool_id, category)
-                )
+                task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
                 _background_tasks.add(task)
                 task.add_done_callback(_background_tasks.discard)
         except Exception:
@@ -2146,9 +2153,7 @@ async def _extract_messages(
             return
         if len(search_terms) < MAX_LEXICON_TERMS_PER_INGEST:
             remaining_terms = MAX_LEXICON_TERMS_PER_INGEST - len(search_terms)
-            search_terms.update(
-                list(extract_search_terms(value))[:remaining_terms]
-            )
+            search_terms.update(list(extract_search_terms(value))[:remaining_terms])
         if search_bytes >= MAX_SEARCH_TEXT_CHARS:
             return
         remaining = MAX_SEARCH_TEXT_CHARS - search_bytes
@@ -2238,32 +2243,37 @@ async def _extract_messages(
     initial_question_interactions: list[dict[str, object]] = []
     if mode == "delta" and start_line > 1:
         recent_rows = (
-            await db.execute(
-                select(ConversationMessage)
-                .where(ConversationMessage.document_id == doc.id)
-                .order_by(ConversationMessage.line_number.desc())
-                .limit(32)
+            (
+                await db.execute(
+                    select(ConversationMessage)
+                    .where(ConversationMessage.document_id == doc.id)
+                    .order_by(ConversationMessage.line_number.desc())
+                    .limit(32)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         delta_tail = recent_rows[0] if recent_rows else None
         initial_question_interactions = _pending_question_interactions(recent_rows)
         if tool_id == "claude_code":
             queue_rows = (
-                await db.execute(
-                    select(ConversationMessage)
-                    .where(
-                        ConversationMessage.document_id == doc.id,
-                        ConversationMessage.message_type
-                        == "queued_user_message",
+                (
+                    await db.execute(
+                        select(ConversationMessage)
+                        .where(
+                            ConversationMessage.document_id == doc.id,
+                            ConversationMessage.message_type == "queued_user_message",
+                        )
+                        .order_by(ConversationMessage.line_number)
                     )
-                    .order_by(ConversationMessage.line_number)
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for queue_row in queue_rows:
                 metadata = (
-                    queue_row.metadata_
-                    if isinstance(queue_row.metadata_, dict)
-                    else {}
+                    queue_row.metadata_ if isinstance(queue_row.metadata_, dict) else {}
                 )
                 if metadata.get("canonical_source_id"):
                     continue
@@ -2305,14 +2315,16 @@ async def _extract_messages(
                 canonical_identity = normalized.source_id or (
                     "claude-user:"
                     + hashlib.sha256(
-                        "\x1f".join((
-                            normalized.timestamp or "",
-                            clean_content,
-                        )).encode("utf-8")
+                        "\x1f".join(
+                            (
+                                normalized.timestamp or "",
+                                clean_content,
+                            )
+                        ).encode("utf-8")
                     ).hexdigest()
                 )
-                queued_metadata["canonical_source_id"] = (
-                    _bounded_message_text(canonical_identity, 256)
+                queued_metadata["canonical_source_id"] = _bounded_message_text(
+                    canonical_identity, 256
                 )
                 queued_row.metadata_ = queued_metadata
                 continue
@@ -2429,13 +2441,15 @@ async def _extract_messages(
                 ConversationMessage.content,
                 ConversationMessage.timestamp,
                 ConversationMessage.line_number,
-            ).where(
+            )
+            .where(
                 ConversationMessage.document_id == doc.id,
                 ConversationMessage.role == "user",
                 ConversationMessage.message_type.is_distinct_from(
                     "history_user_message"
                 ),
-            ).order_by(ConversationMessage.line_number)
+            )
+            .order_by(ConversationMessage.line_number)
         )
         source_occurrences = [
             UserOccurrence(
@@ -2447,14 +2461,17 @@ async def _extract_messages(
             for row in source_users.all()
         ]
         existing_history = (
-            await db.execute(
-                select(ConversationMessage)
-                .where(
-                    ConversationMessage.document_id == doc.id,
-                    ConversationMessage.message_type == "history_user_message",
+            (
+                await db.execute(
+                    select(ConversationMessage).where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.message_type == "history_user_message",
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         existing_source_ids = {
             str((row.metadata_ or {}).get("source_id"))
             for row in existing_history
@@ -2486,9 +2503,7 @@ async def _extract_messages(
             source_id = f"codex-history:{history_index}"
             if source_id in existing_source_ids:
                 continue
-            prepared_history.append(
-                (history_index, clean_history, ts, source_id)
-            )
+            prepared_history.append((history_index, clean_history, ts, source_id))
 
         _, missing_history = partition_recovered_occurrences(
             source_occurrences,
@@ -2545,9 +2560,7 @@ async def _extract_messages(
         if tool_id == "codex" and first_user_msg:
             from .conversation_parser import normalize_codex_user_payload
 
-            first_role, first_user_msg = normalize_codex_user_payload(
-                first_user_msg
-            )
+            first_role, first_user_msg = normalize_codex_user_payload(first_user_msg)
             if first_role != "user":
                 first_user_msg = ""
         if first_user_msg:
@@ -2568,9 +2581,7 @@ async def _extract_messages(
                     await db.execute(
                         select(
                             func.min(ConversationMessage.line_number).filter(
-                                ConversationMessage.role.is_distinct_from(
-                                    "system"
-                                )
+                                ConversationMessage.role.is_distinct_from("system")
                             ),
                             func.max(ConversationMessage.line_number),
                         ).where(

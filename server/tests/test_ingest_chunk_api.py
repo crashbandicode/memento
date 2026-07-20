@@ -122,6 +122,31 @@ class ChunkIngestApiTests(unittest.TestCase):
         self.assertTrue(final.json()["document_id"].startswith("queued:"))
         enqueue.assert_called_once()
 
+    def test_chunk_status_uses_authenticated_upload_identity(self) -> None:
+        status = SimpleNamespace(
+            job_id="a" * 64,
+            status="completed",
+            error_type=None,
+        )
+        with patch.object(
+            ingest_api,
+            "chunk_commit_status",
+            return_value=status,
+        ) as inspect_status:
+            response = self.client.post(
+                "/api/ingest/file/chunk/status",
+                json={"upload_id": "upload-1", "hash": "hash-1"},
+                headers={"x-device-id": "device-1"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "completed")
+        inspect_status.assert_called_once_with(
+            meta={"upload_id": "upload-1", "hash": "hash-1"},
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+        )
+
     def test_invalid_metadata_returns_400_without_enqueuing(self) -> None:
         response = self.client.post(
             "/api/ingest/file/chunk",

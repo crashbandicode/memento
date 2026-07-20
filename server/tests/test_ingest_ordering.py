@@ -98,7 +98,9 @@ def _ingest_kwargs(doc: Document, **overrides) -> dict:
 
 
 class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
-    def test_delta_metadata_accumulates_counts_and_preserves_first_timestamp(self) -> None:
+    def test_delta_metadata_accumulates_counts_and_preserves_first_timestamp(
+        self,
+    ) -> None:
         merged = _merge_delta_metadata(
             {
                 "total_lines": 10,
@@ -115,10 +117,13 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(merged["total_lines"], 14)
-        self.assertEqual(merged["message_types"], {
-            "event_msg": 8,
-            "response_item": 6,
-        })
+        self.assertEqual(
+            merged["message_types"],
+            {
+                "event_msg": 8,
+                "response_item": 6,
+            },
+        )
         self.assertEqual(merged["first_timestamp"], "first")
         self.assertEqual(merged["last_timestamp"], "new-last")
 
@@ -144,6 +149,33 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(doc.content_hash, "newer-hash")
         self.assertEqual(getattr(doc, "_memento_ingest_disposition"), "superseded")
         self.assertIn("pg_advisory_xact_lock", str(db.statements[0][0]))
+
+    async def test_authoritative_rebase_can_replace_a_higher_committed_offset(
+        self,
+    ) -> None:
+        doc = _document(content_hash="newer-hash", timestamp=300.0, offset=300)
+        sync = _sync_state(doc, offset=300)
+        db = _OrderedSession(None, sync, doc)
+
+        with patch(
+            "server.services.ingest_service.ensure_tool",
+            new=AsyncMock(side_effect=RuntimeError("authoritative processing reached")),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "authoritative processing reached",
+            ):
+                await ingest_file(
+                    db,
+                    **_ingest_kwargs(
+                        doc,
+                        content_hash="bounded-rebase-hash",
+                        file_size=100,
+                        offset=100,
+                        timestamp=100.0,
+                        authoritative_rebase=True,
+                    ),
+                )
 
     async def test_same_hash_full_repairs_offset_and_advances_source_time(self) -> None:
         doc = _document(content_hash="same-hash", timestamp=100.0)

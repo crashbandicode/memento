@@ -17,7 +17,7 @@ from ..db.session import async_session_factory
 from ..services.content_sanitizer import sanitize_content_file
 from ..services.device_service import DeviceOwnershipError, ensure_device
 from ..services.ingest_revision import committed_full_supersedes
-from ..services.ingest_service import ingest_file
+from ..services.ingest_service import DeltaBaseMismatch, ingest_file
 from ..services.large_content_store import store_large_content
 from ..services.ingest_spool import (
     DEFAULT_SPOOL_ROOT,
@@ -79,8 +79,7 @@ async def _ingest_ready_job(
         manifest["meta"]["base_hash"] = first_meta.get("base_hash")
         manifest["meta"]["base_offset"] = first_meta.get("base_offset")
         manifest["meta"]["file_size"] = sum(
-            int(candidate["meta"]["file_size"])
-            for _, candidate in payload_jobs
+            int(candidate["meta"]["file_size"]) for _, candidate in payload_jobs
         )
     meta = manifest["meta"]
     user_id = UUID(str(manifest["user_id"]))
@@ -103,7 +102,9 @@ async def _ingest_ready_job(
         machine_id = str(machine.id)
         await device_db.commit()
 
-    if meta.get("mode", "full") == "full":
+    if meta.get("mode", "full") == "full" and not meta.get(
+        "authoritative_rebase", False
+    ):
         async with async_session_factory() as preflight_db:
             existing = (
                 await preflight_db.execute(
@@ -211,6 +212,7 @@ async def _ingest_ready_job(
             offset=meta.get("offset", 0),
             base_hash=meta.get("base_hash"),
             base_offset=meta.get("base_offset"),
+            authoritative_rebase=bool(meta.get("authoritative_rebase", False)),
             metadata=dict(meta.get("metadata", {})),
             timestamp=meta.get("timestamp"),
             machine_id=machine_id,
@@ -408,7 +410,13 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                         ):
                             continue
                         validated_cohort.append((candidate_id, candidate))
+                    rebase_committed = result.get("status") not in {
+                        "superseded",
+                        "superseded_by_committed_full",
+                    }
                     for candidate_id, candidate in validated_cohort:
+                        if not rebase_committed:
+                            continue
                         retain_as_evidence = (
                             candidate["meta"].get("mode", "full") == "delta"
                             or (
@@ -440,6 +448,7 @@ def process_spooled_ingest(self, job_id: str) -> dict:
                         exc,
                         (
                             ChunkValidationError,
+                            DeltaBaseMismatch,
                             DeviceOwnershipError,
                             KeyError,
                             RetryLimitExceeded,

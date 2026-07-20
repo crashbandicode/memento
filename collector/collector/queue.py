@@ -25,6 +25,7 @@ from typing import Any, BinaryIO, Iterator
 
 def _rollback_on_error(method):
     """Keep the shared connection usable if any SQLite write/commit fails."""
+
     @wraps(method)
     def wrapped(self, *args, **kwargs):
         # RLock makes this an outer transaction-safety boundary while the
@@ -36,6 +37,7 @@ def _rollback_on_error(method):
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
+
     return wrapped
 
 
@@ -196,7 +198,9 @@ class SyncQueue:
         }
         for name, definition in state_additions.items():
             if name not in state_columns:
-                self._conn.execute(f"ALTER TABLE file_state ADD COLUMN {name} {definition}")
+                self._conn.execute(
+                    f"ALTER TABLE file_state ADD COLUMN {name} {definition}"
+                )
 
         self._conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_queue_status
@@ -257,8 +261,7 @@ class SyncQueue:
         for value in state_values:
             title, kind = _decode_metadata_state_value(value)
             if title and (
-                kind == "custom"
-                or (kind == "unknown" and title != incoming_fallback)
+                kind == "custom" or (kind == "unknown" and title != incoming_fallback)
             ):
                 return title
 
@@ -359,12 +362,15 @@ class SyncQueue:
                         (current_value, now, namespace, item_key),
                     )
 
-                active = self._conn.execute(
-                    """SELECT 1 FROM queue
+                active = (
+                    self._conn.execute(
+                        """SELECT 1 FROM queue
                        WHERE tool_name=? AND relative_path=?
                          AND status='uploading' LIMIT 1""",
-                    (tool_name, relative_path),
-                ).fetchone() is not None
+                        (tool_name, relative_path),
+                    ).fetchone()
+                    is not None
+                )
                 pending = self._conn.execute(
                     """SELECT id, metadata FROM queue
                        WHERE tool_name=? AND relative_path=?
@@ -394,15 +400,15 @@ class SyncQueue:
                         continue
 
                 payload = dict(record)
-                payload.update({
-                    "_queue_state_namespace": namespace,
-                    "_queue_state_key": item_key,
-                    "_queue_state_value": current_value,
-                })
+                payload.update(
+                    {
+                        "_queue_state_namespace": namespace,
+                        "_queue_state_key": item_key,
+                        "_queue_state_value": current_value,
+                    }
+                )
                 metadata_json = json.dumps(payload, default=str)
-                content_hash = hashlib.sha256(
-                    metadata_json.encode("utf-8")
-                ).hexdigest()
+                content_hash = hashlib.sha256(metadata_json.encode("utf-8")).hexdigest()
 
                 if pending:
                     self._conn.execute(
@@ -421,9 +427,19 @@ class SyncQueue:
                                payload_bytes, available_at
                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
                         (
-                            tool_name, "metadata", "json", relative_path, "",
-                            content_hash, 0, "metadata", 0, 0, metadata_json,
-                            now, 0,
+                            tool_name,
+                            "metadata",
+                            "json",
+                            relative_path,
+                            "",
+                            content_hash,
+                            0,
+                            "metadata",
+                            0,
+                            0,
+                            metadata_json,
+                            now,
+                            0,
                         ),
                     )
                 queued += 1
@@ -432,7 +448,9 @@ class SyncQueue:
         return queued
 
     def _column_names(self, table: str) -> set[str]:
-        return {str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        return {
+            str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")
+        }
 
     def _remove_orphaned_spool_files(self) -> None:
         with self._lock:
@@ -448,8 +466,11 @@ class SyncQueue:
             # A concurrent producer writes before inserting queue metadata.
             # The age guard keeps startup cleanup from racing that window.
             try:
-                if (path.is_file() and str(path.resolve()) not in referenced
-                        and path.stat().st_mtime < stale_before):
+                if (
+                    path.is_file()
+                    and str(path.resolve()) not in referenced
+                    and path.stat().st_mtime < stale_before
+                ):
                     path.unlink()
             except OSError:
                 pass
@@ -572,23 +593,60 @@ class SyncQueue:
                 return None, 0
             return str(synced[0]), int(synced[1] or 0)
 
-    def enqueue(self, tool_name: str, category: str, content_type: str,
-                relative_path: str, content: str, content_hash: str,
-                file_size: int, sync_strategy: str, is_partial: bool = False,
-                offset: int = 0, metadata: dict | None = None,
-                source_modified_at: float | None = None,
-                base_hash: str | None = None, base_offset: int = 0,
-                source_path: str | None = None) -> int:
+    def has_uncommitted_delta_revision(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> bool:
+        """Return whether this source already has a staged delta revision.
+
+        A leased upload is not a committed base. Capturing another tail while
+        it is pending or uploading makes that tail speculative: a restart,
+        receipt failure, or server-side base conflict leaves it anchored to a
+        revision that never became authoritative. The sync callback captures
+        the next window immediately after ``mark_synced``, so filesystem events
+        can safely defer while one revision is uncommitted.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT 1 FROM queue
+                   WHERE tool_name=? AND relative_path=?
+                     AND status IN ('pending','uploading')
+                     AND sync_strategy='delta'
+                   LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            return row is not None
+
+    def enqueue(
+        self,
+        tool_name: str,
+        category: str,
+        content_type: str,
+        relative_path: str,
+        content: str,
+        content_hash: str,
+        file_size: int,
+        sync_strategy: str,
+        is_partial: bool = False,
+        offset: int = 0,
+        metadata: dict | None = None,
+        source_modified_at: float | None = None,
+        base_hash: str | None = None,
+        base_offset: int = 0,
+        source_path: str | None = None,
+    ) -> int:
         del file_size  # payload byte size is measured after sanitization below
-        is_complete_snapshot = (
-            sync_strategy in {"full", "delta"} and not is_partial
-        )
+        is_complete_snapshot = sync_strategy in {"full", "delta"} and not is_partial
         is_coalescible_delta = (
             sync_strategy == "delta" and is_partial and bool(base_hash)
         )
+        force_reprocess = bool(
+            isinstance(metadata, dict) and metadata.get("_queue_force_reprocess_nonce")
+        )
 
         # Avoid writing another spool file for an identical complete observation.
-        if is_complete_snapshot:
+        if is_complete_snapshot and not force_reprocess:
             with self._lock:
                 if self._observed_hash_locked(tool_name, relative_path) == content_hash:
                     row = self._conn.execute(
@@ -613,7 +671,9 @@ class SyncQueue:
                 # Re-check after the spool write closes the concurrent-enqueue race.
                 if (
                     is_complete_snapshot
-                    and self._observed_hash_locked(tool_name, relative_path) == content_hash
+                    and not force_reprocess
+                    and self._observed_hash_locked(tool_name, relative_path)
+                    == content_hash
                 ):
                     row = self._conn.execute(
                         """SELECT id FROM queue
@@ -658,11 +718,24 @@ class SyncQueue:
                            lease_token=NULL, lease_until=NULL, available_at=0,
                            last_attempt_at=NULL, last_error=NULL
                            WHERE id=? AND status='pending'""",
-                        (category, content_type, inline_content, content_hash,
-                         payload_bytes, sync_strategy, int(is_partial), offset,
-                         metadata_json, source_modified_at, base_hash,
-                         int(base_offset), source_path, payload_path,
-                         payload_bytes, item_id),
+                        (
+                            category,
+                            content_type,
+                            inline_content,
+                            content_hash,
+                            payload_bytes,
+                            sync_strategy,
+                            int(is_partial),
+                            offset,
+                            metadata_json,
+                            source_modified_at,
+                            base_hash,
+                            int(base_offset),
+                            source_path,
+                            payload_path,
+                            payload_bytes,
+                            item_id,
+                        ),
                     )
                 else:
                     cursor = self._conn.execute(
@@ -673,11 +746,26 @@ class SyncQueue:
                            payload_bytes, available_at, base_hash, base_offset,
                            source_path
                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)""",
-                        (tool_name, category, content_type, relative_path,
-                         inline_content, content_hash, payload_bytes, sync_strategy,
-                         int(is_partial), offset, metadata_json, now,
-                         source_modified_at, payload_path, payload_bytes,
-                         base_hash, int(base_offset), source_path),
+                        (
+                            tool_name,
+                            category,
+                            content_type,
+                            relative_path,
+                            inline_content,
+                            content_hash,
+                            payload_bytes,
+                            sync_strategy,
+                            int(is_partial),
+                            offset,
+                            metadata_json,
+                            now,
+                            source_modified_at,
+                            payload_path,
+                            payload_bytes,
+                            base_hash,
+                            int(base_offset),
+                            source_path,
+                        ),
                     )
                     item_id = int(cursor.lastrowid)
 
@@ -710,8 +798,15 @@ class SyncQueue:
                            observed_hash=excluded.observed_hash,
                            observed_offset=excluded.observed_offset,
                            observed_at=excluded.observed_at""",
-                    (tool_name, relative_path, content_hash, offset,
-                     content_hash, offset, now),
+                    (
+                        tool_name,
+                        relative_path,
+                        content_hash,
+                        offset,
+                        content_hash,
+                        offset,
+                        now,
+                    ),
                 )
                 self._conn.commit()
         except Exception:
@@ -728,11 +823,13 @@ class SyncQueue:
         return item_id
 
     @_rollback_on_error
-    def claim_batch(self, batch_size: int = 20,
-                    max_bytes: int = 128 * 1024 * 1024,
-                    lease_seconds: int = 300,
-                    live_delta_reserve_bytes: int = 16 * 1024 * 1024,
-                    ) -> list[QueueItem]:
+    def claim_batch(
+        self,
+        batch_size: int = 20,
+        max_bytes: int = 128 * 1024 * 1024,
+        lease_seconds: int = 300,
+        live_delta_reserve_bytes: int = 16 * 1024 * 1024,
+    ) -> list[QueueItem]:
         """Atomically lease a priority-aware, byte-bounded metadata batch.
 
         Lightweight metadata and guarded tails from files that are actively
@@ -749,13 +846,15 @@ class SyncQueue:
                    WHERE status='uploading' AND COALESCE(lease_until, 0) <= ?""",
                 (now,),
             )
-            in_flight_bytes = int(self._conn.execute(
-                """SELECT COALESCE(SUM(
+            in_flight_bytes = int(
+                self._conn.execute(
+                    """SELECT COALESCE(SUM(
                        CASE WHEN payload_bytes > 0 THEN payload_bytes ELSE file_size END
                    ), 0) FROM queue
                    WHERE status='uploading' AND COALESCE(lease_until, 0) > ?""",
-                (now,),
-            ).fetchone()[0])
+                    (now,),
+                ).fetchone()[0]
+            )
             candidates = self._conn.execute(
                 """SELECT q.id, q.tool_name, q.category, q.content_type,
                           q.relative_path, q.content_hash, q.file_size,
@@ -851,21 +950,33 @@ class SyncQueue:
                 metadata = json.loads(row[10])
             except (TypeError, json.JSONDecodeError):
                 metadata = {}
-            items.append(QueueItem(
-                id=item_id, tool_name=row[1], category=row[2],
-                content_type=row[3], relative_path=row[4], content=None,
-                content_hash=row[5], file_size=int(row[6]),
-                sync_strategy=row[7], is_partial=bool(row[8]), offset=int(row[9]),
-                metadata=metadata, created_at=float(row[11]),
-                source_modified_at=(
-                    float(row[12]) if row[12] is not None else None
-                ),
-                retry_count=int(row[13]), payload_path=row[14],
-                payload_bytes=int(row[15] or row[6]),
-                base_hash=row[16], base_offset=int(row[17] or 0),
-                source_path=row[18],
-                lease_token=token,
-            ))
+            items.append(
+                QueueItem(
+                    id=item_id,
+                    tool_name=row[1],
+                    category=row[2],
+                    content_type=row[3],
+                    relative_path=row[4],
+                    content=None,
+                    content_hash=row[5],
+                    file_size=int(row[6]),
+                    sync_strategy=row[7],
+                    is_partial=bool(row[8]),
+                    offset=int(row[9]),
+                    metadata=metadata,
+                    created_at=float(row[11]),
+                    source_modified_at=(
+                        float(row[12]) if row[12] is not None else None
+                    ),
+                    retry_count=int(row[13]),
+                    payload_path=row[14],
+                    payload_bytes=int(row[15] or row[6]),
+                    base_hash=row[16],
+                    base_offset=int(row[17] or 0),
+                    source_path=row[18],
+                    lease_token=token,
+                )
+            )
         return items
 
     @_rollback_on_error
@@ -945,8 +1056,19 @@ class SyncQueue:
                        synced_hash=excluded.synced_hash,
                        synced_offset=excluded.synced_offset,
                        synced_at=excluded.synced_at""",
-                (row[0], row[1], row[2], int(row[3]), now,
-                 row[2], int(row[3]), now, row[2], int(row[3]), now),
+                (
+                    row[0],
+                    row[1],
+                    row[2],
+                    int(row[3]),
+                    now,
+                    row[2],
+                    int(row[3]),
+                    now,
+                    row[2],
+                    int(row[3]),
+                    now,
+                ),
             )
             try:
                 item_metadata = json.loads(str(row[5]))
@@ -955,9 +1077,14 @@ class SyncQueue:
             state_namespace = item_metadata.get("_queue_state_namespace")
             state_key = item_metadata.get("_queue_state_key")
             state_value = item_metadata.get("_queue_state_value")
-            if all(isinstance(value, str) for value in (
-                state_namespace, state_key, state_value,
-            )):
+            if all(
+                isinstance(value, str)
+                for value in (
+                    state_namespace,
+                    state_key,
+                    state_value,
+                )
+            ):
                 self._conn.execute(
                     """UPDATE metadata_state
                        SET synced_value=?, updated_at=?
@@ -989,13 +1116,16 @@ class SyncQueue:
             # A newer complete snapshot covers any older FULL or DELTA
             # payload for this path. Drop the failed predecessor so a legacy
             # strategy transition cannot wedge the authoritative snapshot.
-            has_successor = self._conn.execute(
-                """SELECT 1 FROM queue
+            has_successor = (
+                self._conn.execute(
+                    """SELECT 1 FROM queue
                    WHERE tool_name=? AND relative_path=? AND status='pending'
                      AND sync_strategy IN ('full','delta')
                      AND is_partial=0 AND id > ? LIMIT 1""",
-                (row[0], row[1], item.id),
-            ).fetchone() is not None
+                    (row[0], row[1], item.id),
+                ).fetchone()
+                is not None
+            )
 
             next_retry = int(row[4]) + 1
             if has_successor:
@@ -1010,12 +1140,19 @@ class SyncQueue:
                 """UPDATE queue SET retry_count=?, status=?, lease_token=NULL,
                           lease_until=NULL, available_at=?, last_error=?
                    WHERE id=? AND status='uploading' AND lease_token=?""",
-                (next_retry, status, available_at, (error or "")[:1000],
-                 item.id, item.lease_token),
+                (
+                    next_retry,
+                    status,
+                    available_at,
+                    (error or "")[:1000],
+                    item.id,
+                    item.lease_token,
+                ),
             )
             if status == "superseded":
                 self._conn.execute(
-                    "UPDATE queue SET payload_path=NULL, content='' WHERE id=?", (item.id,)
+                    "UPDATE queue SET payload_path=NULL, content='' WHERE id=?",
+                    (item.id,),
                 )
             self._conn.commit()
         self._discard_payload(payload_path)
@@ -1047,7 +1184,9 @@ class SyncQueue:
                      AND sync_strategy='delta' AND is_partial=1""",
                 (row[0], row[1]),
             ).fetchall()
-            payload_paths.extend(str(candidate[0]) for candidate in pending if candidate[0])
+            payload_paths.extend(
+                str(candidate[0]) for candidate in pending if candidate[0]
+            )
 
             self._conn.execute(
                 """UPDATE queue SET status='superseded', payload_path=NULL,
@@ -1080,7 +1219,9 @@ class SyncQueue:
             self._discard_payload(payload_path)
         return True
 
-    def get_file_state(self, tool_name: str, relative_path: str) -> tuple[str | None, int]:
+    def get_file_state(
+        self, tool_name: str, relative_path: str
+    ) -> tuple[str | None, int]:
         with self._lock:
             row = self._conn.execute(
                 """SELECT COALESCE(observed_hash, last_hash),
@@ -1091,8 +1232,9 @@ class SyncQueue:
             return (row[0], int(row[1])) if row else (None, 0)
 
     @_rollback_on_error
-    def update_file_state(self, tool_name: str, relative_path: str,
-                          content_hash: str, offset: int) -> None:
+    def update_file_state(
+        self, tool_name: str, relative_path: str, content_hash: str, offset: int
+    ) -> None:
         """Compatibility helper: record observation, never claim upload success."""
         now = time.time()
         with self._lock:
@@ -1107,8 +1249,15 @@ class SyncQueue:
                        observed_hash=excluded.observed_hash,
                        observed_offset=excluded.observed_offset,
                        observed_at=excluded.observed_at""",
-                (tool_name, relative_path, content_hash, offset,
-                 content_hash, offset, now),
+                (
+                    tool_name,
+                    relative_path,
+                    content_hash,
+                    offset,
+                    content_hash,
+                    offset,
+                    now,
+                ),
             )
             self._conn.commit()
 
@@ -1134,17 +1283,21 @@ class SyncQueue:
 
     def pending_count(self) -> int:
         with self._lock:
-            return int(self._conn.execute(
-                "SELECT COUNT(*) FROM queue WHERE status IN ('pending','uploading')"
-            ).fetchone()[0])
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM queue WHERE status IN ('pending','uploading')"
+                ).fetchone()[0]
+            )
 
     def outstanding_bytes(self) -> int:
         with self._lock:
-            return int(self._conn.execute(
-                """SELECT COALESCE(SUM(
+            return int(
+                self._conn.execute(
+                    """SELECT COALESCE(SUM(
                        CASE WHEN payload_bytes > 0 THEN payload_bytes ELSE file_size END
                    ), 0) FROM queue WHERE status IN ('pending','uploading')"""
-            ).fetchone()[0])
+                ).fetchone()[0]
+            )
 
     @_rollback_on_error
     def clear_all_state(self) -> None:

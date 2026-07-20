@@ -24,13 +24,19 @@ class SyncQueueTests(unittest.TestCase):
         self.queue.close()
         self._temporary.cleanup()
 
-    def _enqueue(self, path: str, content: str, content_hash: str,
-                 strategy: str = "full", partial: bool = False,
-                 offset: int = 0,
-                 source_modified_at: float | None = None,
-                 base_hash: str | None = None,
-                 base_offset: int = 0,
-                 source_path: str | None = None) -> int:
+    def _enqueue(
+        self,
+        path: str,
+        content: str,
+        content_hash: str,
+        strategy: str = "full",
+        partial: bool = False,
+        offset: int = 0,
+        source_modified_at: float | None = None,
+        base_hash: str | None = None,
+        base_offset: int = 0,
+        source_path: str | None = None,
+    ) -> int:
         return self.queue.enqueue(
             tool_name="codex",
             category="conversation",
@@ -155,7 +161,9 @@ class SyncQueueTests(unittest.TestCase):
         self.assertEqual(state[1], "hash-2")
         self.assertIsNotNone(state[2])
 
-    def test_clear_file_state_forces_identical_complete_snapshot_to_requeue(self) -> None:
+    def test_clear_file_state_forces_identical_complete_snapshot_to_requeue(
+        self,
+    ) -> None:
         relative_path = "sessions/thread.jsonl"
         self._enqueue(relative_path, "complete", "hash-1", "delta")
         self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
@@ -172,6 +180,44 @@ class SyncQueueTests(unittest.TestCase):
         self.assertEqual(
             self.queue.read_payload_text(self.queue.claim_batch()[0]),
             "complete",
+        )
+
+    def test_repair_nonce_requeues_identical_snapshot_without_forgetting_receipt(
+        self,
+    ) -> None:
+        relative_path = "sessions/thread.jsonl"
+        self._enqueue(relative_path, "complete", "hash-1", "delta")
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+
+        item_id = self.queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content="complete",
+            content_hash="hash-1",
+            file_size=8,
+            sync_strategy="delta",
+            is_partial=False,
+            offset=8,
+            metadata={"_queue_force_reprocess_nonce": "repair-1"},
+            source_path="/tmp/sessions/thread.jsonl",
+        )
+
+        self.assertGreater(item_id, 0)
+        self.assertTrue(
+            self.queue.has_uncommitted_delta_revision("codex", relative_path)
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            state = connection.execute(
+                "SELECT synced_hash, synced_offset FROM file_state"
+            ).fetchone()
+        self.assertEqual(state, ("hash-1", 0))
+
+        repair = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_synced(repair))
+        self.assertFalse(
+            self.queue.has_uncommitted_delta_revision("codex", relative_path)
         )
 
     def test_server_requested_repair_moves_ahead_of_ordinary_backlog(self) -> None:
@@ -226,16 +272,30 @@ class SyncQueueTests(unittest.TestCase):
         )
 
         first_id = self._enqueue(
-            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
-            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+            "history.jsonl",
+            "tail-1",
+            "hash-1",
+            "delta",
+            True,
+            20,
+            base_hash="hash-0",
+            base_offset=10,
+            source_path="/tmp/history.jsonl",
         )
         self.assertEqual(
             self.queue.get_delta_base("codex", "history.jsonl"),
             ("hash-0", 10),
         )
         second_id = self._enqueue(
-            "history.jsonl", "tail-1\ntail-2", "hash-2", "delta", True, 30,
-            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+            "history.jsonl",
+            "tail-1\ntail-2",
+            "hash-2",
+            "delta",
+            True,
+            30,
+            base_hash="hash-0",
+            base_offset=10,
+            source_path="/tmp/history.jsonl",
         )
 
         self.assertEqual(second_id, first_id)
@@ -250,13 +310,27 @@ class SyncQueueTests(unittest.TestCase):
         self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
         self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
         self._enqueue(
-            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
-            base_hash="hash-0", base_offset=10, source_path="/tmp/history.jsonl",
+            "history.jsonl",
+            "tail-1",
+            "hash-1",
+            "delta",
+            True,
+            20,
+            base_hash="hash-0",
+            base_offset=10,
+            source_path="/tmp/history.jsonl",
         )
         active = self.queue.claim_batch()[0]
         self._enqueue(
-            "history.jsonl", "tail-2", "hash-2", "delta", True, 30,
-            base_hash="hash-1", base_offset=20, source_path="/tmp/history.jsonl",
+            "history.jsonl",
+            "tail-2",
+            "hash-2",
+            "delta",
+            True,
+            30,
+            base_hash="hash-1",
+            base_offset=20,
+            source_path="/tmp/history.jsonl",
         )
 
         self.assertTrue(self.queue.mark_delta_conflict(active))
@@ -293,7 +367,9 @@ class SyncQueueTests(unittest.TestCase):
         self.assertIsNone(first_batch[0].content)
         self.assertEqual(self.queue.claim_batch(batch_size=10, max_bytes=100_000), [])
         self.assertTrue(self.queue.mark_synced(first_batch[0]))
-        self.assertEqual(len(self.queue.claim_batch(batch_size=10, max_bytes=100_000)), 1)
+        self.assertEqual(
+            len(self.queue.claim_batch(batch_size=10, max_bytes=100_000)), 1
+        )
 
     def test_oversize_payload_is_claimed_alone(self) -> None:
         self._enqueue("large.jsonl", "a" * 150_000, "hash-large")
@@ -391,9 +467,14 @@ class SyncQueueTests(unittest.TestCase):
                 "revision": 1000,
             }
         }
-        self.assertEqual(self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex", records=first,
-        ), 1)
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="codex_thread_titles",
+                tool_name="codex",
+                records=first,
+            ),
+            1,
+        )
         self.assertEqual(self.queue.pending_count(), 1)
         first_item = self.queue.claim_batch()[0]
         self.assertEqual(first_item.metadata["title"], "Original title")
@@ -406,10 +487,17 @@ class SyncQueueTests(unittest.TestCase):
         self.assertEqual(first_state, ("Original title", ""))
         self.assertTrue(self.queue.mark_synced(first_item))
 
-        renamed = {thread_id: {**first[thread_id], "title": "Renamed", "revision": 2000}}
-        self.assertEqual(self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex", records=renamed,
-        ), 1)
+        renamed = {
+            thread_id: {**first[thread_id], "title": "Renamed", "revision": 2000}
+        }
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="codex_thread_titles",
+                tool_name="codex",
+                records=renamed,
+            ),
+            1,
+        )
         item = self.queue.claim_batch()[0]
         self.assertEqual(item.sync_strategy, "metadata")
         self.assertEqual(item.payload_bytes, 0)
@@ -468,8 +556,14 @@ class SyncQueueTests(unittest.TestCase):
     def test_live_delta_leapfrogs_historical_backlog(self) -> None:
         self._enqueue("archived/old.jsonl", "old", "old-hash")
         self._enqueue(
-            "sessions/active.jsonl", "tail", "tail-hash", "delta", True, 20,
-            base_hash="base-hash", base_offset=10,
+            "sessions/active.jsonl",
+            "tail",
+            "tail-hash",
+            "delta",
+            True,
+            20,
+            base_hash="base-hash",
+            base_offset=10,
             source_path="/tmp/sessions/active.jsonl",
         )
 
@@ -483,8 +577,14 @@ class SyncQueueTests(unittest.TestCase):
         large = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]
         self.assertEqual(large.relative_path, "archived/large.jsonl")
         self._enqueue(
-            "sessions/active.jsonl", "tail", "tail-hash", "delta", True, 20,
-            base_hash="base-hash", base_offset=10,
+            "sessions/active.jsonl",
+            "tail",
+            "tail-hash",
+            "delta",
+            True,
+            20,
+            base_hash="base-hash",
+            base_offset=10,
             source_path="/tmp/sessions/active.jsonl",
         )
 
@@ -501,8 +601,14 @@ class SyncQueueTests(unittest.TestCase):
         self._enqueue("archived/large.jsonl", "x" * 150_000, "large-hash")
         self.queue.claim_batch(batch_size=1, max_bytes=100_000)
         self._enqueue(
-            "sessions/active.jsonl", "tail" * 3_000, "tail-hash", "delta", True, 20,
-            base_hash="base-hash", base_offset=10,
+            "sessions/active.jsonl",
+            "tail" * 3_000,
+            "tail-hash",
+            "delta",
+            True,
+            20,
+            base_hash="base-hash",
+            base_offset=10,
             source_path="/tmp/sessions/active.jsonl",
         )
 
@@ -550,7 +656,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "Initial prompt", 1, title_kind="fallback",
+                thread_id,
+                "Initial prompt",
+                1,
+                title_kind="fallback",
             ),
         )
         self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
@@ -558,7 +667,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "netbird setup", 2, title_kind="custom",
+                thread_id,
+                "netbird setup",
+                2,
+                title_kind="custom",
             ),
         )
         self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
@@ -567,7 +679,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "Initial prompt", 3, title_kind="fallback",
+                thread_id,
+                "Initial prompt",
+                3,
+                title_kind="fallback",
             ),
         )
 
@@ -588,7 +703,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "Initial prompt", 1, title_kind="fallback",
+                thread_id,
+                "Initial prompt",
+                1,
+                title_kind="fallback",
             ),
         )
         self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
@@ -596,7 +714,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "netbird setup", 2, title_kind="custom",
+                thread_id,
+                "netbird setup",
+                2,
+                title_kind="custom",
             ),
         )
 
@@ -604,7 +725,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "Initial prompt", 3, title_kind="fallback",
+                thread_id,
+                "Initial prompt",
+                3,
+                title_kind="fallback",
             ),
         )
 
@@ -633,7 +757,10 @@ class SyncQueueTests(unittest.TestCase):
             namespace="codex_thread_titles",
             tool_name="codex",
             records=self._metadata_record(
-                thread_id, "Initial prompt", 3, title_kind="fallback",
+                thread_id,
+                "Initial prompt",
+                3,
+                title_kind="fallback",
             ),
         )
 
@@ -646,24 +773,29 @@ class SyncQueueTests(unittest.TestCase):
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
 
         def record(title: str, revision: int) -> dict[str, dict]:
-            return {thread_id: {
-                "metadata_type": "codex_thread_title",
-                "tool": "codex",
-                "thread_id": thread_id,
-                "title": title,
-                "revision": revision,
-            }}
+            return {
+                thread_id: {
+                    "metadata_type": "codex_thread_title",
+                    "tool": "codex",
+                    "thread_id": thread_id,
+                    "title": title,
+                    "revision": revision,
+                }
+            }
 
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("A", 1),
         )
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("B", 2),
         )
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("C", 3),
         )
         self.assertEqual(self.queue.pending_count(), 1)
@@ -672,15 +804,18 @@ class SyncQueueTests(unittest.TestCase):
         # Use a second thread for the no-in-flight revert case.
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e99"
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("A", 1),
         )
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("B", 2),
         )
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex",
+            namespace="codex_thread_titles",
+            tool_name="codex",
             records=record("A", 3),
         )
         self.assertEqual(self.queue.pending_count(), 2)
@@ -688,44 +823,60 @@ class SyncQueueTests(unittest.TestCase):
 
     def test_force_resync_requeues_unacknowledged_metadata(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
-        baseline = {thread_id: {
-            "metadata_type": "codex_thread_title",
-            "tool": "codex",
-            "thread_id": thread_id,
-            "title": "A",
-            "revision": 1,
-        }}
+        baseline = {
+            thread_id: {
+                "metadata_type": "codex_thread_title",
+                "tool": "codex",
+                "thread_id": thread_id,
+                "title": "A",
+                "revision": 1,
+            }
+        }
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex", records=baseline,
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=baseline,
         )
         changed = {thread_id: {**baseline[thread_id], "title": "B", "revision": 2}}
         self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex", records=changed,
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=changed,
         )
         self.queue.clear_all_state()
         self.assertEqual(self.queue.pending_count(), 0)
 
-        self.assertEqual(self.queue.enqueue_metadata_changes(
-            namespace="codex_thread_titles", tool_name="codex", records=changed,
-        ), 1)
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="codex_thread_titles",
+                tool_name="codex",
+                records=changed,
+            ),
+            1,
+        )
         self.assertEqual(self.queue.claim_batch()[0].metadata["title"], "B")
 
     def test_recreated_queue_reconciles_first_observation_again(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
-        record = {thread_id: {
-            "metadata_type": "codex_thread_title",
-            "tool": "codex",
-            "thread_id": thread_id,
-            "title": "Already renamed before install",
-            "revision": 123_456,
-        }}
+        record = {
+            thread_id: {
+                "metadata_type": "codex_thread_title",
+                "tool": "codex",
+                "thread_id": thread_id,
+                "title": "Already renamed before install",
+                "revision": 123_456,
+            }
+        }
         rebuilt = SyncQueue(self.root / "rebuilt.db")
         try:
-            self.assertEqual(rebuilt.enqueue_metadata_changes(
-                namespace="codex_thread_titles",
-                tool_name="codex",
-                records=record,
-            ), 1)
+            self.assertEqual(
+                rebuilt.enqueue_metadata_changes(
+                    namespace="codex_thread_titles",
+                    tool_name="codex",
+                    records=record,
+                ),
+                1,
+            )
             item = rebuilt.claim_batch()[0]
             self.assertEqual(item.metadata["title"], "Already renamed before install")
             self.assertEqual(item.metadata["revision"], 123_456)
@@ -771,7 +922,14 @@ class SyncQueueMigrationTests(unittest.TestCase):
                            content_hash, file_size, sync_strategy, is_partial,
                            metadata, created_at
                            ) VALUES ('codex','conversation','jsonl',?,?,?,1,?,?, '{}',?)""",
-                        (path, content_hash, content_hash, strategy, partial, created_at),
+                        (
+                            path,
+                            content_hash,
+                            content_hash,
+                            strategy,
+                            partial,
+                            created_at,
+                        ),
                     )
                 connection.execute(
                     """INSERT INTO file_state
@@ -800,12 +958,16 @@ class SyncQueueMigrationTests(unittest.TestCase):
                 self.assertEqual(full_statuses, [("superseded",), ("pending",)])
                 self.assertEqual(delta_statuses, [("pending",), ("pending",)])
                 self.assertEqual(state, ("new", 42, None))
-                self.assertEqual(source_timestamps, [(None,), (None,), (None,), (None,)])
+                self.assertEqual(
+                    source_timestamps, [(None,), (None,), (None,), (None,)]
+                )
                 self.assertEqual(version, SyncQueue.SCHEMA_VERSION)
-                self.assertTrue(all(
-                    item.source_modified_at is None
-                    for item in queue.claim_batch(batch_size=10)
-                ))
+                self.assertTrue(
+                    all(
+                        item.source_modified_at is None
+                        for item in queue.claim_batch(batch_size=10)
+                    )
+                )
             finally:
                 queue.close()
 

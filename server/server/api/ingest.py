@@ -27,6 +27,7 @@ from ..services.ingest_service import (
 from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
     ChunkValidationError,
+    chunk_commit_status,
     has_completion_receipt,
     pending_source_revision_job_id,
     stage_chunk,
@@ -63,6 +64,7 @@ class IngestFileRequest(BaseModel):
     base_offset: int | None = Field(default=None, ge=0)
     metadata: dict = {}
     timestamp: float | None = None
+    authoritative_rebase: bool = Field(default=False, strict=True)
     content: str = ""
 
 
@@ -70,6 +72,17 @@ class IngestResponse(BaseModel):
     status: str = "ok"
     document_id: str
     message: str = ""
+
+
+class IngestChunkStatusRequest(BaseModel):
+    upload_id: str = Field(min_length=1, max_length=8192)
+    hash: str = Field(min_length=1, max_length=64)
+
+
+class IngestChunkStatusResponse(BaseModel):
+    job_id: str
+    status: Literal["completed", "pending", "receiving", "failed", "blocked", "missing"]
+    error_type: str | None = None
 
 
 class IngestMetadataRequest(BaseModel):
@@ -150,6 +163,21 @@ def _reject_synthetic_metadata_file_upload(
             status_code=400,
             detail="metadata updates must use /api/ingest/metadata",
         )
+
+
+def _validated_authoritative_rebase(meta: dict) -> bool:
+    value = meta.get("authoritative_rebase", False)
+    if not isinstance(value, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="authoritative_rebase must be a boolean",
+        )
+    if value and meta.get("mode", "full") != "full":
+        raise HTTPException(
+            status_code=400,
+            detail="only a full snapshot can be an authoritative rebase",
+        )
+    return value
 
 
 async def _ingest_with_delta_guard(**kwargs):
@@ -389,6 +417,7 @@ async def ingest_file_endpoint(
             "user_id": str(_collector_user.id),
             "base_hash": req.base_hash,
             "base_offset": req.base_offset,
+            "authoritative_rebase": req.authoritative_rebase,
         },
         spool_meta=req.model_dump(exclude={"content"}),
         content_bytes=req.content.encode("utf-8"),
@@ -445,6 +474,7 @@ async def ingest_file_upload(
             "user_id": str(_collector_user.id),
             "base_hash": meta.get("base_hash"),
             "base_offset": meta.get("base_offset"),
+            "authoritative_rebase": _validated_authoritative_rebase(meta),
         },
         spool_meta=meta,
         content_bytes=file_content.encode("utf-8"),
@@ -574,6 +604,27 @@ async def ingest_file_chunk(
     return IngestResponse(
         document_id=f"queued:{staged.job_id}",
         message=f"Received {int(meta['total_chunks'])} chunks; durable ingest queued",
+    )
+
+
+@router.post("/file/chunk/status", response_model=IngestChunkStatusResponse)
+async def ingest_file_chunk_status(
+    req: IngestChunkStatusRequest,
+    _collector_user: User = Depends(verify_collector_token),
+    _throttle: None = Depends(throttle_ingest),
+    x_device_id: str = Header("unknown"),
+) -> IngestChunkStatusResponse:
+    """Report whether a durably accepted chunk upload committed to PostgreSQL."""
+    result = await asyncio.to_thread(
+        chunk_commit_status,
+        meta={"upload_id": req.upload_id, "hash": req.hash},
+        user_id=str(_collector_user.id),
+        device_id=x_device_id,
+    )
+    return IngestChunkStatusResponse(
+        job_id=result.job_id,
+        status=result.status,
+        error_type=result.error_type,
     )
 
 

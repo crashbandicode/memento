@@ -22,6 +22,7 @@ from server.services.ingest_spool import (  # noqa: E402
     blocked_job_ids,
     cleanup_completion_receipts,
     cleanup_stale_incomplete_jobs,
+    chunk_commit_status,
     complete_and_remove_job,
     failed_job_ids,
     mark_job_complete,
@@ -69,9 +70,7 @@ class IngestSpoolTests(unittest.TestCase):
         with spool_job_lock(job_id, root=self.root) as acquired:
             self.assertTrue(acquired)
 
-        self.assertTrue(
-            (self.root / ".job-locks" / f".{job_id}.stage.lock").is_file()
-        )
+        self.assertTrue((self.root / ".job-locks" / f".{job_id}.stage.lock").is_file())
         self.assertEqual(
             [path for path in self.root.iterdir() if path.is_file()],
             [],
@@ -1306,6 +1305,42 @@ class IngestSpoolTests(unittest.TestCase):
             1,
         )
         self.assertFalse(receipt.exists())
+
+    def test_chunk_commit_status_distinguishes_pending_failed_and_completed(
+        self,
+    ) -> None:
+        meta = self._meta(0, 1, upload_id="status", hash="status", file_size=4)
+        job_id, complete = self._stage(meta, b"done")
+        self.assertTrue(complete)
+
+        pending = chunk_commit_status(
+            meta=meta,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            root=self.root,
+        )
+        self.assertEqual((pending.job_id, pending.status), (job_id, "pending"))
+
+        mark_job_failed(
+            job_id, error_type="DeltaBaseMismatch", attempts=1, root=self.root
+        )
+        failed = chunk_commit_status(
+            meta=meta,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            root=self.root,
+        )
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.error_type, "DeltaBaseMismatch")
+
+        mark_job_complete(job_id, document_id="document-id", root=self.root)
+        completed = chunk_commit_status(
+            meta=meta,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            root=self.root,
+        )
+        self.assertEqual(completed.status, "completed")
 
     def test_spool_quota_rejects_new_bytes_before_writing(self) -> None:
         with (

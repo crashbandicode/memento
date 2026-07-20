@@ -42,11 +42,13 @@ def test_read_only_events_never_enter_debounce_queue(tmp_path: Path) -> None:
     try:
         handler.on_any_event(FileOpenedEvent(str(path)))
         handler.on_any_event(FileClosedNoWriteEvent(str(path)))
-        handler.on_any_event(SimpleNamespace(
-            is_directory=False,
-            event_type="accessed",
-            src_path=str(path),
-        ))
+        handler.on_any_event(
+            SimpleNamespace(
+                is_directory=False,
+                event_type="accessed",
+                src_path=str(path),
+            )
+        )
 
         assert callbacks == []
         assert handler._pending == {}
@@ -75,7 +77,9 @@ def test_moved_event_routes_existing_destination(tmp_path: Path) -> None:
         handler.stop()
 
 
-def test_relative_resync_resolves_only_files_below_the_tool_root(tmp_path: Path) -> None:
+def test_relative_resync_resolves_only_files_below_the_tool_root(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "codex"
     transcript = root / "sessions" / "thread.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -389,7 +393,9 @@ def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(
 ) -> None:
     path = tmp_path / "active-session.jsonl"
     first = '{"type":"event_msg","payload":{"type":"user_message","message":"first"}}\n'
-    second = '{"type":"event_msg","payload":{"type":"user_message","message":"second"}}\n'
+    second = (
+        '{"type":"event_msg","payload":{"type":"user_message","message":"second"}}\n'
+    )
     path.write_text(first, encoding="utf-8")
     prefix_size = path.stat().st_size
 
@@ -427,9 +433,15 @@ def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(
         assert complete.offset == prefix_size
         assert "first" in queue.read_payload_text(complete)
         assert "second" not in queue.read_payload_text(complete)
+
+        # The appended second record must not become a speculative tail while
+        # the authoritative base is merely leased. Its receipt callback will
+        # capture the tail after the base is committed.
+        watcher._parsers = [JsonlParser()]
+        watcher._process_file_changed(path)
+        assert queue.pending_count() == 1
         assert queue.mark_synced(complete)
 
-        watcher._parsers = [JsonlParser()]
         watcher._process_file_changed(path)
         tail = queue.claim_batch(max_bytes=1024 * 1024)[0]
         assert tail.is_partial is True
@@ -445,10 +457,13 @@ def test_large_jsonl_initial_sync_and_backlog_use_bounded_windows(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "large-session.jsonl"
-    record = json.dumps({
-        "type": "event_msg",
-        "payload": {"text": "x" * 1000},
-    }, separators=(",", ":"))
+    record = json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {"text": "x" * 1000},
+        },
+        separators=(",", ":"),
+    )
     with path.open("w", encoding="utf-8", newline="\n") as stream:
         for _ in range(18_000):
             stream.write(record + "\n")
@@ -492,10 +507,16 @@ def test_large_jsonl_initial_sync_and_backlog_use_bounded_windows(
 
 def test_large_force_full_repair_bootstraps_a_bounded_base(tmp_path: Path) -> None:
     path = tmp_path / "large-repair.jsonl"
-    record = json.dumps({
-        "type": "event_msg",
-        "payload": {"text": "x" * 1000},
-    }, separators=(",", ":")) + "\n"
+    record = (
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"text": "x" * 1000},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     path.write_text(record * 40, encoding="utf-8")
     max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
 
@@ -540,10 +561,16 @@ def test_large_force_full_repair_bootstraps_a_bounded_base(tmp_path: Path) -> No
 def test_large_delta_backlog_is_captured_in_bounded_windows(tmp_path: Path) -> None:
     path = tmp_path / "active-large-session.jsonl"
     first = json.dumps({"type": "event_msg", "payload": {"text": "first"}}) + "\n"
-    record = json.dumps({
-        "type": "event_msg",
-        "payload": {"text": "x" * 1000},
-    }, separators=(",", ":")) + "\n"
+    record = (
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"text": "x" * 1000},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     path.write_text(first + (record * 40), encoding="utf-8")
     base_offset = len(first.encode("utf-8"))
     max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
@@ -556,6 +583,7 @@ def test_large_delta_backlog_is_captured_in_bounded_windows(tmp_path: Path) -> N
         relative_path="sessions/active-large-session.jsonl",
     )
     tool = SimpleNamespace(classify_file=lambda _path: classification)
+
     class RecordingQueue:
         def __init__(self) -> None:
             self.enqueued: list[dict] = []
@@ -587,6 +615,66 @@ def test_large_delta_backlog_is_captured_in_bounded_windows(tmp_path: Path) -> N
     assert tail["offset"] < path.stat().st_size
     assert len(tail["content"].splitlines()) == 8
     assert len(tail["content"].encode("utf-8")) < path.stat().st_size - base_offset
+
+
+def test_bounded_delta_accepts_append_after_captured_window(tmp_path: Path) -> None:
+    path = tmp_path / "actively-growing-session.jsonl"
+    first = json.dumps({"type": "event_msg", "payload": {"text": "first"}}) + "\n"
+    record = json.dumps({"type": "event_msg", "payload": {"text": "x" * 1000}}) + "\n"
+    appended = json.dumps({"type": "event_msg", "payload": {"text": "later"}}) + "\n"
+    path.write_text(first + (record * 32), encoding="utf-8")
+    base_offset = len(first.encode("utf-8"))
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return "observed-hash", base_offset
+
+        def get_delta_base(self, _tool_name: str, _relative_path: str):
+            return "base-hash", base_offset
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    class AppendingParser(JsonlParser):
+        def parse(
+            self, changed_path: Path, offset: int = 0, end_offset: int | None = None
+        ):
+            result = super().parse(changed_path, offset=offset, end_offset=end_offset)
+            with changed_path.open("a", encoding="utf-8") as stream:
+                stream.write(appended)
+            return result
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/actively-growing-session.jsonl",
+    )
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [AppendingParser()]
+    watcher._config = SimpleNamespace(
+        max_delta_upload_bytes=len(record.encode("utf-8")) * 8
+    )
+
+    watcher._process_file_changed(path)
+
+    assert len(queue.enqueued) == 1
+    tail = queue.enqueued[0]
+    assert tail["is_partial"] is True
+    assert tail["base_hash"] == "base-hash"
+    assert tail["base_offset"] == base_offset
+    assert tail["offset"] < path.stat().st_size
+    assert "later" not in tail["content"]
 
 
 def test_mutation_during_read_defers_without_advancing_source_revision(
