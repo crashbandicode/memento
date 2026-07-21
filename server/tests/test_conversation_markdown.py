@@ -9,6 +9,7 @@ from server.services.conversation_markdown import (
     ConversationMarkdownInfo,
     ExportMessage,
     MarkdownExportOptions,
+    is_meaningful_human_prompt,
     parse_prompt_selection,
     safe_markdown_filename,
     write_conversation_markdown,
@@ -35,6 +36,24 @@ def message(
 async def stream(items: list[ExportMessage]):
     for item in items:
         yield item
+
+
+class MeaningfulHumanPromptTests(unittest.TestCase):
+    def test_cursor_task_finished_notifications_are_not_prompts(self) -> None:
+        notice = (
+            "<system_notification>\n"
+            "The following task has finished. If you were already aware, ignore this.\n"
+            "</system_notification>\n"
+            "<user_query>Briefly inform the user about the task result.</user_query>"
+        )
+        self.assertFalse(is_meaningful_human_prompt(notice, {}))
+        self.assertFalse(
+            is_meaningful_human_prompt(
+                "The following task has finished. Ignore this notice.",
+                {},
+            )
+        )
+        self.assertTrue(is_meaningful_human_prompt("Please keep going on the VLSI path.", {}))
 
 
 class PromptSelectionTests(unittest.TestCase):

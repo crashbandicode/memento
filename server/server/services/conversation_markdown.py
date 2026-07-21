@@ -139,12 +139,20 @@ def is_meaningful_human_prompt(
     """Use one prompt definition for the navigator and Markdown exports."""
     clean = (content or "").strip()
     values = metadata or {}
-    return bool(
-        role == "user"
-        and clean
-        and not clean.startswith("[Subagent Context]")
-        and not isinstance(values.get("interaction_response"), dict)
-    )
+    if role != "user" or not clean:
+        return False
+    if clean.startswith("[Subagent Context]"):
+        return False
+    if isinstance(values.get("interaction_response"), dict):
+        return False
+    # Cursor injects shell/await completion notices as user bubbles. Keep them
+    # out of the prompt navigator even before a role backfill lands.
+    lowered = clean.casefold()
+    if "<system_notification" in lowered:
+        return False
+    if "the following task has finished" in lowered:
+        return False
+    return True
 
 
 def safe_markdown_filename(title: str, document_id: str) -> str:

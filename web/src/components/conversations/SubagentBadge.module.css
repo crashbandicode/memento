@@ -40,15 +40,9 @@
 
 .panel {
   box-sizing: border-box;
-  position: absolute;
-  z-index: 90;
-  top: calc(100% + 8px);
-  right: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
-  width: min(440px, calc(100vw - 48px));
   min-width: 300px;
-  max-height: min(520px, 72vh);
   overflow: hidden;
   border: 1px solid var(--aurora-border);
   border-radius: 16px;

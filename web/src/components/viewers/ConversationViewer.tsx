@@ -866,7 +866,9 @@ export default function ConversationViewer({
     }
     const isHumanPrompt = (msg.role || msg.message_type) === "user"
       && !msg.interaction_response
-      && !msg.content.includes("[Subagent Context]");
+      && !msg.content.includes("[Subagent Context]")
+      && !/<system_notification\b/i.test(msg.content)
+      && !/the following task has finished/i.test(msg.content);
     const visibilityGroups = messageVisibilityGroups(msg, toolId || "", questionResponses);
     const messageCategory = visibilityGroups[0] || "context";
     const hideWholeMessage = !visibilityGroups.some((group) => visibility[group]);
