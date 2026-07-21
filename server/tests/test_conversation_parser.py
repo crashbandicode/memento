@@ -1801,6 +1801,40 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.timestamp, "2026-06-26T12:35:00-04:00")
         self.assertIn("Potentially Relevant Websearch Results", msg.session_context)
 
+    def test_cursor_system_notification_is_context_not_human_input(self) -> None:
+        content = (
+            "<system_notification>\n"
+            "The following task has finished. If you were already aware, "
+            "ignore this notification and do not restate prior responses.\n\n"
+            "<task>\n"
+            "kind: shell\n"
+            "status: success\n"
+            "task_id: 15893\n"
+            "title: Measure BAN runtime footprint\n"
+            "</task>\n"
+            "</system_notification>\n"
+            "<user_query>Briefly inform the user about the task result and "
+            "perform any follow-up actions (if needed). If there's no "
+            "follow-ups needed, don't explicitly say that.</user_query>"
+        )
+        raw = json.dumps({
+            "type": "user",
+            "role": "user",
+            "id": "notif-1",
+            "timestamp": "2026-07-21T12:57:06Z",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "system")
+        self.assertEqual(msg.raw_type, "cursor_context")
+        self.assertIn("system_notification", msg.content)
+        self.assertIn("Measure BAN runtime footprint", msg.content)
+        self.assertIn("Briefly inform the user about the task result", msg.content)
+
     def test_cursor_image_attachments_do_not_block_prompt_or_timestamp(self) -> None:
         content = (
             "[Image] [Image]\n"

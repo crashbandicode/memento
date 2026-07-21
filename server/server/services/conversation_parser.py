@@ -129,12 +129,22 @@ _CURSOR_USER_QUERY_ENVELOPE_RE = re.compile(
     re.IGNORECASE,
 )
 _CURSOR_SESSION_CONTEXT_RE = re.compile(
-    r"\A\s*<(?P<tag>external_links|plugin_info|uploaded_documents)\b[^>]*>"
+    r"\A\s*<(?P<tag>external_links|plugin_info|uploaded_documents|"
+    r"system_notification)\b[^>]*>"
     r"[\s\S]*?</(?P=tag)>\s*",
     re.IGNORECASE,
 )
 _CURSOR_SESSION_CONTEXT_PREFIX_RE = re.compile(
-    r"\A\s*<(?:external_links|plugin_info|uploaded_documents)(?:\s|>)",
+    r"\A\s*<(?:external_links|plugin_info|uploaded_documents|"
+    r"system_notification)(?:\s|>)",
+    re.IGNORECASE,
+)
+# Cursor injects a synthetic follow-up prompt after shell/await notifications.
+# It is product instruction to the model, not a human turn.
+_CURSOR_TASK_RESULT_FOLLOWUP_RE = re.compile(
+    r"\A\s*<user_query>\s*"
+    r"Briefly inform the user about the task result\b[\s\S]*?"
+    r"</user_query>\s*\Z",
     re.IGNORECASE,
 )
 _CURSOR_IMAGE_FILES_ENVELOPE_RE = re.compile(
@@ -374,9 +384,14 @@ def parse_cursor_user_payload(content: str) -> CursorUserPayload:
     timestamp_match = _CURSOR_TIMESTAMP_ENVELOPE_RE.match(text)
     if timestamp_match is None:
         prompt = text.strip() if context_parts or attachments else text
-        query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(prompt)
-        if query_match is not None:
-            prompt = query_match.group("content").strip()
+        followup_match = _CURSOR_TASK_RESULT_FOLLOWUP_RE.fullmatch(prompt)
+        if followup_match is not None and context_parts:
+            context_parts.append(followup_match.group(0).strip())
+            prompt = ""
+        else:
+            query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(prompt)
+            if query_match is not None:
+                prompt = query_match.group("content").strip()
         return CursorUserPayload(
             content=prompt,
             session_context="\n\n".join(context_parts),
@@ -397,9 +412,14 @@ def parse_cursor_user_payload(content: str) -> CursorUserPayload:
         )
     text = text[timestamp_match.end():]
 
-    query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(text)
-    if query_match is not None:
-        text = query_match.group("content")
+    followup_match = _CURSOR_TASK_RESULT_FOLLOWUP_RE.fullmatch(text)
+    if followup_match is not None and context_parts:
+        context_parts.append(followup_match.group(0).strip())
+        text = ""
+    else:
+        query_match = _CURSOR_USER_QUERY_ENVELOPE_RE.fullmatch(text)
+        if query_match is not None:
+            text = query_match.group("content")
     return CursorUserPayload(
         content=text.strip(),
         timestamp=parsed_timestamp,
