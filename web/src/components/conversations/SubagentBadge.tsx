@@ -347,7 +347,9 @@ function SubagentPreview({
         values.push({
           key: `${message.id}-content`,
           kind: role,
-          label: role === "assistant" ? "Response" : role === "user" ? "Prompt" : message.tool_name || "Tool",
+          label: formatPreviewLabel(
+            role === "assistant" ? "Response" : role === "user" ? "Prompt" : message.tool_name || "Tool",
+          ),
           content: message.content.trim(),
         });
       }
@@ -381,6 +383,15 @@ function SubagentPreview({
       </Link>
     </div>
   );
+}
+
+function formatPreviewLabel(value: string): string {
+  const clean = value.replace(/\s+/g, " ").trim();
+  if (!clean) return "Tool";
+  // Prefer the readable tail of dotted tool ids (mcp.server.ToolName → ToolName).
+  const leaf = clean.includes(".") ? clean.split(".").pop() || clean : clean;
+  if (leaf.length <= 18) return leaf;
+  return `${leaf.slice(0, 16)}…`;
 }
 
 function compactPreviewText(value: string): string {
