@@ -71,3 +71,30 @@ def test_jsonl_sibling_remains_a_conversation(claude_tool: ClaudeCodeTool) -> No
     assert classification is not None
     assert classification.category is Category.CONVERSATION
     assert classification.metadata["is_subagent"] is True
+    assert classification.metadata["parent_thread_id"] == "session-id"
+    assert classification.metadata["root_session_id"] == "session-id"
+    assert classification.metadata["agent_depth"] == 1
+
+
+def test_nested_jsonl_subagent_tracks_immediate_parent(
+    claude_tool: ClaudeCodeTool,
+) -> None:
+    transcript = (
+        claude_tool.root_path
+        / "projects"
+        / "demo-project"
+        / "session-id"
+        / "subagents"
+        / "child-id"
+        / "subagents"
+        / "grandchild.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+
+    classification = claude_tool.classify_file(transcript)
+
+    assert classification is not None
+    assert classification.metadata["root_session_id"] == "session-id"
+    assert classification.metadata["parent_thread_id"] == "child-id"
+    assert classification.metadata["agent_depth"] == 2

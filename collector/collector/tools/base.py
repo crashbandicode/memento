@@ -41,6 +41,25 @@ class SyncStrategy(str, Enum):
     IGNORE = "ignore"       # Track but don't sync content
 
 
+def path_linked_subagent_identity(relative_path: str | None) -> dict:
+    """Derive shared child-thread identity from Claude/Cursor ``/subagents/`` paths."""
+    path = (relative_path or "").replace("\\", "/")
+    if "/subagents/" not in path:
+        return {}
+    root_base = path.split("/subagents/", 1)[0].rstrip("/")
+    root_thread_id = root_base.rsplit("/", 1)[-1]
+    parent_base = path.rsplit("/subagents/", 1)[0].rstrip("/")
+    parent_thread_id = parent_base.rsplit("/", 1)[-1]
+    if not root_thread_id or not parent_thread_id:
+        return {}
+    return {
+        "is_subagent": True,
+        "parent_thread_id": parent_thread_id,
+        "root_session_id": root_thread_id,
+        "agent_depth": path.count("/subagents/"),
+    }
+
+
 @dataclass
 class WatchPath:
     """A path pattern to watch within a tool's root directory."""

@@ -714,7 +714,7 @@ def _attach_assistant_identity(
 
 
 def _agent_activity_label(agent_path: object) -> str:
-    """Turn a stable Codex agent path into a compact human-readable label."""
+    """Turn a stable agent path into a compact human-readable label."""
     path = _bounded_identity_text(agent_path)
     tail = path.rstrip("/").rsplit("/", 1)[-1]
     words = [word for word in re.split(r"[_\-]+", tail) if word]
@@ -725,6 +725,17 @@ def _agent_activity_label(agent_path: object) -> str:
     )
 
 
+def _agent_path_from_label(label: object) -> str:
+    """Build a stable ``/root/<slug>`` path from a human task label."""
+    text = _bounded_interaction_text(label, 256).strip()
+    if not text:
+        return ""
+    slug = re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+    if not slug:
+        return ""
+    return f"/root/{slug[:120]}"
+
+
 def _normalized_agent_activity_kind(value: object) -> str:
     kind = _coerce_text(value).strip().casefold().replace("-", "_")
     aliases = {
@@ -732,11 +743,122 @@ def _normalized_agent_activity_kind(value: object) -> str:
         "finished": "completed",
         "complete": "completed",
         "stopped": "interrupted",
+        "cancelled": "interrupted",
+        "canceled": "interrupted",
+        "error": "failed",
+        "errored": "failed",
+        "success": "completed",
+        "done": "completed",
+        "running": "started",
+        "pending": "started",
+        "loading": "started",
+        "in_progress": "started",
     }
     kind = aliases.get(kind, kind)
     if kind in {"started", "updated", "completed", "interrupted", "failed"}:
         return kind
     return "updated"
+
+
+def build_agent_lifecycle_event(
+    *,
+    agent_path: object,
+    agent_thread_id: object,
+    kind: object,
+    label: object | None = None,
+) -> dict[str, object] | None:
+    """Build the shared v1 agent lifecycle payload used by badge merge."""
+    path = _bounded_interaction_text(agent_path, 512).strip()
+    thread_id = _bounded_interaction_text(agent_thread_id, 512).strip()
+    if not path or not thread_id:
+        return None
+    resolved_label = _bounded_interaction_text(label, 256).strip()
+    if not resolved_label:
+        resolved_label = _agent_activity_label(path) or "Subagent"
+    return {
+        "version": 1,
+        "agent_path": path,
+        "agent_thread_id": thread_id,
+        "label": resolved_label,
+        "kind": _normalized_agent_activity_kind(kind),
+    }
+
+
+def _is_task_spawn_tool_name(value: object) -> bool:
+    """Recognize Cursor Task spawn tools without matching todo Task* tools."""
+    compact = re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+    return compact in {"task", "taskv2"}
+
+
+def _status_prefix_from_tool_content(content: str) -> str:
+    match = re.match(
+        r"^Status:\s*(?P<status>[A-Za-z0-9_\- ]+)\s*(?:\n|$)",
+        _coerce_text(content),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    return match.group("status").strip()
+
+
+def normalize_task_spawn_agent_event(
+    tool_name: object,
+    tool_input: object,
+    content: object = "",
+    *,
+    tool_status: object = "",
+) -> dict[str, object] | None:
+    """Map Cursor Task spawn rows onto the shared agent lifecycle event.
+
+    Cursor records the child session id and task description on one
+    ``task_v2`` / ``Task`` tool row.  Codex emits the same semantic shape from
+    ``sub_agent_activity``; keeping one payload lets badge merge stay tool-agnostic.
+    """
+    if not _is_task_spawn_tool_name(tool_name):
+        return None
+    payload = _json_mapping(tool_input)
+    result = _json_mapping(content)
+    if not result:
+        # ``Status: cancelled\\n\\n{...}`` keeps JSON after the status line.
+        stripped = re.sub(
+            r"^Status:\s*[A-Za-z0-9_\- ]+\s*(?:\n+|$)",
+            "",
+            _coerce_text(content),
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        result = _json_mapping(stripped)
+    thread_id = _bounded_interaction_text(
+        result.get("agentId")
+        or result.get("agent_id")
+        or payload.get("agentId")
+        or payload.get("agent_id"),
+        512,
+    )
+    if not thread_id:
+        return None
+    label = _bounded_interaction_text(
+        payload.get("description")
+        or payload.get("title")
+        or payload.get("name")
+        or payload.get("subagentType")
+        or payload.get("subagent_type"),
+        256,
+    )
+    agent_path = _agent_path_from_label(label) or f"/root/{thread_id[:8]}"
+    if not label:
+        label = _agent_activity_label(agent_path) or "Subagent"
+    status_hint = (
+        _coerce_text(tool_status).strip()
+        or _status_prefix_from_tool_content(_coerce_text(content))
+        or "completed"
+    )
+    return build_agent_lifecycle_event(
+        agent_path=agent_path,
+        agent_thread_id=thread_id,
+        kind=status_hint,
+        label=label,
+    )
 
 
 def normalize_codex_agent_snapshot(value: object) -> dict[str, object] | None:
@@ -1145,10 +1267,15 @@ def parse_conversation_object(
                     payload.get("agent_thread_id"),
                     512,
                 )
-                if not agent_path:
+                agent_event = build_agent_lifecycle_event(
+                    agent_path=agent_path,
+                    agent_thread_id=thread_id,
+                    kind=payload.get("kind"),
+                )
+                if agent_event is None:
                     return None
-                kind = _normalized_agent_activity_kind(payload.get("kind"))
-                label = _agent_activity_label(agent_path) or "Subagent"
+                label = str(agent_event["label"])
+                kind = str(agent_event["kind"])
                 return NormalizedMessage(
                     role="tool",
                     content=f"{label} {kind}",
@@ -1156,13 +1283,7 @@ def parse_conversation_object(
                     timestamp=timestamp,
                     raw_type="agent_event",
                     source_id=event_id or f"{thread_id}:{timestamp}:{kind}",
-                    agent_event={
-                        "version": 1,
-                        "agent_path": agent_path,
-                        "agent_thread_id": thread_id,
-                        "label": label,
-                        "kind": kind,
-                    },
+                    agent_event=agent_event,
                 )
             # User message — the actual user input in Codex
             if event_type == "user_message":
@@ -1399,17 +1520,32 @@ def parse_conversation_object(
                         interaction,
                         content,
                     )
+            agent_event = normalize_task_spawn_agent_event(
+                tool_name,
+                tool_input,
+                content,
+                tool_status=obj.get("tool_status"),
+            )
+            raw_type = "agent_event" if agent_event is not None else msg_type
+            display_content = content or f"[{tool_name}]"
+            display_tool_name = tool_name
+            if agent_event is not None:
+                display_tool_name = "Agent activity"
+                display_content = (
+                    f"{agent_event['label']} {agent_event['kind']}"
+                )
             return NormalizedMessage(
                 role="tool",
-                content=content or f"[{tool_name}]",
-                tool_name=tool_name,
+                content=display_content,
+                tool_name=display_tool_name,
                 tool_input=tool_input,
                 tool_call_id=tool_call_id,
                 timestamp=timestamp,
-                raw_type=msg_type,
+                raw_type=raw_type,
                 source_id=_cursor_source_id(obj, obj.get("message")),
                 interaction=interaction,
                 interaction_response=interaction_response,
+                agent_event=agent_event,
             )
         message = obj.get("message", {})
         if isinstance(message, dict):

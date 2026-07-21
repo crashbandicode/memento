@@ -97,6 +97,7 @@ _ESSENTIAL_METADATA_KEYS = {
     "cwd",
     "first_user_message",
     "forked_from_id",
+    "is_subagent",
     "model",
     "memento_title_source",
     "parent_thread_id",
@@ -1573,6 +1574,15 @@ async def ingest_file(
         from .conversation_parser import extract_codex_session_metadata
 
         metadata.update(extract_codex_session_metadata(content))
+
+    if (
+        tool_id in {"cursor", "claude_code"}
+        and category == "conversation"
+    ):
+        from .conversation_hierarchy import path_linked_subagent_identity
+
+        for key, value in path_linked_subagent_identity(relative_path).items():
+            metadata.setdefault(key, value)
 
     # Ensure tool exists
     tool = await ensure_tool(db, tool_id)

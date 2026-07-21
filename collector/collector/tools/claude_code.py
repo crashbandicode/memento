@@ -8,6 +8,7 @@ from pathlib import Path
 from ..config import TOOL_PATHS
 from .base import (
     BaseTool, Category, ContentType, FileClassification, SyncStrategy, WatchPath,
+    path_linked_subagent_identity,
 )
 
 
@@ -198,17 +199,20 @@ class ClaudeCodeTool(BaseTool):
             # Conversation JSONL
             if abs_path.suffix == ".jsonl":
                 is_subagent = "subagents" in parts
+                metadata = {
+                    **project_meta,
+                    "session_id": abs_path.stem,
+                    "is_subagent": is_subagent,
+                }
+                if is_subagent:
+                    metadata.update(path_linked_subagent_identity(rel_str))
                 return FileClassification(
                     tool_name=self.name,
                     category=Category.CONVERSATION,
                     content_type=ContentType.JSONL,
                     sync_strategy=SyncStrategy.DELTA,
                     relative_path=rel_str,
-                    metadata={
-                        **project_meta,
-                        "session_id": abs_path.stem,
-                        "is_subagent": is_subagent,
-                    },
+                    metadata=metadata,
                 )
 
             # tool-results directory — skip (large, transient)

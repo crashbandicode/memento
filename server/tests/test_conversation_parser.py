@@ -227,6 +227,58 @@ class ConversationParserTests(unittest.TestCase):
         )
         self.assertNotIn("must-never-render", messages[0].content)
 
+    def test_cursor_task_v2_becomes_shared_agent_lifecycle_event(self) -> None:
+        raw = json.dumps({
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "task-bubble:tool",
+            "timestamp": "2026-07-21T12:00:00Z",
+            "tool_name": "task_v2",
+            "tool_status": "completed",
+            "tool_input": json.dumps({
+                "description": "RNO API Mongo diagnosis",
+                "prompt": "Investigate the site roster",
+                "subagentType": "explore",
+            }),
+            "content": json.dumps({
+                "agentId": "94d64099-e015-4fdb-848a-efaf7acc1695",
+            }),
+        })
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "agent_event")
+        self.assertEqual(messages[0].tool_name, "Agent activity")
+        self.assertEqual(
+            messages[0].agent_event,
+            {
+                "version": 1,
+                "agent_path": "/root/rno_api_mongo_diagnosis",
+                "agent_thread_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
+                "label": "RNO API Mongo diagnosis",
+                "kind": "completed",
+            },
+        )
+
+    def test_cursor_cancelled_task_without_agent_id_is_not_an_agent_event(self) -> None:
+        raw = json.dumps({
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "cancelled-task:tool",
+            "timestamp": "2026-07-21T12:00:00Z",
+            "tool_name": "task_v2",
+            "tool_status": "cancelled",
+            "tool_input": json.dumps({"name": "general-purpose"}),
+            "content": "Status: cancelled",
+        })
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].raw_type, "cursor_state_tool")
+        self.assertIsNone(messages[0].agent_event)
+
     def test_codex_list_agents_result_is_a_subagent_status_snapshot(self) -> None:
         raw = json.dumps({
             "type": "response_item",

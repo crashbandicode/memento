@@ -75,6 +75,30 @@ def explicit_subagent_parent_thread_id(relative_path: str | None) -> str | None:
     return parent_thread_id or None
 
 
+def path_linked_subagent_identity(relative_path: str | None) -> dict[str, Any]:
+    """Derive shared child-thread identity fields from a ``/subagents/`` path.
+
+    Codex children carry these fields in session metadata. Claude Code and
+    Cursor encode the same relationship in the transcript path, so normalize
+    once here for collectors, ingest, and presentation.
+    """
+    path = (relative_path or "").replace("\\", "/")
+    if "/subagents/" not in path:
+        return {}
+    root_base = path.split("/subagents/", 1)[0].rstrip("/")
+    root_thread_id = root_base.rsplit("/", 1)[-1]
+    parent_base = path.rsplit("/subagents/", 1)[0].rstrip("/")
+    parent_thread_id = parent_base.rsplit("/", 1)[-1]
+    if not root_thread_id or not parent_thread_id:
+        return {}
+    return {
+        "is_subagent": True,
+        "parent_thread_id": parent_thread_id,
+        "root_session_id": root_thread_id,
+        "agent_depth": path.count("/subagents/"),
+    }
+
+
 def is_conversation_subagent(
     tool_id: str | None,
     relative_path: str | None,
@@ -409,6 +433,14 @@ def merge_subagent_event_summaries(
             by_thread[thread_id] = existing
         else:
             existing["document_ready"] = bool(existing.get("id"))
+            # Path-linked children often arrive with a first-prompt title and no
+            # agent_path. Overlay the shared lifecycle identity when missing so
+            # Cursor/Claude cards match Codex presentation quality.
+            if agent_path and not existing.get("agent_path"):
+                existing["agent_path"] = agent_path
+                label = str(item.get("label") or "").strip()
+                if label:
+                    existing["title"] = label
         existing["status"] = status
         existing["last_event_at"] = item.get("timestamp")
 

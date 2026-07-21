@@ -614,6 +614,13 @@ export default function ConversationViewer({
       target.scrollIntoView({ behavior: pendingNavigation.behavior, block: "start" });
     }
     const timeout = window.setTimeout(() => {
+      // Reaffirm the prompt that contains the navigation target. Instant
+      // scrollTo can skip scroll events, and a pre-scroll handleScroll pass at
+      // the top of a detached head+tail view would otherwise pin the counter
+      // back to prompt 1.
+      setActivePromptLine(
+        promptLineAtOrBefore(promptLinesRef.current, pendingNavigation.lineNumber),
+      );
       setPendingNavigation(null);
       setNavigatingPromptLine(null);
     }, pendingNavigation.behavior === "smooth" ? 650 : 100);
@@ -623,15 +630,24 @@ export default function ConversationViewer({
   const handleScroll = () => {
     const el = containerRef.current;
     if (!el) return;
-    const promptElements = el.querySelectorAll<HTMLElement>("[data-prompt-line]");
-    const containerTop = el.getBoundingClientRect().top;
-    let currentLine: number | null = null;
-    for (const promptElement of promptElements) {
-      if (promptElement.getBoundingClientRect().top - containerTop > 120) break;
-      currentLine = Number(promptElement.dataset.promptLine);
-    }
-    if (currentLine !== null) {
-      setActivePromptLine((previous) => previous === currentLine ? previous : currentLine);
+    // Ignore scroll-derived prompt tracking while a programmatic jump is in
+    // flight. Large conversations keep the opening page mounted under a
+    // detached live tail; reading prompts at scrollTop 0 during that window
+    // falsely selects the first prompt before the jump scroll lands.
+    if (navigatingPromptLine !== null || pendingNavigation !== null || latestAgentLoading) {
+      // Fall through only for infinite-scroll bookkeeping below after the
+      // early active-prompt update is skipped.
+    } else {
+      const promptElements = el.querySelectorAll<HTMLElement>("[data-prompt-line]");
+      const containerTop = el.getBoundingClientRect().top;
+      let currentLine: number | null = null;
+      for (const promptElement of promptElements) {
+        if (promptElement.getBoundingClientRect().top - containerTop > 120) break;
+        currentLine = Number(promptElement.dataset.promptLine);
+      }
+      if (currentLine !== null) {
+        setActivePromptLine((previous) => previous === currentLine ? previous : currentLine);
+      }
     }
     if (detachedTailRef.current) {
       const marker = el.querySelector<HTMLElement>("[data-message-gap]");
@@ -655,12 +671,14 @@ export default function ConversationViewer({
   const navigateToLine = useCallback(async (
     lineNumber: number,
     loadPromptTurn = false,
+    scrollToLineNumber?: number,
   ) => {
-    const anchorId = `conversation-line-${lineNumber}`;
+    const scrollLine = scrollToLineNumber ?? lineNumber;
+    const anchorId = `conversation-line-${scrollLine}`;
     let loadedTargetWindow = false;
-    const containingPromptLine = promptLineAtOrBefore(promptLinesRef.current, lineNumber);
+    const containingPromptLine = promptLineAtOrBefore(promptLinesRef.current, scrollLine);
     setActivePromptLine(containingPromptLine);
-    setNavigatingPromptLine(lineNumber);
+    setNavigatingPromptLine(scrollLine);
     if (!document.getElementById(anchorId) && loadingRef.current) {
       await new Promise<void>((resolve) => {
         const startedAt = Date.now();
@@ -675,15 +693,39 @@ export default function ConversationViewer({
         return;
       }
     }
-    if (!document.getElementById(anchorId)) {
+    const targetInDom = Boolean(document.getElementById(anchorId));
+    const containingPromptInDom = containingPromptLine === null
+      || Boolean(
+        document.querySelector(`[data-prompt-line="${containingPromptLine}"]`),
+      );
+    // A live detached tail can already contain the latest agent row while the
+    // human prompt that owns it is still outside the loaded window. Force a
+    // centered fetch in that case so the navigator and transcript agree.
+    if (!targetInDom || !containingPromptInDom || loadPromptTurn) {
+      // When loadPromptTurn is set we still short-circuit only if the prompt
+      // turn is already fully present; otherwise fetch from lineNumber.
+      const promptAlreadyLoaded = loadPromptTurn
+        && containingPromptInDom
+        && targetInDom
+        && lineNumber === scrollLine;
+      if (!promptAlreadyLoaded) {
       loadedTargetWindow = true;
       loadingRef.current = true;
       setLoading(true);
       try {
+        const promptGap = containingPromptLine !== null
+          ? Math.max(0, scrollLine - containingPromptLine)
+          : PROMPT_JUMP_CONTEXT_BEFORE;
+        // Server caps context_before at 200; use the full budget when the
+        // owning prompt is farther back than the default jump padding.
+        const contextBefore = Math.min(
+          200,
+          Math.max(PROMPT_JUMP_CONTEXT_BEFORE, promptGap),
+        );
         const response = await api.getMessagesAround(
           documentId,
           lineNumber,
-          PROMPT_JUMP_CONTEXT_BEFORE,
+          loadPromptTurn ? PROMPT_JUMP_CONTEXT_BEFORE : contextBefore,
           PROMPT_JUMP_WINDOW_SIZE,
         );
         let nextMessages = response.messages;
@@ -729,6 +771,26 @@ export default function ConversationViewer({
             };
           }
         }
+        // If we still lack the scroll target after the prompt-turn fetch,
+        // merge an around-window for the agent line itself.
+        if (
+          scrollLine !== lineNumber
+          && !nextMessages.some((message) => message.line_number === scrollLine)
+          && !(nextDetachedTail?.messages.some((message) => message.line_number === scrollLine))
+        ) {
+          const aroundScroll = await api.getMessagesAround(
+            documentId,
+            scrollLine,
+            Math.min(200, Math.max(PROMPT_JUMP_CONTEXT_BEFORE, scrollLine - lineNumber)),
+            PROMPT_JUMP_WINDOW_SIZE,
+          );
+          nextMessages = mergeMessagesChronologically(nextMessages, aroundScroll.messages);
+          contiguousEnd = Math.max(
+            contiguousEnd,
+            aroundScroll.offset + aroundScroll.messages.length,
+          );
+          nextDetachedTail = null;
+        }
         setKnownTotal(response.total);
         startOffsetRef.current = response.offset;
         offsetRef.current = contiguousEnd;
@@ -745,6 +807,7 @@ export default function ConversationViewer({
         setLoading(false);
         loadingRef.current = false;
       }
+      }
     }
 
     const target = document.getElementById(anchorId);
@@ -757,7 +820,7 @@ export default function ConversationViewer({
       ) > container.clientHeight * 2,
     );
     setPendingNavigation({
-      lineNumber,
+      lineNumber: scrollLine,
       behavior: loadedTargetWindow || targetIsDistant ? "instant" : "smooth",
     });
   }, [documentId, updateDetachedTail]);
@@ -773,7 +836,17 @@ export default function ConversationViewer({
     try {
       const target = await api.getLatestAgentMessage(documentId);
       if (target.line_number === null) return false;
-      await navigateToLine(target.line_number);
+      const containingPromptLine = promptLineAtOrBefore(
+        promptLinesRef.current,
+        target.line_number,
+      );
+      // Load the owning human turn, then scroll to the latest agent row in one
+      // navigation so a detached head+tail view cannot pin the counter at 1.
+      if (containingPromptLine !== null) {
+        await navigateToLine(containingPromptLine, true, target.line_number);
+      } else {
+        await navigateToLine(target.line_number);
+      }
       return true;
     } catch (error) {
       console.error("Failed to find latest agent message:", error);

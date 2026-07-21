@@ -14,6 +14,7 @@ from ..config import TOOL_PATHS
 from .claude_code import _extract_cwd_from_jsonl
 from .base import (
     BaseTool, Category, ContentType, FileClassification, SyncStrategy, WatchPath,
+    path_linked_subagent_identity,
 )
 
 
@@ -345,6 +346,8 @@ class CursorTool(BaseTool):
             "session_id": abs_path.stem,
             "is_subagent": is_subagent,
         }
+        if is_subagent:
+            meta.update(path_linked_subagent_identity(rel_str))
         if real_path:
             meta["project_path"] = real_path
         return FileClassification(

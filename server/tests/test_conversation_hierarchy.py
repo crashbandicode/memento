@@ -16,6 +16,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     fold_codex_subagents,
     fold_conversation_subagents,
     merge_subagent_event_summaries,
+    path_linked_subagent_identity,
 )
 
 
@@ -377,6 +378,38 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertTrue(summaries[0]["document_ready"])
         self.assertEqual(summaries[0]["agent_nickname"], "Franklin the 2nd")
         self.assertEqual(summaries[0]["status"], "completed")
+
+    def test_lifecycle_event_fills_missing_path_linked_identity(self) -> None:
+        summaries = merge_subagent_event_summaries([{
+            "id": "cursor-child",
+            "session_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
+            "title": "PowerShell 7 only, never Bash tool. Interpreter…",
+        }], [{
+            "agent_thread_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
+            "agent_path": "/root/rno_api_mongo_diagnosis",
+            "label": "RNO API Mongo diagnosis",
+            "kind": "completed",
+            "timestamp": "2026-07-21T12:00:00+00:00",
+        }])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["title"], "RNO API Mongo diagnosis")
+        self.assertEqual(
+            summaries[0]["agent_path"],
+            "/root/rno_api_mongo_diagnosis",
+        )
+        self.assertEqual(summaries[0]["status"], "completed")
+        self.assertTrue(summaries[0]["document_ready"])
+
+    def test_path_linked_identity_counts_nested_depth(self) -> None:
+        identity = path_linked_subagent_identity(
+            "projects/demo/agent-transcripts/root/subagents/child/"
+            "subagents/grandchild.jsonl"
+        )
+
+        self.assertEqual(identity["root_session_id"], "root")
+        self.assertEqual(identity["parent_thread_id"], "child")
+        self.assertEqual(identity["agent_depth"], 2)
 
     def test_logical_activity_uses_latest_real_child_turn(self) -> None:
         root = _ref(
