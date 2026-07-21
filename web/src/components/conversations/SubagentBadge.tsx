@@ -45,8 +45,10 @@ export default function SubagentBadge({
   const panelId = useId();
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const total = count || subagents.length;
   const agentsLabel = `${total} ${total === 1 ? "subagent" : "subagents"}`;
+  const showSearch = subagents.length > 8;
 
   useLayoutEffect(() => {
     if (!open || !rootRef.current) return;
@@ -55,8 +57,8 @@ export default function SubagentBadge({
       if (!rect) return;
       const mobile = window.matchMedia("(max-width: 640px)").matches;
       if (mobile) {
-        // Definite height is required so the inner list can scroll on iOS Safari.
-        const height = Math.min(Math.round(window.innerHeight * 0.72), 610);
+        // Definite height is required so the flex child list can scroll on iOS Safari.
+        const height = Math.min(Math.round(window.innerHeight * 0.78), 640);
         setPanelStyle({
           position: "fixed",
           top: "auto",
@@ -102,24 +104,22 @@ export default function SubagentBadge({
     if (!open) return;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (rootRef.current?.contains(target) || panelRef.current?.contains(target)) {
-        return;
-      }
-      setOpen(false);
-    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
     };
-    document.addEventListener("pointerdown", closeOnOutsideClick);
     document.addEventListener("keydown", closeOnEscape);
     return () => {
       document.body.style.overflow = previousOverflow;
-      document.removeEventListener("pointerdown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [open]);
+
+  // After open / expand, keep the active card reachable inside the scrollport.
+  useLayoutEffect(() => {
+    if (!open || !expandedKey || !listRef.current) return;
+    const card = listRef.current.querySelector<HTMLElement>(`[data-subagent-key="${CSS.escape(expandedKey)}"]`);
+    card?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [expandedKey, open, previews]);
 
   const orderedSubagents = useMemo(() => {
     if (!matchedSubagentId) return subagents;
@@ -230,7 +230,7 @@ export default function SubagentBadge({
               </button>
             </div>
 
-            {subagents.length > 8 && (
+            {showSearch ? (
               <label className={styles.searchField}>
                 <Icon name="search" size={14} />
                 <input
@@ -241,9 +241,9 @@ export default function SubagentBadge({
                   autoFocus
                 />
               </label>
-            )}
+            ) : null}
 
-            <div className={styles.list} data-subagent-list>
+            <div ref={listRef} className={styles.list} data-subagent-list>
               {visibleSubagents.map((subagent) => {
                 const isMatched = Boolean(matchedSubagentId && subagent.id === matchedSubagentId);
                 const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
@@ -254,7 +254,11 @@ export default function SubagentBadge({
                   && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
                 );
                 return (
-                  <div key={key} className={`${styles.agentCard} ${isMatched ? styles.matched : ""}`}>
+                  <div
+                    key={key}
+                    data-subagent-key={key}
+                    className={`${styles.agentCard} ${isMatched ? styles.matched : ""}`}
+                  >
                     <button
                       type="button"
                       className={styles.agentSummary}
