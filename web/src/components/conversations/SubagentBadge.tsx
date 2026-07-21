@@ -338,24 +338,8 @@ function SubagentPreview({
   }
 
   const rows = preview.messages
-    .flatMap((message) => {
-      const role = message.role || message.message_type || "activity";
-      const values: Array<{ key: string; kind: string; label: string; content: string }> = [];
-      if (message.thinking?.trim()) {
-        values.push({ key: `${message.id}-thinking`, kind: "thinking", label: "Thought", content: message.thinking.trim() });
-      }
-      if (message.content?.trim()) {
-        values.push({
-          key: `${message.id}-content`,
-          kind: role,
-          label: formatPreviewLabel(
-            role === "assistant" ? "Response" : role === "user" ? "Prompt" : message.tool_name || "Tool",
-          ),
-          content: message.content.trim(),
-        });
-      }
-      return values;
-    })
+    .flatMap((message) => previewRowsFromMessage(message))
+    .filter((row) => row.content.trim().length > 0)
     .slice(-8);
 
   return (
@@ -384,6 +368,136 @@ function SubagentPreview({
       </Link>
     </div>
   );
+}
+
+type PreviewRow = {
+  key: string;
+  kind: string;
+  label: string;
+  content: string;
+};
+
+function previewRowsFromMessage(message: ConversationMessage): PreviewRow[] {
+  const role = message.role || message.message_type || "activity";
+  const values: PreviewRow[] = [];
+
+  if (message.thinking?.trim()) {
+    values.push({
+      key: `${message.id}-thinking`,
+      kind: "thinking",
+      label: "Thought",
+      content: message.thinking.trim(),
+    });
+  }
+
+  for (const [index, call] of (message.tool_calls || []).entries()) {
+    const summary = summarizeToolInput(call.input || "");
+    if (!summary) continue;
+    values.push({
+      key: `${message.id}-call-${index}`,
+      kind: "tool",
+      label: formatPreviewLabel(call.name || "Tool"),
+      content: summary,
+    });
+  }
+
+  const content = (message.content || "").trim();
+  const toolInput = (message.tool_input || "").trim();
+  const toolName = (message.tool_name || "").trim();
+  const placeholder = isBracketToolPlaceholder(content, toolName);
+
+  if (role === "tool" || toolName) {
+    const summary = summarizeToolInput(toolInput);
+    const output = placeholder ? "" : content.replace(/^\[Result\]\s*/i, "").trim();
+    const body = summary || output;
+    if (body) {
+      values.push({
+        key: `${message.id}-tool`,
+        kind: "tool",
+        label: formatPreviewLabel(toolName || "Tool"),
+        content: body,
+      });
+    }
+    return values;
+  }
+
+  if (content && !placeholder) {
+    values.push({
+      key: `${message.id}-content`,
+      kind: role,
+      label: formatPreviewLabel(
+        role === "assistant" ? "Response" : role === "user" ? "Prompt" : toolName || "Tool",
+      ),
+      content,
+    });
+  }
+
+  return values;
+}
+
+function isBracketToolPlaceholder(content: string, toolName: string): boolean {
+  const clean = content.trim();
+  if (!/^\[[^\]]+\]$/.test(clean)) return false;
+  if (!toolName) return true;
+  return clean.slice(1, -1).toLocaleLowerCase() === toolName.toLocaleLowerCase();
+}
+
+function summarizeToolInput(raw: string): string {
+  const clean = raw.trim();
+  if (!clean) return "";
+  try {
+    const parsed = JSON.parse(clean) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      const preferred = [
+        "final_summary",
+        "current_step",
+        "command",
+        "pattern",
+        "query",
+        "search_term",
+        "prompt",
+        "description",
+        "path",
+        "file_path",
+        "target_directory",
+        "glob_pattern",
+        "glob",
+        "url",
+        "content",
+      ] as const;
+      for (const key of preferred) {
+        const value = obj[key];
+        if (typeof value !== "string" || !value.trim()) continue;
+        if (key === "command") return simplifyCommand(value.trim());
+        if (key === "path" || key === "file_path" || key === "target_directory") {
+          return shortenPath(value.trim());
+        }
+        return value.trim();
+      }
+      for (const value of Object.values(obj)) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+      }
+    }
+  } catch {
+    // Plain-text tool input.
+  }
+  return clean;
+}
+
+function simplifyCommand(command: string): string {
+  const match = command.match(/-Command\s+(?:"((?:\\.|[^"])*)"|'((?:\\.|[^'])*)')/i);
+  if (match) {
+    const inner = (match[1] ?? match[2] ?? "").replace(/\\"/g, '"').replace(/\\'/g, "'").trim();
+    if (inner) return inner;
+  }
+  return command;
+}
+
+function shortenPath(path: string): string {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (parts.length <= 4) return parts.join("/");
+  return parts.slice(-4).join("/");
 }
 
 function formatPreviewLabel(value: string): string {
