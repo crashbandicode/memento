@@ -43,11 +43,13 @@
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-width: 300px;
+  min-height: 0;
   overflow: hidden;
   border: 1px solid var(--aurora-border);
   border-radius: 16px;
   background: var(--aurora-surface-solid);
   box-shadow: 0 24px 70px -22px rgba(15, 23, 42, 0.5);
+  touch-action: manipulation;
 }
 
 .header {
@@ -107,8 +109,11 @@
   align-content: start;
   gap: 5px;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   padding: 7px 10px 9px;
 }
 
@@ -169,19 +174,20 @@
 @media (max-width: 640px) {
   .backdrop {
     position: fixed;
-    z-index: 88;
+    z-index: 199;
     inset: 0;
     display: block;
     width: 100%;
     height: 100%;
     border: 0;
-    background: rgba(15, 23, 42, 0.22);
+    background: rgba(15, 23, 42, 0.34);
     backdrop-filter: blur(2px);
+    touch-action: none;
   }
 
   .panel {
     position: fixed;
-    z-index: 89;
+    z-index: 200;
     top: auto;
     left: max(10px, env(safe-area-inset-left));
     right: max(10px, env(safe-area-inset-right));
@@ -191,6 +197,11 @@
     max-height: min(72dvh, 610px);
     border-radius: 20px;
     box-shadow: 0 28px 80px -18px rgba(0, 0, 0, 0.68);
+  }
+
+  .list {
+    /* Keep scroll gestures on the sheet, not the page behind it. */
+    overscroll-behavior: contain;
   }
 
   .trigger { min-height: 32px; padding-inline: 10px; }

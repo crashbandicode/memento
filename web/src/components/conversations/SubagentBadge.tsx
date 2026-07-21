@@ -53,18 +53,39 @@ export default function SubagentBadge({
     const place = () => {
       const rect = rootRef.current?.getBoundingClientRect();
       if (!rect) return;
+      const mobile = window.matchMedia("(max-width: 640px)").matches;
+      if (mobile) {
+        // Definite height is required so the inner list can scroll on iOS Safari.
+        const height = Math.min(Math.round(window.innerHeight * 0.72), 610);
+        setPanelStyle({
+          position: "fixed",
+          top: "auto",
+          left: "max(10px, env(safe-area-inset-left))",
+          right: "max(10px, env(safe-area-inset-right))",
+          bottom: "max(10px, env(safe-area-inset-bottom))",
+          width: "auto",
+          height,
+          maxHeight: height,
+          zIndex: 200,
+        });
+        return;
+      }
       const width = Math.min(440, Math.max(300, window.innerWidth - 48));
       const left = Math.min(
         Math.max(24, rect.right - width),
         window.innerWidth - width - 24,
       );
       const top = Math.min(rect.bottom + 8, window.innerHeight - 48);
+      const maxHeight = Math.min(520, window.innerHeight - top - 24);
       setPanelStyle({
         position: "fixed",
         top,
         left,
+        right: "auto",
+        bottom: "auto",
         width,
-        maxHeight: Math.min(520, window.innerHeight - top - 24),
+        height: maxHeight,
+        maxHeight,
         zIndex: 200,
       });
     };
@@ -79,6 +100,8 @@ export default function SubagentBadge({
 
   useEffect(() => {
     if (!open) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     const closeOnOutsideClick = (event: PointerEvent) => {
       const target = event.target as Node;
       if (rootRef.current?.contains(target) || panelRef.current?.contains(target)) {
@@ -92,6 +115,7 @@ export default function SubagentBadge({
     document.addEventListener("pointerdown", closeOnOutsideClick);
     document.addEventListener("keydown", closeOnEscape);
     return () => {
+      document.body.style.overflow = previousOverflow;
       document.removeEventListener("pointerdown", closeOnOutsideClick);
       document.removeEventListener("keydown", closeOnEscape);
     };
@@ -179,90 +203,99 @@ export default function SubagentBadge({
       </button>
 
       {open && typeof document !== "undefined" && createPortal(
-        <div
-          ref={panelRef}
-          id={panelId}
-          className={styles.panel}
-          role="dialog"
-          aria-label={agentsLabel}
-          style={panelStyle}
-        >
-          <div className={styles.header}>
-            <span className={styles.headerIcon}><Icon name="layers" size={15} /></span>
-            <span className={styles.headerText}>
-              <strong>Subagents</strong>
-              <span>Task name first; generated codename second</span>
-            </span>
-            <button type="button" className={styles.closeButton} aria-label="Close subagent browser" onClick={() => setOpen(false)}>
-              <Icon name="close" size={15} />
-            </button>
-          </div>
+        <>
+          <button
+            type="button"
+            className={styles.backdrop}
+            aria-label="Close subagent browser"
+            onClick={() => setOpen(false)}
+          />
+          <div
+            ref={panelRef}
+            id={panelId}
+            className={styles.panel}
+            role="dialog"
+            aria-modal="true"
+            aria-label={agentsLabel}
+            style={panelStyle}
+          >
+            <div className={styles.header}>
+              <span className={styles.headerIcon}><Icon name="layers" size={15} /></span>
+              <span className={styles.headerText}>
+                <strong>Subagents</strong>
+                <span>Task name first; generated codename second</span>
+              </span>
+              <button type="button" className={styles.closeButton} aria-label="Close subagent browser" onClick={() => setOpen(false)}>
+                <Icon name="close" size={15} />
+              </button>
+            </div>
 
-          {subagents.length > 8 && (
-            <label className={styles.searchField}>
-              <Icon name="search" size={14} />
-              <input
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Find a subagent task or codename"
-                autoFocus
-              />
-            </label>
-          )}
-
-          <div className={styles.list}>
-            {visibleSubagents.map((subagent) => {
-              const isMatched = Boolean(matchedSubagentId && subagent.id === matchedSubagentId);
-              const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
-              const expanded = expandedKey === key;
-              const preview = previews[key];
-              const hasDistinctNickname = Boolean(
-                subagent.agent_nickname
-                && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
-              );
-              return (
-                <div key={key} className={`${styles.agentCard} ${isMatched ? styles.matched : ""}`}>
-                  <button
-                    type="button"
-                    className={styles.agentSummary}
-                    aria-expanded={expanded}
-                    onClick={() => void togglePreview(subagent)}
-                  >
-                    <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
-                    <span className={styles.agentText}>
-                      <span className={styles.agentTitle}>{subagent.title}</span>
-                      <span className={styles.agentMeta}>
-                        <span className={`${styles.statusDot} ${styles[`status_${subagent.status || "unknown"}`]}`} />
-                        {subagent.status && subagent.status !== "unknown" ? subagent.status : "Subagent"}
-                        {typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
-                        {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
-                        {subagent.document_ready === false ? " · transcript syncing" : ""}
-                      </span>
-                    </span>
-                    {isMatched && <span className={styles.matchLabel}>Match</span>}
-                    <Icon name={expanded ? "chevron_up" : "chevron_down"} size={11} />
-                  </button>
-                  {expanded && (
-                    <SubagentPreview
-                      subagent={subagent}
-                      preview={preview}
-                      onOpen={() => setOpen(false)}
-                    />
-                  )}
-                </div>
-              );
-            })}
-            {visibleSubagents.length === 0 && (
-              <div className={styles.empty}>No subagents match “{query.trim()}”.</div>
+            {subagents.length > 8 && (
+              <label className={styles.searchField}>
+                <Icon name="search" size={14} />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Find a subagent task or codename"
+                  autoFocus
+                />
+              </label>
             )}
-          </div>
 
-          <div className={styles.footer}>
-            Showing {visibleSubagents.length} of {filteredSubagents.length} matching subagents
-            {filteredSubagents.length < orderedSubagents.length ? ` · ${orderedSubagents.length} total` : ""}
+            <div className={styles.list} data-subagent-list>
+              {visibleSubagents.map((subagent) => {
+                const isMatched = Boolean(matchedSubagentId && subagent.id === matchedSubagentId);
+                const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
+                const expanded = expandedKey === key;
+                const preview = previews[key];
+                const hasDistinctNickname = Boolean(
+                  subagent.agent_nickname
+                  && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
+                );
+                return (
+                  <div key={key} className={`${styles.agentCard} ${isMatched ? styles.matched : ""}`}>
+                    <button
+                      type="button"
+                      className={styles.agentSummary}
+                      aria-expanded={expanded}
+                      onClick={() => void togglePreview(subagent)}
+                    >
+                      <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
+                      <span className={styles.agentText}>
+                        <span className={styles.agentTitle}>{subagent.title}</span>
+                        <span className={styles.agentMeta}>
+                          <span className={`${styles.statusDot} ${styles[`status_${subagent.status || "unknown"}`]}`} />
+                          {subagent.status && subagent.status !== "unknown" ? subagent.status : "Subagent"}
+                          {typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
+                          {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
+                          {subagent.document_ready === false ? " · transcript syncing" : ""}
+                        </span>
+                      </span>
+                      {isMatched && <span className={styles.matchLabel}>Match</span>}
+                      <Icon name={expanded ? "chevron_up" : "chevron_down"} size={11} />
+                    </button>
+                    {expanded && (
+                      <SubagentPreview
+                        subagent={subagent}
+                        preview={preview}
+                        onOpen={() => setOpen(false)}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+              {visibleSubagents.length === 0 && (
+                <div className={styles.empty}>No subagents match “{query.trim()}”.</div>
+              )}
+            </div>
+
+            <div className={styles.footer}>
+              Showing {visibleSubagents.length} of {filteredSubagents.length} matching subagents
+              {filteredSubagents.length < orderedSubagents.length ? ` · ${orderedSubagents.length} total` : ""}
+            </div>
           </div>
-        </div>,
+        </>,
         document.body,
       )}
     </div>
