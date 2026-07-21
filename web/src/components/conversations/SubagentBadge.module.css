@@ -65,6 +65,7 @@
 .searchField,
 .footer {
   flex: 0 0 auto;
+  background: var(--aurora-surface-solid);
 }
 
 .header {
@@ -229,13 +230,13 @@
     position: fixed;
     z-index: 200;
     top: auto;
-    left: max(10px, env(safe-area-inset-left));
-    right: max(10px, env(safe-area-inset-right));
-    bottom: max(10px, env(safe-area-inset-bottom));
+    left: 0;
+    right: 0;
+    bottom: 0;
     width: auto;
     min-width: 0;
     max-height: min(78dvh, 640px);
-    border-radius: 20px;
+    border-radius: 20px 20px 0 0;
     background: var(--aurora-surface-solid);
     box-shadow: 0 28px 80px -18px rgba(0, 0, 0, 0.68);
   }

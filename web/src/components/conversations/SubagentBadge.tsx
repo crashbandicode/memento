@@ -62,13 +62,14 @@ export default function SubagentBadge({
         setPanelStyle({
           position: "fixed",
           top: "auto",
-          left: "max(10px, env(safe-area-inset-left))",
-          right: "max(10px, env(safe-area-inset-right))",
-          bottom: "max(10px, env(safe-area-inset-bottom))",
+          left: 0,
+          right: 0,
+          bottom: 0,
           width: "auto",
           height,
           maxHeight: height,
           zIndex: 200,
+          paddingBottom: "max(10px, env(safe-area-inset-bottom))",
         });
         return;
       }
