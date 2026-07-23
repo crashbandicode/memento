@@ -30,6 +30,18 @@ import TaskProgressCard from "./TaskProgressCard";
 import { Icon } from "@/components/aurora/Icon";
 import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
 import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
+import {
+  DEFAULT_CONVERSATION_VISIBILITY,
+  readConversationVisibility,
+  writeConversationVisibility,
+  type ConversationVisibility,
+} from "@/lib/conversation-visibility";
+import {
+  CONVERSATION_SEARCH_HISTORY_KEY,
+  PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY,
+  pushSearchHistory,
+  readSearchHistory,
+} from "@/lib/search-history";
 
 interface Artifact {
   id: string;
@@ -199,27 +211,7 @@ const PROMPT_JUMP_WINDOW_SIZE = 120;
 const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
 const LIVE_SCROLL_FOLLOW_THRESHOLD = 72;
 
-type ConversationVisibility = {
-  user: boolean;
-  assistant: boolean;
-  tools: boolean;
-  tasks: boolean;
-  agents: boolean;
-  thinking: boolean;
-  context: boolean;
-};
-
 type ConversationVisibilityKey = keyof ConversationVisibility;
-
-const DEFAULT_CONVERSATION_VISIBILITY: ConversationVisibility = {
-  user: true,
-  assistant: true,
-  tools: true,
-  tasks: true,
-  agents: true,
-  thinking: true,
-  context: true,
-};
 
 function isSessionContextMessage(msg: ConversationMessage): boolean {
   const content = cleanTerminalText(msg.content);
@@ -351,8 +343,8 @@ export default function ConversationViewer({
   const [navigatingPromptLine, setNavigatingPromptLine] = useState<number | null>(null);
   const [latestAgentLoading, setLatestAgentLoading] = useState(false);
   const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
-  const [visibility, setVisibility] = useState<ConversationVisibility>(
-    DEFAULT_CONVERSATION_VISIBILITY,
+  const [visibility, setVisibility] = useState<ConversationVisibility>(() =>
+    readConversationVisibility(documentId),
   );
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
@@ -451,7 +443,12 @@ export default function ConversationViewer({
   const updateVisibility = useCallback((nextVisibility: ConversationVisibility) => {
     preserveScrollForNextRender(nextVisibility);
     setVisibility(nextVisibility);
-  }, [preserveScrollForNextRender]);
+    writeConversationVisibility(documentId, nextVisibility);
+  }, [documentId, preserveScrollForNextRender]);
+
+  useEffect(() => {
+    setVisibility(readConversationVisibility(documentId));
+  }, [documentId]);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -1035,6 +1032,7 @@ export default function ConversationViewer({
 
       <PromptNavigator
         key={documentId}
+        documentId={documentId}
         prompts={prompts}
         activeLine={activePromptLine}
         loadingLine={navigatingPromptLine}
@@ -1218,6 +1216,7 @@ function ConversationSearchBar({
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
+  const [history, setHistory] = useState<string[]>(() => readSearchHistory(CONVERSATION_SEARCH_HISTORY_KEY));
   const inputRef = useRef<HTMLInputElement>(null);
   const deepLinkHandledRef = useRef("");
   const searchSnapshotRef = useRef({
@@ -1283,6 +1282,7 @@ function ConversationSearchBar({
           setNextAfterLine(response.next_after_line);
           setHasMore(response.has_more);
           setOpen(true);
+          setHistory(pushSearchHistory(CONVERSATION_SEARCH_HISTORY_KEY, cleanQuery));
         })
         .catch((error: unknown) => {
           if ((error as { name?: string })?.name !== "AbortError") {
@@ -1389,7 +1389,7 @@ function ConversationSearchBar({
           data-conversation-search-input
           type="search"
           value={query}
-          onFocus={() => query.trim() && setOpen(true)}
+          onFocus={() => setOpen(true)}
           onChange={(event) => setQuery(event.target.value)}
           placeholder={t.conversation.searchMessages}
           aria-label={t.conversation.searchMessages}
@@ -1410,6 +1410,55 @@ function ConversationSearchBar({
           {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘F" : "Ctrl F"}
         </kbd>
       </label>
+
+      {open && !query.trim() && history.length > 0 && (
+        <div
+          data-conversation-search-history
+          role="listbox"
+          aria-label={t.conversation.recentSearches}
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            right: 0,
+            maxHeight: "min(280px, 40vh)",
+            overflowY: "auto",
+            border: "1px solid var(--aurora-border)",
+            borderRadius: 15,
+            background: "var(--aurora-surface-solid)",
+            boxShadow: "0 18px 45px rgba(15,23,42,0.18)",
+            padding: 7,
+          }}
+        >
+          <div style={{ padding: "4px 7px 7px", color: "var(--aurora-fg4)", fontSize: 11 }}>
+            {t.conversation.recentSearches}
+          </div>
+          {history.map((item) => (
+            <button
+              key={item}
+              type="button"
+              role="option"
+              aria-selected="false"
+              data-conversation-search-history-item={item}
+              onClick={() => { setQuery(item); setOpen(true); }}
+              style={{
+                display: "block",
+                width: "100%",
+                border: 0,
+                borderTop: "1px solid var(--aurora-border)",
+                background: "transparent",
+                color: "var(--aurora-fg2)",
+                padding: "9px 8px",
+                textAlign: "left",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              {item}
+            </button>
+          ))}
+        </div>
+      )}
 
       {open && query.trim() && (
         <div
@@ -1494,7 +1543,38 @@ function promptSnippet(value: string): string {
     .trim();
 }
 
+function capturePromptListAnchor(container: HTMLElement | null): number | null {
+  if (!container) return null;
+  const top = container.getBoundingClientRect().top;
+  const items = container.querySelectorAll<HTMLElement>("[data-prompt-item]");
+  for (const item of items) {
+    if (item.getBoundingClientRect().bottom > top + 2) {
+      const line = Number(item.dataset.promptItem);
+      return Number.isFinite(line) ? line : null;
+    }
+  }
+  return null;
+}
+
+function restorePromptListAnchor(
+  container: HTMLElement | null,
+  lineNumber: number | null,
+  toBottom = false,
+) {
+  if (!container) return;
+  if (toBottom) {
+    container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    return;
+  }
+  if (lineNumber == null) return;
+  const item = container.querySelector<HTMLElement>(`[data-prompt-item="${lineNumber}"]`);
+  if (!item) return;
+  const delta = item.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  container.scrollTop += delta;
+}
+
 function PromptNavigator({
+  documentId,
   prompts,
   activeLine,
   loadingLine,
@@ -1504,6 +1584,7 @@ function PromptNavigator({
   onSelect,
   onLatestAgent,
 }: {
+  documentId: string;
   prompts: ConversationPrompt[];
   activeLine: number | null;
   loadingLine: number | null;
@@ -1517,9 +1598,16 @@ function PromptNavigator({
   const [expanded, setExpanded] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [history, setHistory] = useState<string[]>(() =>
+    readSearchHistory(PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY),
+  );
   const triggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
+  const desktopListRef = useRef<HTMLDivElement>(null);
+  const mobileListRef = useRef<HTMLDivElement>(null);
+  const scrollAnchorRef = useRef<number | null>(null);
+  const scrollToBottomAfterLatestRef = useRef(false);
   const promptItems = useMemo(
     () => prompts.map((prompt, index) => ({
       prompt,
@@ -1538,6 +1626,37 @@ function PromptNavigator({
   const activeIndex = prompts.findIndex((prompt) => prompt.line_number === activeLine);
   const navigationBusy = loadingLine !== null || latestAgentLoading;
 
+  const rememberScrollSpot = useCallback((container: HTMLElement | null) => {
+    const anchor = capturePromptListAnchor(container);
+    if (anchor != null) scrollAnchorRef.current = anchor;
+  }, []);
+
+  const scrollListsToBottom = useCallback(() => {
+    restorePromptListAnchor(desktopListRef.current, null, true);
+    restorePromptListAnchor(mobileListRef.current, null, true);
+    const last = prompts[prompts.length - 1];
+    if (last) scrollAnchorRef.current = last.line_number;
+  }, [prompts]);
+
+  useLayoutEffect(() => {
+    if (scrollToBottomAfterLatestRef.current) {
+      scrollToBottomAfterLatestRef.current = false;
+      scrollListsToBottom();
+      return;
+    }
+    restorePromptListAnchor(desktopListRef.current, scrollAnchorRef.current);
+  }, [expanded, filteredPromptItems.length, scrollListsToBottom]);
+
+  useLayoutEffect(() => {
+    if (!mobileOpen) return;
+    if (scrollToBottomAfterLatestRef.current) {
+      scrollToBottomAfterLatestRef.current = false;
+      scrollListsToBottom();
+      return;
+    }
+    restorePromptListAnchor(mobileListRef.current, scrollAnchorRef.current);
+  }, [mobileOpen, filteredPromptItems.length, scrollListsToBottom]);
+
   useEffect(() => {
     if (!mobileOpen) return;
     const previousOverflow = document.body.style.overflow;
@@ -1547,13 +1666,11 @@ function PromptNavigator({
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setMobileOpen(false);
-      setQuery("");
       window.requestAnimationFrame(() => triggerRef.current?.focus());
     };
     const handleDesktopBreakpoint = (event: MediaQueryListEvent) => {
       if (!event.matches) return;
       setMobileOpen(false);
-      setQuery("");
     };
     window.addEventListener("keydown", handleEscape);
     desktopBreakpoint.addEventListener("change", handleDesktopBreakpoint);
@@ -1566,9 +1683,27 @@ function PromptNavigator({
   }, [mobileOpen]);
 
   const closeMobileSheet = () => {
+    rememberScrollSpot(mobileListRef.current);
     setMobileOpen(false);
-    setQuery("");
     window.requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
+  const commitPromptQuery = (value: string) => {
+    setQuery(value);
+    const clean = value.trim();
+    if (clean) setHistory(pushSearchHistory(PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY, clean));
+  };
+
+  const handleLatestAgent = async () => {
+    scrollToBottomAfterLatestRef.current = true;
+    const ok = await onLatestAgent();
+    if (ok) {
+      scrollListsToBottom();
+      if (mobileOpen) closeMobileSheet();
+    } else {
+      scrollToBottomAfterLatestRef.current = false;
+    }
+    return ok;
   };
 
   const handleMobileDialogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
@@ -1588,147 +1723,346 @@ function PromptNavigator({
     }
   };
 
+  const latestAgentButton = (opts: {
+    compact: boolean;
+    dataAttr: string;
+    icon: "arrow_down" | "sparkles";
+    showLabel: boolean;
+  }) => (
+    <button
+      type="button"
+      data-latest-agent-message={opts.dataAttr}
+      title={translations.conversation.latestAgentMessage}
+      aria-label={translations.conversation.latestAgentMessage}
+      aria-busy={latestAgentLoading}
+      disabled={navigationBusy}
+      onClick={() => void handleLatestAgent()}
+      style={{
+        width: "100%",
+        minHeight: opts.compact ? 18 : 34,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: opts.showLabel ? "flex-start" : "center",
+        gap: 8,
+        padding: opts.showLabel ? "6px 8px" : 0,
+        border: 0,
+        borderRadius: 8,
+        background: "color-mix(in srgb, var(--aurora-success) 9%, transparent)",
+        color: "var(--aurora-success)",
+        cursor: navigationBusy ? "wait" : "pointer",
+        fontSize: 10.5,
+        fontWeight: 650,
+      }}
+    >
+      <Icon
+        name={latestAgentLoading ? "refresh" : opts.icon}
+        size={11}
+        className={latestAgentLoading ? "animate-spin" : undefined}
+      />
+      {opts.showLabel && <span>{translations.conversation.latestAgentMessage}</span>}
+    </button>
+  );
+
+  const renderPromptButton = (
+    item: { prompt: ConversationPrompt; index: number; snippet: string },
+    opts: { expanded: boolean; mobile?: boolean },
+  ) => {
+    const { prompt, index, snippet } = item;
+    const active = prompt.line_number === activeLine;
+    const isLoading = prompt.line_number === loadingLine;
+    return (
+      <button
+        key={`${prompt.id}-${prompt.line_number}`}
+        type="button"
+        data-prompt-item={prompt.line_number}
+        data-mobile-prompt-item={opts.mobile ? prompt.line_number : undefined}
+        title={snippet}
+        aria-current={active ? "true" : undefined}
+        aria-busy={isLoading}
+        disabled={navigationBusy}
+        onClick={async () => {
+          await onSelect(prompt);
+          if (opts.mobile && dialogRef.current) closeMobileSheet();
+        }}
+        style={opts.mobile ? {
+          width: "100%",
+          minHeight: 54,
+          display: "flex",
+          alignItems: "center",
+          gap: 11,
+          marginBottom: 5,
+          padding: "9px 10px",
+          border: active
+            ? "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))"
+            : "1px solid transparent",
+          borderRadius: 12,
+          background: active
+            ? "color-mix(in srgb, var(--aurora-accent) 8%, var(--aurora-chip))"
+            : "transparent",
+          color: active ? "var(--aurora-accent)" : "var(--aurora-fg2)",
+          textAlign: "left",
+          cursor: navigationBusy ? "wait" : "pointer",
+          opacity: navigationBusy && !isLoading ? 0.5 : 1,
+          contentVisibility: "auto",
+          containIntrinsicSize: "54px",
+        } : {
+          width: "100%",
+          minHeight: opts.expanded ? 34 : 10,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          marginBottom: opts.expanded ? 2 : 5,
+          padding: opts.expanded ? "6px 7px" : 0,
+          border: 0,
+          borderRadius: opts.expanded ? 8 : 999,
+          background: opts.expanded
+            ? active
+              ? "color-mix(in srgb, var(--aurora-accent) 10%, transparent)"
+              : "transparent"
+            : active
+              ? "var(--aurora-accent)"
+              : "var(--aurora-border)",
+          color: active ? "var(--aurora-accent)" : "var(--aurora-fg3)",
+          textAlign: "left",
+          cursor: navigationBusy ? "wait" : "pointer",
+          opacity: navigationBusy && !isLoading ? 0.55 : 1,
+        }}
+      >
+        {opts.mobile ? (
+          <>
+            <span
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 999,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flex: "0 0 auto",
+                background: active ? "var(--aurora-accent)" : "var(--aurora-chip)",
+                color: active ? "#fff" : "var(--aurora-fg3)",
+                fontSize: 9.5,
+                fontWeight: 750,
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {isLoading ? <Icon name="refresh" size={12} className="animate-spin" /> : index + 1}
+            </span>
+            <span
+              style={{
+                minWidth: 0,
+                display: "-webkit-box",
+                overflow: "hidden",
+                WebkitBoxOrient: "vertical",
+                WebkitLineClamp: 2,
+                fontSize: 12.5,
+                lineHeight: 1.35,
+              }}
+            >
+              {isLoading ? loadingLabel : snippet}
+            </span>
+          </>
+        ) : opts.expanded ? (
+          <>
+            <span
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 999,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flex: "0 0 auto",
+                background: active
+                  ? "color-mix(in srgb, var(--aurora-accent) 14%, transparent)"
+                  : "var(--aurora-chip)",
+                fontSize: 8.5,
+                fontWeight: 700,
+              }}
+            >
+              {isLoading ? <Icon name="refresh" size={10} className="animate-spin" /> : index + 1}
+            </span>
+            <span
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                fontSize: 10.5,
+                lineHeight: 1.3,
+              }}
+            >
+              {isLoading ? loadingLabel : snippet}
+            </span>
+          </>
+        ) : isLoading ? (
+          <Icon name="refresh" size={10} className="animate-spin" style={{ color: "#fff" }} />
+        ) : (
+          <span className="sr-only">{snippet}</span>
+        )}
+      </button>
+    );
+  };
+
   return (
     <>
       <aside
-      data-prompt-navigator
-      aria-label={label}
-      className="hidden xl:flex"
-      onMouseEnter={() => setExpanded(true)}
-      onMouseLeave={() => setExpanded(false)}
-      onFocus={() => setExpanded(true)}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setExpanded(false);
-      }}
-      style={{
-        position: "absolute",
-        top: 34,
-        right: -38,
-        bottom: 44,
-        zIndex: 40,
-        width: expanded ? 300 : 28,
-        flexDirection: "column",
-        border: "1px solid var(--aurora-border)",
-        borderRadius: 14,
-        background: "color-mix(in srgb, var(--aurora-surface-solid) 92%, transparent)",
-        boxShadow: expanded
-          ? "0 20px 48px -18px rgba(15,23,42,0.28)"
-          : "0 6px 18px -10px rgba(15,23,42,0.3)",
-        backdropFilter: "blur(18px)",
-        overflow: "hidden",
-        transition: "width .18s ease, box-shadow .18s ease",
-      }}
-    >
-      {expanded && (
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "10px 11px 8px",
-            borderBottom: "1px solid var(--aurora-border)",
-            color: "var(--aurora-fg3)",
-            flex: "0 0 auto",
-          }}
-        >
-          <Icon name="message" size={13} style={{ color: "var(--aurora-accent)" }} />
-          <span style={{ fontSize: 11, fontWeight: 650 }}>{label}</span>
-          <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--aurora-fg4)" }}>
-            {prompts.length}
-          </span>
-        </div>
-      )}
-
-      <div
+        data-prompt-navigator
+        data-document-id={documentId}
+        aria-label={label}
+        className="hidden xl:flex"
+        onMouseEnter={() => setExpanded(true)}
+        onMouseLeave={() => {
+          rememberScrollSpot(desktopListRef.current);
+          setExpanded(false);
+        }}
+        onFocus={() => setExpanded(true)}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) {
+            rememberScrollSpot(desktopListRef.current);
+            setExpanded(false);
+          }
+        }}
         style={{
-          flex: 1,
-          minHeight: 0,
-          overflowY: "auto",
-          padding: expanded ? "6px" : "8px 7px",
+          position: "absolute",
+          top: 34,
+          right: -38,
+          bottom: 44,
+          zIndex: 40,
+          width: expanded ? 300 : 28,
+          flexDirection: "column",
+          border: "1px solid var(--aurora-border)",
+          borderRadius: 14,
+          background: "color-mix(in srgb, var(--aurora-surface-solid) 92%, transparent)",
+          boxShadow: expanded
+            ? "0 20px 48px -18px rgba(15,23,42,0.28)"
+            : "0 6px 18px -10px rgba(15,23,42,0.3)",
+          backdropFilter: "blur(18px)",
+          overflow: "hidden",
+          transition: "width .18s ease, box-shadow .18s ease",
         }}
       >
-        {promptItems.map(({ prompt, index, snippet }) => {
-          const active = prompt.line_number === activeLine;
-          const isLoading = prompt.line_number === loadingLine;
-          return (
-            <button
-              key={`${prompt.id}-${prompt.line_number}`}
-              type="button"
-              data-prompt-item={prompt.line_number}
-              title={snippet}
-              aria-current={active ? "true" : undefined}
-              onClick={() => onSelect(prompt)}
-              disabled={navigationBusy}
-              aria-busy={isLoading}
+        {expanded && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "10px 11px 8px",
+              borderBottom: "1px solid var(--aurora-border)",
+              color: "var(--aurora-fg3)",
+              flex: "0 0 auto",
+            }}
+          >
+            <Icon name="message" size={13} style={{ color: "var(--aurora-accent)" }} />
+            <span style={{ fontSize: 11, fontWeight: 650 }}>{label}</span>
+            <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--aurora-fg4)" }}>
+              {prompts.length}
+            </span>
+          </div>
+        )}
+
+        {expanded && (
+          <div style={{ padding: "8px 8px 0", flex: "0 0 auto" }}>
+            <label
               style={{
-                width: "100%",
-                minHeight: expanded ? 34 : 10,
+                minHeight: 34,
                 display: "flex",
                 alignItems: "center",
-                gap: 8,
-                marginBottom: expanded ? 2 : 5,
-                padding: expanded ? "6px 7px" : 0,
-                border: 0,
-                borderRadius: expanded ? 8 : 999,
-                background: expanded
-                  ? active
-                    ? "color-mix(in srgb, var(--aurora-accent) 10%, transparent)"
-                    : "transparent"
-                  : active
-                    ? "var(--aurora-accent)"
-                    : "var(--aurora-border)",
-                color: active ? "var(--aurora-accent)" : "var(--aurora-fg3)",
-                textAlign: "left",
-                cursor: navigationBusy ? "wait" : "pointer",
-                opacity: navigationBusy && !isLoading ? 0.55 : 1,
+                gap: 7,
+                padding: "6px 8px",
+                border: "1px solid var(--aurora-border)",
+                borderRadius: 10,
+                background: "var(--aurora-chip)",
+                color: "var(--aurora-fg4)",
               }}
             >
-              {expanded ? (
-                <>
-                  <span
+              <Icon name="search" size={12} style={{ flex: "0 0 auto" }} />
+              <span className="sr-only">
+                {fmt(translations.conversation.searchPrompts, { count: prompts.length })}
+              </span>
+              <input
+                data-desktop-prompt-search
+                type="search"
+                value={query}
+                onChange={(event) => commitPromptQuery(event.target.value)}
+                placeholder={fmt(translations.conversation.searchPrompts, { count: prompts.length })}
+                autoComplete="off"
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  padding: 0,
+                  border: 0,
+                  outline: 0,
+                  background: "transparent",
+                  color: "var(--aurora-fg1)",
+                  fontSize: 12,
+                }}
+              />
+            </label>
+            {!query.trim() && history.length > 0 && (
+              <div
+                data-desktop-prompt-search-history
+                style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}
+              >
+                {history.slice(0, 6).map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => commitPromptQuery(item)}
                     style={{
-                      width: 18,
-                      height: 18,
-                      borderRadius: 999,
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      flex: "0 0 auto",
-                      background: active
-                        ? "color-mix(in srgb, var(--aurora-accent) 14%, transparent)"
-                        : "var(--aurora-chip)",
-                      fontSize: 8.5,
-                      fontWeight: 700,
-                    }}
-                  >
-                    {isLoading ? (
-                      <Icon name="refresh" size={10} className="animate-spin" />
-                    ) : (
-                      index + 1
-                    )}
-                  </span>
-                  <span
-                    style={{
-                      minWidth: 0,
+                      maxWidth: "100%",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      fontSize: 10.5,
-                      lineHeight: 1.3,
+                      border: "1px solid var(--aurora-border)",
+                      borderRadius: 999,
+                      background: "var(--aurora-surface-solid)",
+                      color: "var(--aurora-fg3)",
+                      padding: "3px 8px",
+                      fontSize: 10,
+                      cursor: "pointer",
                     }}
                   >
-                    {isLoading ? loadingLabel : snippet}
-                  </span>
-                </>
-              ) : isLoading ? (
-                <Icon name="refresh" size={10} className="animate-spin" style={{ color: "#fff" }} />
-              ) : (
-                <span className="sr-only">{snippet}</span>
-              )}
-            </button>
-          );
-        })}
+                    {item}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ padding: expanded ? "7px 7px 0" : "5px 5px 0", flex: "0 0 auto" }}>
+          {latestAgentButton({
+            compact: !expanded,
+            dataAttr: "top",
+            icon: "sparkles",
+            showLabel: expanded,
+          })}
         </div>
+
+        <div
+          ref={desktopListRef}
+          data-prompt-navigator-list
+          onScroll={() => rememberScrollSpot(desktopListRef.current)}
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: "auto",
+            padding: expanded ? "6px" : "8px 7px",
+          }}
+        >
+          {filteredPromptItems.length === 0 ? (
+            expanded && (
+              <div style={{ padding: "18px 8px", textAlign: "center", color: "var(--aurora-fg4)", fontSize: 11 }}>
+                {translations.conversation.noMatchingPrompts}
+              </div>
+            )
+          ) : (
+            filteredPromptItems.map((item) => renderPromptButton(item, { expanded }))
+          )}
+        </div>
+
         <div
           style={{
             padding: expanded ? "7px" : "5px",
@@ -1736,38 +2070,12 @@ function PromptNavigator({
             flex: "0 0 auto",
           }}
         >
-          <button
-            type="button"
-            data-latest-agent-message
-            title={translations.conversation.latestAgentMessage}
-            aria-label={translations.conversation.latestAgentMessage}
-            aria-busy={latestAgentLoading}
-            disabled={navigationBusy}
-            onClick={() => void onLatestAgent()}
-            style={{
-              width: "100%",
-              minHeight: expanded ? 34 : 18,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: expanded ? "flex-start" : "center",
-              gap: 8,
-              padding: expanded ? "6px 8px" : 0,
-              border: 0,
-              borderRadius: 8,
-              background: "color-mix(in srgb, var(--aurora-success) 9%, transparent)",
-              color: "var(--aurora-success)",
-              cursor: navigationBusy ? "wait" : "pointer",
-              fontSize: 10.5,
-              fontWeight: 650,
-            }}
-          >
-            <Icon
-              name={latestAgentLoading ? "refresh" : "arrow_down"}
-              size={11}
-              className={latestAgentLoading ? "animate-spin" : undefined}
-            />
-            {expanded && <span>{translations.conversation.latestAgentMessage}</span>}
-          </button>
+          {latestAgentButton({
+            compact: !expanded,
+            dataAttr: "bottom",
+            icon: "arrow_down",
+            showLabel: expanded,
+          })}
         </div>
       </aside>
 
@@ -1993,7 +2301,7 @@ function PromptNavigator({
                   data-mobile-prompt-search
                   type="search"
                   value={query}
-                  onChange={(event) => setQuery(event.target.value)}
+                  onChange={(event) => commitPromptQuery(event.target.value)}
                   placeholder={fmt(translations.conversation.searchPrompts, { count: prompts.length })}
                   autoComplete="off"
                   style={{
@@ -2008,14 +2316,41 @@ function PromptNavigator({
                   }}
                 />
               </label>
+              {!query.trim() && history.length > 0 && (
+                <div
+                  data-mobile-prompt-search-history
+                  style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}
+                >
+                  {history.slice(0, 8).map((item) => (
+                    <button
+                      key={item}
+                      type="button"
+                      onClick={() => commitPromptQuery(item)}
+                      style={{
+                        maxWidth: "100%",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        border: "1px solid var(--aurora-border)",
+                        borderRadius: 999,
+                        background: "var(--aurora-surface-solid)",
+                        color: "var(--aurora-fg3)",
+                        padding: "5px 10px",
+                        fontSize: 11,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {item}
+                    </button>
+                  ))}
+                </div>
+              )}
               <button
                 type="button"
-                data-mobile-latest-agent-message
+                data-mobile-latest-agent-message="top"
                 aria-busy={latestAgentLoading}
                 disabled={navigationBusy}
-                onClick={async () => {
-                  if (await onLatestAgent()) closeMobileSheet();
-                }}
+                onClick={() => void handleLatestAgent()}
                 style={{
                   width: "100%",
                   minHeight: 42,
@@ -2044,12 +2379,15 @@ function PromptNavigator({
             </div>
 
             <div
+              ref={mobileListRef}
+              data-mobile-prompt-list
+              onScroll={() => rememberScrollSpot(mobileListRef.current)}
               style={{
                 flex: 1,
                 minHeight: 0,
                 overflowY: "auto",
                 overscrollBehavior: "contain",
-                padding: "0 10px calc(12px + env(safe-area-inset-bottom))",
+                padding: "0 10px 8px",
               }}
             >
               {filteredPromptItems.length === 0 ? (
@@ -2060,83 +2398,41 @@ function PromptNavigator({
                   {translations.conversation.noMatchingPrompts}
                 </div>
               ) : (
-                filteredPromptItems.map(({ prompt, index, snippet }) => {
-                  const active = prompt.line_number === activeLine;
-                  const isLoading = prompt.line_number === loadingLine;
-                  return (
-                    <button
-                      key={`${prompt.id}-${prompt.line_number}`}
-                      type="button"
-                      data-mobile-prompt-item={prompt.line_number}
-                      aria-current={active ? "true" : undefined}
-                      aria-busy={isLoading}
-                      disabled={navigationBusy}
-                      onClick={async () => {
-                        await onSelect(prompt);
-                        if (dialogRef.current) closeMobileSheet();
-                      }}
-                      style={{
-                        width: "100%",
-                        minHeight: 54,
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 11,
-                        marginBottom: 5,
-                        padding: "9px 10px",
-                        border: active
-                          ? "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))"
-                          : "1px solid transparent",
-                        borderRadius: 12,
-                        background: active
-                          ? "color-mix(in srgb, var(--aurora-accent) 8%, var(--aurora-chip))"
-                          : "transparent",
-                        color: active ? "var(--aurora-accent)" : "var(--aurora-fg2)",
-                        textAlign: "left",
-                        cursor: navigationBusy ? "wait" : "pointer",
-                        opacity: navigationBusy && !isLoading ? 0.5 : 1,
-                        contentVisibility: "auto",
-                        containIntrinsicSize: "54px",
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: 999,
-                          display: "inline-flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          flex: "0 0 auto",
-                          background: active ? "var(--aurora-accent)" : "var(--aurora-chip)",
-                          color: active ? "#fff" : "var(--aurora-fg3)",
-                          fontSize: 9.5,
-                          fontWeight: 750,
-                          fontVariantNumeric: "tabular-nums",
-                        }}
-                      >
-                        {isLoading ? (
-                          <Icon name="refresh" size={12} className="animate-spin" />
-                        ) : (
-                          index + 1
-                        )}
-                      </span>
-                      <span
-                        style={{
-                          minWidth: 0,
-                          display: "-webkit-box",
-                          overflow: "hidden",
-                          WebkitBoxOrient: "vertical",
-                          WebkitLineClamp: 2,
-                          fontSize: 12.5,
-                          lineHeight: 1.35,
-                        }}
-                      >
-                        {isLoading ? loadingLabel : snippet}
-                      </span>
-                    </button>
-                  );
-                })
+                filteredPromptItems.map((item) => renderPromptButton(item, { expanded: true, mobile: true }))
               )}
+            </div>
+
+            <div style={{ padding: "8px 14px calc(12px + env(safe-area-inset-bottom))", flex: "0 0 auto", borderTop: "1px solid var(--aurora-border)" }}>
+              <button
+                type="button"
+                data-mobile-latest-agent-message="bottom"
+                aria-busy={latestAgentLoading}
+                disabled={navigationBusy}
+                onClick={() => void handleLatestAgent()}
+                style={{
+                  width: "100%",
+                  minHeight: 42,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 9,
+                  padding: "8px 11px",
+                  border: "1px solid color-mix(in srgb, var(--aurora-success) 22%, var(--aurora-border))",
+                  borderRadius: 12,
+                  background: "color-mix(in srgb, var(--aurora-success) 8%, var(--aurora-chip))",
+                  color: "var(--aurora-success)",
+                  cursor: navigationBusy ? "wait" : "pointer",
+                  fontSize: 12,
+                  fontWeight: 650,
+                }}
+              >
+                <Icon
+                  name={latestAgentLoading ? "refresh" : "arrow_down"}
+                  size={14}
+                  className={latestAgentLoading ? "animate-spin" : undefined}
+                />
+                <span>{latestAgentLoading ? loadingLabel : translations.conversation.latestAgentMessage}</span>
+                {!latestAgentLoading && <Icon name="arrow_down" size={13} style={{ marginLeft: "auto" }} />}
+              </button>
             </div>
           </section>
         </div>

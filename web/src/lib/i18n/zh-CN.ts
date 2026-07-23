@@ -232,6 +232,7 @@ const zhCN = {
     clearSearch: "清除对话搜索",
     matchingMessages: "{count} 条匹配消息",
     noMatchingMessages: "没有匹配的消息",
+    recentSearches: "最近搜索",
     closePromptNavigator: "关闭提示词导航",
     promptFallback: "提示词 {number}",
     lastActivity: "最近活动",

@@ -226,6 +226,7 @@ const enUS: Translations = {
     clearSearch: "Clear conversation search",
     matchingMessages: "{count} matching messages",
     noMatchingMessages: "No matching messages",
+    recentSearches: "Recent searches",
     closePromptNavigator: "Close prompt navigator",
     promptFallback: "Prompt {number}",
     lastActivity: "Last activity",

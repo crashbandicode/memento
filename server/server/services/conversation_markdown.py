@@ -40,7 +40,11 @@ class MarkdownExportOptions:
     prompt_selection: PromptSelection | None = None
     start_at: datetime | None = None
     end_at: datetime | None = None
+    include_user: bool = True
+    include_assistant: bool = True
     include_tools: bool = True
+    include_tasks: bool = True
+    include_agents: bool = True
     include_thinking: bool = True
     include_session_context: bool = True
     include_timestamps: bool = True
@@ -349,6 +353,8 @@ def _write_message(
 ) -> bool:
     metadata = message.metadata or {}
     if isinstance(metadata.get("interaction_response"), dict):
+        if not options.include_user:
+            return False
         response = metadata["interaction_response"]
         interaction_id = str(response.get("interaction_id") or "")
         if interaction_id in rendered_interactions:
@@ -368,24 +374,32 @@ def _write_message(
     _write_attachments(writer, metadata.get("attachments"))
 
     if role == "assistant":
-        content = message.content.strip()
+        content = message.content.strip() if options.include_assistant else ""
         thinking = str(metadata.get("thinking") or "").strip()
         tool_calls = metadata.get("tool_calls")
         has_tools = options.include_tools and isinstance(tool_calls, list) and bool(tool_calls)
-        if content or (thinking and options.include_thinking):
-            _write(writer, f"### Assistant{timestamp}")
-            _write(writer)
-            if content:
-                _write(writer, content)
+        wrote_thinking = bool(
+            thinking and options.include_thinking and thinking != content
+        )
+        if content or (thinking and options.include_thinking and options.include_assistant):
+            if options.include_assistant or wrote_thinking:
+                _write(writer, f"### Assistant{timestamp}")
                 _write(writer)
-            if thinking and options.include_thinking and thinking != content:
-                _write_details(writer, "Thinking", thinking)
+                if content:
+                    _write(writer, content)
+                    _write(writer)
+                if wrote_thinking:
+                    _write_details(writer, "Thinking", thinking)
+        elif wrote_thinking and not options.include_assistant:
+            _write_details(writer, "Thinking", thinking)
         if has_tools:
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
                 interaction = call.get("interaction")
                 if isinstance(interaction, dict):
+                    if not options.include_assistant and not options.include_user:
+                        continue
                     interaction_id = str(interaction.get("id") or "")
                     _write_interaction(writer, interaction, responses.get(interaction_id))
                     if interaction_id:
@@ -396,24 +410,44 @@ def _write_message(
                         str(call.get("name") or "Tool"),
                         call.get("input", ""),
                     )
-        return bool(content or thinking or has_tools)
+        return bool(
+            content
+            or (thinking and options.include_thinking)
+            or has_tools
+        )
 
     if role == "tool":
-        if not options.include_tools:
+        if isinstance(metadata.get("agent_event"), dict):
+            if not options.include_agents:
+                return False
+        elif isinstance(metadata.get("task_state"), dict):
+            if not options.include_tasks:
+                return False
+        elif not options.include_tools:
             return False
         interaction = metadata.get("interaction")
         if isinstance(interaction, dict):
+            if not options.include_assistant and not options.include_user:
+                return False
             interaction_id = str(interaction.get("id") or "")
             _write_interaction(writer, interaction, responses.get(interaction_id))
             if interaction_id:
                 rendered_interactions.add(interaction_id)
         else:
-            _write_tool(
-                writer,
-                str(metadata.get("tool_name") or "Tool result"),
-                metadata.get("tool_input", ""),
-                message.content,
+            label = "Agent activity" if isinstance(metadata.get("agent_event"), dict) else (
+                "Task" if isinstance(metadata.get("task_state"), dict) else (
+                    str(metadata.get("tool_name") or "Tool result")
+                )
             )
+            if isinstance(metadata.get("agent_event"), dict) or isinstance(metadata.get("task_state"), dict):
+                _write_details(writer, label, message.content.strip() or "_Empty message._")
+            else:
+                _write_tool(
+                    writer,
+                    label,
+                    metadata.get("tool_input", ""),
+                    message.content,
+                )
         return True
 
     is_context = bool(
@@ -427,6 +461,11 @@ def _write_message(
         if options.include_session_context:
             _write_details(writer, "Subagent context" if "Subagent Context" in message.content else "Session context", message.content.strip())
             return True
+        return False
+
+    if role == "user" and not options.include_user:
+        return False
+    if role not in {"user", "assistant", "tool"} and not options.include_session_context:
         return False
 
     heading = "You" if role == "user" else role.title()
@@ -487,6 +526,8 @@ async def write_conversation_markdown(
             if not include_current:
                 continue
             prompts_exported += 1
+            if not options.include_user:
+                continue
             timestamp = f" · {_iso(message.timestamp)}" if options.include_timestamps and message.timestamp else ""
             _write(writer, f"## Prompt {prompt_number} — You{timestamp}")
             _write(writer)
