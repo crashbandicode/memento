@@ -530,14 +530,14 @@ For commercial licensing (waiver of AGPL terms, closed-source use, SaaS deployme
 
 ## 🚀 What this fork adds over upstream
 
-This repository builds on [ddong8/memento](https://github.com/ddong8/memento) and keeps its self-hosted architecture, while adding a substantial set of conversation, reliability, and operations features:
+This repository builds on [ddong8/memento](https://github.com/ddong8/memento) and keeps the same self-hosted collector → API → Web/MCP architecture. Relative to upstream `main`, it adds:
 
-- **A conversation attention inbox** — detects unanswered interactive questions from Cursor, Claude Code, and Codex, including questions in subagent transcripts or outside the currently loaded message window. A lightweight metadata lane surfaces them quickly, while canonical transcript ingestion remains the source of truth.
-- **Live subagent visibility** — shows active and completed subagents, tool arguments, model and thinking identity, thread relationships, and drill-in previews, with dedicated desktop and mobile navigation.
-- **Reliable large-transcript synchronization** — guarded append-only deltas, bounded catch-up windows, durable source revisions, chunk commit receipts, priority lanes for live updates, and recovery from interrupted or reordered uploads.
-- **Stronger conversation navigation** — indexed in-conversation search, a persistent prompt navigator, latest-agent-message jumps, low-activity and tool filters, preserved reading position, Markdown export controls, and rich-text copying.
-- **Better cross-tool fidelity** — preserves Codex thread names and interrupted turns, Cursor tasks, attachments and structured tool calls, Claude sidecars and queued prompts, plus assistant model and reasoning metadata.
-- **Lower operational overhead** — external storage for oversized transcripts, coalesced post-ingest work, bounded collector queues, embedding admission controls, purpose-aware embedding profiles, and more efficient search and backup paths.
-- **Additional self-hosting safeguards** — single-user TOTP support, stricter OAuth callback handling, safer event-stream credentials, and more durable reverse-proxy deployment behavior.
+- **Live subagent browsing** — active and completed Cursor and Codex subagents with tool-argument previews, model and thinking identity, thread relationships, and desktop/mobile drill-in.
+- **Higher-fidelity multi-tool transcripts** — Cursor tasks, attachments and structured tools; Codex thread names and interrupted turns; Claude sidecars and queued prompts; Mermaid diagrams; and assistant identity badges.
+- **Stronger conversation UX** — indexed in-conversation search, a persistent prompt navigator, jump-to-latest controls, low-activity and tool filters, remembered reading position, Markdown export, and rich-text copying.
+- **Interactive agent questions in-thread** — ask-user and pending-response cards rendered in the conversation viewer instead of remaining buried in raw tool JSON.
+- **More reliable live and large sync** — guarded delta uploads, durable spool revisions and commit receipts, bounded catch-up, priority handling for live updates, and external storage for oversized transcripts.
+- **Lower baseline overhead** — coalesced post-ingest work, bounded collector queues, embedding admission controls, and CPU/thread caps that keep health checks responsive during inference.
+- **Extra self-hosting safeguards** — optional single-user TOTP, stricter disabled-OAuth handling, safer event-stream credentials, reverse-proxy routing fixes, and signed desktop updates from this fork.
 
-The fork aims to stay compatible with upstream data and deployment conventions; the list above summarizes product-level differences rather than every internal patch.
+The dashboard attention inbox and the newer embedding tiering, ONNX, search-routing, and backup-efficiency work are still in development and are not presented here as released capabilities.
