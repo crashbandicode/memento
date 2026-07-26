@@ -2,43 +2,43 @@
 
 # Memento
 
-**给你的 AI 工具建个共享大脑**
+**A shared brain for your AI coding tools**
 
-跨设备、跨工具自动采集 AI 编程对话与记忆,自建后端汇总,Web + MCP 统一查看、搜索、召回。
+Auto-collect AI coding conversations and memory across devices and tools, aggregate on your own backend, and view / search / recall through a unified Web UI + MCP.
 
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
-[![Python ≥3.10](https://img.shields.io/badge/python-≥3.10-blue.svg)](#技术栈)
-[![Next.js 16](https://img.shields.io/badge/next.js-16-black.svg)](#技术栈)
+[![Python ≥3.10](https://img.shields.io/badge/python-≥3.10-blue.svg)](#-tech-stack)
+[![Next.js 16](https://img.shields.io/badge/next.js-16-black.svg)](#-tech-stack)
 [![PyPI - memento-brain](https://img.shields.io/pypi/v/memento-brain?label=memento-brain)](https://pypi.org/project/memento-brain/)
 [![PyPI - memento-brain-collector](https://img.shields.io/pypi/v/memento-brain-collector?label=collector)](https://pypi.org/project/memento-brain-collector/)
 [![PyPI - memento-brain-memory](https://img.shields.io/pypi/v/memento-brain-memory?label=mcp-memory)](https://pypi.org/project/memento-brain-memory/)
 
-[快速开始](#-快速开始) · [架构](#️-架构) · [支持的工具](#-支持的-ai-工具) · [自部署](#-自托管部署) · [MCP 接入](#-mcp-记忆服务)
+[Quick Start](#-quick-start) · [Architecture](#️-architecture) · [Supported Tools](#-supported-ai-tools) · [Self-host](#-quick-start) · [MCP](#-mcp-memory-service)
 
-🌐 **Languages**: [中文](README.md) · [English](README.en.md)
+🌐 **Languages**: [English](README.md) · [简体中文](README.zh-CN.md)
 
 </div>
 
 ---
 
-## ✨ 它能做什么
+## ✨ What it does
 
-- 🧠 **跨设备同步对话** — Mac / Linux / Windows 上的 Claude Code / Codex / Cursor / Antigravity 等工具,聊过的内容统一汇总
-- 🔍 **混合检索** — BGE-M3 向量 + jieba 分词的全文索引,中英文都能搜
-- 🕸️ **知识图谱** — LLM 自动从对话抽实体(项目 / 工具 / 技术 / 人物 / 概念)、关系、观察;超过 7 天的老观察自动压缩成 summary
-- 🔗 **MCP 接入** — 8 个 tool(找:`memory_search` / `memory_recall` / `memory_context`;钻:`memory_open` / `memory_conversation` / `memory_graph`;写:`memory_store`;总览:`daily_summary`)外加 4 个 resources;任何 AI IDE 都能直接查、读、改你的记忆
-- 📅 **AI 日报** — Celery 每天 23:30 跑两阶段:先为每篇文档生成摘要,再聚合成跨工具每日 digest
-- 🔒 **入队前脱敏** — Collector 本地就过 14 类密钥正则(OpenAI / Anthropic / GitHub / Slack / Telegram / AWS / Bearer / 私钥 / URL 内嵌凭证 …),磁盘上 SQLite 队列也安全
-- 🌐 **公开分享** — 项目时间线 / 日报一键生成 share 链接,带 GeoIP 访客统计、有效期、随时撤销
-- 🛡️ **完全自托管** — Docker Compose 一键起,Postgres + Redis + MinIO 全在你机器上,数据不出门
-- 🔐 **多租户隔离** — 多用户独立空间,owner / admin / viewer 三级角色 + 细粒度授权 + 审计日志
-- ⚡ **守护进程级** — 设备上跑成 launchd / systemd / Task Scheduler,断网离线队列、自愈重试
+- 🧠 **Cross-device conversation sync** — Claude Code / Codex / Cursor / Antigravity etc. on Mac / Linux / Windows, all aggregated in one place
+- 🔍 **Hybrid retrieval** — BGE-M3 vectors + jieba-tokenized full-text index; works for both English and Chinese
+- 🕸️ **Knowledge graph** — LLM extracts entities (projects / tools / technologies / people / concepts), relations and observations from conversations; observations older than 7 days are auto-compacted into summaries
+- 🔗 **MCP integration** — 8 tools (find: `memory_search` / `memory_recall` / `memory_context`; drill: `memory_open` / `memory_conversation` / `memory_graph`; write: `memory_store`; overview: `daily_summary`) plus 4 resources; any AI IDE can query, read, and update your memory directly
+- 📅 **AI daily digest** — Celery runs a two-stage job at 23:30 every day: per-document summaries first, then aggregated into a cross-tool digest
+- 🔒 **Sanitize-before-enqueue** — The collector strips 14 classes of secrets locally (OpenAI / Anthropic / GitHub / Slack / Telegram / AWS / Bearer tokens / private keys / URL-embedded credentials …) so even the on-disk SQLite queue is safe
+- 🌐 **Public sharing** — One-click share links for project timelines / daily digests, with GeoIP visitor stats, expiry, revoke any time
+- 🛡️ **Fully self-hosted** — One-shot Docker Compose; Postgres + Redis + MinIO all on your own machine — data never leaves
+- 🔐 **Multi-tenant isolation** — Per-user namespaces with owner / admin / viewer roles + fine-grained per-resource grants + audit log
+- ⚡ **Daemon-grade** — Runs as launchd / systemd / Task Scheduler; offline queue and self-healing retry when network drops
 
-## 🏗️ 架构
+## 🏗️ Architecture
 
 ```mermaid
 graph TB
-    subgraph DEV["📱 用户设备 Mac/Linux/Windows"]
+    subgraph DEV["📱 User devices Mac/Linux/Windows"]
         direction LR
         CC["Claude Code<br/>~/.claude"]
         CDX["Codex<br/>~/.codex"]
@@ -47,7 +47,7 @@ graph TB
         OC["OpenClaw<br/>~/.openclaw"]
         HM["Hermes<br/>~/.hermes"]
         OBS["Obsidian Vault"]
-        COL["memento-brain-collector<br/>watchdog 监听<br/>SQLite 离线队列<br/>sanitizer 入队脱敏"]
+        COL["memento-brain-collector<br/>watchdog listener<br/>SQLite offline queue<br/>sanitizer on enqueue"]
         CC --- COL
         CDX --- COL
         CUR --- COL
@@ -57,7 +57,7 @@ graph TB
         OBS --- COL
     end
 
-    subgraph SRV["☁️ 自托管 Memento 服务端"]
+    subgraph SRV["☁️ Self-hosted Memento server"]
         direction TB
         NGX["nginx<br/>HTTPS + gzip"]
 
@@ -69,23 +69,23 @@ graph TB
             CB["Celery Beat"]
             PG[("PostgreSQL 16<br/>+ pgvector")]
             RD[("Redis 7")]
-            S3[("MinIO<br/>S3 兼容")]
+            S3[("MinIO<br/>S3 compatible")]
         end
 
-        EMB["BGE-M3 Embedding<br/>:8002 (Docker / 宿主)"]
+        EMB["BGE-M3 Embedding<br/>:8002 host process"]
 
         NGX --> API
         NGX --> WEB
         API <--> PG
         API <--> RD
         API <--> S3
-        API -.调用.-> EMB
+        API -.calls.-> EMB
         CW <--> PG
         CW <--> RD
         CB --> CW
     end
 
-    subgraph CLT["🤖 AI 工具 MCP 客户端"]
+    subgraph CLT["🤖 AI tools MCP clients"]
         direction LR
         MCC["Claude Code"]
         MCDX["Codex"]
@@ -102,9 +102,9 @@ graph TB
     COL ==>|"HTTPS + collector token"| NGX
     MCP ==>|"HTTPS + JWT"| NGX
 
-    subgraph PUB["🌍 公开访问"]
-        SHARE["分享链接 /s/&lt;token&gt;"]
-        GEO["GeoIP DB<br/>访客统计"]
+    subgraph PUB["🌍 Public access"]
+        SHARE["Share link /s/&lt;token&gt;"]
+        GEO["GeoIP DB<br/>visitor stats"]
     end
     NGX --> SHARE
     SHARE --> GEO
@@ -119,52 +119,52 @@ graph TB
     class SHARE,GEO public
 ```
 
-### 数据流(单条对话从产生到可搜)
+### Data flow (a single conversation, from creation to searchable)
 
 ```mermaid
 sequenceDiagram
-    participant T as AI 工具
-    participant W as 本地文件
+    participant T as AI tool
+    participant W as Local file
     participant C as Collector
-    participant Q as SQLite 队列
+    participant Q as SQLite queue
     participant A as API
     participant P as Postgres
     participant E as Embedding
     participant M as MCP
 
-    T->>W: 写 .jsonl 对话
-    W->>C: watchdog 文件事件
-    C->>C: 解析 + 脱敏
-    C->>Q: 入离线队列
-    Q->>A: HTTPS POST(失败重试)
-    A->>P: 写 documents / conversation_messages / content_tsv
-    A-->>E: 异步算 embedding
-    E->>P: 写 document_embeddings (pgvector)
-    A-->>P: LLM 抽 entities / relations
-    Note over M: 用户在 Claude Code 里调 memory_search
+    T->>W: write .jsonl conversation
+    W->>C: watchdog file event
+    C->>C: parse + sanitize
+    C->>Q: enqueue (offline-safe)
+    Q->>A: HTTPS POST (retry on failure)
+    A->>P: write documents / conversation_messages / content_tsv
+    A-->>E: async embedding
+    E->>P: write document_embeddings (pgvector)
+    A-->>P: LLM extracts entities / relations
+    Note over M: User calls memory_search inside Claude Code
     M->>A: GET /api/memory/semantic
-    A->>E: 算 query embedding
-    E->>P: cosine_distance 排序
-    P-->>M: 返回相关 chunk
+    A->>E: embed query
+    E->>P: cosine_distance ranking
+    P-->>M: return relevant chunks
 ```
 
-> Embedding 失败时 `embedding_status` 写为 `failed`,Celery beat **每 15 分钟**扫 `pending/failed` 自动重试,不会因为单次抖动丢向量。
+> When embedding fails, `embedding_status` is set to `failed`; Celery beat scans `pending/failed` rows **every 15 minutes** and retries — no vectors are lost to transient hiccups.
 
-## 🧰 支持的 AI 工具
+## 🧰 Supported AI tools
 
-| 工具 | 采集内容 | 格式 |
-|------|---------|------|
-| **Claude Code** | 对话、记忆、计划、历史 | JSONL / Markdown |
-| **OpenClaw** | 对话会话、身份、记忆、学习、技能 | JSONL / Markdown |
-| **Codex** | 对话、历史、技能、状态 | JSONL / TOML / SQLite |
-| **Antigravity** | 完整对话(内置解密 `.pb`)、计划、代码快照 | Protobuf / Markdown |
-| **Obsidian** | 所有笔记 | Markdown |
-| **Cursor** | 对话、技能、MCP 配置 | JSONL / Markdown |
-| **Hermes** | 完整对话(含工具调用)、persona、技能、CLI 历史 | JSON / Markdown / SQLite |
+| Tool | What's collected | Format |
+|------|------------------|--------|
+| **Claude Code** | conversations, memory, plans, history | JSONL / Markdown |
+| **OpenClaw** | conversation sessions, identity, memory, learnings, skills | JSONL / Markdown |
+| **Codex** | conversations, history, skills, state | JSONL / TOML / SQLite |
+| **Antigravity** | full conversations (built-in `.pb` decryption), plans, code snapshots | Protobuf / Markdown |
+| **Obsidian** | all notes | Markdown |
+| **Cursor** | conversations, skills, MCP config | JSONL / Markdown |
+| **Hermes** | full conversations (incl. tool calls), persona, skills, CLI history | JSON / Markdown / SQLite |
 
-## 🚀 快速开始
+## 🚀 Quick start
 
-### 一键安装(推荐)
+### One-shot install (recommended)
 
 ```bash
 # macOS / Linux
@@ -174,9 +174,9 @@ curl -fsSL https://mem.ihasy.com/install.sh | sh
 iwr https://mem.ihasy.com/install.ps1 -useb | iex
 ```
 
-也可以浏览器打开 <https://mem.ihasy.com/install> 拿复制好的命令。脚本会下载仓库到 `~/memento/`(可用 `MEMENTO_INSTALL_DIR` 覆盖),然后跑内置 `./install.sh`。
+Or open <https://mem.ihasy.com/install> in a browser to copy a ready-made command. The script clones the repo into `~/memento/` (override with `MEMENTO_INSTALL_DIR`) and runs the bundled `./install.sh`.
 
-### 已 clone 仓库
+### From a cloned repo
 
 ```bash
 git clone https://github.com/ddong8/memento.git && cd memento
@@ -184,346 +184,360 @@ git clone https://github.com/ddong8/memento.git && cd memento
 .\install.ps1           # Windows
 ```
 
-`install.sh` 自动完成:
+`install.sh` does it all:
 
-1. 生成 `.env` 随机密钥(JWT / collector token / MinIO / Postgres 密码)
-2. `docker compose up -d --build` 起 7 个容器
-3. 探活 API `/health`
-4. 交互提示创建第一个用户(自动 owner,拿 collector_token)
-5. `pip install memento-brain-collector` + setup + 注册系统服务
+1. Generate `.env` with random secrets (JWT / collector token / MinIO / Postgres passwords)
+2. `docker compose up -d --build` — boots 7 containers
+3. Liveness probe on API `/health`
+4. Interactive prompt to create the first user (auto-promoted to owner with a `collector_token`)
+5. `pip install memento-brain-collector` + setup + register the system service
 
-可选参数:
+Optional commands:
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `./install.sh embedding` | 装 BGE-M3 嵌入服务(Docker 模式,~1.3 GB,语义搜索 / MCP 召回必需) |
-| `./install.sh embedding --native` | 改用宿主 venv 安装(NVIDIA CUDA / Apple MPS GPU 加速场景) |
-| `./install.sh doctor` | 检查所有服务状态 |
-| `./install.sh update` | git pull + 重建 + 升级 |
-| `./install.sh uninstall` | 停服务,保留数据和配置 |
-| `./install.sh uninstall --purge` | 同上 + 清 Docker 数据卷 + `.env` |
-| `./install.sh uninstall --all` | 核弹级:pip 包 / `~/.memento` / 模型缓存 / Docker 镜像 / MCP 配置 全清 |
+| `./install.sh embedding` | Install BGE-M3 embedding server (Docker mode, ~1.3 GB; required for semantic search / MCP recall) |
+| `./install.sh embedding --native` | Switch to host-venv install (use this if you have NVIDIA CUDA or Apple MPS GPU) |
+| `./install.sh doctor` | Check status of all services |
+| `./install.sh update` | git pull + rebuild + upgrade |
+| `./install.sh uninstall` | Stop services; keep data and config |
+| `./install.sh uninstall --purge` | Above + drop Docker volumes + `.env` |
+| `./install.sh uninstall --all` | Nuclear: pip packages / `~/.memento` / model cache / Docker images / MCP entries — wiped |
 
-### 服务端口
+### Service ports
 
-| 端口 | 服务 |
+| Port | Service |
 |---|---|
 | **8001** | API (Swagger: `/docs`) |
 | **3001** | Web UI |
-| 8002 | Embedding(`--native` 模式宿主;Docker 模式不暴露到宿主,走 `embedding:8002` docker DNS) |
+| 8002 | Embedding (host port only in `--native` mode; Docker mode keeps it on the docker network at `embedding:8002` without host publish) |
 | 5433 | PostgreSQL |
 | 6380 | Redis |
-| 9000 / 9001 | MinIO / 控制台 |
+| 9000 / 9001 | MinIO / console |
 
-> 端口与常见项目错开,避免冲突。
+> Ports are deliberately offset from common defaults to avoid conflicts.
 
-## 💻 在额外设备上接入
+## 💻 Adding more devices
 
-把你日常用 AI 工具的每台 Mac / Windows / Linux 接到服务端,有两种方式:
+Connect every Mac / Windows / Linux box where you use AI tools. Two ways:
 
-### 方式一:桌面客户端(推荐)
+### Option 1: Desktop app (recommended)
 
-不想碰命令行、机器上没装 Python 的,直接下客户端 —— **内置采集器 + MCP sidecar**(冻结打包,无需 Python),自动更新,系统托盘常驻。
+No command line, no Python on the machine — just grab the app. It **bundles the collector + MCP sidecar** (frozen, no Python needed), auto-updates, and lives in the system tray.
 
-**[⬇️ 前往 GitHub Releases 下载最新版](https://github.com/ddong8/memento/releases/latest)**
+**[⬇️ Download the latest release from GitHub](https://github.com/ddong8/memento/releases/latest)**
 
-| 平台 | 安装包 |
+| Platform | Installer |
 |---|---|
-| **macOS**(Apple Silicon) | `.dmg` — 拖进 Applications 即可 |
-| **Windows** | `.exe` — NSIS 安装版 |
-| **Linux** | `.AppImage`(直接跑)或 `.deb`(`sudo dpkg -i`) |
+| **macOS** (Apple Silicon) | `.dmg` — drag into Applications |
+| **Windows** | `.exe` — NSIS installer |
+| **Linux** | `.AppImage` (run directly) or `.deb` (`sudo dpkg -i`) |
 
-首次打开极简:**Server** 标签里只有 3 样东西:
+First launch is intentionally minimal — the **Server** tab has only three things:
 
-1. **服务器地址**(粘 `https://mem.ihasy.com` 或你自部署的 URL)
-2. **启动 APP 时自动跑 collector**(默认勾上)
-3. **开机自启动 Memento**(默认勾上)
+1. **Server URL** (paste `https://mem.ihasy.com` or your self-hosted URL)
+2. **Auto-start collector when the app launches** (on by default)
+3. **Launch Memento at system startup** (on by default)
 
-点 **保存** → 自动跳到 **仪表板**,在内嵌网页里登录或注册。登录成功后:
-- 网页通过 `postMessage` 把 collector token 偷偷回传给桌面端
-- 桌面端落地 token + 配 MCP + 启动 collector(整树清扫旧实例,保证单实例)
-- 仪表板 SSO 自动登录,你直接看到自己的数据
+Click **Save** → you land on the **Dashboard**, log in or register inside the embedded web. On success:
+- The web posts the collector token back to the desktop via `postMessage`
+- The desktop saves the token + wires MCP + starts the collector (sweeps any stray instances first, so it's always single-instance)
+- The dashboard auto-SSOs you in — your data shows up immediately
 
-整个流程**用户感知不到 token**,全程一个浏览器都不用开。客户端会在新版本发布时自动检查并提示安装(minisign 签名校验)。
+The user **never sees a token** — no browser tab, no manual paste. The client checks for new releases (minisign-signed) and prompts to install them automatically.
 
-> macOS 首次打开若提示"无法验证开发者",右键图标 → 打开,或 `xattr -dr com.apple.quarantine /Applications/Memento.app`。
+> If macOS says it "can't verify the developer", right-click the icon → Open, or run `xattr -dr com.apple.quarantine /Applications/Memento.app`.
 
-### 方式二:命令行(pip)
+### Option 2: Command line (pip)
 
-适合服务器 / headless / 习惯 CLI 的环境:
-
-```bash
-pip install memento-brain-collector   # 只装采集器
-# 或 pip install memento-brain         # 一并装齐 collector + MCP memory
-memento-collector setup                # 交互式填 URL + token
-```
-
-> PyPI 包名 `memento-brain-collector` / `memento-brain-memory`(短名 `memento-memory` 被占了),CLI 保留短别名 `memento-collector` / `memento-memory`。
-
-**怎么拿 token?**(仅 pip / 命令行场景需要;桌面客户端**完全自动**)
-
-- **跑过 `./install.sh`** → 末尾会打印,同时存到 `.env.local`
-- **Web 自助注册** → `/auth/register` 即刻发 token(open 模式默认行为)
-- **同账号其他设备** → 在已登录的 Web 上调 `POST /api/auth/me/rotate-collector-token`
-
-### 守护进程
+For servers / headless / CLI-first setups:
 
 ```bash
-memento-collector status    # 查看状态
-memento-collector start     # 启动服务
-memento-collector stop      # 停止服务
-memento-collector run       # 前台运行(调试)
+pip install memento-brain-collector   # collector only
+# or pip install memento-brain         # bundles collector + MCP memory together
+memento-collector setup                # interactive: server URL + token
 ```
 
-按平台自动适配:**macOS** launchd / **Linux** systemd user / **Windows** Task Scheduler。
+> PyPI packages are `memento-brain-collector` / `memento-brain-memory` (the short names were taken). CLIs keep the short aliases `memento-collector` / `memento-memory`.
 
-## 🕸️ 知识图谱
+**How to get a token?** (only the pip / CLI path needs it — the desktop client is fully automatic)
 
-LLM 自动从同步进来的对话和文档里抽:
+- **Ran `./install.sh`** → printed at the end and stored in `.env.local`
+- **Web self-register** → `/auth/register` (open mode) hands back a token immediately
+- **Other devices of the same account** → call `POST /api/auth/me/rotate-collector-token` while logged into the web
 
-- **实体** (`knowledge_entities`) — 项目 / 工具 / 技术 / 人物 / 概念,跨对话去重合并
-- **关系** (`knowledge_relations`) — 实体之间的 `uses` / `creates` / `depends_on` / `discussed`
-- **观察** (`observations`) — 关于某个实体的具体事实陈述,带时间戳和来源 doc
+### Daemon control
 
-**自动压缩**:同一实体超过 7 天的累积观察会被 LLM 合并成一段更短的 summary,保语义、省空间。压缩窗口可通过 `MEMENTO_COMPACTION_AGE_DAYS` 调整。
+```bash
+memento-collector status    # show status
+memento-collector start     # start service
+memento-collector stop      # stop service
+memento-collector run       # run in foreground (debug)
+```
 
-通过 MCP 工具读写:写用 `memory_store`,读用 `memory_graph(entity_name)` 拿邻居 + 观察、`memory_context(project)` 拿项目级上下文、`memory_recall(category, days)` 拿时间序列。Web `/memory` 页可视化查看。
+Auto-detects platform: **macOS** launchd / **Linux** systemd user / **Windows** Task Scheduler.
 
-## 🧠 MCP 记忆服务
+## 🕸️ Knowledge graph
 
-装齐 `memento-brain` 后,所有 AI IDE 会自动配置 MCP 接入(由 `memento-collector setup` 完成):
+The system extracts the following from every synced conversation / document via LLM:
 
-| AI 工具 | MCP 配置文件 | 写入方式 |
+- **Entities** (`knowledge_entities`) — projects / tools / technologies / people / concepts; deduplicated across conversations
+- **Relations** (`knowledge_relations`) — `uses` / `creates` / `depends_on` / `discussed` between entities
+- **Observations** (`observations`) — concrete factual statements about an entity, with timestamp and source document
+
+**Auto-compaction**: observations on the same entity older than 7 days get merged by an LLM into a shorter summary — preserves semantics, saves space. The window is tunable via `MEMENTO_COMPACTION_AGE_DAYS`.
+
+Read / write through MCP tools: write with `memory_store`; read with `memory_graph(entity_name)` for an entity's neighbors and observations, `memory_context(project)` for project-level context, or `memory_recall(category, days)` for a time-series view. Visualize at the Web `/memory` page.
+
+## 🧠 MCP memory service
+
+After installing `memento-brain`, `memento-collector setup` automatically wires MCP into every AI IDE it finds:
+
+| AI tool | MCP config file | How it's written |
 |---|---|---|
 | Claude Code | `~/.claude.json` | `claude mcp add` CLI |
 | Cursor | `~/.cursor/mcp.json` | JSON `mcpServers.memento-memory` |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | 同上 |
-| Antigravity | `~/.gemini/antigravity/mcp_config.json` | 同上 |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | same |
+| Antigravity | `~/.gemini/antigravity/mcp_config.json` | same |
 | **Codex** | `~/.codex/config.toml` | TOML `[mcp_servers.memento-memory]` |
 | OpenClaw | `~/.openclaw/openclaw.json` | `openclaw mcp set` CLI |
 
-接入后在任何 AI IDE 里可以调(8 个 tool,分四组):
+After installation, AI IDEs can call 8 tools, grouped in 4 buckets:
 
-| 工具 | 用途 |
+| Tool | Purpose |
 |---|---|
-| **查找** | |
-| `memory_search(q, limit, tool_filter, days)` | 跨工具混合检索(BGE-M3 语义 + jieba 全文),`days` 限定时间窗,`tool_filter` 限定工具 |
-| `memory_recall(category, days, project, date)` | 按类别召回最近 N 天(或指定日期)的记录 |
-| `memory_context(project_name)` | 切换项目时拉相关上下文(文档清单 + 项目元信息) |
-| **钻取** | |
-| `memory_open(doc_id)` | 拿一篇文档的全文(配合 search 用,先找到再"打开") |
-| `memory_conversation(doc_id, limit, offset)` | 把对话展开成 role/content/timestamp 消息序列,支持分页 |
-| `memory_graph(entity_name)` | 知识图谱钻取:实体 summary + 出/入向关系 + 近期观察 |
-| **写入** | |
-| `memory_store(content, entity_name, entity_type)` | 主动保存观察到知识图谱 |
-| **总览** | |
-| `daily_summary(date)` | 某天的跨工具活动汇总 + AI 摘要 |
+| **Find** | |
+| `memory_search(q, limit, tool_filter, days)` | Hybrid BGE-M3 semantic + jieba full-text search; `days` bounds the time window, `tool_filter` restricts to one tool |
+| `memory_recall(category, days, project, date)` | List recent files of a category (optionally for a specific date or project) |
+| `memory_context(project_name)` | Pull project context (document list + project metadata) when switching projects |
+| **Drill in** | |
+| `memory_open(doc_id)` | Fetch the full content of a document (use after `memory_search` returns a snippet) |
+| `memory_conversation(doc_id, limit, offset)` | Unfold a conversation document into role/content/timestamp messages, with pagination |
+| `memory_graph(entity_name)` | Knowledge-graph drill-in: entity summary + incoming/outgoing relations + recent observations |
+| **Write** | |
+| `memory_store(content, entity_name, entity_type)` | Save an observation into the knowledge graph |
+| **Overview** | |
+| `daily_summary(date)` | Cross-tool activity digest + AI summary for a given day |
 
-外加 4 个 MCP **resources**(以 URI 形式暴露,IDE 可订阅):
+Plus 4 MCP **resources** exposed as URIs (subscribable from any IDE):
 
-| URI | 内容 |
+| URI | Content |
 |---|---|
-| `memory://projects` | 所有项目列表 |
-| `memory://projects/{name}` | 单个项目详情(对话 / 实体 / 观察) |
-| `memory://identity/{tool}` | 指定工具的"身份卡"(用户偏好 / 长期记忆) |
-| `memory://daily/{date}` | 某天的活动汇总 |
+| `memory://projects` | list of all projects |
+| `memory://projects/{name}` | single project detail (conversations / entities / observations) |
+| `memory://identity/{tool}` | "identity card" for a tool (user preferences / long-term memory) |
+| `memory://daily/{date}` | activity digest for a given day |
 
-## 👥 用户与权限
+## 👥 Users and permissions
 
-| 角色 | 说明 |
+| Role | Description |
 |---|---|
-| `owner` | 首个注册用户。可改任意用户 role/status,看全量数据 |
-| `admin` | 可管理设备、看 audit log;`invite_only` 模式下还能审批 pending 用户 |
-| `viewer` | 只读(默认)。只能看分给自己的 project/tool |
-| `pending` | 仅出现在 `invite_only` 模式下还没拿到邀请码就自助注册的边角场景 |
+| `owner` | First registered user. Can change any user's role/status; sees all data |
+| `admin` | Manages devices, reads audit log; approves pending users in `invite_only` mode |
+| `viewer` | Read-only (default). Sees only projects/tools granted to them |
+| `pending` | Edge case — only appears in `invite_only` mode for users who self-register without a valid code |
 
-**注册模式**(`MEMENTO_REGISTRATION_MODE`,默认 `open`):
+**Registration mode** (`MEMENTO_REGISTRATION_MODE`, defaults to `open`):
 
-| 模式 | 行为 |
+| Mode | Behavior |
 |---|---|
-| `open` | 任何人自助注册即激活,服务端直接发 collector token,无需 admin 介入 |
-| `invite_only` | 必须带 `invite_code` 才能注册,否则拒绝;邀请码由 owner/admin 在 `/admin/invites` 创建 |
-| `closed` | 注册接口完全关闭(给只有 owner 一个人用的部署) |
+| `open` | Anyone can self-register and is activated immediately with a collector token — no admin in the loop |
+| `invite_only` | Must present an `invite_code` to register; otherwise rejected. Codes are created by owner/admin at `/admin/invites` |
+| `closed` | The register endpoint refuses everyone (deployments meant for the owner alone) |
 
-关键流程:
+Key flows:
 
-- **注册**:`/auth/register` — 首个用户自动 owner + active;之后按 `MEMENTO_REGISTRATION_MODE` 决定
-- **桌面客户端**:Server 标签填地址 → Save → 在内嵌仪表板 iframe 里登录或注册即可,token 由网页通过 `postMessage` 偷偷送给桌面端,用户**全程感知不到 token**
-- **细粒度授权**:`/admin/permissions` 按 project / tool 给 viewer 发 read/write 权限
-- **审计日志**:`access_logs` 表落库每次敏感操作(user_id / action / IP / metadata),便于事后追溯
-- **token 轮换**:命令行用户可 `POST /api/auth/me/rotate-collector-token`(需 JWT);桌面端会随每次登录自动拿最新 token,无需手动管理
+- **Register** — `/auth/register`. First user becomes owner + active automatically; later registrations follow `MEMENTO_REGISTRATION_MODE`.
+- **Desktop client** — fill the Server URL on the Server tab → Save → log in or register inside the embedded dashboard iframe. The web posts the collector token back via `postMessage` and the desktop wires up everything; **users never see the token**.
+- **Fine-grained grants** — `/admin/permissions` issues per-project / per-tool read/write grants to viewers.
+- **Audit log** — every sensitive action is recorded in `access_logs` (user_id / action / IP / metadata) for after-the-fact review.
+- **Token rotation** — CLI users can `POST /api/auth/me/rotate-collector-token` (JWT required); the desktop app pulls a fresh token automatically on every login, so manual rotation isn't needed there.
 
-## 🌐 公开分享
+## 🌐 Public sharing
 
-项目时间线和日报可以一键生成公开分享链接:
+Project timelines and daily digests can be shared publicly with one click:
 
-- 进 `/projects/<id>/timeline` 或 `/daily/<date>`,右上角 **分享** 按钮
-- 选有效期(可永久),生成 `/s/<token>` URL
-- 访客无需登录直接查看
-- 后台记录访客 IP + 国家/地区/城市(本地 GeoIP DB,无外发请求)
-- 随时可撤销
+- Open `/projects/<id>/timeline` or `/daily/<date>` and click **Share** (top right)
+- Pick an expiry (or never), and a `/s/<token>` URL is generated
+- Visitors view without logging in
+- Backend records visitor IP + country / region / city (local GeoIP DB; no outbound calls)
+- Revocable any time
 
-## 🛠️ 技术栈
+## 🛠️ Tech stack
 
-| 层级 | 技术 |
-|------|------|
-| 采集器 | Python ≥3.10, watchdog, httpx, pydantic-settings |
-| MCP 记忆 | Python ≥3.10, mcp ≥1.26, asyncpg, pgvector |
-| 服务端 | Python ≥3.12, FastAPI ≥0.115, SQLAlchemy 2.0 async, asyncpg, Celery |
-| 数据库 | PostgreSQL 16 (+ pgvector + pg_trgm), Redis 7, MinIO (S3 兼容) |
-| 前端 | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
-| AI 摘要 / 图谱 | Anthropic Claude API + OpenAI 兼容端点(Kimi / DashScope...) |
-| Embedding | BGE-M3,默认 Docker 容器(CPU);`--native` 模式跑宿主 venv 用 macOS MPS / Linux CUDA |
-| GeoIP | MaxMind GeoLite2 / db-ip city-lite(离线 mmdb) |
-| 部署 | Docker Compose(7 服务) |
+| Layer | Technology |
+|------|------------|
+| Collector | Python ≥3.10, watchdog, httpx, pydantic-settings |
+| MCP memory | Python ≥3.10, mcp ≥1.26, asyncpg, pgvector |
+| Server | Python ≥3.12, FastAPI ≥0.115, SQLAlchemy 2.0 async, asyncpg, Celery |
+| Database | PostgreSQL 16 (+ pgvector + pg_trgm), Redis 7, MinIO (S3-compatible) |
+| Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
+| AI summary / graph | Anthropic Claude API + OpenAI-compatible endpoints (Kimi / DashScope...) |
+| Embedding | BGE-M3 host process (macOS MPS / Linux CUDA / CPU fallback) |
+| GeoIP | MaxMind GeoLite2 / db-ip city-lite (offline mmdb) |
+| Deployment | Docker Compose (7 services) |
 
-## ⚙️ 后台任务
+## ⚙️ Background tasks
 
-Celery beat 调度的定时任务:
+Scheduled by Celery beat:
 
-| 任务 | 触发 | 作用 |
+| Task | Trigger | Purpose |
 |---|---|---|
-| `daily_digest` | 每天 23:30 | 生成跨工具的每日 AI 活动汇总(逐 doc 摘要 → 聚合) |
-| `embedding_retry` | 每 15 分钟 | 扫 `embedding_status=pending/failed` 的 doc 重新算向量 |
-| `tsvector_backfill` | 启动时 | 给历史数据补全 jieba 分词的全文索引 |
-| `memory_compaction` | 手动 / 周期 | 合并 7 天以上累积过多的实体观察为 summary |
+| `daily_digest` | every day at 23:30 | Cross-tool daily activity digest (per-doc summaries → aggregation) |
+| `embedding_retry` | every 15 minutes | Scan `embedding_status=pending/failed` and re-embed |
+| `tsvector_backfill` | on startup | Backfill jieba-tokenized full-text index for legacy data |
+| `memory_compaction` | manual / periodic | Merge accumulated observations older than 7 days into summaries |
 
-## 📁 目录结构
+## 📁 Directory layout
 
 ```
 memento/
-├── collector/                # 本地采集器 — PyPI: memento-brain-collector
+├── collector/                # Local collector — PyPI: memento-brain-collector
 │   └── collector/
-│       ├── main.py           # 守护进程入口
+│       ├── main.py           # daemon entry
 │       ├── cli.py            # setup / install / start / stop / uninstall
-│       ├── watcher.py        # watchdog 跨平台监听 + 去抖
-│       ├── queue.py          # SQLite WAL 离线队列
-│       ├── sync_client.py    # HTTPS 同步(分片上传 / 离线重试)
-│       ├── sanitizer.py      # 入队前脱敏(API key / 私钥 / OAuth)
-│       ├── parsers/          # 8 个解析器
-│       └── tools/            # 6 个工具定义
-├── mcp_server/               # MCP 记忆 — PyPI: memento-brain-memory
-├── memento_brain/            # Meta — PyPI: memento-brain(一键装齐)
-├── server/                   # 后端 FastAPI
+│       ├── watcher.py        # cross-platform watchdog + debounce
+│       ├── queue.py          # SQLite WAL offline queue
+│       ├── sync_client.py    # HTTPS sync (chunked upload / offline retry)
+│       ├── sanitizer.py      # sanitize on enqueue (API keys / private keys / OAuth)
+│       ├── parsers/          # 8 parsers
+│       └── tools/            # 6 tool definitions
+├── mcp_server/               # MCP memory — PyPI: memento-brain-memory
+├── memento_brain/            # Meta — PyPI: memento-brain (one-shot install)
+├── server/                   # Backend FastAPI
 │   └── server/
-│       ├── main.py           # 入口 + schema 迁移 + validate_production
-│       ├── config.py         # MEMENTO_ 前缀 settings + fail-fast
+│       ├── main.py           # entry + schema migrations + validate_production
+│       ├── config.py         # MEMENTO_-prefixed settings + fail-fast
 │       ├── middleware/       # JWT + collector token (constant-time)
-│       ├── api/              # REST + SSE + MCP 挂载
-│       ├── db/               # 16 张表
+│       ├── api/              # REST + SSE + MCP mount
+│       ├── db/               # 16 tables
 │       ├── services/         # ingest / embedding / graph / cache / geoip
 │       └── tasks/            # Celery worker + beat
-├── web/                      # Next.js 16 前端
-│   ├── src/app/              # 18+ 页面
-│   └── src/components/       # Aurora 设计系统
-├── embedding/                # BGE-M3 宿主服务
-├── scripts/                  # install.py 后端 + 工具脚本
-├── deploy/bootstrap/         # curl 一键安装(install.sh / .ps1 / index.html)
+├── web/                      # Next.js 16 frontend
+│   ├── src/app/              # 18+ pages
+│   └── src/components/       # Aurora design system
+├── embedding/                # BGE-M3 host service
+├── scripts/                  # install.py backend + utility scripts
+├── deploy/bootstrap/         # curl one-shot installer (install.sh / .ps1 / index.html)
 ├── docs/                     # project-architecture.md / collector-architecture.md
 └── docker-compose.yml
 ```
 
-## ⚙️ 环境变量
+## ⚙️ Environment variables
 
-所有变量统一 `MEMENTO_` 前缀。
+All variables share the `MEMENTO_` prefix.
 
 <details>
-<summary><b>采集器(collector)</b></summary>
+<summary><b>Collector</b></summary>
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MEMENTO_SERVER_URL` | http://localhost:8001 | 服务端 API 地址 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMENTO_SERVER_URL` | http://localhost:8001 | Server API URL |
 | `MEMENTO_SERVER_TOKEN` | — | collector token |
-| `MEMENTO_OBSIDIAN_VAULT_PATH` | 自动发现 | Obsidian vault 路径 |
-| `MEMENTO_NONINTERACTIVE` | — | setup 时设 `1` 跳过 prompt |
+| `MEMENTO_OBSIDIAN_VAULT_PATH` | auto-detected | Obsidian vault path |
+| `MEMENTO_NONINTERACTIVE` | — | set `1` to skip prompts during setup |
 
 </details>
 
 <details>
-<summary><b>服务端(api / celery)</b></summary>
+<summary><b>Server (api / celery)</b></summary>
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MEMENTO_DATABASE_URL` | postgresql+asyncpg://postgres:postgres@localhost:5433/memento | Postgres 连接 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMENTO_DATABASE_URL` | postgresql+asyncpg://postgres:postgres@localhost:5433/memento | Postgres connection |
 | `MEMENTO_REDIS_URL` | redis://localhost:6380/0 | Redis broker + backend |
-| `MEMENTO_COLLECTOR_TOKEN` | collector-dev-token | 兜底 collector token(dev 用) |
-| `MEMENTO_SECRET_KEY` | change-me-in-production | JWT 签名密钥(生产必须覆盖) |
-| `MEMENTO_S3_ENDPOINT` | http://localhost:9000 | MinIO/S3 端点 |
-| `MEMENTO_S3_ACCESS_KEY` / `MEMENTO_S3_SECRET_KEY` | minioadmin | MinIO 凭据 |
-| `MEMENTO_S3_BUCKET` | memento | 大文件 bucket |
-| `MEMENTO_ANTHROPIC_API_KEY` | — | Claude API(AI 摘要) |
-| `MEMENTO_AI_API_KEY` / `_BASE_URL` / `_MODEL` | — / dashscope / kimi-k2.5 | OpenAI 兼容备用 |
-| `MEMENTO_EMBEDDING_SERVER_URL` | http://embedding:8002 | Docker 模式默认;`--native` 装的宿主服务请改为 `http://host.docker.internal:8002` |
-| `MEMENTO_GEOIP_DB` | /data/geoip/GeoLite2-City.mmdb | GeoIP 数据库路径 |
-| `MEMENTO_DEBUG` | `0` | 设 `1` 允许 dev 默认值启动 |
-| `MEMENTO_PORT` | 8000 | API 监听端口 |
+| `MEMENTO_COLLECTOR_TOKEN` | collector-dev-token | Fallback collector token (dev only) |
+| `MEMENTO_SECRET_KEY` | change-me-in-production | JWT signing key (must override in prod) |
+| `MEMENTO_S3_ENDPOINT` | http://localhost:9000 | MinIO/S3 endpoint |
+| `MEMENTO_S3_ACCESS_KEY` / `MEMENTO_S3_SECRET_KEY` | minioadmin | MinIO credentials |
+| `MEMENTO_S3_BUCKET` | memento | bucket for large files |
+| `MEMENTO_ANTHROPIC_API_KEY` | — | Claude API (AI summaries) |
+| `MEMENTO_AI_API_KEY` / `_BASE_URL` / `_MODEL` | — / dashscope / kimi-k2.5 | OpenAI-compatible fallback |
+| `MEMENTO_EMBEDDING_SERVER_URL` | http://host.docker.internal:8002 | Host BGE-M3 service |
+| `MEMENTO_GEOIP_DB` | /data/geoip/GeoLite2-City.mmdb | GeoIP database path |
+| `MEMENTO_DEBUG` | `0` | set `1` to allow startup with dev defaults |
+| `MEMENTO_PORT` | 8000 | API listen port |
 
 </details>
 
 <details>
-<summary><b>Embedding 服务</b></summary>
+<summary><b>Embedding service</b></summary>
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MEMENTO_EMBEDDING_PORT` | 8002 | HTTP 端口 |
-| `MEMENTO_EMBEDDING_MODEL_NAME` | BAAI/bge-m3 | sentence-transformers 模型 |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMENTO_EMBEDDING_PORT` | 8002 | HTTP port |
+| `MEMENTO_EMBEDDING_MODEL_NAME` | BAAI/bge-m3 | sentence-transformers model |
 
 </details>
 
-## 🌐 远程访问 / 自定义域名
+## 🌐 Remote access / custom domain
 
-- 前端 API 地址自动跟随 `window.location.hostname`(代码里 `getApiBase()`,不写死)
-- Docker 端口映射自动支持 IPv4 + IPv6
-- 放行域名改 [server/server/main.py](server/server/main.py) 里的 `allow_origin_regex`,默认:
+- The frontend's API base URL automatically follows `window.location.hostname` (see `getApiBase()`; never hardcoded)
+- Docker port mappings work over both IPv4 and IPv6
+- To allow another origin, edit `allow_origin_regex` in [server/server/main.py](server/server/main.py); default:
 
   ```python
   allow_origin_regex=r"(https?://localhost:\d+|https?://mem\.ihasy\.com)"
   ```
 
-## 🗑️ 卸载
+## 🗑️ Uninstall
 
 <details>
-<summary><b>服务端(跑过 install.sh)</b></summary>
+<summary><b>Server (installed via install.sh)</b></summary>
 
 ```bash
-./install.sh uninstall          # 只停容器,保留数据 / .env / pip 包
-./install.sh uninstall --purge  # 同上 + 删 Docker 数据卷 + .env
-./install.sh uninstall --all    # 核弹级(加 -y 跳过二次确认)
+./install.sh uninstall          # stop containers; keep data / .env / pip packages
+./install.sh uninstall --purge  # above + drop Docker volumes + .env
+./install.sh uninstall --all    # nuclear (add -y to skip confirmation)
 ```
 
-`--all` 会清:
-- pip 包(memento-brain-* + 旧品牌 daily-report-*)
-- `~/.memento` + `~/.daily-report`(旧路径)
-- Collector 日志(macOS / Linux / Windows 各自路径)
-- Embedding venv + HuggingFace 模型缓存(~1.3 GB)
-- Docker 镜像 + 数据卷
+`--all` removes:
+- pip packages (memento-brain-* + legacy daily-report-*)
+- `~/.memento` + `~/.daily-report` (legacy path)
+- Collector logs (macOS / Linux / Windows paths)
+- Embedding venv + HuggingFace model cache (~1.3 GB)
+- Docker images + volumes
 - `.env` / `.env.local`
-- AI 工具的 MCP `memento-memory` 条目
+- The `memento-memory` MCP entry from every AI tool
 
 </details>
 
 <details>
-<summary><b>只装了采集器的设备</b></summary>
+<summary><b>Collector-only device</b></summary>
 
 ```bash
-memento-collector uninstall                                  # 摘掉 launchd/systemd/Task
+memento-collector uninstall                                  # drop launchd/systemd/Task entry
 pip uninstall -y memento-brain-collector memento-brain-memory memento-brain
 rm -rf ~/.memento
 
-# 日志(选一)
+# Logs (pick one)
 rm -rf ~/Library/Logs/memento                                # macOS
 rm -rf ~/.local/share/memento/logs                           # Linux
 # Windows: Remove-Item -Recurse $env:LOCALAPPDATA\memento
 
-# AI 工具 MCP 条目手动删掉 memento-memory 块
+# Manually remove the memento-memory block from each AI tool's MCP config
 ```
 
 </details>
 
 ## 📄 License
 
-本项目采用 [AGPL-3.0](LICENSE) 许可证。
+This project is licensed under [AGPL-3.0](LICENSE).
 
-简单说:个人使用、自托管、内部用、研究学习都免费。但如果你拿这份代码(或任何改动)对外提供网络服务(SaaS / 公开 host),按 AGPL 第 13 条,你**必须**把你修改后的完整源码也按 AGPL 公开。
+In short: personal use, self-hosting, internal corporate use, and research are all free. But if you take this code (or any modifications) and offer it as a network service (SaaS / public hosting), AGPL §13 requires you to release your full modified source code under AGPL as well.
 
-商业授权(免除 AGPL 限制、闭源使用、SaaS 化等场景)请联系作者。
+For commercial licensing (waiver of AGPL terms, closed-source use, SaaS deployment, etc.), please contact the author.
+
+## 🚀 What this fork adds over upstream
+
+This repository builds on [ddong8/memento](https://github.com/ddong8/memento) and keeps its self-hosted architecture, while adding a substantial set of conversation, reliability, and operations features:
+
+- **A conversation attention inbox** — detects unanswered interactive questions from Cursor, Claude Code, and Codex, including questions in subagent transcripts or outside the currently loaded message window. A lightweight metadata lane surfaces them quickly, while canonical transcript ingestion remains the source of truth.
+- **Live subagent visibility** — shows active and completed subagents, tool arguments, model and thinking identity, thread relationships, and drill-in previews, with dedicated desktop and mobile navigation.
+- **Reliable large-transcript synchronization** — guarded append-only deltas, bounded catch-up windows, durable source revisions, chunk commit receipts, priority lanes for live updates, and recovery from interrupted or reordered uploads.
+- **Stronger conversation navigation** — indexed in-conversation search, a persistent prompt navigator, latest-agent-message jumps, low-activity and tool filters, preserved reading position, Markdown export controls, and rich-text copying.
+- **Better cross-tool fidelity** — preserves Codex thread names and interrupted turns, Cursor tasks, attachments and structured tool calls, Claude sidecars and queued prompts, plus assistant model and reasoning metadata.
+- **Lower operational overhead** — external storage for oversized transcripts, coalesced post-ingest work, bounded collector queues, embedding admission controls, purpose-aware embedding profiles, and more efficient search and backup paths.
+- **Additional self-hosting safeguards** — single-user TOTP support, stricter OAuth callback handling, safer event-stream credentials, and more durable reverse-proxy deployment behavior.
+
+The fork aims to stay compatible with upstream data and deployment conventions; the list above summarizes product-level differences rather than every internal patch.
