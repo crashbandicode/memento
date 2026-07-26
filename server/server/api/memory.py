@@ -10,10 +10,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
-    Document, DocumentEmbedding, KnowledgeEntity, KnowledgeObservation,
-    KnowledgeRelation, Machine, User,
+    Document, DocumentEmbedding, DocumentEmbeddingFast, KnowledgeEntity,
+    KnowledgeObservation, KnowledgeRelation, Machine, User,
 )
-from ..db.session import get_db
+from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
     ConversationRef,
@@ -74,6 +74,13 @@ async def get_memory_stats(
         emb_q = emb_q.where(DocumentEmbedding.document_id.in_(_user_doc_ids_subq(_user)))
     embeddings = (await db.execute(emb_q)).scalar() or 0
 
+    emb_fast_q = select(func.count()).select_from(DocumentEmbeddingFast)
+    if not admin:
+        emb_fast_q = emb_fast_q.where(
+            DocumentEmbeddingFast.document_id.in_(_user_doc_ids_subq(_user))
+        )
+    embeddings_fast = (await db.execute(emb_fast_q)).scalar() or 0
+
     # Entity type breakdown
     type_q = select(KnowledgeEntity.entity_type, func.count()).group_by(KnowledgeEntity.entity_type)
     if not admin:
@@ -85,7 +92,9 @@ async def get_memory_stats(
         "entities": entities,
         "relations": relations,
         "observations": observations,
-        "embeddings": embeddings,
+        "embeddings": embeddings + embeddings_fast,
+        "embeddings_quality": embeddings,
+        "embeddings_fast": embeddings_fast,
         "entity_types": entity_types,
     }
 
@@ -211,7 +220,7 @@ async def get_entity_detail(
 async def search_memory(
     q: str = Query(..., min_length=1),
     limit: int = Query(10, ge=1, le=50),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_search_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
     """Search entities and observations."""
@@ -291,6 +300,7 @@ async def reset_memory(
         rels = (await db.execute(delete(KnowledgeRelation))).rowcount
         ents = (await db.execute(delete(KnowledgeEntity))).rowcount
         embs = (await db.execute(delete(DocumentEmbedding))).rowcount
+        embs_fast = (await db.execute(delete(DocumentEmbeddingFast))).rowcount
         await db.execute(text(
             "UPDATE documents SET metadata = metadata - '_graph_hash' "
             "WHERE metadata ? '_graph_hash'"
@@ -314,6 +324,11 @@ async def reset_memory(
                 DocumentEmbedding.document_id.in_(_user_doc_ids_subq(_user))
             )
         )).rowcount
+        embs_fast = (await db.execute(
+            delete(DocumentEmbeddingFast).where(
+                DocumentEmbeddingFast.document_id.in_(_user_doc_ids_subq(_user))
+            )
+        )).rowcount
         await db.execute(text(
             "UPDATE documents SET metadata = metadata - '_graph_hash' "
             "WHERE metadata ? '_graph_hash' "
@@ -327,7 +342,9 @@ async def reset_memory(
             "entities": ents,
             "relations": rels,
             "observations": obs,
-            "embeddings": embs,
+            "embeddings": (embs or 0) + (embs_fast or 0),
+            "embeddings_quality": embs,
+            "embeddings_fast": embs_fast,
         },
     }
 
@@ -384,46 +401,27 @@ async def create_observation(
 
 
 # ---------------------------------------------------------------------------
-# Vector-backed semantic search over DocumentEmbedding
+# Vector-backed semantic search over DocumentEmbedding (+ optional fast tier)
 # ---------------------------------------------------------------------------
-@router.get("/semantic")
-async def semantic_search(
-    q: str = Query(..., min_length=1, max_length=1000),
-    limit: int = Query(5, ge=1, le=20),
-    tool_filter: str | None = None,
-    days: int | None = Query(None, ge=1, le=3650),
-    db: AsyncSession = Depends(get_db),
-    _user: User = Depends(get_current_user),
-) -> dict:
-    """Semantic search over document chunks via BGE-M3 embeddings.
+async def _semantic_rank_for_tier(
+    db,
+    *,
+    qvec: list[float],
+    tier: str,
+    embedding_table,
+    profile,
+    limit: int,
+    tool_filter: str | None,
+    days: int | None,
+    mids,
+) -> tuple[list[dict], dict, dict[str, set[str]]]:
+    """Rank best-per-document chunks inside one tier's vector table/index."""
+    from ..services.embedding_service import embedding_row_profile_filter
 
-    Embeds the query against the host-side embedding server, ranks
-    DocumentEmbedding rows by pgvector cosine distance, deduplicates by
-    document keeping the best-scoring chunk's text as snippet. Returns empty
-    list if the embedding server is unavailable — caller should fall back to
-    substring search.
-    """
-    from ..services.embedding_service import _call_embedding_server  # noqa: F401
-
-    mids = await user_machine_ids(db, _user)
-
-    # 30s timeout: the embedding server is CPU-only on Apple Silicon
-    # (MPS deliberately avoided — see embedding_server.py:33-43 for the
-    # macOS kernel deadlock). A cold-cached query + 4kB Chinese tokenize
-    # can easily push 5-12s on M-series CPU. 8s was tripping false
-    # "embedding-server-unavailable" returns on a perfectly healthy
-    # server, silently degrading semantic search to a trigram fallback.
-    # The MCP client's own timeout is well above this.
-    embeds = await _call_embedding_server([q], timeout=30.0)
-    if not embeds or not embeds[0]:
-        return {"results": [], "note": "embedding-server-unavailable"}
-
-    qvec = embeds[0]
-    dist_col = DocumentEmbedding.embedding.cosine_distance(qvec).label("dist")
-
+    dist_col = embedding_table.embedding.cosine_distance(qvec).label("dist")
     ranked_chunks_q = (
         select(
-            DocumentEmbedding.chunk_text.label("chunk_text"),
+            embedding_table.chunk_text.label("chunk_text"),
             Document.id.label("document_id"),
             Document.tool_id.label("tool_id"),
             Document.title.label("title"),
@@ -436,12 +434,19 @@ async def semantic_search(
             dist_col,
             func.row_number().over(
                 partition_by=Document.id,
-                order_by=(dist_col.asc(), DocumentEmbedding.id),
+                order_by=(dist_col.asc(), embedding_table.id),
             ).label("chunk_rank"),
         )
-        .join(Document, DocumentEmbedding.document_id == Document.id)
-        .where(Document.embedding_status == "ok")
+        .join(Document, embedding_table.document_id == Document.id)
+        .where(
+            Document.embedding_status == "ok",
+            embedding_row_profile_filter(embedding_table, profile),
+        )
     )
+    # Always bind each physical table to its active document tier. This avoids
+    # orphan quality rows leaking into fast documents and keeps existing fast
+    # rows visible when new fast-tier assignment is disabled.
+    ranked_chunks_q = ranked_chunks_q.where(Document.embedding_tier == tier)
     if tool_filter:
         ranked_chunks_q = ranked_chunks_q.where(Document.tool_id == tool_filter)
     if days:
@@ -470,9 +475,6 @@ async def semantic_search(
         .order_by(ranked_chunks.c.dist.asc(), ranked_chunks.c.document_id)
     )
 
-    # Rank one best chunk per document in SQL, then page document candidates
-    # until enough *logical* groups exist. A root with hundreds of subagents no
-    # longer consumes 50 chunks per child or defeats a fixed overfetch window.
     batch_size = max(100, limit * 10)
     rows: list = []
     logical_groups: set[tuple[str, str]] = set()
@@ -525,15 +527,106 @@ async def semantic_search(
             "relative_path": rpath,
             "category": cat,
             "snippet": (chunk or "")[:400],
-            "synced_at": synced.isoformat() if synced else None,
             "score": round(1.0 - float(dist), 4),
+            "_tier": tier,
             "_metadata": metadata,
             "_source_modified_at": source_modified,
             "_synced_at_value": synced,
             "_file_size_bytes": file_size,
         }
+        item["synced_at"] = synced.isoformat() if synced else None
         best_by_document[did] = item
         ranked_documents.append(item)
+    return ranked_documents, best_by_document, companion_roots_by_tool
+
+
+@router.get("/semantic")
+async def semantic_search(
+    q: str = Query(..., min_length=1, max_length=1000),
+    limit: int = Query(5, ge=1, le=20),
+    tool_filter: str | None = None,
+    days: int | None = Query(None, ge=1, le=3650),
+    db: AsyncSession = Depends(get_search_db),
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Semantic search over document chunks via embedding tiers.
+
+    Default: quality-only (BGE-M3 / 1024-d ``document_embeddings``).
+    When tiering is enabled, searches each active tier's own table/index with
+    a matching query vector, then fuses ranks with reciprocal rank fusion so
+    incompatible vector spaces are never compared inside one ANN index.
+    Hierarchy folding and user filters are preserved; output shape is unchanged.
+    """
+    from ..services.embedding_service import (
+        TIER_QUALITY,
+        _call_embedding_server,
+        embedding_profile,
+        reciprocal_rank_fusion,
+        tiers_with_searchable_rows,
+    )
+
+    mids = await user_machine_ids(db, _user)
+
+    # 30s timeout: the embedding server is CPU-only on Apple Silicon
+    # (MPS deliberately avoided — see embedding_server.py:33-43 for the
+    # macOS kernel deadlock). A cold-cached query + 4kB Chinese tokenize
+    # can easily push 5-12s on M-series CPU. 8s was tripping false
+    # "embedding-server-unavailable" returns on a perfectly healthy
+    # server, silently degrading semantic search to a trigram fallback.
+    # The MCP client's own timeout is well above this.
+    active_tiers = await tiers_with_searchable_rows(
+        db,
+        machine_ids=mids,
+        tool_filter=tool_filter,
+        days=days,
+    )
+    if not active_tiers:
+        active_tiers = [TIER_QUALITY]
+
+    tier_rankings: list[list[dict]] = []
+    best_by_document: dict = {}
+    companion_roots_by_tool: dict[str, set[str]] = {}
+    any_server = False
+    unavailable_tiers: list[str] = []
+
+    for tier in active_tiers:
+        profile = embedding_profile(tier)
+        embeds = await _call_embedding_server(
+            [q],
+            timeout=30.0,
+            profile=profile,
+            purpose="query",
+        )
+        if not embeds or not embeds[0]:
+            unavailable_tiers.append(tier)
+            continue
+        any_server = True
+        ranked, best, companions = await _semantic_rank_for_tier(
+            db,
+            qvec=embeds[0],
+            tier=tier,
+            embedding_table=profile.orm_model,
+            profile=profile,
+            limit=limit,
+            tool_filter=tool_filter,
+            days=days,
+            mids=mids,
+        )
+        if ranked:
+            tier_rankings.append(ranked)
+        best_by_document.update(best)
+        for tool_id, roots in companions.items():
+            companion_roots_by_tool.setdefault(tool_id, set()).update(roots)
+
+    if not any_server:
+        return {"results": [], "note": "embedding-server-unavailable"}
+    if not tier_rankings:
+        return {"results": []}
+
+    if len(tier_rankings) == 1:
+        ranked_documents = tier_rankings[0]
+    else:
+        ranked_documents = reciprocal_rank_fusion(tier_rankings)
 
     # Pull lightweight root/sibling metadata for every agent group represented
     # by the ranked candidates. This lets a matching child navigate through its
@@ -650,7 +743,13 @@ async def semantic_search(
         if len(results) >= limit:
             break
 
-    return {"results": results}
+    payload: dict = {"results": results}
+    if unavailable_tiers and results:
+        # Partial degradation is success — note which tier servers were down.
+        payload["note"] = (
+            "embedding-tier-partial:" + ",".join(unavailable_tiers)
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------

@@ -27,8 +27,14 @@ from server.api.ingest import (  # noqa: E402
 from server.services.thread_metadata_service import (  # noqa: E402
     ThreadTitleUpdateResult,
     apply_codex_thread_title_update,
+    apply_conversation_interaction_update,
     codex_thread_documents_select,
     sanitize_explicit_codex_title,
+)
+from server.services.ingest_service import (  # noqa: E402
+    CURRENT_PENDING_QUESTIONS_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
+    PENDING_QUESTION_COUNT_KEY,
 )
 
 
@@ -153,6 +159,66 @@ class ThreadMetadataValidationTests(unittest.TestCase):
 
 
 class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_interaction_updates_pending_inbox_state(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            pending = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="question-1",
+                interaction_status="pending",
+                question_tool="AskUserQuestion",
+                interaction_input={
+                    "questions": [{
+                        "question": "Continue?",
+                        "header": "Next",
+                        "options": [{"label": "Yes"}],
+                    }]
+                },
+                timestamp="2026-07-24T23:04:05Z",
+            )
+
+        self.assertEqual((pending.matched, pending.updated), (1, 1))
+        self.assertEqual(
+            document.metadata_[CURRENT_PENDING_QUESTIONS_KEY],
+            ["question-1"],
+        )
+        self.assertEqual(document.metadata_[PENDING_QUESTION_COUNT_KEY], 1)
+        self.assertIn(
+            "question-1",
+            document.metadata_[LIVE_INTERACTION_SIGNALS_KEY],
+        )
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            answered = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="question-1",
+                interaction_status="answered",
+                question_tool="AskUserQuestion",
+                interaction_input={},
+            )
+
+        self.assertEqual((answered.matched, answered.updated), (1, 1))
+        self.assertNotIn(CURRENT_PENDING_QUESTIONS_KEY, document.metadata_)
+        self.assertNotIn(PENDING_QUESTION_COUNT_KEY, document.metadata_)
+        self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
+
     async def test_applies_monotonic_rename_without_touching_content_state(self) -> None:
         machine_id = uuid.uuid4()
         document = _document(machine_id=machine_id)

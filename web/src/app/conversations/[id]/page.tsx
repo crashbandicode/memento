@@ -114,6 +114,12 @@ export default function ConversationPage() {
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
               <Chip>{currentMeta.tool_id}</Chip>
+              {Boolean(currentMeta.pending_question_count) && (
+                <Chip tone="warn" icon="message">{t.conversation.awaitingResponse}</Chip>
+              )}
+              {currentMeta.agent_mode?.toLocaleLowerCase() === "plan" && (
+                <Chip tone="accent">{t.conversation.planMode}</Chip>
+              )}
               <span>{currentMeta.message_count} {t.conversation.messages}</span>
               {currentAgentLabel && (
                 <span

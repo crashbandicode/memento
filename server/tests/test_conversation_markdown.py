@@ -211,17 +211,53 @@ class MarkdownRenderingTests(unittest.TestCase):
                 "thinking": "Hidden reasoning",
                 "tool_calls": [{"name": "Read", "input": "file.txt"}],
             }),
+            message(3, "tool", "task update", metadata={"task_state": {"status": "running"}}),
+            message(4, "tool", "agent spawned", metadata={"agent_event": {"kind": "spawned", "label": "Helper"}}),
         ]
         text, _stats = self.render(items, MarkdownExportOptions(
+            include_user=False,
+            include_assistant=False,
             include_tools=False,
+            include_tasks=False,
+            include_agents=False,
             include_thinking=False,
             include_session_context=False,
             include_timestamps=False,
         ))
+        self.assertNotIn("Hello", text)
+        self.assertNotIn("Answer", text)
         self.assertNotIn("Private context", text)
         self.assertNotIn("Hidden reasoning", text)
         self.assertNotIn("<strong>Tool</strong>", text)
+        self.assertNotIn("task update", text)
+        self.assertNotIn("agent spawned", text)
         self.assertNotIn("UTC", text.split("---", 1)[1])
+
+    def test_display_filter_parity_keeps_selected_categories(self) -> None:
+        items = [
+            message(1, "user", "Keep prompt"),
+            message(2, "assistant", "Keep answer", metadata={
+                "thinking": "Keep thinking",
+                "tool_calls": [{"name": "Shell", "input": "{}"}],
+            }),
+            message(3, "tool", "task pulse", metadata={"task_state": {"status": "running"}}),
+            message(4, "tool", "agent pulse", metadata={"agent_event": {"kind": "completed", "label": "Worker"}}),
+        ]
+        text, _stats = self.render(items, MarkdownExportOptions(
+            include_user=True,
+            include_assistant=True,
+            include_tools=False,
+            include_tasks=True,
+            include_agents=True,
+            include_thinking=True,
+            include_session_context=False,
+        ))
+        self.assertIn("Keep prompt", text)
+        self.assertIn("Keep answer", text)
+        self.assertIn("Keep thinking", text)
+        self.assertNotIn("<strong>Tool</strong>", text)
+        self.assertIn("task pulse", text)
+        self.assertIn("agent pulse", text)
 
 
 class FilenameTests(unittest.TestCase):

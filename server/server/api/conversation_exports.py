@@ -78,7 +78,11 @@ class ConversationExportRequest(BaseModel):
     project_ids: list[uuid.UUID] = Field(default_factory=list, max_length=50)
     include_subagents: bool = False
     include_low_activity: bool = False
+    include_user: bool = True
+    include_assistant: bool = True
     include_tools: bool = True
+    include_tasks: bool = True
+    include_agents: bool = True
     include_thinking: bool = True
     include_session_context: bool = True
     include_timestamps: bool = True
@@ -153,6 +157,10 @@ def _options(
     include_thinking: bool,
     include_session_context: bool,
     include_timestamps: bool,
+    include_user: bool = True,
+    include_assistant: bool = True,
+    include_tasks: bool = True,
+    include_agents: bool = True,
 ) -> MarkdownExportOptions:
     if start_at is not None and end_at is not None and start_at > end_at:
         raise HTTPException(status_code=422, detail="start_at must not be after end_at")
@@ -164,7 +172,11 @@ def _options(
         prompt_selection=prompt_selection,
         start_at=start_at,
         end_at=end_at,
+        include_user=include_user,
+        include_assistant=include_assistant,
         include_tools=include_tools,
+        include_tasks=include_tasks,
+        include_agents=include_agents,
         include_thinking=include_thinking,
         include_session_context=include_session_context,
         include_timestamps=include_timestamps,
@@ -912,7 +924,11 @@ async def export_one_conversation(
     start_at: datetime | None = Query(None),
     end_at: datetime | None = Query(None),
     prompt_range: str = Query("", max_length=512),
+    include_user: bool = Query(True),
+    include_assistant: bool = Query(True),
     include_tools: bool = Query(True),
+    include_tasks: bool = Query(True),
+    include_agents: bool = Query(True),
     include_thinking: bool = Query(True),
     include_session_context: bool = Query(True),
     include_timestamps: bool = Query(True),
@@ -927,6 +943,10 @@ async def export_one_conversation(
         include_thinking,
         include_session_context,
         include_timestamps,
+        include_user=include_user,
+        include_assistant=include_assistant,
+        include_tasks=include_tasks,
+        include_agents=include_agents,
     )
     lock = _export_lock(str(user.id))
     if lock.locked():
@@ -980,6 +1000,10 @@ async def export_conversations(
         request.include_thinking,
         request.include_session_context,
         request.include_timestamps,
+        include_user=request.include_user,
+        include_assistant=request.include_assistant,
+        include_tasks=request.include_tasks,
+        include_agents=request.include_agents,
     )
     lock = _export_lock(str(user.id))
     if lock.locked():

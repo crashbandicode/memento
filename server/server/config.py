@@ -10,6 +10,10 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/memento"
+    # Optional read/search database. Leave blank to use the primary engine.
+    # Point this at a streaming replica or independently maintained search
+    # database only when its replication lag is acceptable for search.
+    search_database_url: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6380/0"

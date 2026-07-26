@@ -10,7 +10,7 @@ from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine, User
-from ..db.session import get_db
+from ..db.session import get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
     ConversationRef,
@@ -73,7 +73,7 @@ async def search_messages(
     days: int | None = Query(None, ge=1, le=3650),
     cursor: str | None = None,
     limit: int = Query(20, ge=1, le=50),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_search_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Search every normalized user/assistant message with bounded results.
@@ -342,7 +342,7 @@ async def search(
     days: int | None = Query(None, ge=1, le=3650),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_search_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Full-text search across title, path, and content.

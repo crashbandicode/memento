@@ -39,7 +39,7 @@ def _state(
 
 
 def test_configured_conversation_dispatch_uses_bounded_quiet_window() -> None:
-    assert 120 <= post_ingest.POST_INGEST_QUIET_SECONDS <= 300
+    assert 120 <= post_ingest.POST_INGEST_QUIET_SECONDS <= 1800
     assert (
         post_ingest.initial_post_ingest_countdown(
             "conversation", post_ingest.CONVERSATION_QUIET_WINDOW_MIN_BYTES

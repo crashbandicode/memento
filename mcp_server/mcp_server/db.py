@@ -72,6 +72,8 @@ class Document(Base):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
     ai_summary: Mapped[str | None] = mapped_column(Text)
+    embedding_status: Mapped[str] = mapped_column(String(20))
+    embedding_tier: Mapped[str] = mapped_column(String(20))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -104,7 +106,23 @@ class DocumentEmbedding(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id"))
     chunk_index: Mapped[int] = mapped_column(Integer)
     chunk_text: Mapped[str] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    backend: Mapped[str | None] = mapped_column(String(32))
+    profile_signature: Mapped[str | None] = mapped_column(String(80))
     embedding = mapped_column(Vector(1024) if Vector else Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DocumentEmbeddingFast(Base):
+    __tablename__ = "document_embeddings_fast"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id"))
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    chunk_text: Mapped[str] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    backend: Mapped[str | None] = mapped_column(String(32))
+    profile_signature: Mapped[str | None] = mapped_column(String(80))
+    embedding = mapped_column(Vector(384) if Vector else Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -144,7 +162,36 @@ def get_db_url() -> str:
     )
 
 
-def create_engine_and_session(db_url: str | None = None) -> async_sessionmaker[AsyncSession]:
+def get_search_db_url(primary_url: str | None = None) -> str:
+    """Return an optional direct-MCP search target, falling back to primary."""
+    return (
+        os.environ.get("MEMENTO_SEARCH_DATABASE_URL", "").strip()
+        or primary_url
+        or get_db_url()
+    )
+
+
+def create_engine_and_session(
+    db_url: str | None = None,
+    *,
+    read_only: bool = False,
+) -> async_sessionmaker[AsyncSession]:
     url = db_url or get_db_url()
-    engine = create_async_engine(url, pool_size=5, max_overflow=10)
+    connect_args = (
+        {
+            "server_settings": {
+                "default_transaction_read_only": "on",
+                "application_name": "memento-mcp-search",
+            }
+        }
+        if read_only
+        else {}
+    )
+    engine = create_async_engine(
+        url,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=read_only,
+        connect_args=connect_args,
+    )
     return async_sessionmaker(engine, expire_on_commit=False)

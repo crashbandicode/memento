@@ -11,6 +11,16 @@ RestartSec=10
 Environment=PYTORCH_ENABLE_MPS_FALLBACK=1
 Environment=PATH={path}
 Environment=MEMENTO_EMBEDDING_MODEL_NAME={model}
+Environment=MEMENTO_EMBEDDING_MODEL_REVISION={model_revision}
+Environment=MEMENTO_EMBEDDING_BACKEND={backend}
+Environment=MEMENTO_EMBEDDING_DEVICE={device}
+Environment="MEMENTO_EMBEDDING_QUERY_PREFIX={query_prefix}"
+Environment="MEMENTO_EMBEDDING_DOCUMENT_PREFIX={document_prefix}"
+Environment=MEMENTO_EMBEDDING_MAX_SEQUENCE_LENGTH={max_sequence_length}
+Environment=MEMENTO_EMBEDDING_CPU_THREADS={cpu_threads}
+Environment=MEMENTO_EMBEDDING_ONNX_PROVIDER={onnx_provider}
+Environment=MEMENTO_EMBEDDING_ONNX_FILE={onnx_file}
+Environment=MEMENTO_EMBEDDING_ARTIFACT_SHA256={artifact_sha256}
 StandardOutput=append:{logdir}/embedding_stdout.log
 StandardError=append:{logdir}/embedding_stderr.log
 

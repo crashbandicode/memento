@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from collector.cursor_state_export import (
     CursorStateExporter,
+    _tool_record,
     enqueue_cursor_state_snapshots,
 )
 from collector.tools.cursor import CursorTool
@@ -20,6 +21,33 @@ class FixtureCursorTool(CursorTool):
     @property
     def root_path(self) -> Path:
         return self._root
+
+
+def test_pending_question_uses_cursor_interaction_status() -> None:
+    record = _tool_record(
+        {
+            "name": "ask_question",
+            "status": "completed",
+            "additionalData": {"status": "pending"},
+            "params": {
+                "title": "Sample question",
+                "questions": [{
+                    "id": "choice",
+                    "prompt": "Which option?",
+                    "options": [{"id": "safe", "label": "Safe"}],
+                }],
+            },
+            "toolCallId": "call-question-1",
+        },
+        source_id="question-1",
+        timestamp="2026-07-24T20:00:00Z",
+        model="grok-4.5",
+        reasoning_effort="high",
+    )
+
+    assert record["tool_status"] == "pending"
+    assert record["content"] == "Status: pending"
+    assert "Which option?" in str(record["tool_input"])
 
 
 def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:

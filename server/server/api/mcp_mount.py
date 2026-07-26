@@ -38,7 +38,7 @@ def mount_mcp(app):
             list_projects, get_project, get_identity, get_daily,
             init_server,
         )
-        init_server(db_url)
+        init_server(db_url=db_url)
 
         # Re-register tools on this instance
         mcp.tool()(memory_search)

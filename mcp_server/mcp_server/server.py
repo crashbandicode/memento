@@ -22,18 +22,25 @@ mcp = FastMCP(
 # Initialized on startup
 _remote = None  # RemoteClient for HTTP mode
 _session_factory = None  # SQLAlchemy session factory for DB mode
+_search_session_factory = None  # Optional read-only replica/search pool
 
 
 def init_server(server_url: str | None = None, token: str | None = None, db_url: str | None = None):
     """Initialize the MCP server. Either (server_url + token) or db_url."""
-    global _remote, _session_factory
+    global _remote, _session_factory, _search_session_factory
     if server_url and token:
         from .remote_client import RemoteClient
         _remote = RemoteClient(server_url, token)
         logger.info("MCP Memory Server initialized in remote mode: %s", server_url)
     elif db_url:
-        from .db import create_engine_and_session
+        from .db import create_engine_and_session, get_search_db_url
         _session_factory = create_engine_and_session(db_url)
+        search_db_url = get_search_db_url(db_url)
+        _search_session_factory = (
+            _session_factory
+            if search_db_url == db_url
+            else create_engine_and_session(search_db_url, read_only=True)
+        )
         logger.info("MCP Memory Server initialized in direct DB mode")
     else:
         raise ValueError("Either --server/--token or --db-url required")
@@ -90,7 +97,7 @@ async def memory_search(
 
     # Direct DB mode
     from .search import hybrid_search
-    async with _session_factory() as db:
+    async with _search_session_factory() as db:
         results = await hybrid_search(db, query, limit=limit, tool_filter=tool_filter, days=days)
         if not results:
             return "No matching memories found."

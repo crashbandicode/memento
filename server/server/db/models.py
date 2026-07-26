@@ -138,6 +138,10 @@ class Document(Base):
     # often change on disk without changing the first 100 messages / 50 chunks
     # that Memento embeds.
     embedding_content_hash: Mapped[str | None] = mapped_column(String(64))
+    # Active embedding route: "quality" (1024-d BGE-M3 table) or "fast"
+    # (384-d small-model table). Historical rows default to quality; the
+    # sticky policy never auto-demotes quality → fast.
+    embedding_tier: Mapped[str] = mapped_column(String(20), default="quality")
     # Knowledge-graph extraction pipeline status. Same shape as the
     # embedding pair above. Values: pending (just ingested), ok
     # (extracted), failed (LLM errored — retry candidate via
@@ -395,6 +399,14 @@ class DocumentEmbedding(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Chunk-local identity lets append/small-edit re-embeds update only changed
+    # vectors instead of rewriting every row and its HNSW entry.
+    chunk_hash: Mapped[str | None] = mapped_column(String(64))
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    backend: Mapped[str | None] = mapped_column(String(32))
+    # Immutable fingerprint of model revision, backend/artifact, dimensions,
+    # pooling/normalization, prefixes, and sequence-length policy.
+    profile_signature: Mapped[str | None] = mapped_column(String(80))
     embedding = mapped_column(Vector(1024) if Vector else Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -403,6 +415,35 @@ class DocumentEmbedding(Base):
     __table_args__ = (
         UniqueConstraint("document_id", "chunk_index", name="uq_doc_embedding_chunk"),
         Index("idx_doc_embedding_doc", "document_id"),
+    )
+
+
+class DocumentEmbeddingFast(Base):
+    """Fast-tier vectors — separate 384-d table/index from quality 1024-d rows.
+
+    Never pad or mix dimensions with ``document_embeddings``. Used only when
+    ``MEMENTO_EMBEDDING_TIERING_ENABLED`` routes ordinary conversation/backlog
+    documents to the smaller model.
+    """
+
+    __tablename__ = "document_embeddings_fast"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_hash: Mapped[str | None] = mapped_column(String(64))
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    backend: Mapped[str | None] = mapped_column(String(32))
+    profile_signature: Mapped[str | None] = mapped_column(String(80))
+    embedding = mapped_column(Vector(384) if Vector else Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    document: Mapped[Document] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("document_id", "chunk_index", name="uq_doc_embedding_fast_chunk"),
+        Index("idx_doc_embedding_fast_doc", "document_id"),
     )
 
 

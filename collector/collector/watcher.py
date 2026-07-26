@@ -16,6 +16,7 @@ from watchdog.observers import Observer
 
 from .compat import normalize_path, path_starts_with
 from .config import CollectorConfig
+from .interaction_signals import extract_conversation_interaction_updates
 from .parsers.base import BaseParser
 from .parsers.json_parser import JsonParser
 from .parsers.jsonl import JsonlParser
@@ -308,7 +309,11 @@ class FileWatcher:
                 for _attempt in range(3):
                     if self._stop_event.is_set() or not path.is_file():
                         return
-                    self._on_file_changed(path, force_full=True)
+                    self._on_file_changed(
+                        path,
+                        force_full=True,
+                        emit_live_signals=False,
+                    )
                     self._queue.prioritize_file(
                         classification.tool_name,
                         classification.relative_path,
@@ -354,7 +359,7 @@ class FileWatcher:
             try:
                 if self._stop_event.is_set() or not path.is_file():
                     return
-                self._on_file_changed(path)
+                self._on_file_changed(path, emit_live_signals=False)
             finally:
                 with self._catchup_lock:
                     self._catching_up_paths.discard(path_key)
@@ -449,16 +454,30 @@ class FileWatcher:
                 conv["cascade_id"],
             )
 
-    def _on_file_changed(self, path: Path, force_full: bool = False) -> None:
+    def _on_file_changed(
+        self,
+        path: Path,
+        force_full: bool = False,
+        emit_live_signals: bool = True,
+    ) -> None:
         """Serialize parsing and make shutdown a hard callback boundary."""
         if self._stop_event.is_set():
             return
         with self._processing_lock:
             if self._stop_event.is_set():
                 return
-            self._process_file_changed(path, force_full=force_full)
+            self._process_file_changed(
+                path,
+                force_full=force_full,
+                emit_live_signals=emit_live_signals,
+            )
 
-    def _process_file_changed(self, path: Path, force_full: bool = False) -> None:
+    def _process_file_changed(
+        self,
+        path: Path,
+        force_full: bool = False,
+        emit_live_signals: bool = True,
+    ) -> None:
         tool = self._find_tool(path)
         if tool is None:
             return
@@ -475,6 +494,35 @@ class FileWatcher:
         # Skip POLL strategy files (SQLite)
         if classification.sync_strategy == SyncStrategy.POLL:
             return
+
+        # A same-path delta already being uploaded is an ordering barrier for
+        # canonical transcript content. Questions must still reach the inbox
+        # immediately, so publish their tiny state records on the independent
+        # metadata lane before honoring that barrier.
+        if (
+            emit_live_signals
+            and classification.category.value == "conversation"
+            and classification.content_type == ContentType.JSONL
+            and classification.sync_strategy == SyncStrategy.DELTA
+        ):
+            try:
+                interaction_updates = extract_conversation_interaction_updates(
+                    path,
+                    tool_name=classification.tool_name,
+                    relative_path=classification.relative_path,
+                )
+                if interaction_updates:
+                    self._queue.enqueue_metadata_changes(
+                        namespace="conversation_interactions",
+                        tool_name=classification.tool_name,
+                        records=interaction_updates,
+                    )
+            except Exception:
+                logger.debug(
+                    "Could not extract live interaction state from %s",
+                    path,
+                    exc_info=True,
+                )
 
         if not force_full and classification.sync_strategy == SyncStrategy.DELTA:
             path_key = normalize_path(str(path))
@@ -752,7 +800,7 @@ class FileWatcher:
                 if self._stop_event.wait(0.5) or self._scan_cancel_event.is_set():
                     return count
             try:
-                self._on_file_changed(path)
+                self._on_file_changed(path, emit_live_signals=False)
                 count += 1
             except Exception:
                 logger.debug("Error scanning %s", path)

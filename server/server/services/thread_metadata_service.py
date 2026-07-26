@@ -11,14 +11,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine
 from .cache import cache_delete_prefix
-from .conversation_parser import strip_terminal_sequences
+from .conversation_parser import (
+    normalize_question_interaction,
+    strip_terminal_sequences,
+)
 from .ingest_service import (
+    CURRENT_PENDING_QUESTIONS_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
     MAX_SEARCH_TEXT_CHARS,
+    PENDING_QUESTION_COUNT_KEY,
     _bounded_message_text,
     _conversation_title_needs_derivation,
 )
 from .tokenize import tokenize_for_index
-
 
 _MANUAL_TITLE_SOURCES = {
     "manual",
@@ -154,7 +159,7 @@ def _bounded_revision_map(
     """Keep per-source clocks bounded without comparing clocks across hosts."""
     revisions = dict(revisions)
     revisions.pop(source_machine, None)
-    retained_keys = sorted(revisions)[-_TITLE_REVISION_MAP_LIMIT + 1:]
+    retained_keys = sorted(revisions)[-_TITLE_REVISION_MAP_LIMIT + 1 :]
     bounded = {key: revisions[key] for key in retained_keys}
     bounded[source_machine] = revision
     return bounded
@@ -184,9 +189,7 @@ async def _refresh_title_search_index(
         "\n".join(row for row in reversed(latest_rows) if row),
         MAX_SEARCH_TEXT_CHARS,
     )
-    tsv_input = tokenize_for_index(
-        f"{document.title or ''} {searchable_content}"
-    )
+    tsv_input = tokenize_for_index(f"{document.title or ''} {searchable_content}")
     await db.execute(
         update(Document)
         .where(Document.id == document.id)
@@ -214,9 +217,7 @@ async def apply_codex_thread_title_update(
         return ThreadTitleUpdateResult(0, 0, 1, valid=False)
 
     source_match = (
-        await db.execute(
-            _codex_source_thread_select(machine_id, user_id, thread_id)
-        )
+        await db.execute(_codex_source_thread_select(machine_id, user_id, thread_id))
     ).scalar_one_or_none()
     if source_match is not None:
         result = await db.execute(codex_thread_documents_select(user_id, thread_id))
@@ -302,7 +303,9 @@ async def apply_codex_thread_title_update(
 
     if updated:
         await cache_delete_prefix(f"daily:detail:{user_id}:")
-        project_ids = {document.project_id for document in documents if document.project_id}
+        project_ids = {
+            document.project_id for document in documents if document.project_id
+        }
         for project_id in project_ids:
             await cache_delete_prefix(f"project:conv:{user_id}:{project_id}:")
 
@@ -311,3 +314,112 @@ async def apply_codex_thread_title_update(
         updated=updated,
         ignored=ignored,
     )
+
+
+async def apply_conversation_interaction_update(
+    db: AsyncSession,
+    *,
+    machine_id: uuid.UUID,
+    user_id: uuid.UUID,
+    tool_id: str,
+    relative_path: str,
+    interaction_id: str,
+    interaction_status: str,
+    question_tool: str,
+    interaction_input: object,
+    timestamp: str = "",
+) -> ThreadTitleUpdateResult:
+    """Apply a live question preview without waiting for its transcript delta."""
+    interaction_id = _bounded_message_text(str(interaction_id or ""), 512)
+    relative_path = str(relative_path or "").replace("\\", "/").lstrip("/")
+    status = str(interaction_status or "").strip().lower()
+    if (
+        tool_id not in {"claude_code", "codex", "cursor"}
+        or not relative_path
+        or not interaction_id
+        or status not in {"pending", "answered", "cancelled"}
+    ):
+        return ThreadTitleUpdateResult(0, 0, 1, valid=False)
+
+    document = (
+        await db.execute(
+            select(Document)
+            .where(
+                Document.machine_id == machine_id,
+                Document.machine_id.in_(
+                    select(Machine.id).where(Machine.user_id == user_id)
+                ),
+                Document.tool_id == tool_id,
+                Document.category == "conversation",
+                Document.relative_path == relative_path,
+            )
+            .limit(1)
+            .with_for_update(of=Document)
+        )
+    ).scalar_one_or_none()
+    if document is None:
+        return ThreadTitleUpdateResult(0, 0, 0)
+
+    metadata = dict(document.metadata_ or {})
+    raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+    signals = (
+        {
+            str(key): value
+            for key, value in raw_signals.items()
+            if isinstance(value, dict)
+        }
+        if isinstance(raw_signals, dict)
+        else {}
+    )
+    raw_pending_ids = metadata.get(CURRENT_PENDING_QUESTIONS_KEY)
+    pending_ids = (
+        {
+            _bounded_message_text(str(value), 512)
+            for value in raw_pending_ids[:64]
+            if value
+        }
+        if isinstance(raw_pending_ids, list)
+        else set()
+    )
+
+    previous_signal = signals.get(interaction_id)
+    if status == "pending":
+        interaction = normalize_question_interaction(
+            question_tool,
+            interaction_input,
+            source=tool_id,
+            interaction_id=interaction_id,
+        )
+        if interaction is None:
+            return ThreadTitleUpdateResult(1, 0, 1, valid=False)
+        signals[interaction_id] = {
+            "interaction": interaction,
+            "timestamp": _bounded_message_text(str(timestamp or ""), 128),
+            "tool_name": _bounded_message_text(str(question_tool or ""), 256),
+        }
+        pending_ids.add(interaction_id)
+    else:
+        signals.pop(interaction_id, None)
+        pending_ids.discard(interaction_id)
+
+    bounded_ids = sorted(pending_ids)[:64]
+    if signals:
+        metadata[LIVE_INTERACTION_SIGNALS_KEY] = dict(list(signals.items())[-64:])
+    else:
+        metadata.pop(LIVE_INTERACTION_SIGNALS_KEY, None)
+    if bounded_ids:
+        metadata[CURRENT_PENDING_QUESTIONS_KEY] = bounded_ids
+        metadata[PENDING_QUESTION_COUNT_KEY] = len(bounded_ids)
+    else:
+        metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
+        metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
+
+    if previous_signal == signals.get(interaction_id) and metadata == dict(
+        document.metadata_ or {}
+    ):
+        return ThreadTitleUpdateResult(1, 0, 0)
+    document.metadata_ = metadata
+    await cache_delete_prefix(f"daily:detail:{user_id}:")
+    if document.project_id:
+        await cache_delete_prefix(f"project:conv:{user_id}:{document.project_id}:")
+    return ThreadTitleUpdateResult(1, 1, 0)

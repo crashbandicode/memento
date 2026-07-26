@@ -10,17 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
 from ..db.models import ConversationMessage, Document, User
-from ..db.session import get_db
+from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
-from ..services.conversation_parser import (
-    count_conversation_messages,
-    normalize_message_attachments,
-    normalize_tool_calls,
-    parse_conversation,
-)
 from ..services.conversation_hierarchy import (
-    ConversationRef,
     FOLDABLE_CONVERSATION_TOOLS,
+    ConversationRef,
     build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
@@ -29,6 +23,14 @@ from ..services.conversation_hierarchy import (
     group_conversation_root_thread_ids,
     merge_subagent_event_summaries,
 )
+from ..services.conversation_markdown import is_meaningful_human_prompt
+from ..services.conversation_parser import (
+    count_conversation_messages,
+    normalize_message_attachments,
+    normalize_tool_calls,
+    parse_conversation,
+)
+from ..services.ingest_service import LIVE_INTERACTION_SIGNALS_KEY
 from ..services.message_search import (
     MAX_SEARCH_CONTENT_CHARS,
     build_message_search_expressions,
@@ -36,7 +38,6 @@ from ..services.message_search import (
     normalize_search_query,
     suggest_corrected_query,
 )
-from ..services.conversation_markdown import is_meaningful_human_prompt
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -74,6 +75,15 @@ def _stored_task_state(metadata: object) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _pending_question_count(metadata: object) -> int:
+    if not isinstance(metadata, dict):
+        return 0
+    try:
+        return max(0, int(metadata.get("pending_question_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _stored_agent_event(metadata: object) -> dict | None:
     if not isinstance(metadata, dict):
         return None
@@ -91,17 +101,37 @@ async def _get_conversation_identity(
     doc = (
         await db.execute(
             select(Document)
-            .options(load_only(
-                Document.id,
-                Document.machine_id,
-                Document.tool_id,
-            ))
+            .options(
+                load_only(
+                    Document.id,
+                    Document.machine_id,
+                    Document.tool_id,
+                    Document.title,
+                    Document.relative_path,
+                    Document.metadata_,
+                )
+            )
             .where(Document.id == doc_id)
         )
     ).scalar_one_or_none()
     if not doc or (mids is not None and doc.machine_id not in mids):
         raise HTTPException(status_code=404)
     return doc
+
+
+def _message_question_interactions(metadata: object) -> list[dict]:
+    """Return every normalized question carried by one message row."""
+    if not isinstance(metadata, dict):
+        return []
+    interactions: list[dict] = []
+    direct = metadata.get("interaction")
+    if isinstance(direct, dict):
+        interactions.append(direct)
+    for call in _stored_tool_calls(metadata):
+        interaction = call.get("interaction")
+        if isinstance(interaction, dict):
+            interactions.append(interaction)
+    return interactions
 
 
 @router.get("/{doc_id}")
@@ -115,18 +145,20 @@ async def get_conversation(
 
     result = await db.execute(
         select(Document)
-        .options(load_only(
-            Document.id,
-            Document.machine_id,
-            Document.tool_id,
-            Document.title,
-            Document.relative_path,
-            Document.metadata_,
-            Document.source_modified_at,
-            Document.activity_at,
-            Document.synced_at,
-            Document.file_size_bytes,
-        ))
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+                Document.source_modified_at,
+                Document.activity_at,
+                Document.synced_at,
+                Document.file_size_bytes,
+            )
+        )
         .where(Document.id == doc_id)
     )
     doc = result.scalar_one_or_none()
@@ -162,7 +194,8 @@ async def get_conversation(
                             ConversationMessage.metadata_,
                             "task_state",
                             "is_current",
-                        ) == "true"
+                        )
+                        == "true"
                     ).desc(),
                     ConversationMessage.line_number.desc(),
                 )
@@ -204,18 +237,20 @@ async def get_conversation(
         )
         hierarchy_q = (
             select(Document)
-            .options(load_only(
-                Document.id,
-                Document.machine_id,
-                Document.tool_id,
-                Document.title,
-                Document.relative_path,
-                Document.metadata_,
-                Document.source_modified_at,
-                Document.activity_at,
-                Document.synced_at,
-                Document.file_size_bytes,
-            ))
+            .options(
+                load_only(
+                    Document.id,
+                    Document.machine_id,
+                    Document.tool_id,
+                    Document.title,
+                    Document.relative_path,
+                    Document.metadata_,
+                    Document.source_modified_at,
+                    Document.activity_at,
+                    Document.synced_at,
+                    Document.file_size_bytes,
+                )
+            )
             .where(
                 Document.tool_id == doc.tool_id,
                 Document.category == "conversation",
@@ -264,7 +299,8 @@ async def get_conversation(
                             "agent_thread_id",
                         ),
                         "",
-                    ) != "",
+                    )
+                    != "",
                 )
                 .order_by(ConversationMessage.line_number)
             )
@@ -274,10 +310,12 @@ async def get_conversation(
             event = _stored_agent_event(metadata)
             if event is None:
                 continue
-            lifecycle_events.append({
-                **event,
-                "timestamp": timestamp.isoformat() if timestamp else None,
-            })
+            lifecycle_events.append(
+                {
+                    **event,
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                }
+            )
         subagents = merge_subagent_event_summaries(
             subagents,
             lifecycle_events,
@@ -306,16 +344,18 @@ async def get_conversation(
             # Skip resolved versions and metadata JSON
             if ".resolved" in p.relative_path or ".metadata.json" in p.relative_path:
                 continue
-            related_plans.append({
-                "id": str(p.id),
-                "title": p.title,
-                "relative_path": p.relative_path,
-                "category": p.category,
-                "content_type": p.content_type,
-                "content": p.content[:5000] if p.content else None,
-                "file_size_bytes": p.file_size_bytes,
-                "synced_at": p.synced_at.isoformat(),
-            })
+            related_plans.append(
+                {
+                    "id": str(p.id),
+                    "title": p.title,
+                    "relative_path": p.relative_path,
+                    "category": p.category,
+                    "content_type": p.content_type,
+                    "content": p.content[:5000] if p.content else None,
+                    "file_size_bytes": p.file_size_bytes,
+                    "synced_at": p.synced_at.isoformat(),
+                }
+            )
 
     activity_at = logical_activity.get(doc.id) or effective_conversation_timestamp(
         ConversationRef(
@@ -336,6 +376,12 @@ async def get_conversation(
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
         "active_task_state": active_task_state,
+        "pending_question_count": _pending_question_count(doc.metadata_),
+        "agent_mode": (
+            str((doc.metadata_ or {}).get("_assistant_agent_mode") or "")
+            if isinstance(doc.metadata_, dict)
+            else ""
+        ),
         "message_count": message_count,
         "subagent_count": len(subagents),
         "is_subagent_orphan": is_subagent_orphan,
@@ -364,9 +410,7 @@ async def get_conversation_messages(
     # preserve the viewer fields, and avoid reparsing the raw transcript for
     # every initial page, prompt jump, and scroll page.
     base_filter = [ConversationMessage.document_id == doc_id]
-    count_result = await db.execute(
-        select(func.count()).where(*base_filter)
-    )
+    count_result = await db.execute(select(func.count()).where(*base_filter))
     total = count_result.scalar() or 0
     if total > 0:
         if tail is True and line_number is None:
@@ -405,19 +449,15 @@ async def get_conversation_messages(
                     "role": m.role or m.message_type,
                     "content": m.content,
                     "thinking": (
-                        (m.metadata_ or {}).get("thinking")
-                        if m.metadata_ else None
+                        (m.metadata_ or {}).get("thinking") if m.metadata_ else None
                     ),
                     "model": (m.metadata_ or {}).get("model", ""),
-                    "reasoning_effort": (m.metadata_ or {}).get(
-                        "reasoning_effort", ""
-                    ),
+                    "reasoning_effort": (m.metadata_ or {}).get("reasoning_effort", ""),
                     "service_tier": (m.metadata_ or {}).get("service_tier", ""),
+                    "agent_mode": (m.metadata_ or {}).get("agent_mode", ""),
                     "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                     "tool_input": (m.metadata_ or {}).get("tool_input", ""),
-                    "session_context": (m.metadata_ or {}).get(
-                        "session_context", ""
-                    ),
+                    "session_context": (m.metadata_ or {}).get("session_context", ""),
                     "attachments": _stored_attachments(m.metadata_),
                     "tool_calls": _stored_tool_calls(m.metadata_),
                     "interaction": _stored_interaction(m.metadata_, "interaction"),
@@ -460,6 +500,7 @@ async def get_conversation_messages(
                     "model": m.model,
                     "reasoning_effort": m.reasoning_effort,
                     "service_tier": m.service_tier,
+                    "agent_mode": m.agent_mode,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
                     "session_context": m.session_context,
@@ -478,6 +519,188 @@ async def get_conversation_messages(
     return {"total": 0, "offset": offset, "limit": limit, "messages": []}
 
 
+@router.get("/{doc_id}/pending-interactions")
+async def get_pending_conversation_interactions(
+    doc_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Return unresolved questions independently of transcript pagination."""
+    doc = await _get_conversation_identity(db, _user, doc_id)
+    source_documents = {doc.id: doc.title}
+    source_metadata = {doc.id: doc.metadata_}
+
+    if doc.tool_id in FOLDABLE_CONVERSATION_TOOLS:
+        current_ref = ConversationRef(
+            document_id=doc.id,
+            tool_id=doc.tool_id,
+            relative_path=doc.relative_path,
+            metadata=doc.metadata_,
+            title=doc.title,
+        )
+        roots_by_tool = group_conversation_root_thread_ids([current_ref])
+        companion_filter = build_conversation_companion_filter(
+            Document.tool_id,
+            Document.metadata_,
+            Document.relative_path,
+            roots_by_tool,
+        )
+        companion_rows = (
+            await db.execute(
+                select(Document.id, Document.title, Document.metadata_).where(
+                    Document.machine_id == doc.machine_id,
+                    Document.tool_id == doc.tool_id,
+                    Document.category == "conversation",
+                    or_(Document.id == doc.id, companion_filter),
+                )
+            )
+        ).all()
+        for companion_id, companion_title, companion_metadata in companion_rows:
+            source_documents[companion_id] = companion_title
+            source_metadata[companion_id] = companion_metadata
+
+    rows = (
+        (
+            await db.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.document_id.in_(source_documents),
+                    or_(
+                        ConversationMessage.role == "user",
+                        ConversationMessage.metadata_.op("?")("interaction"),
+                        ConversationMessage.metadata_.op("?")("interaction_response"),
+                        ConversationMessage.metadata_.op("?")("tool_calls"),
+                    ),
+                )
+                .order_by(
+                    ConversationMessage.document_id,
+                    ConversationMessage.line_number,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    questions: dict[str, tuple[ConversationMessage, dict]] = {}
+    resolved_ids: set[str] = set()
+    open_ids: dict[uuid.UUID, set[str]] = {}
+    inferred_responses: dict[str, tuple[ConversationMessage, dict]] = {}
+    for message in rows:
+        document_open_ids = open_ids.setdefault(message.document_id, set())
+        for interaction in _message_question_interactions(message.metadata_):
+            interaction_id = str(interaction.get("id") or "").strip()
+            if interaction_id:
+                questions[interaction_id] = (message, interaction)
+                document_open_ids.add(interaction_id)
+        response = _stored_interaction(message.metadata_, "interaction_response")
+        if response is not None:
+            interaction_id = str(response.get("interaction_id") or "").strip()
+            if interaction_id:
+                resolved_ids.add(interaction_id)
+                document_open_ids.discard(interaction_id)
+        elif is_meaningful_human_prompt(
+            message.content,
+            message.metadata_,
+            message.role,
+        ):
+            for interaction_id in document_open_ids:
+                resolved_ids.add(interaction_id)
+                inferred_responses[interaction_id] = (
+                    message,
+                    {
+                        "kind": "question_response",
+                        "interaction_id": interaction_id,
+                        "status": "answered",
+                        "answers": [],
+                        "raw_text": message.content[:4000],
+                    },
+                )
+            document_open_ids.clear()
+
+    pending = [
+        (message, interaction)
+        for interaction_id, (message, interaction) in questions.items()
+        if interaction_id not in resolved_ids
+    ]
+    pending.sort(
+        key=lambda item: (
+            item[0].timestamp.isoformat() if item[0].timestamp else "",
+            str(item[0].document_id),
+            item[0].line_number,
+        )
+    )
+    pending = pending[-64:]
+    live_pending: list[dict] = []
+    for source_document_id, metadata in source_metadata.items():
+        if not isinstance(metadata, dict):
+            continue
+        signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+        if not isinstance(signals, dict):
+            continue
+        for interaction_id, signal in signals.items():
+            if (
+                interaction_id in resolved_ids
+                or interaction_id in questions
+                or not isinstance(signal, dict)
+            ):
+                continue
+            interaction = signal.get("interaction")
+            if not isinstance(interaction, dict):
+                continue
+            live_pending.append(
+                {
+                    "document_id": str(source_document_id),
+                    "source_title": source_documents.get(source_document_id),
+                    "message_id": 0,
+                    "line_number": 0,
+                    "interaction": interaction,
+                    "model": signal.get("model", ""),
+                    "reasoning_effort": signal.get("reasoning_effort", ""),
+                    "service_tier": signal.get("service_tier", ""),
+                    "agent_mode": signal.get("agent_mode", ""),
+                    "timestamp": signal.get("timestamp") or None,
+                }
+            )
+    live_pending.sort(key=lambda item: str(item.get("timestamp") or ""))
+    live_pending = live_pending[-64:]
+    return {
+        "count": len(pending) + len(live_pending),
+        "interactions": [
+            {
+                "document_id": str(message.document_id),
+                "source_title": source_documents.get(message.document_id),
+                "message_id": message.id,
+                "line_number": message.line_number,
+                "interaction": interaction,
+                "model": (message.metadata_ or {}).get("model", ""),
+                "reasoning_effort": (message.metadata_ or {}).get(
+                    "reasoning_effort", ""
+                ),
+                "service_tier": (message.metadata_ or {}).get("service_tier", ""),
+                "agent_mode": (message.metadata_ or {}).get("agent_mode", ""),
+                "timestamp": (
+                    message.timestamp.isoformat() if message.timestamp else None
+                ),
+            }
+            for message, interaction in pending
+        ]
+        + live_pending,
+        "inferred_responses": [
+            {
+                "document_id": str(message.document_id),
+                "message_id": message.id,
+                "line_number": message.line_number,
+                "response": response,
+                "timestamp": (
+                    message.timestamp.isoformat() if message.timestamp else None
+                ),
+            }
+            for message, response in inferred_responses.values()
+        ],
+    }
+
+
 @router.get("/{doc_id}/latest-agent-message")
 async def get_latest_agent_message(
     doc_id: uuid.UUID,
@@ -494,7 +717,8 @@ async def get_latest_agent_message(
                 func.coalesce(
                     ConversationMessage.role,
                     ConversationMessage.message_type,
-                ) == "assistant",
+                )
+                == "assistant",
             )
             .order_by(
                 ConversationMessage.line_number.desc(),
@@ -537,7 +761,7 @@ async def search_conversation_messages(
     q: str = Query(..., min_length=1, max_length=500),
     after_line: int | None = Query(None, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_search_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Search one normalized transcript without loading it into the client.
@@ -557,6 +781,7 @@ async def search_conversation_messages(
             "has_more": False,
             "corrected_query": None,
         }
+
     def search_statement(search_text: str):
         expressions = build_message_search_expressions(
             search_text,
@@ -583,21 +808,17 @@ async def search_conversation_messages(
             .limit(limit + 1)
         )
         if after_line is not None:
-            statement = statement.where(
-                ConversationMessage.line_number > after_line
-            )
+            statement = statement.where(ConversationMessage.line_number > after_line)
         return statement
 
-    primary_rows = (
-        await db.execute(search_statement(query_text))
-    ).mappings().all()
+    primary_rows = (await db.execute(search_statement(query_text))).mappings().all()
     rows = [dict(row, snippet_query=query_text) for row in primary_rows]
     corrected_query = await suggest_corrected_query(db, query_text)
     corrected_count = 0
     if corrected_query:
         corrected_rows = (
-            await db.execute(search_statement(corrected_query))
-        ).mappings().all()
+            (await db.execute(search_statement(corrected_query))).mappings().all()
+        )
         corrected_count = len(corrected_rows)
         seen_message_ids = {row["id"] for row in rows}
         for corrected_row in corrected_rows:
@@ -611,11 +832,7 @@ async def search_conversation_messages(
             row["match_type"] = "fuzzy"
             rows.append(row)
     rows.sort(key=lambda row: (row["line_number"], row["id"]))
-    has_more = (
-        len(rows) > limit
-        or len(primary_rows) > limit
-        or corrected_count > limit
-    )
+    has_more = len(rows) > limit or len(primary_rows) > limit or corrected_count > limit
     page = rows[:limit]
     return {
         "query": query_text,
@@ -624,9 +841,7 @@ async def search_conversation_messages(
                 "id": row["id"],
                 "line_number": row["line_number"],
                 "role": row["role"],
-                "snippet": make_search_snippet(
-                    row["content"], row["snippet_query"]
-                ),
+                "snippet": make_search_snippet(row["content"], row["snippet_query"]),
                 "timestamp": (
                     row["timestamp"].isoformat() if row["timestamp"] else None
                 ),
@@ -675,12 +890,14 @@ async def get_conversation_prompts(
             clean = (content or "").strip()
             if not is_meaningful_human_prompt(clean, metadata):
                 continue
-            prompts.append({
-                "id": message_id,
-                "line_number": line_number,
-                "content": clean[:500],
-                "timestamp": timestamp.isoformat() if timestamp else None,
-            })
+            prompts.append(
+                {
+                    "id": message_id,
+                    "line_number": line_number,
+                    "content": clean[:500],
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                }
+            )
     else:
         raw_content = (
             await db.execute(select(Document.content).where(Document.id == doc_id))
@@ -698,7 +915,8 @@ async def get_conversation_prompts(
                 if is_meaningful_human_prompt(
                     message.content,
                     {"interaction_response": message.interaction_response}
-                    if message.interaction_response else {},
+                    if message.interaction_response
+                    else {},
                     message.role,
                 )
             ]

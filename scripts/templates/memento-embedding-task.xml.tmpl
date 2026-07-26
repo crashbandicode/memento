@@ -39,10 +39,12 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <!-- Windows scheduled tasks have no native Environment block; pass the
-           model path via a wrapper cmd that sets the env then execs python. -->
+      <!-- Windows scheduled tasks have no native Environment block; pass env
+           via a wrapper cmd that sets vars then execs python. cmd.exe is the
+           platform task runner (preserved); values are installer-validated to
+           block shell metacharacters. -->
       <Command>cmd.exe</Command>
-      <Arguments>/c set "MEMENTO_EMBEDDING_MODEL_NAME={model}" &amp;&amp; "{pythonw}" -m server.services.embedding_server --port 8002</Arguments>
+      <Arguments>/c set "MEMENTO_EMBEDDING_MODEL_NAME={model}" &amp;&amp; set "MEMENTO_EMBEDDING_MODEL_REVISION={model_revision}" &amp;&amp; set "MEMENTO_EMBEDDING_BACKEND={backend}" &amp;&amp; set "MEMENTO_EMBEDDING_DEVICE={device}" &amp;&amp; set "MEMENTO_EMBEDDING_QUERY_PREFIX={query_prefix}" &amp;&amp; set "MEMENTO_EMBEDDING_DOCUMENT_PREFIX={document_prefix}" &amp;&amp; set "MEMENTO_EMBEDDING_MAX_SEQUENCE_LENGTH={max_sequence_length}" &amp;&amp; set "MEMENTO_EMBEDDING_CPU_THREADS={cpu_threads}" &amp;&amp; set "MEMENTO_EMBEDDING_ONNX_PROVIDER={onnx_provider}" &amp;&amp; set "MEMENTO_EMBEDDING_ONNX_FILE={onnx_file}" &amp;&amp; set "MEMENTO_EMBEDDING_ARTIFACT_SHA256={artifact_sha256}" &amp;&amp; "{pythonw}" -m server.services.embedding_server --port 8002</Arguments>
       <WorkingDirectory>{repo}\server</WorkingDirectory>
     </Exec>
   </Actions>

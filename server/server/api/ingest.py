@@ -19,8 +19,8 @@ from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
 from ..services.ingest_service import (
-    DeltaBaseMismatch,
     STORED_SOURCE_REVISION_KEY,
+    DeltaBaseMismatch,
     _get_ingest_semaphore,
     ingest_file,
 )
@@ -32,7 +32,10 @@ from ..services.ingest_spool import (
     pending_source_revision_job_id,
     stage_chunk,
 )
-from ..services.thread_metadata_service import apply_codex_thread_title_update
+from ..services.thread_metadata_service import (
+    apply_codex_thread_title_update,
+    apply_conversation_interaction_update,
+)
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 logger = logging.getLogger("ingest")
@@ -86,13 +89,18 @@ class IngestChunkStatusResponse(BaseModel):
 
 
 class IngestMetadataRequest(BaseModel):
-    metadata_type: Literal["codex_thread_title"]
-    tool: Literal["codex"]
-    thread_id: UUID
-    title: str = Field(min_length=1, max_length=500)
+    metadata_type: Literal["codex_thread_title", "conversation_interaction"]
+    tool: Literal["codex", "claude_code", "cursor"]
+    thread_id: UUID | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=500)
     title_kind: Literal["custom", "fallback", "unknown"] = "unknown"
-    revision: int = Field(gt=0, le=2**63 - 1)
+    revision: int | None = Field(default=None, gt=0, le=2**63 - 1)
     relative_path: str | None = Field(default=None, max_length=2000)
+    interaction_id: str | None = Field(default=None, min_length=1, max_length=512)
+    interaction_status: Literal["pending", "answered", "cancelled"] | None = None
+    question_tool: str = Field(default="", max_length=256)
+    interaction_input: object = Field(default_factory=dict)
+    timestamp: str = Field(default="", max_length=128)
 
 
 class IngestMetadataResponse(BaseModel):
@@ -346,7 +354,7 @@ async def ingest_metadata_endpoint(
     x_device_name: str = Header("unknown"),
     x_device_platform: str = Header("unknown"),
 ) -> IngestMetadataResponse:
-    """Apply a revisioned source-title change without ingesting file content."""
+    """Apply trusted lightweight source state without ingesting file content."""
     machine = await ensure_device(
         db,
         x_device_id,
@@ -354,20 +362,50 @@ async def ingest_metadata_endpoint(
         x_device_platform,
         user_id=_collector_user.id,
     )
-    result = await apply_codex_thread_title_update(
-        db,
-        machine_id=machine.id,
-        thread_id=req.thread_id,
-        title=req.title,
-        title_kind=req.title_kind,
-        revision=req.revision,
-        relative_path=req.relative_path,
-        user_id=_collector_user.id,
-    )
+    if req.metadata_type == "codex_thread_title":
+        if (
+            req.tool != "codex"
+            or req.thread_id is None
+            or req.title is None
+            or req.revision is None
+        ):
+            raise HTTPException(status_code=422, detail="invalid Codex title update")
+        result = await apply_codex_thread_title_update(
+            db,
+            machine_id=machine.id,
+            thread_id=req.thread_id,
+            title=req.title,
+            title_kind=req.title_kind,
+            revision=req.revision,
+            relative_path=req.relative_path,
+            user_id=_collector_user.id,
+        )
+    else:
+        if (
+            req.relative_path is None
+            or req.interaction_id is None
+            or req.interaction_status is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid conversation interaction update",
+            )
+        result = await apply_conversation_interaction_update(
+            db,
+            machine_id=machine.id,
+            user_id=_collector_user.id,
+            tool_id=req.tool,
+            relative_path=req.relative_path,
+            interaction_id=req.interaction_id,
+            interaction_status=req.interaction_status,
+            question_tool=req.question_tool,
+            interaction_input=req.interaction_input,
+            timestamp=req.timestamp,
+        )
     if result.valid and result.matched == 0:
         # Keep the collector's durable item pending when its transcript upload
         # is still in flight. The same idempotent update will succeed later.
-        raise HTTPException(status_code=404, detail="Codex thread not ingested yet")
+        raise HTTPException(status_code=404, detail="conversation not ingested yet")
     return IngestMetadataResponse(
         status="ok" if result.valid else "ignored",
         matched=result.matched,
@@ -646,8 +684,8 @@ async def ingest_discovery(
     )
 
     # Clean up paths in discovery data (URL decode, strip \\?\)
-    from urllib.parse import unquote
     import re as _re
+    from urllib.parse import unquote
 
     tools_data = req.get("tools", {})
     for tool_info in tools_data.values():

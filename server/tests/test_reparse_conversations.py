@@ -16,15 +16,20 @@ from server.scripts.reparse_conversations import (
 )
 from server.services.ingest_service import (
     CURRENT_ASSISTANT_MODEL_KEY,
+    CURRENT_ASSISTANT_MODE_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    CURRENT_PENDING_QUESTIONS_KEY,
+    PENDING_QUESTION_COUNT_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
     _assistant_identity_for_ingest,
     _set_stored_source_identity,
     _store_assistant_identity,
+    _store_pending_question_ids,
     _stored_source_is_current,
+    _update_pending_question_ids,
     iter_stored_conversation_messages,
 )
 
@@ -218,7 +223,11 @@ def test_reparse_persists_codex_model_and_reasoning_metadata() -> None:
     content = _jsonl(
         {
             "type": "turn_context",
-            "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+            "payload": {
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+                "collaboration_mode": {"mode": "plan"},
+            },
         },
         {
             "timestamp": "2026-07-17T20:00:00Z",
@@ -237,6 +246,7 @@ def test_reparse_persists_codex_model_and_reasoning_metadata() -> None:
     assert len(rows) == 1
     assert rows[0][2]["model"] == "gpt-5.6-sol"
     assert rows[0][2]["reasoning_effort"] == "xhigh"
+    assert rows[0][2]["agent_mode"] == "plan"
 
 
 def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
@@ -245,6 +255,7 @@ def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
     identity.model = "gpt-5.6-sol"
     identity.reasoning_effort = "high"
     identity.service_tier = "priority"
+    identity.agent_mode = "plan"
 
     _store_assistant_identity(document, identity)
     next_delta = _assistant_identity_for_ingest(document, "delta")
@@ -252,11 +263,61 @@ def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
     assert next_delta.model == "gpt-5.6-sol"
     assert next_delta.reasoning_effort == "high"
     assert next_delta.service_tier == "priority"
+    assert next_delta.agent_mode == "plan"
     assert document.metadata_["unrelated"] == "preserved"
     assert document.metadata_[CURRENT_ASSISTANT_MODEL_KEY] == "gpt-5.6-sol"
     assert document.metadata_[CURRENT_ASSISTANT_REASONING_KEY] == "high"
     assert document.metadata_[CURRENT_ASSISTANT_SERVICE_TIER_KEY] == "priority"
+    assert document.metadata_[CURRENT_ASSISTANT_MODE_KEY] == "plan"
     assert _assistant_identity_for_ingest(document, "full").model == ""
+
+
+def test_pending_question_state_is_added_and_cleared_by_matching_response() -> None:
+    document = SimpleNamespace(metadata_={"unrelated": "preserved"})
+    pending: set[str] = set()
+    question = SimpleNamespace(
+        interaction={"id": "question-1"},
+        interaction_response=None,
+        tool_calls=[],
+    )
+    response = SimpleNamespace(
+        interaction=None,
+        interaction_response={"interaction_id": "question-1"},
+        tool_calls=[],
+    )
+
+    _update_pending_question_ids(pending, question)
+    _store_pending_question_ids(document, pending)
+
+    assert document.metadata_[CURRENT_PENDING_QUESTIONS_KEY] == ["question-1"]
+    assert document.metadata_[PENDING_QUESTION_COUNT_KEY] == 1
+    assert document.metadata_["unrelated"] == "preserved"
+
+    _update_pending_question_ids(pending, response)
+    _store_pending_question_ids(document, pending)
+
+    assert CURRENT_PENDING_QUESTIONS_KEY not in document.metadata_
+    assert PENDING_QUESTION_COUNT_KEY not in document.metadata_
+
+
+def test_later_human_turn_clears_question_abandoned_across_restart() -> None:
+    document = SimpleNamespace(metadata_={"unrelated": "preserved"})
+    pending = {"claude-question-before-restart"}
+    resumed_user = SimpleNamespace(
+        role="user",
+        content="Keep going, you got rebooted. Where are we at?",
+        interaction=None,
+        interaction_response=None,
+        tool_calls=[],
+    )
+
+    _update_pending_question_ids(pending, resumed_user)
+    _store_pending_question_ids(document, pending)
+
+    assert pending == set()
+    assert CURRENT_PENDING_QUESTIONS_KEY not in document.metadata_
+    assert PENDING_QUESTION_COUNT_KEY not in document.metadata_
+    assert document.metadata_["unrelated"] == "preserved"
 
 
 def test_reparse_preserves_repeated_cursor_source_rows() -> None:

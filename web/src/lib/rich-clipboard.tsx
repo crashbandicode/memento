@@ -48,29 +48,85 @@ async function richClipboardHtml(markdown: string): Promise<string> {
   return html;
 }
 
+/** Fallback when Permissions-Policy / iframe policy blocks Clipboard API (crbug.com/414348233). */
+function copyWithExecCommand(text: string, html?: string): boolean {
+  const onCopy = (event: ClipboardEvent) => {
+    event.clipboardData?.setData("text/plain", text);
+    if (html) event.clipboardData?.setData("text/html", html);
+    event.preventDefault();
+  };
+  document.addEventListener("copy", onCopy);
+  try {
+    // Prefer a focused selection so execCommand('copy') is allowed in more hosts.
+    const selection = window.getSelection();
+    const probe = document.createElement("span");
+    probe.textContent = text.slice(0, 1) || " ";
+    probe.setAttribute("aria-hidden", "true");
+    probe.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;white-space:pre";
+    document.body.appendChild(probe);
+    const range = document.createRange();
+    range.selectNodeContents(probe);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    const ok = document.execCommand("copy");
+    selection?.removeAllRanges();
+    probe.remove();
+    return ok;
+  } catch {
+    return false;
+  } finally {
+    document.removeEventListener("copy", onCopy);
+  }
+}
+
+async function writePlainClipboard(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Permissions-Policy can reject writeText even when the method exists.
+  }
+  if (!copyWithExecCommand(text)) {
+    throw new Error("Clipboard write was blocked by the browser.");
+  }
+}
+
 /** Copy Markdown directly or as styled HTML with Markdown as its plain fallback. */
 export async function copyMarkdownToClipboard(
   markdown: string,
   format: ClipboardFormat,
 ): Promise<ClipboardFormat> {
   if (format === "markdown") {
-    await navigator.clipboard.writeText(markdown);
+    await writePlainClipboard(markdown);
     return "markdown";
   }
 
-  if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+  let html: string | null = null;
+  try {
+    html = await richClipboardHtml(markdown);
+  } catch {
+    html = null;
+  }
+
+  if (html && typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
     try {
-      const html = await richClipboardHtml(markdown);
       await navigator.clipboard.write([new ClipboardItem({
         "text/plain": new Blob([markdown], { type: "text/plain" }),
         "text/html": new Blob([html], { type: "text/html" }),
       })]);
       return "rich";
     } catch {
-      // Some WebViews expose ClipboardItem but reject custom MIME writes.
+      // Some WebViews expose ClipboardItem but reject custom MIME writes /
+      // Permissions-Policy blocks the Clipboard API entirely.
     }
   }
 
-  await navigator.clipboard.writeText(markdown);
+  if (html && copyWithExecCommand(markdown, html)) {
+    return "rich";
+  }
+
+  await writePlainClipboard(markdown);
   return "markdown";
 }

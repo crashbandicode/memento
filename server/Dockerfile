@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
@@ -17,6 +17,10 @@ ENV PIP_DEFAULT_TIMEOUT=300
 # Install server
 COPY server/pyproject.toml .
 COPY server/server/ server/
+# pyproject force-includes the canonical embedding runtime into the installed
+# wheel so `python -m server.services.embedding_server` also works outside a
+# monorepo checkout.
+COPY embedding/embedding_server.py /embedding/embedding_server.py
 RUN pip install --no-cache-dir .
 
 # Install MCP server package (for remote /mcp endpoint)
@@ -32,3 +36,14 @@ COPY deploy/bootstrap/ /app/bootstrap/
 EXPOSE 8000
 
 CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Reproducible test target for hosts where the application runs entirely in
+# Docker and no compatible Python is installed. The production/runtime target
+# below remains free of pytest and test sources.
+FROM base AS test
+COPY server/tests/ tests/
+RUN pip install --no-cache-dir ".[dev]"
+ENTRYPOINT ["python", "-m", "pytest"]
+CMD ["-q"]
+
+FROM base AS runtime

@@ -524,6 +524,28 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
             [codex_interaction, cursor_interaction],
         )
 
+    def test_delta_lookback_does_not_revive_answered_question(self) -> None:
+        interaction = {
+            "kind": "question",
+            "id": "codex-question-answered",
+            "source": "codex",
+            "questions": [],
+        }
+        recent_rows = [
+            SimpleNamespace(line_number=10, metadata_={"interaction": interaction}),
+            SimpleNamespace(
+                line_number=11,
+                metadata_={
+                    "interaction_response": {
+                        "interaction_id": "codex-question-answered",
+                        "status": "answered",
+                    },
+                },
+            ),
+        ]
+
+        self.assertEqual(_pending_question_interactions(recent_rows), [])
+
 
 if __name__ == "__main__":
     unittest.main()

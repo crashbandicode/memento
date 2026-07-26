@@ -23,6 +23,30 @@ engine = create_async_engine(
     pool_timeout=10,  # fail fast instead of stalling user requests 30s
 )
 
+# Search is optionally isolated from the write-heavy primary. Keep the default
+# as the existing engine so self-hosted installs do not create a second pool or
+# require a replica. A configured search URL receives a deliberately smaller,
+# read-only pool.
+_search_database_url = settings.search_database_url.strip()
+if _search_database_url and _search_database_url != settings.database_url:
+    search_engine = create_async_engine(
+        _search_database_url,
+        echo=False,
+        pool_size=10,
+        max_overflow=5,
+        pool_recycle=3600,
+        pool_timeout=10,
+        pool_pre_ping=True,
+        connect_args={
+            "server_settings": {
+                "default_transaction_read_only": "on",
+                "application_name": "memento-search",
+            }
+        },
+    )
+else:
+    search_engine = engine
+
 # Separate engine for post-ingest (embedding + knowledge graph) so a re-sync
 # storm can't starve the user-facing request pool. Smaller pool because
 # post-ingest is already capped at 8 concurrent tasks via Semaphore.
@@ -41,6 +65,16 @@ async_session_factory = async_sessionmaker(
     expire_on_commit=False,
 )
 
+search_session_factory = (
+    async_session_factory
+    if search_engine is engine
+    else async_sessionmaker(
+        search_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+)
+
 post_ingest_session_factory = async_sessionmaker(
     post_ingest_engine,
     class_=AsyncSession,
@@ -57,3 +91,14 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+async def get_search_db() -> AsyncGenerator[AsyncSession, None]:
+    """Provide a read-only search session, optionally backed by a replica."""
+    async with search_session_factory() as session:
+        try:
+            yield session
+        finally:
+            # End the read transaction promptly so a primary fallback does not
+            # retain snapshots that delay vacuum.
+            await session.rollback()

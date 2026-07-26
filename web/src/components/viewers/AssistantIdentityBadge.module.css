@@ -132,6 +132,19 @@
   font-weight: 750;
 }
 
+.agentMode {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #7c3aed;
+  font-weight: 750;
+}
+
+.agentMode svg {
+  width: 10px;
+  height: 10px;
+}
+
 .serviceTier svg {
   width: 10px;
   height: 10px;

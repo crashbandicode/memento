@@ -43,8 +43,23 @@ def _install_http_client(monkeypatch, response: _Response, calls: list[dict]) ->
 
 @pytest.fixture(autouse=True)
 def _reset_server_availability() -> None:
-    embedding_service._server_available = None
-    embedding_service._last_check_time = 0
+    embedding_service.reset_embedding_server_state()
+
+
+def _expected_embed_payload(
+    texts: list[str],
+    *,
+    purpose: str = "document",
+) -> dict:
+    profile = embedding_service.embedding_profile("quality")
+    return {
+        "texts": texts,
+        "model": profile.model_name,
+        "dimensions": profile.dimension,
+        "backend": profile.backend,
+        "profile_signature": profile.profile_signature,
+        "purpose": purpose,
+    }
 
 
 @pytest.mark.asyncio
@@ -65,7 +80,7 @@ async def test_interactive_busy_response_fails_fast_without_marking_server_down(
         {"timeout": 30},
         {
             "url": f"{embedding_service.EMBEDDING_SERVER_URL}/embed",
-            "json": {"texts": ["query"]},
+            "json": _expected_embed_payload(["query"]),
         },
     ]
 
@@ -87,7 +102,10 @@ async def test_background_busy_response_is_transient(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_whole_document_uses_one_admission_request(monkeypatch) -> None:
     texts = [f"chunk-{index}" for index in range(50)]
-    vectors = [[float(index)] for index in range(50)]
+    vectors = [
+        [float(index), *([0.0] * (embedding_service.EMBEDDING_DIM - 1))]
+        for index in range(50)
+    ]
     calls: list[dict] = []
     _install_http_client(
         monkeypatch,
@@ -102,7 +120,7 @@ async def test_whole_document_uses_one_admission_request(monkeypatch) -> None:
     assert post_calls == [
         {
             "url": f"{embedding_service.EMBEDDING_SERVER_URL}/embed",
-            "json": {"texts": texts},
+            "json": _expected_embed_payload(texts),
         }
     ]
 
@@ -117,7 +135,7 @@ class _RecordingDB:
         self.statements.append(statement)
         self.update_params.append(statement.compile().params)
         rowcount = self.rowcounts.pop(0) if self.rowcounts else 1
-        return SimpleNamespace(rowcount=rowcount)
+        return SimpleNamespace(rowcount=rowcount, all=lambda: [])
 
     async def commit(self) -> None:
         return None
@@ -132,6 +150,7 @@ def _document(*, attempts: int = 4) -> SimpleNamespace:
         embedding_status="failed",
         embedding_attempts=attempts,
         embedding_content_hash=None,
+        embedding_tier="quality",
         content_hash="a" * 64,
         content_type="text/plain",
         content="durable conversation text " * 20,
@@ -157,6 +176,7 @@ async def test_busy_document_stays_pending_without_consuming_attempt(monkeypatch
         "embedding_attempts"
         not in {getattr(column, "key", str(column)) for column in statement._values}
         for statement in db.statements
+        if hasattr(statement, "_values")
     )
     final_sql = str(db.statements[-1].compile())
     assert "documents.embedding_content_hash" in final_sql
@@ -200,7 +220,7 @@ async def test_stale_revision_cannot_claim_or_call_embedding_server(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_revision_change_deletes_vectors_and_resets_claim() -> None:
+async def test_revision_change_preserves_vectors_for_delta_reuse() -> None:
     class _DB:
         def __init__(self) -> None:
             self.statements: list = []
@@ -217,6 +237,8 @@ async def test_revision_change_deletes_vectors_and_resets_claim() -> None:
         embedding_attempts=4,
         embedding_claim_token="claim",
         embedding_claimed_at=object(),
+        embedding_tier="quality",
+        category="conversation",
     )
 
     changed = await _invalidate_embeddings_for_revision(
@@ -227,13 +249,40 @@ async def test_revision_change_deletes_vectors_and_resets_claim() -> None:
     )
 
     assert changed is True
-    assert len(db.statements) == 1
-    assert "DELETE FROM document_embeddings" in str(db.statements[0].compile())
+    assert db.statements == []
     assert doc.embedding_status == "pending"
     assert doc.embedding_attempts == 0
     assert doc.embedding_claim_token is None
     assert doc.embedding_claimed_at is None
     assert doc.embedding_content_hash == "new-input"
+
+
+def test_incremental_embedding_reuses_exact_legacy_and_hashed_chunks() -> None:
+    chunk = "stable chunk"
+    assert embedding_service.chunk_embedding_is_reusable(
+        chunk=chunk,
+        stored_text=chunk,
+        stored_hash=None,
+        stored_model=None,
+    )
+    assert embedding_service.chunk_embedding_is_reusable(
+        chunk=chunk,
+        stored_text="ignored when hash is present",
+        stored_hash=embedding_service.chunk_content_hash(chunk),
+        stored_model=embedding_service.EMBEDDING_MODEL_NAME,
+    )
+    assert not embedding_service.chunk_embedding_is_reusable(
+        chunk=chunk,
+        stored_text=chunk,
+        stored_hash=None,
+        stored_model="different/model",
+    )
+    assert not embedding_service.chunk_embedding_is_reusable(
+        chunk=chunk,
+        stored_text=chunk,
+        stored_hash=embedding_service.chunk_content_hash("changed"),
+        stored_model=embedding_service.EMBEDDING_MODEL_NAME,
+    )
 
 
 @pytest.mark.asyncio
@@ -250,6 +299,8 @@ async def test_same_embedding_input_keeps_existing_vectors_and_claim() -> None:
         embedding_attempts=4,
         embedding_claim_token="claim",
         embedding_claimed_at=claimed_at,
+        embedding_tier="quality",
+        category="conversation",
     )
 
     changed = await _invalidate_embeddings_for_revision(
@@ -382,8 +433,16 @@ async def test_semantic_search_filters_non_current_embedding_status(monkeypatch)
     async def _embed(*_args, **_kwargs):
         return [[0.0] * embedding_service.EMBEDDING_DIM]
 
+    async def _tiers(*_args, **_kwargs):
+        return ["quality"]
+
     monkeypatch.setattr(memory, "user_machine_ids", _machines)
     monkeypatch.setattr(embedding_service, "_call_embedding_server", _embed)
+    monkeypatch.setattr(
+        embedding_service,
+        "tiers_with_searchable_rows",
+        _tiers,
+    )
     db = _DB()
 
     result = await memory.semantic_search(
@@ -486,8 +545,16 @@ async def test_semantic_search_pages_documents_past_large_subagent_group(
     async def _embed(*_args, **_kwargs):
         return [[0.0] * embedding_service.EMBEDDING_DIM]
 
+    async def _tiers(*_args, **_kwargs):
+        return ["quality"]
+
     monkeypatch.setattr(memory, "user_machine_ids", _machines)
     monkeypatch.setattr(embedding_service, "_call_embedding_server", _embed)
+    monkeypatch.setattr(
+        embedding_service,
+        "tiers_with_searchable_rows",
+        _tiers,
+    )
     db = _DB()
 
     result = await memory.semantic_search(

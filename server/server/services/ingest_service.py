@@ -9,13 +9,12 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
     ConversationMessage,
     Document,
-    DocumentEmbedding,
     DocumentVersion,
     Machine,
     Project,
@@ -23,17 +22,17 @@ from ..db.models import (
     Tool,
 )
 from ..tool_catalog import tool_display_name
+from .conversation_identity import (
+    conversation_session_id,
+    select_canonical_conversation_document,
+    should_relocate_conversation_document,
+)
 from .history_recovery import (
     UserOccurrence,
     partition_recovered_occurrences,
     recovered_occurrence_anchors,
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
-from .conversation_identity import (
-    conversation_session_id,
-    select_canonical_conversation_document,
-    should_relocate_conversation_document,
-)
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
@@ -82,6 +81,10 @@ STORED_SOURCE_SIZE_KEY = "_stored_source_size"
 CURRENT_ASSISTANT_MODEL_KEY = "_assistant_model"
 CURRENT_ASSISTANT_REASONING_KEY = "_assistant_reasoning_effort"
 CURRENT_ASSISTANT_SERVICE_TIER_KEY = "_assistant_service_tier"
+CURRENT_ASSISTANT_MODE_KEY = "_assistant_agent_mode"
+CURRENT_PENDING_QUESTIONS_KEY = "_pending_question_ids"
+PENDING_QUESTION_COUNT_KEY = "pending_question_count"
+LIVE_INTERACTION_SIGNALS_KEY = "_live_interaction_signals"
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -92,8 +95,11 @@ _ESSENTIAL_METADATA_KEYS = {
     "codex_title_revision",
     "codex_title_revisions",
     CURRENT_ASSISTANT_MODEL_KEY,
+    CURRENT_ASSISTANT_MODE_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    CURRENT_PENDING_QUESTIONS_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
     "cwd",
     "first_user_message",
     "forked_from_id",
@@ -101,6 +107,7 @@ _ESSENTIAL_METADATA_KEYS = {
     "model",
     "memento_title_source",
     "parent_thread_id",
+    PENDING_QUESTION_COUNT_KEY,
     "project_hash",
     "project_path",
     "root_session_id",
@@ -124,6 +131,7 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
@@ -280,19 +288,28 @@ async def _invalidate_embeddings_for_revision(
     incoming_embedding_content_hash: str,
 ) -> bool:
     """Reconcile vectors against the exact bounded model input identity."""
+    from .embedding_service import apply_embedding_tier_policy
+
     persisted_hash = doc.embedding_content_hash
     doc.embedding_content_hash = incoming_embedding_content_hash
-    if (
+    content_changed = (
         persisted_hash or previous_embedding_content_hash
-    ) == incoming_embedding_content_hash:
+    ) != incoming_embedding_content_hash
+    # Sticky tier policy may promote fast → quality even when the bounded
+    # model input is unchanged. Promotion marks pending so stale fast rows
+    # are not searchable while quality vectors are generated.
+    promoted = apply_embedding_tier_policy(doc)
+    if not content_changed and not promoted:
         return False
-    await db.execute(
-        delete(DocumentEmbedding).where(DocumentEmbedding.document_id == doc.id)
-    )
-    doc.embedding_status = "pending"
-    doc.embedding_attempts = 0
-    doc.embedding_claim_token = None
-    doc.embedding_claimed_at = None
+    if content_changed:
+        # Keep the previous rows as an internal reuse cache. Search excludes this
+        # document while status is pending, and the fenced embedding finalizer
+        # atomically upserts changed chunks plus trims any stale tail. Deleting here
+        # forced every small edit to recompute and rewrite the full HNSW footprint.
+        doc.embedding_status = "pending"
+        doc.embedding_attempts = 0
+        doc.embedding_claim_token = None
+        doc.embedding_claimed_at = None
     return True
 
 
@@ -378,6 +395,11 @@ def _conversation_message_metadata(normalized) -> dict:
     if normalized.service_tier:
         meta["service_tier"] = _bounded_message_text(
             str(normalized.service_tier),
+            MAX_STORED_IDENTITY_CHARS,
+        )
+    if normalized.agent_mode:
+        meta["agent_mode"] = _bounded_message_text(
+            str(normalized.agent_mode),
             MAX_STORED_IDENTITY_CHARS,
         )
     if normalized.task_state:
@@ -469,6 +491,10 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
             CURRENT_ASSISTANT_SERVICE_TIER_KEY,
             "service_tier",
         ),
+        agent_mode=stored_value(
+            CURRENT_ASSISTANT_MODE_KEY,
+            "agent_mode",
+        ),
     )
 
 
@@ -479,6 +505,7 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
         (CURRENT_ASSISTANT_MODEL_KEY, assistant_identity.model),
         (CURRENT_ASSISTANT_REASONING_KEY, assistant_identity.reasoning_effort),
         (CURRENT_ASSISTANT_SERVICE_TIER_KEY, assistant_identity.service_tier),
+        (CURRENT_ASSISTANT_MODE_KEY, assistant_identity.agent_mode),
     ):
         if value:
             metadata[key] = _bounded_message_text(
@@ -487,6 +514,123 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
             )
         else:
             metadata.pop(key, None)
+    doc.metadata_ = metadata
+
+
+def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
+    """Seed active interaction IDs from the previous committed delta."""
+    if mode != "delta":
+        return set()
+    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    stored = metadata.get(CURRENT_PENDING_QUESTIONS_KEY)
+    if not isinstance(stored, list):
+        return set()
+    return {_bounded_message_text(str(value), 512) for value in stored[:64] if value}
+
+
+def _update_pending_question_ids(
+    pending_ids: set[str],
+    normalized,
+) -> None:
+    interactions = (
+        [normalized.interaction] if isinstance(normalized.interaction, dict) else []
+    )
+    interactions.extend(
+        interaction
+        for call in normalized.tool_calls
+        if isinstance(call, dict)
+        and isinstance((interaction := call.get("interaction")), dict)
+    )
+    for interaction in interactions:
+        interaction_id = _bounded_message_text(str(interaction.get("id") or ""), 512)
+        if interaction_id:
+            pending_ids.add(interaction_id)
+    response = normalized.interaction_response
+    if isinstance(response, dict):
+        interaction_id = _bounded_message_text(
+            str(response.get("interaction_id") or ""),
+            512,
+        )
+        if interaction_id:
+            pending_ids.discard(interaction_id)
+    elif getattr(normalized, "role", "") == "user" and pending_ids:
+        from .conversation_markdown import is_meaningful_human_prompt
+
+        if is_meaningful_human_prompt(
+            getattr(normalized, "content", ""),
+            None,
+            getattr(normalized, "role", ""),
+        ):
+            # A new human turn supersedes any older interactive prompt even
+            # when the source tool was restarted before it emitted a structured
+            # tool result. This applies equally to Cursor, Claude, and Codex.
+            pending_ids.clear()
+
+
+def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
+    metadata = dict(doc.metadata_ or {})
+    bounded = sorted(pending_ids)[:64]
+    if bounded:
+        metadata[CURRENT_PENDING_QUESTIONS_KEY] = bounded
+        metadata[PENDING_QUESTION_COUNT_KEY] = len(bounded)
+    else:
+        metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
+        metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
+    doc.metadata_ = metadata
+
+
+def _normalized_interaction_ids(normalized) -> set[str]:
+    ids: set[str] = set()
+    interactions = (
+        [normalized.interaction] if isinstance(normalized.interaction, dict) else []
+    )
+    interactions.extend(
+        interaction
+        for call in normalized.tool_calls
+        if isinstance(call, dict)
+        and isinstance((interaction := call.get("interaction")), dict)
+    )
+    for interaction in interactions:
+        interaction_id = _bounded_message_text(
+            str(interaction.get("id") or ""),
+            512,
+        )
+        if interaction_id:
+            ids.add(interaction_id)
+    response = normalized.interaction_response
+    if isinstance(response, dict):
+        interaction_id = _bounded_message_text(
+            str(response.get("interaction_id") or ""),
+            512,
+        )
+        if interaction_id:
+            ids.add(interaction_id)
+    return ids
+
+
+def _reconcile_live_interaction_signals(
+    doc: Document,
+    canonical_ids: set[str],
+    *,
+    clear_all: bool,
+) -> None:
+    """Retire previews once their canonical transcript rows have arrived."""
+    metadata = dict(doc.metadata_ or {})
+    raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+    if not isinstance(raw_signals, dict):
+        return
+    signals = {
+        str(key): value for key, value in raw_signals.items() if isinstance(value, dict)
+    }
+    if clear_all:
+        signals.clear()
+    else:
+        for interaction_id in canonical_ids:
+            signals.pop(interaction_id, None)
+    if signals:
+        metadata[LIVE_INTERACTION_SIGNALS_KEY] = signals
+    else:
+        metadata.pop(LIVE_INTERACTION_SIGNALS_KEY, None)
     doc.metadata_ = metadata
 
 
@@ -501,6 +645,7 @@ def _pending_question_interactions(
 
     newest_line = max(int(row.line_number or 0) for row in recent_rows)
     pending: dict[str, dict[str, object]] = {}
+    resolved: set[str] = set()
     for recent in reversed(recent_rows):
         metadata = recent.metadata_ if isinstance(recent.metadata_, dict) else {}
         direct = metadata.get("interaction")
@@ -517,6 +662,8 @@ def _pending_question_interactions(
             interaction_id = str(interaction.get("id") or "")
             if not interaction_id:
                 continue
+            if interaction_id in resolved:
+                continue
             if (
                 interaction.get("source") == "cursor"
                 and newest_line - int(recent.line_number or 0)
@@ -526,7 +673,10 @@ def _pending_question_interactions(
             pending[interaction_id] = interaction
         response = metadata.get("interaction_response")
         if isinstance(response, dict):
-            pending.pop(str(response.get("interaction_id") or ""), None)
+            interaction_id = str(response.get("interaction_id") or "")
+            if interaction_id:
+                resolved.add(interaction_id)
+                pending.pop(interaction_id, None)
     return list(pending.values())
 
 
@@ -972,8 +1122,18 @@ def _select_updated_document_title(
     *,
     category: str,
     tool_id: str,
+    metadata: object = None,
+    incoming_title_is_explicit: bool = False,
 ) -> str:
-    """Keep a legitimate existing Codex title across collector syncs."""
+    """Keep legitimate source titles across later transcript deltas."""
+    stored_metadata = metadata if isinstance(metadata, dict) else {}
+    if (
+        tool_id == "claude_code"
+        and category == "conversation"
+        and stored_metadata.get("memento_title_source") == "claude_ai_title"
+        and existing_title
+    ):
+        return incoming_title if incoming_title_is_explicit else existing_title
     if (
         tool_id == "codex"
         and category == "conversation"
@@ -1575,10 +1735,7 @@ async def ingest_file(
 
         metadata.update(extract_codex_session_metadata(content))
 
-    if (
-        tool_id in {"cursor", "claude_code"}
-        and category == "conversation"
-    ):
+    if tool_id in {"cursor", "claude_code"} and category == "conversation":
         from .conversation_hierarchy import path_linked_subagent_identity
 
         for key, value in path_linked_subagent_identity(relative_path).items():
@@ -1677,6 +1834,11 @@ async def ingest_file(
         tool_id=tool_id,
     )
     now = received_at
+    incoming_title_is_explicit = (
+        stored_metadata.pop("source_title_kind", None) == "claude_ai_title"
+    )
+    if incoming_title_is_explicit:
+        stored_metadata["memento_title_source"] = "claude_ai_title"
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
     previous_stored_revision = (
         (doc.metadata_ or {}).get(STORED_SOURCE_REVISION_KEY)
@@ -1704,6 +1866,8 @@ async def ingest_file(
     if doc is None:
         # Very large conversations keep their raw source in object storage.
         # They are still fully parsed into ConversationMessage rows below.
+        from .embedding_service import desired_embedding_tier
+
         doc = Document(
             tool_id=tool_id,
             project_id=project_id,
@@ -1720,6 +1884,8 @@ async def ingest_file(
             needs_review=had_sensitive,
             synced_at=now,
             source_modified_at=source_modified_at,
+            # Initial tier only; quality is sticky thereafter (never auto-demoted).
+            embedding_tier=desired_embedding_tier(category),
         )
         db.add(doc)
     else:
@@ -1767,6 +1933,8 @@ async def ingest_file(
             if mode == "delta"
             else {**existing_metadata, **stored_metadata}
         )
+        if incoming_title_is_explicit:
+            metadata_update["memento_title_source"] = "claude_ai_title"
         merged_metadata, _, _ = _prepare_document_metadata(
             metadata_update,
             tool_id=tool_id,
@@ -1786,6 +1954,8 @@ async def ingest_file(
             title,
             category=category,
             tool_id=tool_id,
+            metadata=doc.metadata_,
+            incoming_title_is_explicit=incoming_title_is_explicit,
         )
         # Backfill project_id when newly resolved (was NULL, or changed).
         # Don't overwrite an existing link with NULL — keep last good value.
@@ -1807,7 +1977,8 @@ async def ingest_file(
             revision_hash=stored_revision_hash,
         )
 
-    from sqlalchemy import func as _func, update as _update
+    from sqlalchemy import func as _func
+    from sqlalchemy import update as _update
 
     await db.flush()
 
@@ -2176,6 +2347,7 @@ async def _extract_messages(
     # Always full-replace (file is rewritten on each turn).
     if doc.tool_id == "hermes":
         from sqlalchemy import delete
+
         from .conversation_parser import parse_conversation
 
         await db.execute(
@@ -2245,6 +2417,9 @@ async def _extract_messages(
 
     tool_id = doc.tool_id
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
+    pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
+    canonical_interaction_ids: set[str] = set()
+    clear_live_interaction_signals = False
     line_num = start_line
     batch: list[ConversationMessage] = []
     batch_bytes = 0
@@ -2266,6 +2441,13 @@ async def _extract_messages(
         )
         delta_tail = recent_rows[0] if recent_rows else None
         initial_question_interactions = _pending_question_interactions(recent_rows)
+        for interaction in initial_question_interactions:
+            interaction_id = _bounded_message_text(
+                str(interaction.get("id") or ""),
+                512,
+            )
+            if interaction_id:
+                pending_question_ids.add(interaction_id)
         if tool_id == "claude_code":
             queue_rows = (
                 (
@@ -2301,6 +2483,16 @@ async def _extract_messages(
         initial_question_interactions=initial_question_interactions,
         assistant_identity=assistant_identity,
     ):
+        pending_before = bool(pending_question_ids)
+        _update_pending_question_ids(pending_question_ids, normalized)
+        canonical_interaction_ids.update(_normalized_interaction_ids(normalized))
+        if (
+            pending_before
+            and not pending_question_ids
+            and normalized.role == "user"
+            and not isinstance(normalized.interaction_response, dict)
+        ):
+            clear_live_interaction_signals = True
         # Claude persists a steer immediately as a queue enqueue, then may
         # write the canonical user row in a later collector delta after the
         # active turn finishes. Retain the submission-time row and mark it as
@@ -2426,6 +2618,12 @@ async def _extract_messages(
             batch = []
             batch_bytes = 0
 
+    _reconcile_live_interaction_signals(
+        doc,
+        canonical_interaction_ids,
+        clear_all=clear_live_interaction_signals,
+    )
+    _store_pending_question_ids(doc, pending_question_ids)
     _store_assistant_identity(doc, assistant_identity)
 
     if batch:

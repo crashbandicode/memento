@@ -519,6 +519,51 @@ class SyncQueueTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(after, ("Renamed", "Renamed"))
 
+    def test_interaction_metadata_coalesces_without_title_field(self) -> None:
+        item_key = "claude_code:projects/thread.jsonl:question-1"
+        pending = {
+            item_key: {
+                "metadata_type": "conversation_interaction",
+                "tool": "claude_code",
+                "relative_path": "projects/thread.jsonl",
+                "interaction_id": "question-1",
+                "interaction_status": "pending",
+                "question_tool": "AskUserQuestion",
+                "interaction_input": {"questions": [{"question": "Continue?"}]},
+            }
+        }
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="conversation_interactions",
+                tool_name="claude_code",
+                records=pending,
+            ),
+            1,
+        )
+        item = self.queue.claim_batch()[0]
+        self.assertEqual(item.sync_strategy, "metadata")
+        self.assertEqual(item.metadata["interaction_status"], "pending")
+        self.assertTrue(self.queue.mark_synced(item))
+
+        answered = {
+            item_key: {
+                **pending[item_key],
+                "interaction_status": "answered",
+            }
+        }
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="conversation_interactions",
+                tool_name="claude_code",
+                records=answered,
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.queue.claim_batch()[0].metadata["interaction_status"],
+            "answered",
+        )
+
     def test_metadata_is_claimed_before_an_older_large_payload(self) -> None:
         self._enqueue("sessions/large.jsonl", "x" * 150_000, "large-hash")
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
@@ -620,6 +665,40 @@ class SyncQueueTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_small_live_delta_skips_oversized_tail_from_another_path(self) -> None:
+        self._enqueue("archived/large.jsonl", "x" * 150_000, "large-hash")
+        self.queue.claim_batch(batch_size=1, max_bytes=100_000)
+        self._enqueue(
+            "sessions/noisy.jsonl",
+            "noise" * 3_000,
+            "noisy-hash",
+            "delta",
+            True,
+            20,
+            base_hash="noisy-base",
+            base_offset=10,
+            source_path="/tmp/sessions/noisy.jsonl",
+        )
+        self._enqueue(
+            "sessions/question.jsonl",
+            "question",
+            "question-hash",
+            "delta",
+            True,
+            20,
+            base_hash="question-base",
+            base_offset=10,
+            source_path="/tmp/sessions/question.jsonl",
+        )
+
+        live = self.queue.claim_batch(
+            batch_size=1,
+            max_bytes=100_000,
+            live_delta_reserve_bytes=10_000,
+        )[0]
+
+        self.assertEqual(live.relative_path, "sessions/question.jsonl")
 
     def test_metadata_priority_preserves_fifo_and_same_path_barrier(self) -> None:
         first_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"

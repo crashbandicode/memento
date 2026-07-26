@@ -27,7 +27,11 @@ class ConversationParserTests(unittest.TestCase):
         raw = "\n".join([
             json.dumps({
                 "type": "turn_context",
-                "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+                "payload": {
+                    "model": "gpt-5.6-sol",
+                    "effort": "xhigh",
+                    "collaboration_mode": {"mode": "plan"},
+                },
             }),
             json.dumps({
                 "type": "response_item",
@@ -41,7 +45,11 @@ class ConversationParserTests(unittest.TestCase):
             }),
             json.dumps({
                 "type": "turn_context",
-                "payload": {"model": "gpt-5.6", "effort": "medium"},
+                "payload": {
+                    "model": "gpt-5.6",
+                    "effort": "medium",
+                    "collaboration_mode": {"mode": "default"},
+                },
             }),
             json.dumps({
                 "type": "response_item",
@@ -58,15 +66,25 @@ class ConversationParserTests(unittest.TestCase):
         messages = parse_conversation(raw, "codex")
 
         self.assertEqual(
-            [(message.model, message.reasoning_effort) for message in messages],
-            [("gpt-5.6-sol", "xhigh"), ("gpt-5.6", "medium")],
+            [
+                (message.model, message.reasoning_effort, message.agent_mode)
+                for message in messages
+            ],
+            [
+                ("gpt-5.6-sol", "xhigh", "plan"),
+                ("gpt-5.6", "medium", "default"),
+            ],
         )
 
     def test_codex_assistant_identity_survives_delta_boundary(self) -> None:
         identity = AssistantIdentityState()
         context_delta = json.dumps({
             "type": "turn_context",
-            "payload": {"model": "gpt-5.6-sol", "effort": "high"},
+            "payload": {
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "collaboration_mode": {"mode": "plan"},
+            },
         })
         assistant_delta = json.dumps({
             "type": "event_msg",
@@ -91,6 +109,7 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(identity.model, "gpt-5.6-sol")
         self.assertEqual(messages[0].model, "gpt-5.6-sol")
         self.assertEqual(messages[0].reasoning_effort, "high")
+        self.assertEqual(messages[0].agent_mode, "plan")
 
     def test_codex_thread_settings_preserve_fast_service_tier(self) -> None:
         raw = "\n".join([
@@ -549,6 +568,14 @@ class ConversationParserTests(unittest.TestCase):
     def test_codex_request_user_input_call_and_output_are_preserved(self) -> None:
         raw = "\n".join([
             json.dumps({
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.6-sol",
+                    "effort": "xhigh",
+                    "collaboration_mode": {"mode": "plan"},
+                },
+            }),
+            json.dumps({
                 "type": "response_item",
                 "timestamp": "2026-07-14T12:00:00Z",
                 "payload": {
@@ -585,11 +612,47 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[0].tool_name, "request_user_input")
+        self.assertEqual(messages[0].agent_mode, "plan")
         self.assertEqual(messages[0].interaction["questions"][0]["id"], "rollout")
         self.assertEqual(
             messages[1].interaction_response["answers"][0]["selected_option_ids"],
             ["Proceed"],
         )
+
+    def test_codex_empty_question_output_is_cancelled(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "call_id": "call-question-empty",
+                    "arguments": json.dumps({
+                        "questions": [{
+                            "id": "rollout",
+                            "header": "Rollout",
+                            "question": "Proceed with deployment?",
+                            "options": [{"label": "Proceed"}],
+                        }],
+                    }),
+                },
+            }),
+            json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-question-empty",
+                    "output": json.dumps({"answers": {}}),
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "codex")
+
+        response = messages[1].interaction_response
+        assert response is not None
+        self.assertEqual(response["status"], "cancelled")
+        self.assertEqual(response["answers"], [])
 
     def test_codex_ordinary_tool_calls_and_outputs_are_preserved(self) -> None:
         raw = "\n".join([

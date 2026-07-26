@@ -44,3 +44,18 @@ def test_jsonl_parser_tolerates_non_object_records(tmp_path):
 
     assert result.metadata["total_lines"] == 2
     assert result.metadata["message_types"] == {"user": 1}
+
+
+def test_jsonl_parser_uses_latest_claude_ai_title(tmp_path):
+    transcript = tmp_path / "conversation.jsonl"
+    transcript.write_text(
+        '{"type":"ai-title","aiTitle":"Initial title"}\n'
+        '{"type":"user","timestamp":"2026-01-01T00:00:00Z"}\n'
+        '{"type":"ai-title","aiTitle":"Audit multi-repo deployments"}\n',
+        encoding="utf-8",
+    )
+
+    result = JsonlParser().parse(transcript)
+
+    assert result.title == "Audit multi-repo deployments"
+    assert result.metadata["source_title_kind"] == "claude_ai_title"

@@ -66,7 +66,15 @@ class QueueItem:
     lease_token: str | None = None
 
 
-def _metadata_state_value(record: dict[str, Any], title: str) -> str:
+def _metadata_state_value(record: dict[str, Any], title: str = "") -> str:
+    if str(record.get("metadata_type") or "") != "codex_thread_title":
+        return json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
     kind = str(record.get("title_kind") or "").strip().lower()
     if kind not in {"custom", "fallback"}:
         return title
@@ -296,7 +304,7 @@ class SyncQueue:
         tool_name: str,
         records: dict[str, dict[str, Any]],
     ) -> int:
-        """Durably coalesce changed lightweight metadata into the upload queue.
+        """Durably coalesce lightweight source state into the upload queue.
 
         The first observation is intentionally unsynced and therefore queued.
         Codex polling excludes subagents, while the server rejects injected
@@ -313,8 +321,10 @@ class SyncQueue:
             self._conn.execute("BEGIN IMMEDIATE")
             for item_key, source_record in records.items():
                 record = dict(source_record)
+                metadata_type = str(record.get("metadata_type") or "").strip()
+                is_title_update = metadata_type == "codex_thread_title"
                 current_title = str(record.get("title") or "").strip()
-                if not current_title:
+                if not metadata_type or (is_title_update and not current_title):
                     continue
 
                 path_key = hashlib.sha256(item_key.encode("utf-8")).hexdigest()
@@ -327,7 +337,10 @@ class SyncQueue:
                     (namespace, item_key),
                 ).fetchone()
                 state_values = tuple(state_row) if state_row is not None else ()
-                if str(record.get("title_kind") or "").lower() == "fallback":
+                if (
+                    is_title_update
+                    and str(record.get("title_kind") or "").lower() == "fallback"
+                ):
                     protected_title = self._protected_custom_title_locked(
                         tool_name=tool_name,
                         relative_path=relative_path,
@@ -904,9 +917,10 @@ class SyncQueue:
                 if len(selected) >= batch_size:
                     break
                 # Metadata-only work has no payload and must remain claimable
-                # while a large file consumes the byte budget. Payload rows
-                # retain the existing FIFO barrier at the first item that does
-                # not fit, so later files cannot leapfrog it.
+                # while a large file consumes the byte budget. Same-path FIFO
+                # is enforced by the candidate query; a large row from another
+                # path must not hide a later small live tail such as an
+                # interactive question.
                 if size > 0 and total_bytes and total_bytes + size > max_bytes:
                     # An oversized historical upload may consume the ordinary
                     # byte budget by itself. Keep a small, explicit reserve for
@@ -916,7 +930,7 @@ class SyncQueue:
                         is_live_delta
                         and live_delta_bytes + size <= live_delta_reserve_bytes
                     ):
-                        break
+                        continue
                 selected.append(row)
                 selected_paths.add(path_key)
                 total_bytes += size

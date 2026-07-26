@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import gzip
-import io
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime, timezone, timedelta
+from typing import BinaryIO
 
 import asyncpg
 import boto3
@@ -29,6 +31,14 @@ logger = logging.getLogger("db_backup")
 
 BACKUP_BUCKET = "memento-backups"
 RETENTION_DAYS = 14
+BACKUP_SPOOL_MEMORY_BYTES = 64 * 1024 * 1024
+try:
+    BACKUP_GZIP_LEVEL = min(
+        9,
+        max(1, int(os.environ.get("MEMENTO_BACKUP_GZIP_LEVEL", "1"))),
+    )
+except (TypeError, ValueError):
+    BACKUP_GZIP_LEVEL = 1
 
 # Tables to back up, in load order (FK-safe). Append new tables here as
 # the schema grows.
@@ -41,6 +51,7 @@ TABLES = [
     "documents",
     "document_versions",
     "document_embeddings",
+    "document_embeddings_fast",
     "conversation_messages",
     "knowledge_entities",
     "knowledge_relations",
@@ -58,7 +69,18 @@ def _libpq_url() -> str:
     return settings.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
-async def _dump_async(buf: io.BytesIO) -> dict:
+def _backup_buffer(
+    *,
+    max_memory_bytes: int = BACKUP_SPOOL_MEMORY_BYTES,
+) -> BinaryIO:
+    """Keep small backups in RAM and spill large deployments to local disk."""
+    return tempfile.SpooledTemporaryFile(
+        max_size=max_memory_bytes,
+        mode="w+b",
+    )
+
+
+async def _dump_async(buf: BinaryIO) -> dict:
     """Stream every table out via COPY ... TO STDOUT (binary), gzip into buf.
     Returns per-table row counts for the manifest.
     """
@@ -69,7 +91,11 @@ async def _dump_async(buf: io.BytesIO) -> dict:
         # two minutes. A full COPY snapshot is maintenance work and can exceed
         # that on a populated instance, so opt this dedicated connection out.
         await conn.execute("SET statement_timeout = 0")
-        gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6)
+        gz = gzip.GzipFile(
+            fileobj=buf,
+            mode="wb",
+            compresslevel=BACKUP_GZIP_LEVEL,
+        )
         try:
             for table in TABLES:
                 # Validate table name (defensive — TABLES is a static allow-list,
@@ -95,7 +121,11 @@ async def _dump_async(buf: io.BytesIO) -> dict:
     return counts
 
 
-@celery_app.task(name="server.tasks.db_backup.run_daily_backup")
+@celery_app.task(
+    name="server.tasks.db_backup.run_daily_backup",
+    time_limit=3600,
+    soft_time_limit=3300,
+)
 def run_daily_backup() -> dict:
     """Celery entry point. Runs an event loop because asyncpg is async-only."""
     return asyncio.run(_run_backup())
@@ -104,12 +134,6 @@ def run_daily_backup() -> dict:
 async def _run_backup() -> dict:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"daily/{today}.csv.gz"
-
-    buf = io.BytesIO()
-    counts = await _dump_async(buf)
-    size = buf.tell()
-    buf.seek(0)
-    logger.info("Backup built in memory: %d bytes, %d tables", size, len(counts))
 
     s3 = boto3.client(
         "s3",
@@ -123,7 +147,18 @@ async def _run_backup() -> dict:
         s3.head_bucket(Bucket=BACKUP_BUCKET)
     except Exception:
         s3.create_bucket(Bucket=BACKUP_BUCKET)
-    s3.put_object(Bucket=BACKUP_BUCKET, Key=key, Body=buf.getvalue())
+    with _backup_buffer() as buf:
+        counts = await _dump_async(buf)
+        size = buf.tell()
+        buf.seek(0)
+        logger.info(
+            "Backup built in spooled storage: %d bytes, %d tables",
+            size,
+            len(counts),
+        )
+        # upload_fileobj streams/multipart-uploads from the spooled file.
+        # Never materialize a second full-size bytes object with getvalue().
+        s3.upload_fileobj(buf, BACKUP_BUCKET, key)
     logger.info("Uploaded s3://%s/%s (%d bytes)", BACKUP_BUCKET, key, size)
 
     # Prune older than RETENTION_DAYS

@@ -104,8 +104,15 @@ class JsonlParser(BaseParser):
                     msg_type = str(obj.get("type") or "unknown")
                     message_types[msg_type] = message_types.get(msg_type, 0) + 1
 
-                    if msg_type == "ai-title" and not title:
-                        title = str(obj.get("title") or "")
+                    if msg_type == "ai-title":
+                        # Claude Code persists custom thread names as
+                        # ``aiTitle``. Keep the latest rename in the bounded
+                        # revision instead of freezing the first title.
+                        candidate_title = str(
+                            obj.get("aiTitle") or obj.get("title") or ""
+                        ).strip()
+                        if candidate_title:
+                            title = candidate_title
 
                     ts = obj.get("timestamp", "")
                     if ts:
@@ -125,6 +132,8 @@ class JsonlParser(BaseParser):
             metadata["first_timestamp"] = first_timestamp
         if last_timestamp:
             metadata["last_timestamp"] = last_timestamp
+        if title:
+            metadata["source_title_kind"] = "claude_ai_title"
         if MAX_CONTENT_SIZE and content_size >= MAX_CONTENT_SIZE:
             metadata["truncated"] = True
 

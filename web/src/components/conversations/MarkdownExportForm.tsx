@@ -3,6 +3,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ConversationMarkdownExportSettings, ProjectSummary, ToolSummary } from "@/lib/api-client";
 import { copyMarkdownToClipboard } from "@/lib/rich-clipboard";
+import {
+  DEFAULT_CONVERSATION_VISIBILITY,
+  readConversationVisibility,
+  type ConversationVisibility,
+} from "@/lib/conversation-visibility";
 import { Btn, Chip, GhostInput, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 
@@ -39,15 +44,20 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
   const [projectId, setProjectId] = useState("");
   const [includeSubagents, setIncludeSubagents] = useState(false);
   const [includeLowActivity, setIncludeLowActivity] = useState(false);
-  const [includeTools, setIncludeTools] = useState(true);
-  const [includeThinking, setIncludeThinking] = useState(true);
-  const [includeContext, setIncludeContext] = useState(true);
+  const [contentFilters, setContentFilters] = useState<ConversationVisibility>(
+    DEFAULT_CONVERSATION_VISIBILITY,
+  );
   const [includeTimestamps, setIncludeTimestamps] = useState(true);
   const [output, setOutput] = useState<"zip" | "combined">("zip");
   const [maxThreads, setMaxThreads] = useState(250);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    if (!documentId) return;
+    setContentFilters(readConversationVisibility(documentId));
+  }, [documentId]);
 
   useEffect(() => {
     if (!global) return;
@@ -76,6 +86,10 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
       : [...current, id]);
   };
 
+  const toggleContent = (key: keyof ConversationVisibility) => {
+    setContentFilters((current) => ({ ...current, [key]: !current[key] }));
+  };
+
   const settings = (): ConversationMarkdownExportSettings => ({
     start_at: localDayBoundary(startDate, false),
     end_at: localDayBoundary(endDate, true),
@@ -85,9 +99,13 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
     project_ids: projectId ? [projectId] : [],
     include_subagents: includeSubagents,
     include_low_activity: includeLowActivity,
-    include_tools: includeTools,
-    include_thinking: includeThinking,
-    include_session_context: includeContext,
+    include_user: contentFilters.user,
+    include_assistant: contentFilters.assistant,
+    include_tools: contentFilters.tools,
+    include_tasks: contentFilters.tasks,
+    include_agents: contentFilters.agents,
+    include_thinking: contentFilters.thinking,
+    include_session_context: contentFilters.context,
     include_timestamps: includeTimestamps,
     output,
     max_threads: maxThreads,
@@ -143,6 +161,16 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
       setBusy(false);
     }
   };
+
+  const contentOptions: Array<{ key: keyof ConversationVisibility; label: string }> = [
+    { key: "user", label: "User prompts" },
+    { key: "assistant", label: "Agent messages" },
+    { key: "tools", label: "Tool calls and results" },
+    { key: "tasks", label: "Tasks" },
+    { key: "agents", label: "Agent activity" },
+    { key: "thinking", label: "Agent thinking" },
+    { key: "context", label: "Session context" },
+  ];
 
   return (
     <div>
@@ -250,17 +278,28 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
         </div>
       )}
 
-      <div className="mt-5 grid gap-2 sm:grid-cols-2">
-        <Toggle label="Tool calls and results" checked={includeTools} onChange={setIncludeTools} />
-        <Toggle label="Agent thinking" checked={includeThinking} onChange={setIncludeThinking} />
-        <Toggle label="Session context" checked={includeContext} onChange={setIncludeContext} />
-        <Toggle label="Message timestamps" checked={includeTimestamps} onChange={setIncludeTimestamps} />
-        {global && (
-          <Toggle label="Include subagent threads" checked={includeSubagents} onChange={setIncludeSubagents} />
-        )}
-        {global && (
-          <Toggle label="Include virtually empty threads" checked={includeLowActivity} onChange={setIncludeLowActivity} />
-        )}
+      <div className="mt-5">
+        <SectionLabel style={{ margin: "0 0 8px" }}>
+          Content filters
+          {documentId ? " · matched to Display" : ""}
+        </SectionLabel>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {contentOptions.map((option) => (
+            <Toggle
+              key={option.key}
+              label={option.label}
+              checked={contentFilters[option.key]}
+              onChange={() => toggleContent(option.key)}
+            />
+          ))}
+          <Toggle label="Message timestamps" checked={includeTimestamps} onChange={setIncludeTimestamps} />
+          {global && (
+            <Toggle label="Include subagent threads" checked={includeSubagents} onChange={setIncludeSubagents} />
+          )}
+          {global && (
+            <Toggle label="Include virtually empty threads" checked={includeLowActivity} onChange={setIncludeLowActivity} />
+          )}
+        </div>
       </div>
 
       {global && (
@@ -302,7 +341,7 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
         }}
       >
         <Icon name="message" size={13} style={{ display: "inline", marginRight: 7, verticalAlign: -2 }} />
-        Prompt and date filters keep the full response turn through the next human prompt.
+        Prompt and date filters keep the full response turn through the next human prompt. Content filters match the Display options on the thread.
       </div>
 
       {(error || notice) && (

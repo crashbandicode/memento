@@ -259,6 +259,16 @@ def _tool_record(
     name = _TOOL_LABELS.get(raw_name.lower(), raw_name)
     raw_input = tool_data.get("rawArgs") or tool_data.get("params") or ""
     status = _coerce_text(tool_data.get("status")).strip().lower()
+    additional_data = tool_data.get("additionalData")
+    if (
+        raw_name.lower() in {"ask_question", "askquestion"}
+        and isinstance(additional_data, dict)
+    ):
+        interaction_status = _coerce_text(
+            additional_data.get("status")
+        ).strip().lower()
+        if interaction_status:
+            status = interaction_status
     result = tool_data.get("result")
     content = _serialized_field(result) if result not in (None, "") else ""
     if not content and status:

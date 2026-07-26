@@ -231,6 +231,29 @@ class ConversationTitleTests(unittest.TestCase):
 
         self.assertEqual(selected, "New Claude title")
 
+    def test_claude_ai_title_survives_plain_transcript_delta(self) -> None:
+        selected = _select_updated_document_title(
+            "Audit multi-repo deployments",
+            "ee4adbf8-4899-49b1-87e0-d3029ba9f32a.jsonl",
+            category="conversation",
+            tool_id="claude_code",
+            metadata={"memento_title_source": "claude_ai_title"},
+        )
+
+        self.assertEqual(selected, "Audit multi-repo deployments")
+
+    def test_new_claude_ai_title_replaces_previous_source_title(self) -> None:
+        selected = _select_updated_document_title(
+            "Initial Claude title",
+            "Renamed Claude title",
+            category="conversation",
+            tool_id="claude_code",
+            metadata={"memento_title_source": "claude_ai_title"},
+            incoming_title_is_explicit=True,
+        )
+
+        self.assertEqual(selected, "Renamed Claude title")
+
 
 if __name__ == "__main__":
     unittest.main()

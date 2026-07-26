@@ -30,6 +30,8 @@ interface DashboardData {
     synced_at: string;
     project_title: string | null;
     message_count: number;
+    pending_question_count?: number;
+    agent_mode?: string | null;
     subagent_count?: number;
     is_subagent_orphan?: boolean;
     is_low_activity: boolean;
@@ -154,11 +156,14 @@ export default function Dashboard() {
     ...new Map(data.recent_conversations.map((item) => [item.id, item])).values(),
   ];
   const maxDaily = Math.max(...daily.map((d) => d.count), 1);
+  const attentionConversations = recent_conversations
+    .filter((conversation) => (conversation.pending_question_count || 0) > 0);
+  const attentionIds = new Set(attentionConversations.map((conversation) => conversation.id));
   const activeRecentConversations = recent_conversations
-    .filter((conversation) => !conversation.is_low_activity)
+    .filter((conversation) => !conversation.is_low_activity && !attentionIds.has(conversation.id))
     .slice(0, 10);
   const lowActivityConversations = recent_conversations
-    .filter((conversation) => conversation.is_low_activity);
+    .filter((conversation) => conversation.is_low_activity && !attentionIds.has(conversation.id));
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -341,6 +346,34 @@ export default function Dashboard() {
 
         {/* Right col */}
         <div className="space-y-6">
+          {attentionConversations.length > 0 && (
+            <div>
+              <SectionLabel>{t.dashboard.needsAttention}</SectionLabel>
+              <Glass
+                padding={6}
+                radius={20}
+                style={{ borderColor: "color-mix(in srgb, #D97706 34%, var(--aurora-border))" }}
+              >
+                {attentionConversations.map((conv) => (
+                  <RecentRow
+                    key={conv.id}
+                    toolId={conv.tool_id}
+                    title={conv.title || "Untitled"}
+                    subtitle={[
+                      conv.project_title,
+                      `${conv.message_count} msg`,
+                      timeAgo(conv.activity_at || conv.synced_at),
+                    ].filter(Boolean).join(" · ")}
+                    href={`/conversations/${conv.id}`}
+                    subagentCount={conv.subagent_count}
+                    isSubagentOrphan={conv.is_subagent_orphan}
+                    attentionLabel={t.conversation.awaitingResponse}
+                    modeLabel={conv.agent_mode?.toLocaleLowerCase() === "plan" ? t.conversation.planMode : undefined}
+                  />
+                ))}
+              </Glass>
+            </div>
+          )}
           <div>
             <SectionLabel>{t.dashboard.recentConversations}</SectionLabel>
             <Glass padding={6} radius={20}>
@@ -501,7 +534,7 @@ memento-collector setup`}
 }
 
 function RecentRow({
-  toolId, title, subtitle, href, subagentCount, isSubagentOrphan,
+  toolId, title, subtitle, href, subagentCount, isSubagentOrphan, attentionLabel, modeLabel,
 }: {
   toolId: string;
   title: string;
@@ -509,6 +542,8 @@ function RecentRow({
   href: string;
   subagentCount?: number;
   isSubagentOrphan?: boolean;
+  attentionLabel?: string;
+  modeLabel?: string;
 }) {
   const [h, setH] = useState(false);
   return (
@@ -555,6 +590,12 @@ function RecentRow({
         >
           {subtitle}
         </div>
+        {(attentionLabel || modeLabel) && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 5 }}>
+            {attentionLabel && <Chip tone="warn" icon="message">{attentionLabel}</Chip>}
+            {modeLabel && <Chip tone="accent">{modeLabel}</Chip>}
+          </div>
+        )}
         <div style={{ marginTop: subagentCount ? 5 : 0 }}>
           <SubagentBadge count={subagentCount} orphan={isSubagentOrphan} />
         </div>

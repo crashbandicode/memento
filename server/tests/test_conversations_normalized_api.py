@@ -15,9 +15,10 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.conversations import (  # noqa: E402
     get_conversation,
-    get_latest_agent_message,
     get_conversation_messages,
     get_conversation_prompts,
+    get_latest_agent_message,
+    get_pending_conversation_interactions,
     search_conversation_messages,
 )
 
@@ -75,9 +76,15 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             file_size_bytes=64 * 1024 * 1024,
         )
 
-    def message(self, line_number: int, role: str = "assistant"):
+    def message(
+        self,
+        line_number: int,
+        role: str = "assistant",
+        document_id=None,
+    ):
         return SimpleNamespace(
             id=line_number,
+            document_id=document_id or self.doc_id,
             line_number=line_number,
             role=role,
             message_type=role,
@@ -87,6 +94,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "model": "gpt-5.6-sol" if role == "assistant" else "",
                 "reasoning_effort": "xhigh" if role == "assistant" else "",
                 "service_tier": "priority" if role == "assistant" else "",
+                "agent_mode": "plan" if role == "assistant" else "",
                 "tool_name": "shell" if role == "assistant" else "",
                 "tool_input": "Get-Item" if role == "assistant" else "",
                 "tool_calls": [],
@@ -95,11 +103,13 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_messages_prefer_indexed_normalized_rows(self) -> None:
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=2),
-            _Result(rows=[self.message(1, "user"), self.message(2)]),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=2),
+                _Result(rows=[self.message(1, "user"), self.message(2)]),
+            ]
+        )
 
         payload = await get_conversation_messages(
             self.doc_id,
@@ -117,17 +127,20 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["messages"][1]["model"], "gpt-5.6-sol")
         self.assertEqual(payload["messages"][1]["reasoning_effort"], "xhigh")
         self.assertEqual(payload["messages"][1]["service_tier"], "priority")
+        self.assertEqual(payload["messages"][1]["agent_mode"], "plan")
         self.assertEqual(len(db.statements), 3)
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
 
     async def test_around_line_uses_index_and_reports_row_offset(self) -> None:
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=4306),
-            _Result(scalar_value=4281),
-            _Result(rows=[self.message(4282), self.message(4283)]),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=4306),
+                _Result(scalar_value=4281),
+                _Result(rows=[self.message(4282), self.message(4283)]),
+            ]
+        )
 
         payload = await get_conversation_messages(
             self.doc_id,
@@ -146,11 +159,13 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("documents.content", message_sql)
 
     async def test_tail_returns_latest_normalized_rows(self) -> None:
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=4306),
-            _Result(rows=[self.message(4305), self.message(4306)]),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=4306),
+                _Result(rows=[self.message(4305), self.message(4306)]),
+            ]
+        )
 
         payload = await get_conversation_messages(
             self.doc_id,
@@ -173,11 +188,160 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("OFFSET", message_sql.upper())
         self.assertNotIn("documents.content", message_sql)
 
+    async def test_pending_interactions_include_out_of_window_subagent_questions(
+        self,
+    ) -> None:
+        child_id = uuid.uuid4()
+        answered = self.message(10)
+        answered.metadata_ = {
+            "interaction": {
+                "id": "answered-question",
+                "kind": "question",
+                "source": "codex",
+                "tool_name": "request_user_input",
+                "questions": [],
+            }
+        }
+        response = self.message(11, "user")
+        response.metadata_ = {
+            "interaction_response": {
+                "interaction_id": "answered-question",
+                "status": "answered",
+                "answers": [],
+                "raw_text": "Done",
+            }
+        }
+        abandoned = self.message(12)
+        abandoned.metadata_ = {
+            "interaction": {
+                "id": "question-before-restart",
+                "kind": "question",
+                "source": "codex",
+                "tool_name": "request_user_input",
+                "questions": [],
+            }
+        }
+        resumed = self.message(13, "user")
+        resumed.content = "Keep going, you got rebooted."
+        resumed.metadata_ = {}
+        pending = self.message(2, document_id=child_id)
+        pending.metadata_ = {
+            "model": "gpt-5.6-sol",
+            "agent_mode": "plan",
+            "tool_calls": [
+                {
+                    "name": "request_user_input",
+                    "input": "{}",
+                    "interaction": {
+                        "id": "child-question",
+                        "kind": "question",
+                        "source": "codex",
+                        "tool_name": "request_user_input",
+                        "questions": [
+                            {
+                                "id": "scope",
+                                "prompt": "Which scope?",
+                                "type": "single_select",
+                                "allow_custom": True,
+                                "options": [],
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(
+                    rows=[
+                        (self.doc_id, self.doc.title, self.doc.metadata_),
+                        (child_id, "Child", {}),
+                    ]
+                ),
+                _Result(rows=[answered, response, abandoned, resumed, pending]),
+            ]
+        )
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(
+            payload["interactions"][0]["interaction"]["id"],
+            "child-question",
+        )
+        self.assertEqual(
+            payload["interactions"][0]["document_id"],
+            str(child_id),
+        )
+        self.assertEqual(
+            payload["inferred_responses"][0]["response"]["interaction_id"],
+            "question-before-restart",
+        )
+        self.assertEqual(
+            payload["inferred_responses"][0]["response"]["raw_text"],
+            resumed.content,
+        )
+        pending_sql = str(db.statements[2].compile(dialect=postgresql.dialect()))
+        self.assertIn("conversation_messages.metadata ? ", pending_sql)
+
+    async def test_pending_interactions_include_live_metadata_preview(self) -> None:
+        self.doc.metadata_["_live_interaction_signals"] = {
+            "live-question": {
+                "timestamp": "2026-07-24T23:04:05Z",
+                "interaction": {
+                    "id": "live-question",
+                    "kind": "question",
+                    "source": "codex",
+                    "tool_name": "request_user_input",
+                    "questions": [
+                        {
+                            "id": "speed",
+                            "prompt": "Proceed?",
+                            "type": "single_select",
+                            "allow_custom": True,
+                            "options": [],
+                        }
+                    ],
+                },
+            }
+        }
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(
+                    rows=[
+                        (self.doc_id, self.doc.title, self.doc.metadata_),
+                    ]
+                ),
+                _Result(rows=[]),
+            ]
+        )
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(
+            payload["interactions"][0]["interaction"]["id"],
+            "live-question",
+        )
+        self.assertEqual(payload["interactions"][0]["line_number"], 0)
+
     async def test_latest_agent_message_uses_indexed_assistant_line(self) -> None:
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=4298),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=4298),
+            ]
+        )
 
         payload = await get_latest_agent_message(
             self.doc_id,
@@ -194,20 +358,24 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DOCUMENTS.CONTENT", latest_sql)
 
     async def test_prompts_prefer_normalized_rows(self) -> None:
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=2),
-            _Result(rows=[
-                (7, 12, "A prompt", self.now, {}),
-                (
-                    8,
-                    13,
-                    "The selected answer",
-                    self.now,
-                    {"interaction_response": {"interaction_id": "question-1"}},
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=2),
+                _Result(
+                    rows=[
+                        (7, 12, "A prompt", self.now, {}),
+                        (
+                            8,
+                            13,
+                            "The selected answer",
+                            self.now,
+                            {"interaction_response": {"interaction_id": "question-1"}},
+                        ),
+                    ]
                 ),
-            ]),
-        ])
+            ]
+        )
 
         payload = await get_conversation_prompts(
             self.doc_id,
@@ -232,21 +400,25 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         correction: AsyncMock,
     ) -> None:
         correction.return_value = "stale clean lookup"
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(rows=[]),
-            _Result(rows=[
-                {
-                    "id": 9,
-                    "line_number": 22,
-                    "role": "assistant",
-                    "content": "The stale clean lookup is now indexed.",
-                    "timestamp": self.now,
-                    "score": 4.1,
-                    "match_type": "full_text",
-                },
-            ]),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(rows=[]),
+                _Result(
+                    rows=[
+                        {
+                            "id": 9,
+                            "line_number": 22,
+                            "role": "assistant",
+                            "content": "The stale clean lookup is now indexed.",
+                            "timestamp": self.now,
+                            "score": 4.1,
+                            "match_type": "full_text",
+                        },
+                    ]
+                ),
+            ]
+        )
 
         payload = await search_conversation_messages(
             self.doc_id,
@@ -267,7 +439,9 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("documents.content", search_sql)
         self.assertNotIn(" %> ", search_sql)
 
-    async def test_metadata_counts_normalized_rows_and_scopes_codex_hierarchy(self) -> None:
+    async def test_metadata_counts_normalized_rows_and_scopes_codex_hierarchy(
+        self,
+    ) -> None:
         root_thread_id = self.doc.metadata_["session_id"]
         self.doc.metadata_["thread_id"] = root_thread_id
         child = SimpleNamespace(
@@ -287,13 +461,15 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             synced_at=self.now,
             file_size_bytes=60 * 1024 * 1024,
         )
-        db = _Db([
-            _Result(scalar_value=self.doc),
-            _Result(scalar_value=4306),
-            _Result(scalar_value=None),
-            _Result(rows=[self.doc, child]),
-            _Result(rows=[]),
-        ])
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=4306),
+                _Result(scalar_value=None),
+                _Result(rows=[self.doc, child]),
+                _Result(rows=[]),
+            ]
+        )
 
         payload = await get_conversation(
             self.doc_id,

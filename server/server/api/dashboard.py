@@ -114,6 +114,40 @@ async def get_dashboard(
     recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
     candidate_rows = list((await db.execute(recent_convos_q)).all())
+    # Pending questions are an inbox, not merely recent activity. Pin every
+    # active interaction even when its thread falls outside the bounded recent
+    # window, then fold any child result into its logical root below.
+    attention_convos_q = (
+        select(
+            Document.id,
+            Document.tool_id,
+            Document.title,
+            Document.synced_at,
+            Document.project_id,
+            Document.file_size_bytes,
+            Project.title.label("project_title"),
+            Document.relative_path,
+            Document.metadata_,
+            Document.source_modified_at,
+            Document.activity_at,
+        )
+        .outerjoin(Project, Document.project_id == Project.id)
+        .where(
+            Document.category == "conversation",
+            Document.metadata_.op("?")("pending_question_count"),
+            Document.metadata_["pending_question_count"].astext != "0",
+        )
+    )
+    attention_convos_q = _apply_device_filter(attention_convos_q, device_id)
+    attention_convos_q = apply_user_filter(
+        attention_convos_q,
+        mids,
+        Document.machine_id,
+    )
+    rows_by_id = {row.id: row for row in candidate_rows}
+    for row in (await db.execute(attention_convos_q)).all():
+        rows_by_id[row.id] = row
+    candidate_rows = list(rows_by_id.values())
 
     candidate_refs = [
         ConversationRef(
@@ -182,21 +216,48 @@ async def get_dashboard(
         conversation_hierarchy,
         conversation_refs,
     )
-    convos_rows = sorted(
-        (
-            row
-            for row in all_convo_rows
-            if row.id in conversation_hierarchy.visible_document_ids
-        ),
-        key=lambda row: (
+    pending_question_counts: dict = {}
+    for row in all_convo_rows:
+        metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
+        try:
+            count = max(0, int(metadata.get("pending_question_count") or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if not count:
+            continue
+        canonical_id = conversation_hierarchy.canonical_document_ids.get(
+            row.id,
+            row.id,
+        )
+        pending_question_counts[canonical_id] = (
+            pending_question_counts.get(canonical_id, 0) + count
+        )
+    visible_convo_rows = [
+        row
+        for row in all_convo_rows
+        if row.id in conversation_hierarchy.visible_document_ids
+    ]
+    def activity_key(row):
+        return (
             logical_activity_by_document.get(row.id)
             or row.activity_at
             or row.source_modified_at
             or row.synced_at,
             str(row.id),
-        ),
-        reverse=True,
-    )[:20]
+        )
+    attention_rows = [
+        row
+        for row in visible_convo_rows
+        if pending_question_counts.get(row.id, 0) > 0
+    ]
+    attention_ids = {row.id for row in attention_rows}
+    recent_rows = [
+        row for row in visible_convo_rows if row.id not in attention_ids
+    ]
+    convos_rows = (
+        sorted(attention_rows, key=activity_key, reverse=True)
+        + sorted(recent_rows, key=activity_key, reverse=True)[:20]
+    )
 
     # Batch both display counts and meaningful human/assistant activity in one
     # GROUP BY instead of one query per document.
@@ -227,6 +288,8 @@ async def get_dashboard(
     recent_conversations = []
     for r in convos_rows:
         activity_at = logical_activity_by_document.get(r.id) or r.activity_at
+        metadata = r.metadata_ if isinstance(r.metadata_, dict) else {}
+        pending_question_count = pending_question_counts.get(r.id, 0)
         total, users, assistants, characters = msg_activity.get(
             r.id,
             (0, 0, 0, 0),
@@ -239,6 +302,8 @@ async def get_dashboard(
             "synced_at": r.synced_at.isoformat(),
             "project_title": r.project_title,
             "message_count": total,
+            "pending_question_count": pending_question_count,
+            "agent_mode": str(metadata.get("_assistant_agent_mode") or ""),
             "subagent_count": conversation_hierarchy.subagent_counts.get(r.id, 0),
             "is_subagent_orphan": (
                 r.id in conversation_hierarchy.orphan_document_ids

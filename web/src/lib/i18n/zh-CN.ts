@@ -114,6 +114,7 @@ const zhCN = {
     conversations: "对话",
     today: "今日",
     weeklyActivity: "近 7 日活动",
+    needsAttention: "需要处理",
     recentConversations: "最近对话",
   },
 
@@ -199,6 +200,7 @@ const zhCN = {
     interactiveQuestion: "交互式问题",
     answered: "已回答",
     awaitingResponse: "等待回答",
+    planMode: "计划模式",
     cancelled: "已取消",
     chooseOne: "选择一项",
     chooseMany: "可选择多项",
@@ -232,6 +234,7 @@ const zhCN = {
     clearSearch: "清除对话搜索",
     matchingMessages: "{count} 条匹配消息",
     noMatchingMessages: "没有匹配的消息",
+    recentSearches: "最近搜索",
     closePromptNavigator: "关闭提示词导航",
     promptFallback: "提示词 {number}",
     lastActivity: "最近活动",

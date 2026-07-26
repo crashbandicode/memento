@@ -169,10 +169,84 @@ def _run_migrations(conn) -> None:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN embedding_content_hash VARCHAR(64)"
         ))
+    if "embedding_tier" not in doc_cols:
+        # Additive: existing corpus stays on the quality (1024-d) path. No
+        # mass re-embed. Fast tier is opt-in via MEMENTO_EMBEDDING_TIERING_ENABLED
+        # for newly routed documents only.
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN embedding_tier VARCHAR(20) "
+            "NOT NULL DEFAULT 'quality'"
+        ))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_documents_embedding_retry "
         "ON documents (embedding_status, embedding_attempts, embedding_claimed_at)"
     ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_documents_embedding_tier "
+        "ON documents (embedding_tier, embedding_status)"
+    ))
+
+    # Per-chunk model identity enables incremental embedding updates. Historical
+    # rows stay NULL and are safely recognized by exact chunk text until their
+    # document next changes; no corpus-wide vector rewrite is required.
+    if "document_embeddings" in tables:
+        embedding_cols = {c["name"] for c in insp.get_columns("document_embeddings")}
+        if "chunk_hash" not in embedding_cols:
+            conn.execute(text(
+                "ALTER TABLE document_embeddings ADD COLUMN chunk_hash VARCHAR(64)"
+            ))
+        if "model_name" not in embedding_cols:
+            conn.execute(text(
+                "ALTER TABLE document_embeddings ADD COLUMN model_name VARCHAR(200)"
+            ))
+        if "backend" not in embedding_cols:
+            conn.execute(text(
+                "ALTER TABLE document_embeddings ADD COLUMN backend VARCHAR(32)"
+            ))
+        if "profile_signature" not in embedding_cols:
+            conn.execute(text(
+                "ALTER TABLE document_embeddings "
+                "ADD COLUMN profile_signature VARCHAR(80)"
+            ))
+
+    # Fast-tier table (384-d). Separate from document_embeddings so dimensions
+    # are never padded or mixed in one HNSW index. create_all also defines this
+    # model; the DDL here covers existing deployments before metadata create.
+    if "document_embeddings_fast" not in tables:
+        sp_fast = conn.begin_nested()
+        try:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS document_embeddings_fast ("
+                "id UUID PRIMARY KEY, "
+                "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+                "chunk_index INTEGER NOT NULL, "
+                "chunk_text TEXT NOT NULL, "
+                "chunk_hash VARCHAR(64), "
+                "model_name VARCHAR(200), "
+                "backend VARCHAR(32), "
+                "profile_signature VARCHAR(80), "
+                "embedding vector(384) NOT NULL, "
+                "created_at TIMESTAMPTZ DEFAULT now(), "
+                "CONSTRAINT uq_doc_embedding_fast_chunk "
+                "UNIQUE (document_id, chunk_index)"
+                ")"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_doc_embedding_fast_doc "
+                "ON document_embeddings_fast (document_id)"
+            ))
+            sp_fast.commit()
+        except Exception:
+            sp_fast.rollback()
+    else:
+        fast_embedding_cols = {
+            c["name"] for c in insp.get_columns("document_embeddings_fast")
+        }
+        if "profile_signature" not in fast_embedding_cols:
+            conn.execute(text(
+                "ALTER TABLE document_embeddings_fast "
+                "ADD COLUMN profile_signature VARCHAR(80)"
+            ))
 
     # knowledge_status / knowledge_attempts: same pattern as the embedding
     # pair, added later to give a way to retry LLM extraction. Existing rows
@@ -325,6 +399,34 @@ def _run_migrations(conn) -> None:
     # Performance indexes (idempotent). Each runs in its own savepoint so a
     # single failure doesn't abort the whole migration tx.
     for stmt in (
+        # These append/update-heavy tables need vacuum/analyze decisions based
+        # on a small absolute fraction of the table. PostgreSQL's default 20%
+        # scale factor leaves hundreds of thousands of dead message tuples
+        # behind and makes ingest/search bursts unnecessarily CPU-heavy.
+        "ALTER TABLE conversation_messages SET ("
+        "autovacuum_vacuum_scale_factor = 0.02, "
+        "autovacuum_vacuum_threshold = 10000, "
+        "autovacuum_analyze_scale_factor = 0.01, "
+        "autovacuum_analyze_threshold = 5000"
+        ")",
+        "ALTER TABLE document_embeddings SET ("
+        "autovacuum_vacuum_scale_factor = 0.05, "
+        "autovacuum_vacuum_threshold = 1000, "
+        "autovacuum_analyze_scale_factor = 0.02, "
+        "autovacuum_analyze_threshold = 500"
+        ")",
+        "ALTER TABLE document_embeddings_fast SET ("
+        "autovacuum_vacuum_scale_factor = 0.05, "
+        "autovacuum_vacuum_threshold = 1000, "
+        "autovacuum_analyze_scale_factor = 0.02, "
+        "autovacuum_analyze_threshold = 500"
+        ")",
+        "ALTER TABLE documents SET ("
+        "autovacuum_vacuum_scale_factor = 0.05, "
+        "autovacuum_vacuum_threshold = 250, "
+        "autovacuum_analyze_scale_factor = 0.02, "
+        "autovacuum_analyze_threshold = 100"
+        ")",
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_timestamp ON conversation_messages (timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_doc_ts ON conversation_messages (document_id, timestamp)",
         # Partial index for the daily / dashboard hot path: filter user+assistant
@@ -366,6 +468,10 @@ def _run_migrations(conn) -> None:
         # 0.5+ required. Dim must match Vector(1024) in DocumentEmbedding.
         "CREATE INDEX IF NOT EXISTS idx_doc_embedding_hnsw "
         "ON document_embeddings USING hnsw (embedding vector_cosine_ops)",
+        # Separate HNSW for the fast (384-d) table. Never share an index with
+        # the 1024-d quality vectors.
+        "CREATE INDEX IF NOT EXISTS idx_doc_embedding_fast_hnsw "
+        "ON document_embeddings_fast USING hnsw (embedding vector_cosine_ops)",
     ):
         sp = conn.begin_nested()
         try:
@@ -404,13 +510,60 @@ async def _warm_embedding_server() -> None:
     await asyncio.sleep(5)
     try:
         from .services.embedding_service import _call_embedding_server
-        v = await _call_embedding_server(["warmup"], timeout=30.0)
+        v = await _call_embedding_server(
+            ["warmup"],
+            timeout=30.0,
+            purpose="query",
+        )
         if v and v[0]:
             log.info("embedding server warmed (dim=%d)", len(v[0]))
         else:
             log.info("embedding server warmup returned empty — service likely down")
     except Exception as e:
         log.info("embedding warmup skipped: %s", e)
+
+
+async def _require_fast_embedding_server() -> None:
+    """Reject a half-enabled tiering deployment with a clear startup error."""
+    import asyncio
+
+    from .services.embedding_service import (
+        TIER_FAST,
+        embedding_profile,
+        embedding_tiering_enabled,
+        tiers_with_searchable_rows,
+        validate_embedding_profile_server,
+    )
+
+    fast_required = embedding_tiering_enabled()
+    if not fast_required:
+        from .db.session import async_session_factory
+
+        async with async_session_factory() as db:
+            fast_required = TIER_FAST in await tiers_with_searchable_rows(
+                db,
+                machine_ids=None,
+            )
+    if not fast_required:
+        return
+    profile = embedding_profile(TIER_FAST)
+    last_error: Exception | None = None
+    # Compose starts profiled services concurrently. Give the baked model time
+    # to load, but do not accept traffic that would be routed into a dead tier.
+    for _ in range(30):
+        try:
+            await validate_embedding_profile_server(profile, timeout=3.0)
+            return
+        except Exception as exc:
+            last_error = exc
+            await asyncio.sleep(2)
+    raise RuntimeError(
+        "The fast embedding service is required by tiering or persisted fast "
+        "vectors, but it is not ready. "
+        "Start the deployment with `docker compose --profile embedding-fast "
+        "up -d`; disabling MEMENTO_EMBEDDING_TIERING_ENABLED is sufficient "
+        "only after no searchable fast-tier rows remain."
+    ) from last_error
 
 
 @asynccontextmanager
@@ -420,6 +573,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     async with engine.begin() as conn:
         await conn.run_sync(_run_migrations)
         await conn.run_sync(Base.metadata.create_all)
+    await _require_fast_embedding_server()
     # Start daily compaction in background
     compaction_task = asyncio.create_task(_schedule_daily_compaction())
     # Fire-and-forget warmup of the embedding server (5s after boot)

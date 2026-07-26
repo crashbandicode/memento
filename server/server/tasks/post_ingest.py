@@ -25,7 +25,7 @@ logger = logging.getLogger("post_ingest_task")
 
 _SUPPORTED_CATEGORIES = {"conversation", "memory", "learning", "plan", "identity"}
 _MIN_QUIET_SECONDS = 120
-_MAX_QUIET_SECONDS = 300
+_MAX_QUIET_SECONDS = 1800
 POST_INGEST_CONTENTION_RETRY_SECONDS = 30
 POST_INGEST_COALESCE_RECHECK_SECONDS = 5
 POST_INGEST_COALESCE_TTL_SECONDS = 60 * 60
@@ -67,12 +67,12 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
 
 
 # Actively-written transcripts otherwise re-run a full CPU-heavy BGE-M3 pass
-# after every append. Keep the quiet period deliberately bounded: shorter than
-# two minutes does not debounce normal agent turns, while longer than five makes
-# semantic search feel broken after an agent stops.
+# after every append. Ten minutes avoids repeatedly re-embedding a large live
+# agent transcript during short thinking/review pauses. The value remains
+# bounded and configurable for deployments that prefer fresher semantic search.
 POST_INGEST_QUIET_SECONDS = _bounded_env_int(
     "MEMENTO_POST_INGEST_QUIET_SECONDS",
-    180,
+    600,
     _MIN_QUIET_SECONDS,
     _MAX_QUIET_SECONDS,
 )

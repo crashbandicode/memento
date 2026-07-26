@@ -65,6 +65,7 @@ class NormalizedMessage:
     model: str = ""
     reasoning_effort: str = ""
     service_tier: str = ""
+    agent_mode: str = ""
     # Cross-tool task snapshot captured from Codex update_plan, Claude
     # TodoWrite/TaskUpdate, or Cursor composer todos.
     task_state: dict[str, object] | None = None
@@ -80,6 +81,7 @@ class AssistantIdentityState:
     model: str = ""
     reasoning_effort: str = ""
     service_tier: str = ""
+    agent_mode: str = ""
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -610,6 +612,24 @@ def _set_identity_field(
     return False
 
 
+def _set_agent_mode(state: AssistantIdentityState, payload: dict) -> bool:
+    """Apply a native collaboration mode while preserving explicit clears."""
+    for key in ("collaboration_mode", "collaborationMode"):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if isinstance(value, dict):
+            value = value.get("mode") or value.get("kind")
+        state.agent_mode = _bounded_identity_text(value)
+        return True
+    return _set_identity_field(
+        state,
+        payload,
+        ("collaboration_mode_kind", "collaborationModeKind", "agent_mode"),
+        "agent_mode",
+    )
+
+
 def _has_claude_thinking_block(content: object) -> bool:
     """Return whether a Claude response records extended-thinking use."""
     return isinstance(content, list) and any(
@@ -645,6 +665,7 @@ def _update_assistant_identity(
                 ("service_tier", "serviceTier"),
                 "service_tier",
             )
+            _set_agent_mode(state, payload)
             return
         if (
             msg_type == "event_msg"
@@ -664,6 +685,10 @@ def _update_assistant_identity(
                 ("service_tier", "serviceTier"),
                 "service_tier",
             )
+            _set_agent_mode(state, settings)
+            return
+        if msg_type == "event_msg" and payload.get("type") == "task_started":
+            _set_agent_mode(state, payload)
             return
 
     if tool_id == "claude_code":
@@ -725,12 +750,17 @@ def _attach_assistant_identity(
     message: NormalizedMessage,
     state: AssistantIdentityState,
 ) -> None:
-    """Copy the active model selection onto assistant presentation rows."""
-    if message.role != "assistant":
+    """Copy active identity onto assistant rows and interactive prompts."""
+    has_interaction = message.interaction is not None or any(
+        isinstance(call, dict) and isinstance(call.get("interaction"), dict)
+        for call in message.tool_calls
+    )
+    if message.role != "assistant" and not has_interaction:
         return
     message.model = state.model
     message.reasoning_effort = state.reasoning_effort
     message.service_tier = state.service_tier
+    message.agent_mode = state.agent_mode
 
 
 def _agent_activity_label(agent_path: object) -> str:
@@ -2512,6 +2542,7 @@ def build_question_response(
         )
         parsed = raw_output if isinstance(raw_output, dict) else {}
     structured_answers = parsed.get("answers")
+    has_structured_answer_payload = isinstance(structured_answers, (dict, list))
     if isinstance(structured_answers, list):
         answers_by_question: dict[str, list[str]] = {}
         for item in structured_answers:
@@ -2544,7 +2575,7 @@ def build_question_response(
             continue
         question_id = _coerce_text(question.get("id"))
         answer_values = _answer_texts(structured_answers.get(question_id))
-        if not answer_values and raw_text:
+        if not answer_values and raw_text and not has_structured_answer_payload:
             prompt = _coerce_text(question.get("prompt"))
             next_prompt = None
             if index + 1 < len(questions) and isinstance(questions[index + 1], dict):
@@ -2552,7 +2583,12 @@ def build_question_response(
             claude_answer = _claude_answer_for_prompt(raw_text, prompt, next_prompt)
             if claude_answer:
                 answer_values = [claude_answer]
-        if not answer_values and len(questions) == 1 and raw_text:
+        if (
+            not answer_values
+            and len(questions) == 1
+            and raw_text
+            and not has_structured_answer_payload
+        ):
             answer_values = [raw_text]
 
         combined = "\n".join(answer_values)
@@ -2581,7 +2617,12 @@ def build_question_response(
             })
 
     lowered = raw_text.casefold()
-    status = "cancelled" if "cancel" in lowered and not answers else "answered"
+    status = (
+        "cancelled"
+        if not answers
+        and (has_structured_answer_payload or "cancel" in lowered)
+        else "answered"
+    )
     return {
         "kind": "question_response",
         "interaction_id": _bounded_interaction_text(interaction.get("id"), 512),

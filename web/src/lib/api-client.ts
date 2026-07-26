@@ -258,6 +258,8 @@ export interface ConversationMeta {
   relative_path: string;
   metadata: Record<string, unknown>;
   active_task_state?: ConversationTaskState | null;
+  pending_question_count?: number;
+  agent_mode?: string | null;
   message_count: number;
   subagent_count?: number;
   is_subagent_orphan?: boolean;
@@ -275,7 +277,11 @@ export interface ConversationMarkdownExportSettings {
   project_ids?: string[];
   include_subagents?: boolean;
   include_low_activity?: boolean;
+  include_user: boolean;
+  include_assistant: boolean;
   include_tools: boolean;
+  include_tasks: boolean;
+  include_agents: boolean;
   include_thinking: boolean;
   include_session_context: boolean;
   include_timestamps: boolean;
@@ -378,6 +384,7 @@ export interface ConversationMessage {
   model?: string | null;
   reasoning_effort?: string | null;
   service_tier?: string | null;
+  agent_mode?: string | null;
   session_context?: string | null;
   attachments?: ConversationAttachment[];
   tool_name?: string;
@@ -412,6 +419,33 @@ export interface MessagesResponse {
   offset: number;
   limit: number;
   messages: ConversationMessage[];
+}
+
+export interface PendingConversationInteraction {
+  document_id: string;
+  source_title?: string | null;
+  message_id: number;
+  line_number: number;
+  interaction: QuestionInteraction;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  service_tier?: string | null;
+  agent_mode?: string | null;
+  timestamp: string | null;
+}
+
+export interface InferredConversationInteractionResponse {
+  document_id: string;
+  message_id: number;
+  line_number: number;
+  response: QuestionInteractionResponse;
+  timestamp: string | null;
+}
+
+export interface PendingConversationInteractionsResponse {
+  count: number;
+  interactions: PendingConversationInteraction[];
+  inferred_responses: InferredConversationInteractionResponse[];
 }
 
 export interface LatestAgentMessageResponse {
@@ -666,7 +700,11 @@ export const api = {
     if (settings.start_at) params.set("start_at", settings.start_at);
     if (settings.end_at) params.set("end_at", settings.end_at);
     if (settings.prompt_range) params.set("prompt_range", settings.prompt_range);
+    params.set("include_user", String(settings.include_user));
+    params.set("include_assistant", String(settings.include_assistant));
     params.set("include_tools", String(settings.include_tools));
+    params.set("include_tasks", String(settings.include_tasks));
+    params.set("include_agents", String(settings.include_agents));
     params.set("include_thinking", String(settings.include_thinking));
     params.set("include_session_context", String(settings.include_session_context));
     params.set("include_timestamps", String(settings.include_timestamps));
@@ -682,6 +720,11 @@ export const api = {
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
   getLatestMessages: (id: string, limit = 200) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?tail=true&limit=${limit}`),
+  getPendingInteractions: (id: string) =>
+    apiFetch<PendingConversationInteractionsResponse>(
+      `/api/conversations/${id}/pending-interactions`,
+      { cache: "no-store" },
+    ),
   getLatestAgentMessage: (id: string) =>
     apiFetch<LatestAgentMessageResponse>(
       `/api/conversations/${id}/latest-agent-message`,
