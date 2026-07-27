@@ -104,8 +104,8 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           ( cd deploy/k8s && kustomize edit set image \
-              "${REGISTRY}/${OWNER}/memento-server=${REGISTRY}/${OWNER}/memento-server:${SHA}" \
-              "${REGISTRY}/${OWNER}/memento-web=${REGISTRY}/${OWNER}/memento-web:${SHA}" )
+              "${REGISTRY}/ddong8/memento-server=${REGISTRY}/${OWNER}/memento-server:${SHA}" \
+              "${REGISTRY}/ddong8/memento-web=${REGISTRY}/${OWNER}/memento-web:${SHA}" )
           # 断言 tag 确实回写成功
           grep -q "memento-server" deploy/k8s/kustomization.yaml && grep -q "${SHA}" deploy/k8s/kustomization.yaml \
             || { echo "镜像 tag 回写失败"; exit 1; }
