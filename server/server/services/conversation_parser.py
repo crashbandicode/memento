@@ -179,6 +179,10 @@ _CURSOR_REDACTED_TRANSPORT_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _CLAUDE_QUEUE_MATCH_WINDOW_SECONDS = 24 * 60 * 60
+_SCHEDULED_AUTOMATION_RE = re.compile(
+    r"^\s*(?:\[(?:AUTO|CRON)\b|#\s*/(?:loop|cron)\b)",
+    re.IGNORECASE,
+)
 
 
 class _ClaudeQueueCandidate(Protocol):
@@ -216,6 +220,11 @@ def normalize_codex_user_payload(content: str) -> tuple[str, str]:
     if _CODEX_SYSTEM_CONTEXT_RE.match(text):
         return "system", text
     return "user", text
+
+
+def is_scheduled_automation_content(content: str | None) -> bool:
+    """Return whether text is an agent-scheduled instruction, not a human turn."""
+    return bool(_SCHEDULED_AUTOMATION_RE.match(content or ""))
 
 
 def is_claude_session_context_record(obj: dict) -> bool:
@@ -851,6 +860,21 @@ def _status_prefix_from_tool_content(content: str) -> str:
     return match.group("status").strip()
 
 
+def _tool_content_payload(content: object) -> dict:
+    text = _coerce_text(content)
+    parsed = _json_mapping(text)
+    if parsed:
+        return parsed
+    stripped = re.sub(
+        r"^Status:\s*[A-Za-z0-9_\- ]+\s*(?:\n+|$)",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    return _json_mapping(stripped)
+
+
 def normalize_task_spawn_agent_event(
     tool_name: object,
     tool_input: object,
@@ -1089,13 +1113,20 @@ def parse_conversation_object(
             if not content.strip():
                 content = thinking
                 thinking = ""
-            if role == "user" and is_claude_session_context_record(obj):
+            scheduled_automation = is_scheduled_automation_content(content)
+            if role == "user" and (
+                is_claude_session_context_record(obj) or scheduled_automation
+            ):
                 return NormalizedMessage(
                     role="system",
                     content=content,
                     thinking=thinking,
                     timestamp=timestamp,
-                    raw_type="claude_context",
+                    raw_type=(
+                        "scheduled_automation"
+                        if scheduled_automation
+                        else "claude_context"
+                    ),
                     source_id=source_id,
                 )
             return NormalizedMessage(
@@ -1137,11 +1168,16 @@ def parse_conversation_object(
                 "claude-queue:"
                 + hashlib.sha256(queue_identity.encode("utf-8")).hexdigest()
             )
+            scheduled_automation = is_scheduled_automation_content(content)
             return NormalizedMessage(
-                role="user",
+                role="system" if scheduled_automation else "user",
                 content=content,
                 timestamp=timestamp,
-                raw_type="queued_user_message",
+                raw_type=(
+                    "queued_scheduled_automation"
+                    if scheduled_automation
+                    else "queued_user_message"
+                ),
                 source_id=queue_source_id,
             )
 
@@ -1564,12 +1600,11 @@ def parse_conversation_object(
             )
             interaction_response = None
             if interaction is not None:
-                response_payload = _json_mapping(content)
-                if "answers" in response_payload or "cancel" in content.casefold():
-                    interaction_response = build_question_response(
-                        interaction,
-                        content,
-                    )
+                interaction_response = build_cursor_question_response(
+                    interaction,
+                    content,
+                    obj.get("tool_status"),
+                )
             agent_event = normalize_task_spawn_agent_event(
                 tool_name,
                 tool_input,
@@ -2534,7 +2569,7 @@ def build_question_response(
     """Build a shared answer model from structured or human-readable output."""
     if isinstance(raw_output, str):
         raw_text = _bounded_interaction_text(raw_output, 16 * 1024)
-        parsed = _json_mapping(raw_output)
+        parsed = _tool_content_payload(raw_output)
     else:
         raw_text = _bounded_interaction_text(
             json.dumps(raw_output, ensure_ascii=False, default=str),
@@ -2630,6 +2665,27 @@ def build_question_response(
         "answers": answers,
         "raw_text": raw_text,
     }
+
+
+def build_cursor_question_response(
+    interaction: dict[str, object],
+    content: object,
+    tool_status: object = "",
+) -> dict[str, object] | None:
+    """Recognize Cursor state rows whose submitted answer follows a status line."""
+    text = _coerce_text(content)
+    payload = _tool_content_payload(text)
+    status = (
+        _coerce_text(tool_status).strip().casefold()
+        or _status_prefix_from_tool_content(text).casefold()
+    )
+    if (
+        "answers" not in payload
+        and "cancel" not in text.casefold()
+        and status not in {"answered", "completed", "submitted", "success"}
+    ):
+        return None
+    return build_question_response(interaction, payload or text)
 
 
 def normalize_tool_calls(value: object) -> list[dict[str, object]]:
@@ -2894,14 +2950,23 @@ def _iter_claude_conversation_messages(
         for message in _parse_claude_record_messages(source_object):
             _attach_assistant_identity(message, identity)
 
-            if message.role == "user" and message.raw_type == "user":
+            if (
+                (message.role == "user" and message.raw_type == "user")
+                or (
+                    message.role == "system"
+                    and message.raw_type == "scheduled_automation"
+                )
+            ):
                 if pop_matching_claude_queue_user(
                     pending_queue,
                     message.content,
                     message.timestamp,
                 ) is not None:
                     continue
-            if message.raw_type == "queued_user_message":
+            if message.raw_type in {
+                "queued_user_message",
+                "queued_scheduled_automation",
+            }:
                 pending_queue[message.content.strip()].append(message)
 
             if message.tool_call_id and message.tool_call_id in pending_questions:
@@ -3522,8 +3587,13 @@ def iter_conversation_messages(
         if (
             tool_id == "claude_code"
             and message is not None
-            and message.role == "user"
-            and message.raw_type == "user"
+            and (
+                (message.role == "user" and message.raw_type == "user")
+                or (
+                    message.role == "system"
+                    and message.raw_type == "scheduled_automation"
+                )
+            )
         ):
             if pop_matching_claude_queue_user(
                 pending_claude_queue,
@@ -3535,7 +3605,8 @@ def iter_conversation_messages(
         if (
             tool_id == "claude_code"
             and message is not None
-            and message.raw_type == "queued_user_message"
+            and message.raw_type
+            in {"queued_user_message", "queued_scheduled_automation"}
         ):
             pending_claude_queue[message.content.strip()].append(message)
 

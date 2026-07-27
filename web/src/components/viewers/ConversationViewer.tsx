@@ -212,14 +212,17 @@ const PROMPT_JUMP_CONTEXT_BEFORE = 12;
 const PROMPT_JUMP_WINDOW_SIZE = 120;
 const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
 const LIVE_SCROLL_FOLLOW_THRESHOLD = 72;
+const PAGE_LOAD_SCROLL_THRESHOLD = 300;
 
 type ConversationVisibilityKey = keyof ConversationVisibility;
 
 function isSessionContextMessage(msg: ConversationMessage): boolean {
   const content = cleanTerminalText(msg.content);
-  return /(?:^|_)(?:codex|claude|cursor)_context$/i.test(
+  return /(?:^|_)(?:(?:codex|claude|cursor)_context|(?:queued_)?scheduled_automation)$/i.test(
     msg.raw_type || msg.message_type || "",
-  ) || /^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)/i.test(content);
+  )
+    || isScheduledSystemContent(content)
+    || /^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)/i.test(content);
 }
 
 function isSubagentDispatchMessage(msg: ConversationMessage): boolean {
@@ -261,6 +264,7 @@ function messageVisibilityGroups(
   questionResponses: ReadonlyMap<string, PairedQuestionResponse>,
 ): ConversationVisibilityKey[] {
   const role = msg.role || msg.message_type || "unknown";
+  if (isScheduledSystemContent(msg.content)) return ["context"];
   if (msg.interaction_response && !messageOwnsQuestionResponse(msg)) return ["user"];
   if (role === "user") return [isSubagentDispatchMessage(msg) ? "context" : "user"];
   if (role === "assistant") {
@@ -360,6 +364,7 @@ export default function ConversationViewer({
   const promptLinesRef = useRef<number[]>([]);
   const detachedTailRef = useRef<DetachedTail | null>(null);
   const pendingScrollAnchorRef = useRef<ScrollAnchor | null>(null);
+  const lastScrollTopRef = useRef(0);
   const { t, locale } = useI18n();
   const updateDetachedTail = useCallback((next: DetachedTail | null) => {
     detachedTailRef.current = next;
@@ -476,7 +481,6 @@ export default function ConversationViewer({
       const res = await api.getMessages(documentId, offsetRef.current, MESSAGE_PAGE_SIZE);
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
-        if (rangeLoadedRef.current) preserveScrollForNextRender();
         if (!rangeLoadedRef.current) {
           startOffsetRef.current = res.offset;
           rangeLoadedRef.current = true;
@@ -577,6 +581,7 @@ export default function ConversationViewer({
     syncingTailRef.current = false;
     detachedTailRef.current = null;
     pendingScrollAnchorRef.current = null;
+    lastScrollTopRef.current = 0;
     setHasMore(true);
     setHasEarlier(false);
     setKnownTotal(totalMessages);
@@ -668,6 +673,10 @@ export default function ConversationViewer({
   const handleScroll = () => {
     const el = containerRef.current;
     if (!el) return;
+    const previousScrollTop = lastScrollTopRef.current;
+    const scrollingUp = el.scrollTop < previousScrollTop;
+    const scrollingDown = el.scrollTop > previousScrollTop;
+    lastScrollTopRef.current = el.scrollTop;
     // Ignore scroll-derived prompt tracking while a programmatic jump is in
     // flight. Large conversations keep the opening page mounted under a
     // detached live tail; reading prompts at scrollTop 0 during that window
@@ -687,22 +696,29 @@ export default function ConversationViewer({
         setActivePromptLine((previous) => previous === currentLine ? previous : currentLine);
       }
     }
+    if (scrollingUp && el.scrollTop <= PAGE_LOAD_SCROLL_THRESHOLD && hasEarlier) {
+      void loadEarlier();
+      return;
+    }
     if (detachedTailRef.current) {
       const marker = el.querySelector<HTMLElement>("[data-message-gap]");
       if (marker) {
         const markerBounds = marker.getBoundingClientRect();
         const containerBounds = el.getBoundingClientRect();
         if (
-          markerBounds.top <= containerBounds.bottom + 300
+          markerBounds.top <= containerBounds.bottom + PAGE_LOAD_SCROLL_THRESHOLD
           && markerBounds.bottom >= containerBounds.top - 100
         ) {
-          loadMore();
+          void loadMore();
         }
       }
       return;
     }
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
-      loadMore();
+    if (
+      scrollingDown
+      && el.scrollTop + el.clientHeight >= el.scrollHeight - PAGE_LOAD_SCROLL_THRESHOLD
+    ) {
+      void loadMore();
     }
   };
 
@@ -905,6 +921,7 @@ export default function ConversationViewer({
     const isHumanPrompt = (msg.role || msg.message_type) === "user"
       && !msg.interaction_response
       && !msg.content.includes("[Subagent Context]")
+      && !isScheduledSystemContent(msg.content)
       && !/<system_notification\b/i.test(msg.content)
       && !/the following task has finished/i.test(msg.content);
     const visibilityGroups = messageVisibilityGroups(msg, toolId || "", questionResponses);
@@ -3024,10 +3041,26 @@ function QuestionResponseCard({
   );
 }
 
+function isScheduledSystemContent(content: string): boolean {
+  const normalized = cleanTerminalText(content).trimStart();
+  return /^\[(?:AUTO|CRON)\b/i.test(normalized)
+    || /^#\s*\/(?:loop|cron)\b/i.test(normalized);
+}
+
+function scheduledSystemSummary(content: string): string {
+  const firstLine = cleanTerminalText(content).trim().split(/\r?\n/, 1)[0] || "";
+  const bracketed = firstLine.match(/^\[(?:AUTO|CRON)\s+(.+?)\]$/i);
+  if (!bracketed) return firstLine.replace(/^#+\s*/, "").slice(0, 180);
+  return bracketed[1].replace(/\s+[—-]\s+/, " · ").slice(0, 180);
+}
+
 function sessionContextSummary(
   content: string,
   t: ReturnType<typeof useI18n>["t"],
 ): string {
+  if (isScheduledSystemContent(content)) {
+    return scheduledSystemSummary(content) || t.conversation.scheduledAutomation;
+  }
   if (/<recommended_plugins\b/i.test(content)) return t.conversation.recommendedPlugins;
   if (/<external_links\b/i.test(content)) return t.conversation.webSearchContext;
   if (/<plugin_info\b/i.test(content)) return t.conversation.pluginContext;
@@ -3053,6 +3086,7 @@ function ConversationContextCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const summary = sessionContextSummary(content, t);
+  const isScheduled = isScheduledSystemContent(content);
 
   return (
     <div
@@ -3098,10 +3132,12 @@ function ConversationContextCard({
             color: "var(--aurora-accent)",
           }}
         >
-          <Icon name="layers" size={14} />
+          <Icon name={isScheduled ? "clock" : "layers"} size={14} />
         </span>
         <span style={{ minWidth: 0, display: "grid", gap: 1 }}>
-          <span style={{ fontSize: 11.5, fontWeight: 650 }}>{t.conversation.sessionContext}</span>
+          <span style={{ fontSize: 11.5, fontWeight: 650 }}>
+            {isScheduled ? t.conversation.scheduledAutomation : t.conversation.sessionContext}
+          </span>
           <span
             style={{
               overflow: "hidden",
@@ -3126,24 +3162,43 @@ function ConversationContextCard({
         />
       </button>
       {expanded && (
-        <pre
-          style={{
-            margin: 0,
-            maxHeight: "min(50vh, 480px)",
-            overflow: "auto",
-            padding: "12px 14px",
-            borderTop: "1px solid var(--aurora-border)",
-            color: "var(--aurora-fg3)",
-            background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
-            fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
-            fontSize: 11,
-            lineHeight: 1.5,
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {content}
-        </pre>
+        isScheduled ? (
+          <div
+            className="prose prose-sm max-w-none"
+            style={{
+              maxHeight: "min(50vh, 480px)",
+              overflow: "auto",
+              padding: "12px 14px",
+              borderTop: "1px solid var(--aurora-border)",
+              color: "var(--aurora-fg3)",
+              background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
+              fontSize: 12,
+              lineHeight: 1.55,
+              overflowWrap: "anywhere",
+            }}
+          >
+            <MarkdownViewer content={content} />
+          </div>
+        ) : (
+          <pre
+            style={{
+              margin: 0,
+              maxHeight: "min(50vh, 480px)",
+              overflow: "auto",
+              padding: "12px 14px",
+              borderTop: "1px solid var(--aurora-border)",
+              color: "var(--aurora-fg3)",
+              background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
+              fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
+              fontSize: 11,
+              lineHeight: 1.5,
+              whiteSpace: "pre-wrap",
+              overflowWrap: "anywhere",
+            }}
+          >
+            {content}
+          </pre>
+        )
       )}
     </div>
   );
@@ -3264,7 +3319,9 @@ export function conversationMessageMarkdown(
 ): string {
   const role = msg.role || msg.message_type || "unknown";
   const content = cleanTerminalText(msg.content);
-  const roleLabel = role === "user"
+  const roleLabel = isScheduledSystemContent(content)
+    ? "Scheduled automation"
+    : role === "user"
     ? (isSubagentDispatchMessage(msg) ? "Subagent dispatch" : "You")
     : role === "assistant"
       ? "Assistant"
@@ -3753,6 +3810,14 @@ export const ChatBubble = memo(function ChatBubble({
         )}
       </MessageCopyFrame>
     );
+  }
+
+  // Older normalized rows may still carry Claude's scheduled queue enqueue as
+  // role=user. Content semantics take precedence so it never appears as human
+  // input while the canonical role repair catches up.
+  if (isScheduledSystemContent(content)) {
+    if (!showContext) return null;
+    return withCopyControls(<ConversationContextCard content={content} t={t} />);
   }
 
   // User — right aligned, violet gradient.

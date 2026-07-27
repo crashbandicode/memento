@@ -85,6 +85,11 @@ CURRENT_ASSISTANT_MODE_KEY = "_assistant_agent_mode"
 CURRENT_PENDING_QUESTIONS_KEY = "_pending_question_ids"
 PENDING_QUESTION_COUNT_KEY = "pending_question_count"
 LIVE_INTERACTION_SIGNALS_KEY = "_live_interaction_signals"
+LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY = "_latest_meaningful_human_timestamp"
+PENDING_QUESTION_RECONCILIATION_VERSION_KEY = (
+    "_pending_question_reconciliation_version"
+)
+PENDING_QUESTION_RECONCILIATION_VERSION = 3
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -99,7 +104,9 @@ _ESSENTIAL_METADATA_KEYS = {
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     CURRENT_PENDING_QUESTIONS_KEY,
+    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
+    PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
     "cwd",
     "first_user_message",
     "forked_from_id",
@@ -131,7 +138,9 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
+    PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
@@ -528,10 +537,59 @@ def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
     return {_bounded_message_text(str(value), 512) for value in stored[:64] if value}
 
 
+def _latest_human_timestamp_for_ingest(doc: Document, mode: str) -> str:
+    if mode != "delta":
+        return ""
+    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    return _bounded_message_text(
+        str(metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY) or ""),
+        128,
+    )
+
+
+def _normalized_interaction_timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def interaction_at_or_before_human(
+    interaction_timestamp: object,
+    human_timestamp: object,
+) -> bool:
+    interaction_at = _normalized_interaction_timestamp(interaction_timestamp)
+    human_at = _normalized_interaction_timestamp(human_timestamp)
+    return (
+        interaction_at is not None
+        and human_at is not None
+        and interaction_at <= human_at
+    )
+
+
+def _newest_interaction_timestamp(current: object, candidate: object) -> str:
+    current_at = _normalized_interaction_timestamp(current)
+    candidate_at = _normalized_interaction_timestamp(candidate)
+    if candidate_at is None:
+        return _bounded_message_text(str(current or ""), 128)
+    if current_at is not None and current_at >= candidate_at:
+        return _bounded_message_text(str(current or ""), 128)
+    return candidate_at.isoformat()
+
+
 def _update_pending_question_ids(
     pending_ids: set[str],
     normalized,
-) -> None:
+    latest_human_timestamp: object = "",
+) -> str:
     interactions = (
         [normalized.interaction] if isinstance(normalized.interaction, dict) else []
     )
@@ -544,7 +602,13 @@ def _update_pending_question_ids(
     for interaction in interactions:
         interaction_id = _bounded_message_text(str(interaction.get("id") or ""), 512)
         if interaction_id:
-            pending_ids.add(interaction_id)
+            if interaction_at_or_before_human(
+                getattr(normalized, "timestamp", ""),
+                latest_human_timestamp,
+            ):
+                pending_ids.discard(interaction_id)
+            else:
+                pending_ids.add(interaction_id)
     response = normalized.interaction_response
     if isinstance(response, dict):
         interaction_id = _bounded_message_text(
@@ -553,10 +617,10 @@ def _update_pending_question_ids(
         )
         if interaction_id:
             pending_ids.discard(interaction_id)
-    elif getattr(normalized, "role", "") == "user" and pending_ids:
-        from .conversation_markdown import is_meaningful_human_prompt
+    if getattr(normalized, "role", "") == "user":
+        from .conversation_markdown import is_meaningful_human_turn
 
-        if is_meaningful_human_prompt(
+        if is_meaningful_human_turn(
             getattr(normalized, "content", ""),
             None,
             getattr(normalized, "role", ""),
@@ -565,6 +629,11 @@ def _update_pending_question_ids(
             # when the source tool was restarted before it emitted a structured
             # tool result. This applies equally to Cursor, Claude, and Codex.
             pending_ids.clear()
+            latest_human_timestamp = _newest_interaction_timestamp(
+                latest_human_timestamp,
+                getattr(normalized, "timestamp", ""),
+            )
+    return _bounded_message_text(str(latest_human_timestamp or ""), 128)
 
 
 def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
@@ -576,6 +645,16 @@ def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
     else:
         metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
         metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
+    doc.metadata_ = metadata
+
+
+def _store_latest_human_timestamp(doc: Document, timestamp: object) -> None:
+    metadata = dict(doc.metadata_ or {})
+    bounded = _bounded_message_text(str(timestamp or ""), 128)
+    if bounded:
+        metadata[LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY] = bounded
+    else:
+        metadata.pop(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY, None)
     doc.metadata_ = metadata
 
 
@@ -638,15 +717,19 @@ def _pending_question_interactions(
     recent_rows: list[ConversationMessage],
 ) -> list[dict[str, object]]:
     """Recover delta-boundary questions without reviving stale Cursor prompts."""
-    from .conversation_parser import CURSOR_QUESTION_RESPONSE_WINDOW
+    from .conversation_parser import (
+        CURSOR_QUESTION_RESPONSE_WINDOW,
+        build_cursor_question_response,
+    )
+    from .conversation_markdown import is_meaningful_human_turn
 
     if not recent_rows:
         return []
 
     newest_line = max(int(row.line_number or 0) for row in recent_rows)
     pending: dict[str, dict[str, object]] = {}
-    resolved: set[str] = set()
-    for recent in reversed(recent_rows):
+    latest_human_timestamp = ""
+    for recent in sorted(recent_rows, key=lambda row: int(row.line_number or 0)):
         metadata = recent.metadata_ if isinstance(recent.metadata_, dict) else {}
         direct = metadata.get("interaction")
         interactions = [direct] if isinstance(direct, dict) else []
@@ -662,7 +745,10 @@ def _pending_question_interactions(
             interaction_id = str(interaction.get("id") or "")
             if not interaction_id:
                 continue
-            if interaction_id in resolved:
+            if interaction_at_or_before_human(
+                getattr(recent, "timestamp", ""),
+                latest_human_timestamp,
+            ):
                 continue
             if (
                 interaction.get("source") == "cursor"
@@ -675,9 +761,197 @@ def _pending_question_interactions(
         if isinstance(response, dict):
             interaction_id = str(response.get("interaction_id") or "")
             if interaction_id:
-                resolved.add(interaction_id)
                 pending.pop(interaction_id, None)
+        else:
+            for interaction in interactions:
+                inferred = build_cursor_question_response(
+                    interaction,
+                    getattr(recent, "content", ""),
+                )
+                if inferred is not None:
+                    pending.pop(str(interaction.get("id") or ""), None)
+        if is_meaningful_human_turn(
+            getattr(recent, "content", ""),
+            metadata,
+            getattr(recent, "role", ""),
+        ):
+            pending.clear()
+            latest_human_timestamp = _newest_interaction_timestamp(
+                latest_human_timestamp,
+                getattr(recent, "timestamp", ""),
+            )
     return list(pending.values())
+
+
+def _advance_stored_pending_questions(
+    pending: dict[str, dict[str, object]],
+    stored,
+    latest_human_timestamp: object = "",
+) -> tuple[set[str], str]:
+    """Apply one canonical DB row to persisted pending-question state."""
+    from .conversation_markdown import is_meaningful_human_turn
+    from .conversation_parser import build_cursor_question_response
+
+    metadata = stored.metadata_ if isinstance(stored.metadata_, dict) else {}
+    direct = metadata.get("interaction")
+    interactions = [direct] if isinstance(direct, dict) else []
+    calls = metadata.get("tool_calls")
+    if isinstance(calls, list):
+        interactions.extend(
+            interaction
+            for call in calls
+            if isinstance(call, dict)
+            and isinstance((interaction := call.get("interaction")), dict)
+        )
+
+    seen: set[str] = set()
+    for interaction in interactions:
+        interaction_id = _bounded_message_text(
+            str(interaction.get("id") or ""),
+            512,
+        )
+        if interaction_id:
+            seen.add(interaction_id)
+            if not interaction_at_or_before_human(
+                getattr(stored, "timestamp", ""),
+                latest_human_timestamp,
+            ):
+                pending[interaction_id] = interaction
+
+    response = metadata.get("interaction_response")
+    if isinstance(response, dict):
+        interaction_id = _bounded_message_text(
+            str(response.get("interaction_id") or ""),
+            512,
+        )
+        if interaction_id:
+            seen.add(interaction_id)
+            pending.pop(interaction_id, None)
+    else:
+        for interaction in interactions:
+            inferred = build_cursor_question_response(
+                interaction,
+                getattr(stored, "content", ""),
+            )
+            if inferred is None:
+                continue
+            interaction_id = _bounded_message_text(
+                str(interaction.get("id") or ""),
+                512,
+            )
+            if interaction_id:
+                seen.add(interaction_id)
+                pending.pop(interaction_id, None)
+    if is_meaningful_human_turn(
+        getattr(stored, "content", ""),
+        metadata,
+        getattr(stored, "role", ""),
+    ):
+        pending.clear()
+        latest_human_timestamp = _newest_interaction_timestamp(
+            latest_human_timestamp,
+            getattr(stored, "timestamp", ""),
+        )
+    return seen, _bounded_message_text(str(latest_human_timestamp or ""), 128)
+
+
+async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
+    """One-time repair for badges persisted before human-turn reconciliation."""
+    documents = (
+        (
+            await db.execute(
+                select(Document).where(
+                    Document.category == "conversation",
+                    Document.metadata_.op("?")(CURRENT_PENDING_QUESTIONS_KEY),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated = 0
+    for document in documents:
+        original_metadata = (
+            dict(document.metadata_) if isinstance(document.metadata_, dict) else {}
+        )
+        if (
+            original_metadata.get(PENDING_QUESTION_RECONCILIATION_VERSION_KEY)
+            == PENDING_QUESTION_RECONCILIATION_VERSION
+        ):
+            continue
+
+        pending: dict[str, dict[str, object]] = {}
+        seen_ids: set[str] = set()
+        latest_human_timestamp = ""
+        rows = await db.stream(
+            select(
+                ConversationMessage.line_number,
+                ConversationMessage.role,
+                ConversationMessage.content,
+                ConversationMessage.metadata_.label("metadata_"),
+                ConversationMessage.timestamp,
+            )
+            .where(ConversationMessage.document_id == document.id)
+            .order_by(ConversationMessage.line_number)
+            .execution_options(yield_per=500)
+        )
+        try:
+            async for row in rows:
+                row_seen_ids, latest_human_timestamp = (
+                    _advance_stored_pending_questions(
+                        pending,
+                        row,
+                        latest_human_timestamp,
+                    )
+                )
+                seen_ids.update(row_seen_ids)
+        finally:
+            await rows.close()
+
+        metadata = dict(original_metadata)
+        raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+        signals = (
+            {
+                str(interaction_id): signal
+                for interaction_id, signal in raw_signals.items()
+                if isinstance(signal, dict)
+            }
+            if isinstance(raw_signals, dict)
+            else {}
+        )
+        for interaction_id in seen_ids:
+            signals.pop(interaction_id, None)
+        for interaction_id, signal in list(signals.items()):
+            if interaction_at_or_before_human(
+                signal.get("timestamp"),
+                latest_human_timestamp,
+            ):
+                signals.pop(interaction_id, None)
+
+        active_ids = sorted(set(pending) | set(signals))[:64]
+        if signals:
+            metadata[LIVE_INTERACTION_SIGNALS_KEY] = signals
+        else:
+            metadata.pop(LIVE_INTERACTION_SIGNALS_KEY, None)
+        if active_ids:
+            metadata[CURRENT_PENDING_QUESTIONS_KEY] = active_ids
+            metadata[PENDING_QUESTION_COUNT_KEY] = len(active_ids)
+        else:
+            metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
+            metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
+        if latest_human_timestamp:
+            metadata[LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY] = latest_human_timestamp
+        else:
+            metadata.pop(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY, None)
+        metadata[PENDING_QUESTION_RECONCILIATION_VERSION_KEY] = (
+            PENDING_QUESTION_RECONCILIATION_VERSION
+        )
+        if metadata != original_metadata:
+            document.metadata_ = metadata
+            updated += 1
+
+    await db.commit()
+    return updated
 
 
 def _json_size(value: object) -> int:
@@ -2418,6 +2692,7 @@ async def _extract_messages(
     tool_id = doc.tool_id
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
+    latest_human_timestamp = _latest_human_timestamp_for_ingest(doc, mode)
     canonical_interaction_ids: set[str] = set()
     clear_live_interaction_signals = False
     line_num = start_line
@@ -2455,7 +2730,12 @@ async def _extract_messages(
                         select(ConversationMessage)
                         .where(
                             ConversationMessage.document_id == doc.id,
-                            ConversationMessage.message_type == "queued_user_message",
+                            ConversationMessage.message_type.in_(
+                                (
+                                    "queued_user_message",
+                                    "queued_scheduled_automation",
+                                )
+                            ),
                         )
                         .order_by(ConversationMessage.line_number)
                     )
@@ -2484,7 +2764,11 @@ async def _extract_messages(
         assistant_identity=assistant_identity,
     ):
         pending_before = bool(pending_question_ids)
-        _update_pending_question_ids(pending_question_ids, normalized)
+        latest_human_timestamp = _update_pending_question_ids(
+            pending_question_ids,
+            normalized,
+            latest_human_timestamp,
+        )
         canonical_interaction_ids.update(_normalized_interaction_ids(normalized))
         if (
             pending_before
@@ -2493,15 +2777,23 @@ async def _extract_messages(
             and not isinstance(normalized.interaction_response, dict)
         ):
             clear_live_interaction_signals = True
-        # Claude persists a steer immediately as a queue enqueue, then may
-        # write the canonical user row in a later collector delta after the
-        # active turn finishes. Retain the submission-time row and mark it as
-        # reconciled instead of appending a duplicate at completion time.
+        # Claude persists steers and scheduled instructions as queue enqueues,
+        # then may write their canonical row in a later collector delta.
+        # Retain the submission-time row and mark it as reconciled instead of
+        # appending a duplicate at completion time.
         if (
             mode == "delta"
             and tool_id == "claude_code"
-            and normalized.role == "user"
-            and normalized.raw_type == "user"
+            and (
+                (
+                    normalized.role == "user"
+                    and normalized.raw_type == "user"
+                )
+                or (
+                    normalized.role == "system"
+                    and normalized.raw_type == "scheduled_automation"
+                )
+            )
         ):
             queued_row = pop_matching_claude_queue_user(
                 queued_claude_users,
@@ -2514,8 +2806,13 @@ async def _extract_messages(
                     if isinstance(queued_row.metadata_, dict)
                     else {}
                 )
+                identity_kind = (
+                    "scheduled"
+                    if normalized.raw_type == "scheduled_automation"
+                    else "user"
+                )
                 canonical_identity = normalized.source_id or (
-                    "claude-user:"
+                    f"claude-{identity_kind}:"
                     + hashlib.sha256(
                         "\x1f".join(
                             (
@@ -2624,6 +2921,7 @@ async def _extract_messages(
         clear_all=clear_live_interaction_signals,
     )
     _store_pending_question_ids(doc, pending_question_ids)
+    _store_latest_human_timestamp(doc, latest_human_timestamp)
     _store_assistant_identity(doc, assistant_identity)
 
     if batch:

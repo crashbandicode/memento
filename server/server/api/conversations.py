@@ -23,14 +23,21 @@ from ..services.conversation_hierarchy import (
     group_conversation_root_thread_ids,
     merge_subagent_event_summaries,
 )
-from ..services.conversation_markdown import is_meaningful_human_prompt
+from ..services.conversation_markdown import (
+    is_meaningful_human_prompt,
+    is_meaningful_human_turn,
+)
 from ..services.conversation_parser import (
+    build_cursor_question_response,
     count_conversation_messages,
     normalize_message_attachments,
     normalize_tool_calls,
     parse_conversation,
 )
-from ..services.ingest_service import LIVE_INTERACTION_SIGNALS_KEY
+from ..services.ingest_service import (
+    LIVE_INTERACTION_SIGNALS_KEY,
+    interaction_at_or_before_human,
+)
 from ..services.message_search import (
     MAX_SEARCH_CONTENT_CHARS,
     build_message_search_expressions,
@@ -585,12 +592,21 @@ async def get_pending_conversation_interactions(
     questions: dict[str, tuple[ConversationMessage, dict]] = {}
     resolved_ids: set[str] = set()
     open_ids: dict[uuid.UUID, set[str]] = {}
+    latest_human_timestamps: dict[uuid.UUID, object] = {}
     inferred_responses: dict[str, tuple[ConversationMessage, dict]] = {}
     for message in rows:
         document_open_ids = open_ids.setdefault(message.document_id, set())
-        for interaction in _message_question_interactions(message.metadata_):
+        message_interactions = _message_question_interactions(message.metadata_)
+        for interaction in message_interactions:
             interaction_id = str(interaction.get("id") or "").strip()
             if interaction_id:
+                if interaction_at_or_before_human(
+                    message.timestamp,
+                    latest_human_timestamps.get(message.document_id),
+                ):
+                    resolved_ids.add(interaction_id)
+                    document_open_ids.discard(interaction_id)
+                    continue
                 questions[interaction_id] = (message, interaction)
                 document_open_ids.add(interaction_id)
         response = _stored_interaction(message.metadata_, "interaction_response")
@@ -599,7 +615,19 @@ async def get_pending_conversation_interactions(
             if interaction_id:
                 resolved_ids.add(interaction_id)
                 document_open_ids.discard(interaction_id)
-        elif is_meaningful_human_prompt(
+        else:
+            for interaction in message_interactions:
+                inferred = build_cursor_question_response(
+                    interaction,
+                    message.content,
+                )
+                if inferred is None:
+                    continue
+                interaction_id = str(interaction.get("id") or "").strip()
+                if interaction_id:
+                    resolved_ids.add(interaction_id)
+                    document_open_ids.discard(interaction_id)
+        if response is None and is_meaningful_human_prompt(
             message.content,
             message.metadata_,
             message.role,
@@ -617,6 +645,23 @@ async def get_pending_conversation_interactions(
                     },
                 )
             document_open_ids.clear()
+        if is_meaningful_human_turn(
+            message.content,
+            message.metadata_,
+            message.role,
+        ):
+            if response is not None:
+                resolved_ids.update(document_open_ids)
+                document_open_ids.clear()
+            current_human_timestamp = latest_human_timestamps.get(message.document_id)
+            if (
+                current_human_timestamp is None
+                or not interaction_at_or_before_human(
+                    message.timestamp,
+                    current_human_timestamp,
+                )
+            ):
+                latest_human_timestamps[message.document_id] = message.timestamp
 
     pending = [
         (message, interaction)
@@ -643,6 +688,10 @@ async def get_pending_conversation_interactions(
                 interaction_id in resolved_ids
                 or interaction_id in questions
                 or not isinstance(signal, dict)
+                or interaction_at_or_before_human(
+                    signal.get("timestamp"),
+                    latest_human_timestamps.get(source_document_id),
+                )
             ):
                 continue
             interaction = signal.get("interaction")

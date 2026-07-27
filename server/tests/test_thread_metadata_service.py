@@ -33,6 +33,7 @@ from server.services.thread_metadata_service import (  # noqa: E402
 )
 from server.services.ingest_service import (  # noqa: E402
     CURRENT_PENDING_QUESTIONS_KEY,
+    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_COUNT_KEY,
 )
@@ -215,6 +216,46 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual((answered.matched, answered.updated), (1, 1))
+        self.assertNotIn(CURRENT_PENDING_QUESTIONS_KEY, document.metadata_)
+        self.assertNotIn(PENDING_QUESTION_COUNT_KEY, document.metadata_)
+        self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
+
+    async def test_live_interaction_does_not_reopen_before_latest_human_turn(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(
+            machine_id=machine_id,
+            metadata={
+                LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY: "2026-07-24T23:07:30Z"
+            },
+        )
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            result = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="cursor",
+                relative_path="projects/thread.jsonl",
+                interaction_id="question-1",
+                interaction_status="pending",
+                question_tool="ask_question",
+                interaction_input={
+                    "questions": [{
+                        "id": "next",
+                        "prompt": "Continue?",
+                        "options": [{"id": "yes", "label": "Yes"}],
+                    }]
+                },
+                timestamp="2026-07-24T23:04:05Z",
+            )
+
+        self.assertEqual((result.matched, result.updated), (1, 0))
         self.assertNotIn(CURRENT_PENDING_QUESTIONS_KEY, document.metadata_)
         self.assertNotIn(PENDING_QUESTION_COUNT_KEY, document.metadata_)
         self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)

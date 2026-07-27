@@ -1432,6 +1432,35 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(messages[0].raw_type, "queued_user_message")
         self.assertEqual(messages[0].content, content)
 
+    def test_claude_scheduled_queue_and_context_are_one_system_message(self) -> None:
+        content = (
+            "[AUTO BASH-WATCH — runs every 5 min; keep it SILENT]\n\n"
+            "Check active agents and correct shell usage."
+        )
+        raw = "\n".join([
+            json.dumps({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": "session-1",
+                "timestamp": "2026-07-27T14:00:00.000Z",
+                "content": content,
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "canonical-automation-1",
+                "isMeta": True,
+                "timestamp": "2026-07-27T14:00:01.000Z",
+                "message": {"role": "user", "content": content},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].role, "system")
+        self.assertEqual(messages[0].raw_type, "queued_scheduled_automation")
+        self.assertEqual(messages[0].content, content)
+
     def test_claude_repeated_queue_prompts_are_reconciled_one_to_one(self) -> None:
         content = "keep going"
         rows = []
@@ -1792,7 +1821,7 @@ class ConversationParserTests(unittest.TestCase):
         self.assertIsNotNone(msg)
         assert msg is not None
         self.assertEqual(msg.role, "system")
-        self.assertEqual(msg.raw_type, "claude_context")
+        self.assertEqual(msg.raw_type, "scheduled_automation")
 
     def test_claude_compaction_summary_is_session_context(self) -> None:
         raw = json.dumps({

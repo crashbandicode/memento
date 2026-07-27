@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -202,6 +202,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "questions": [],
             }
         }
+        answered.timestamp = self.now
         response = self.message(11, "user")
         response.metadata_ = {
             "interaction_response": {
@@ -211,6 +212,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "raw_text": "Done",
             }
         }
+        response.timestamp = self.now + timedelta(minutes=1)
         abandoned = self.message(12)
         abandoned.metadata_ = {
             "interaction": {
@@ -221,9 +223,11 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "questions": [],
             }
         }
+        abandoned.timestamp = self.now + timedelta(minutes=2)
         resumed = self.message(13, "user")
         resumed.content = "Keep going, you got rebooted."
         resumed.metadata_ = {}
+        resumed.timestamp = self.now + timedelta(minutes=3)
         pending = self.message(2, document_id=child_id)
         pending.metadata_ = {
             "model": "gpt-5.6-sol",
@@ -335,6 +339,57 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["interactions"][0]["line_number"], 0)
 
+    async def test_pending_interactions_ignore_question_replayed_after_human_turn(
+        self,
+    ) -> None:
+        interaction = {
+            "id": "replayed-question",
+            "kind": "question",
+            "source": "cursor",
+            "tool_name": "ask_question",
+            "questions": [{
+                "id": "scope",
+                "prompt": "Which scope?",
+                "type": "single_select",
+                "allow_custom": True,
+                "options": [],
+            }],
+        }
+        original = self.message(10)
+        original.metadata_ = {"interaction": interaction}
+        original.timestamp = self.now
+        human = self.message(11, "user")
+        human.content = "Use the first option."
+        human.metadata_ = {}
+        human.timestamp = self.now + timedelta(minutes=1)
+        replay = self.message(12)
+        replay.metadata_ = {"interaction": interaction}
+        replay.timestamp = self.now
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(
+                    rows=[
+                        (self.doc_id, self.doc.title, self.doc.metadata_),
+                    ]
+                ),
+                _Result(rows=[original, human, replay]),
+            ]
+        )
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["interactions"], [])
+        self.assertEqual(
+            payload["inferred_responses"][0]["response"]["interaction_id"],
+            "replayed-question",
+        )
+
     async def test_latest_agent_message_uses_indexed_assistant_line(self) -> None:
         db = _Db(
             [
@@ -371,6 +426,13 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                             "The selected answer",
                             self.now,
                             {"interaction_response": {"interaction_id": "question-1"}},
+                        ),
+                        (
+                            9,
+                            14,
+                            "[AUTO HEALTH-CHECK — runs every 5 min]\nCheck status.",
+                            self.now,
+                            {},
                         ),
                     ]
                 ),

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TextIO
 
+from .conversation_parser import is_scheduled_automation_content
+
 
 _MAX_PROMPT_RANGE_LENGTH = 512
 _MAX_PROMPT_RANGE_PARTS = 100
@@ -149,14 +151,27 @@ def is_meaningful_human_prompt(
         return False
     if isinstance(values.get("interaction_response"), dict):
         return False
-    # Cursor injects shell/await completion notices as user bubbles. Keep them
-    # out of the prompt navigator even before a role backfill lands.
+    # Keep product-injected notices and scheduled instructions out of the
+    # prompt navigator even before a role backfill lands.
+    if is_scheduled_automation_content(clean):
+        return False
     lowered = clean.casefold()
     if "<system_notification" in lowered:
         return False
     if "the following task has finished" in lowered:
         return False
     return True
+
+
+def is_meaningful_human_turn(
+    content: str | None,
+    metadata: Mapping[str, Any] | None,
+    role: str | None = "user",
+) -> bool:
+    """Recognize a real human turn, including structured question answers."""
+    values = dict(metadata or {})
+    values.pop("interaction_response", None)
+    return is_meaningful_human_prompt(content, values, role)
 
 
 def safe_markdown_filename(title: str, document_id: str) -> str:

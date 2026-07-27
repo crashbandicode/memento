@@ -17,11 +17,13 @@ from .conversation_parser import (
 )
 from .ingest_service import (
     CURRENT_PENDING_QUESTIONS_KEY,
+    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
     MAX_SEARCH_TEXT_CHARS,
     PENDING_QUESTION_COUNT_KEY,
     _bounded_message_text,
     _conversation_title_needs_derivation,
+    interaction_at_or_before_human,
 )
 from .tokenize import tokenize_for_index
 
@@ -383,7 +385,11 @@ async def apply_conversation_interaction_update(
     )
 
     previous_signal = signals.get(interaction_id)
-    if status == "pending":
+    stale_pending = status == "pending" and interaction_at_or_before_human(
+        timestamp,
+        metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY),
+    )
+    if status == "pending" and not stale_pending:
         interaction = normalize_question_interaction(
             question_tool,
             interaction_input,

@@ -55,6 +55,20 @@ class MeaningfulHumanPromptTests(unittest.TestCase):
         )
         self.assertTrue(is_meaningful_human_prompt("Please keep going on the VLSI path.", {}))
 
+    def test_scheduled_automations_are_not_human_prompts(self) -> None:
+        self.assertFalse(
+            is_meaningful_human_prompt(
+                "[AUTO BASH-WATCH — runs every 5 min]\n\nCheck active agents.",
+                {},
+            )
+        )
+        self.assertFalse(
+            is_meaningful_human_prompt(
+                "# /loop — schedule a recurring prompt\n\n15m Check production.",
+                {},
+            )
+        )
+
 
 class PromptSelectionTests(unittest.TestCase):
     def test_parses_merges_and_supports_open_end(self) -> None:

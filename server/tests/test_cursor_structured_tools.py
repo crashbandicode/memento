@@ -61,6 +61,43 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         answer = messages[0].interaction_response["answers"][0]
         self.assertEqual(answer["selected_option_ids"], ["api", "web"])
 
+    def test_cursor_state_submitted_status_keeps_structured_answer(self) -> None:
+        answer_payload = {
+            "answers": [{
+                "questionId": "target",
+                "selectedOptionIds": ["api"],
+                "freeformText": "",
+            }]
+        }
+        record = {
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "question-1",
+            "timestamp": "2026-07-20T12:00:00Z",
+            "tool_name": "ask_question",
+            "tool_status": "submitted",
+            "tool_input": json.dumps({
+                "questions": [{
+                    "id": "target",
+                    "prompt": "Which target?",
+                    "options": [{"id": "api", "label": "API"}],
+                }]
+            }),
+            "content": (
+                "Status: submitted\n\n"
+                + json.dumps(answer_payload)
+            ),
+        }
+
+        messages = list(iter_conversation_messages(json.dumps(record), "cursor"))
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].interaction_response["status"], "answered")
+        self.assertEqual(
+            messages[0].interaction_response["answers"][0]["selected_option_ids"],
+            ["api"],
+        )
+
     def test_cursor_state_todowrite_uses_authoritative_final_todos(self) -> None:
         record = {
             "type": "cursor_state_tool",
@@ -541,6 +578,39 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
                         "status": "answered",
                     },
                 },
+            ),
+        ]
+
+        self.assertEqual(_pending_question_interactions(recent_rows), [])
+
+    def test_delta_lookback_does_not_revive_question_after_human_reply(self) -> None:
+        interaction = {
+            "kind": "question",
+            "id": "cursor-question-with-unlinked-reply",
+            "source": "cursor",
+            "questions": [],
+        }
+        recent_rows = [
+            SimpleNamespace(
+                line_number=10,
+                role="tool",
+                content="Status: pending",
+                metadata_={"interaction": interaction},
+                timestamp="2026-07-20T12:00:00Z",
+            ),
+            SimpleNamespace(
+                line_number=11,
+                role="user",
+                content="Use the first option and continue.",
+                metadata_={},
+                timestamp="2026-07-20T12:01:00Z",
+            ),
+            SimpleNamespace(
+                line_number=12,
+                role="tool",
+                content="Status: pending",
+                metadata_={"interaction": interaction},
+                timestamp="2026-07-20T12:00:00Z",
             ),
         ]
 

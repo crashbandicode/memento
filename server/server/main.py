@@ -523,6 +523,28 @@ async def _warm_embedding_server() -> None:
         log.info("embedding warmup skipped: %s", e)
 
 
+async def _repair_pending_question_badges() -> None:
+    """Reconcile stale attention badges after the interactive-inbox rollout."""
+    import asyncio
+    import logging
+
+    await asyncio.sleep(3)
+    try:
+        from .db.session import async_session_factory
+        from .services.ingest_service import reconcile_pending_question_metadata
+
+        async with async_session_factory() as db:
+            updated = await reconcile_pending_question_metadata(db)
+        logging.getLogger("memento.pending_questions").info(
+            "reconciled pending-question metadata for %d conversations",
+            updated,
+        )
+    except Exception:
+        logging.getLogger("memento.pending_questions").exception(
+            "pending-question metadata reconciliation failed"
+        )
+
+
 async def _require_fast_embedding_server() -> None:
     """Reject a half-enabled tiering deployment with a clear startup error."""
     import asyncio
@@ -578,9 +600,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     compaction_task = asyncio.create_task(_schedule_daily_compaction())
     # Fire-and-forget warmup of the embedding server (5s after boot)
     warmup_task = asyncio.create_task(_warm_embedding_server())
+    pending_question_repair_task = asyncio.create_task(
+        _repair_pending_question_badges()
+    )
     yield
     compaction_task.cancel()
     warmup_task.cancel()
+    pending_question_repair_task.cancel()
     await engine.dispose()
 
 

@@ -180,6 +180,7 @@ const enUS: Translations = {
     expandAll: "Expand All",
     subagentDispatch: "Subagent dispatch",
     sessionContext: "Session context",
+    scheduledAutomation: "Scheduled automation",
     attachments: "Attachments",
     imageAttachment: "Image",
     timeUnavailable: "Time unavailable",

@@ -24,6 +24,7 @@ from server.services.ingest_service import (
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
+    _advance_stored_pending_questions,
     _assistant_identity_for_ingest,
     _set_stored_source_identity,
     _store_assistant_identity,
@@ -318,6 +319,88 @@ def test_later_human_turn_clears_question_abandoned_across_restart() -> None:
     assert CURRENT_PENDING_QUESTIONS_KEY not in document.metadata_
     assert PENDING_QUESTION_COUNT_KEY not in document.metadata_
     assert document.metadata_["unrelated"] == "preserved"
+
+
+def test_stored_question_reconciliation_ignores_synthetic_system_turns() -> None:
+    pending: dict[str, dict[str, object]] = {}
+    question = {"id": "question-1", "kind": "question", "questions": []}
+    latest_human_timestamp = ""
+
+    _, latest_human_timestamp = _advance_stored_pending_questions(
+        pending,
+        SimpleNamespace(
+            role="tool",
+            content="Status: pending",
+            metadata_={"interaction": question},
+            timestamp="2026-07-20T12:00:00Z",
+        ),
+        latest_human_timestamp,
+    )
+    _, latest_human_timestamp = _advance_stored_pending_questions(
+        pending,
+        SimpleNamespace(
+            role="user",
+            content=(
+                "<system_notification>The following task has finished."
+                "</system_notification>"
+            ),
+            metadata_={},
+            timestamp="2026-07-20T12:01:00Z",
+        ),
+        latest_human_timestamp,
+    )
+
+    assert set(pending) == {"question-1"}
+
+    _, latest_human_timestamp = _advance_stored_pending_questions(
+        pending,
+        SimpleNamespace(
+            role="user",
+            content="Use the first option.",
+            metadata_={},
+            timestamp="2026-07-20T12:02:00Z",
+        ),
+        latest_human_timestamp,
+    )
+
+    assert pending == {}
+
+    _advance_stored_pending_questions(
+        pending,
+        SimpleNamespace(
+            role="tool",
+            content="Status: pending",
+            metadata_={"interaction": question},
+            timestamp="2026-07-20T12:00:00Z",
+        ),
+        latest_human_timestamp,
+    )
+
+    assert pending == {}
+
+
+def test_stored_question_reconciliation_recognizes_submitted_cursor_answer() -> None:
+    pending: dict[str, dict[str, object]] = {}
+    question = {
+        "id": "question-1",
+        "kind": "question",
+        "questions": [{"id": "target", "prompt": "Which target?", "options": []}],
+    }
+
+    _advance_stored_pending_questions(
+        pending,
+        SimpleNamespace(
+            role="tool",
+            content=(
+                'Status: submitted\n\n{"answers": ['
+                '{"questionId": "target", "freeformText": "API"}]}'
+            ),
+            metadata_={"interaction": question},
+            timestamp="2026-07-20T12:00:00Z",
+        ),
+    )
+
+    assert pending == {}
 
 
 def test_reparse_preserves_repeated_cursor_source_rows() -> None:

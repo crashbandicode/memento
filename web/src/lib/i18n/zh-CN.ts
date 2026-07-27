@@ -186,6 +186,7 @@ const zhCN = {
     expandAll: "展开全部",
     subagentDispatch: "子任务派发",
     sessionContext: "会话上下文",
+    scheduledAutomation: "定时自动化",
     attachments: "附件",
     imageAttachment: "图片",
     timeUnavailable: "时间不可用",
