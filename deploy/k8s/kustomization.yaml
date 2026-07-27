@@ -29,6 +29,12 @@ configMapGenerator:
 # `kustomize edit set image` 回写为该 commit 的 sha,Fleet 监听到改动后部署。
 # 初始 latest 仅占位;首跑后即被替换成不可变的 12 位 sha。
 images:
+- name: ghcr.io/crashbandicode/memento-server
+  newName: ghcr.io/crashbandicode/memento-server
+  newTag: 5465e575b88f
+- name: ghcr.io/crashbandicode/memento-web
+  newName: ghcr.io/crashbandicode/memento-web
+  newTag: 5465e575b88f
 - name: ghcr.io/ddong8/memento-server
   newName: ghcr.io/ddong8/memento-server
   newTag: 19dafcbcb0aa
