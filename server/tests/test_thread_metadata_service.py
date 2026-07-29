@@ -160,6 +160,58 @@ class ThreadMetadataValidationTests(unittest.TestCase):
 
 
 class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cursor_plan_mode_signal_updates_pending_inbox_state(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        interaction_input = {
+            "fromModeId": "agent",
+            "toModeId": "plan",
+            "explanation": "Confirm the design first.",
+        }
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            pending = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="cursor",
+                relative_path="projects/thread.jsonl",
+                interaction_id="call-plan-1",
+                interaction_status="pending",
+                question_tool="switch_mode",
+                interaction_input=interaction_input,
+                timestamp="2026-07-26T22:42:27Z",
+            )
+
+        self.assertEqual((pending.matched, pending.updated), (1, 1))
+        self.assertEqual(document.metadata_[PENDING_QUESTION_COUNT_KEY], 1)
+        signal = document.metadata_[LIVE_INTERACTION_SIGNALS_KEY]["call-plan-1"]
+        self.assertEqual(signal["interaction"]["interaction_type"], "mode_switch")
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            skipped = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="cursor",
+                relative_path="projects/thread.jsonl",
+                interaction_id="call-plan-1",
+                interaction_status="cancelled",
+                question_tool="switch_mode",
+                interaction_input=interaction_input,
+            )
+
+        self.assertEqual((skipped.matched, skipped.updated), (1, 1))
+        self.assertNotIn(PENDING_QUESTION_COUNT_KEY, document.metadata_)
+        self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
+
     async def test_live_interaction_updates_pending_inbox_state(self) -> None:
         machine_id = uuid.uuid4()
         user_id = uuid.uuid4()

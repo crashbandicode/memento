@@ -1592,7 +1592,7 @@ def parse_conversation_object(
                 obj.get("tool_call_id") or obj.get("id"),
                 512,
             )
-            interaction = normalize_question_interaction(
+            interaction = normalize_interaction(
                 tool_name,
                 tool_input,
                 source="cursor",
@@ -1600,10 +1600,11 @@ def parse_conversation_object(
             )
             interaction_response = None
             if interaction is not None:
-                interaction_response = build_cursor_question_response(
+                interaction_response = build_cursor_interaction_response(
                     interaction,
                     content,
                     obj.get("tool_status"),
+                    obj.get("tool_status_reason"),
                 )
             agent_event = normalize_task_spawn_agent_event(
                 tool_name,
@@ -1734,7 +1735,10 @@ def _extract_tool_result_details(content) -> tuple[str, str] | None:
         found = True
         if not tool_call_id:
             tool_call_id = _bounded_interaction_text(
-                item.get("tool_use_id") or item.get("tool_call_id"),
+                item.get("tool_use_id")
+                or item.get("tool_call_id")
+                or item.get("toolCallId")
+                or item.get("call_id"),
                 512,
             )
         result = item.get("content", item.get("output", ""))
@@ -1910,6 +1914,33 @@ _QUESTION_TOOL_NAMES = {
     "askquestion",
     "askuserquestion",
     "requestuserinput",
+}
+_CURSOR_PLAN_MODE_TOOL_NAMES = {"switchmode"}
+_CURSOR_PENDING_INTERACTION_STATUSES = {
+    "",
+    "awaiting",
+    "loading",
+    "pending",
+    "requested",
+    "running",
+}
+_CURSOR_CANCELLED_INTERACTION_STATUSES = {
+    "aborted",
+    "cancelled",
+    "canceled",
+    "dismissed",
+    "error",
+    "failed",
+    "rejected",
+    "skipped",
+    "timeout",
+}
+_CURSOR_ANSWERED_INTERACTION_STATUSES = {
+    "answered",
+    "completed",
+    "done",
+    "submitted",
+    "success",
 }
 _MAX_INTERACTION_QUESTIONS = 8
 _MAX_INTERACTION_OPTIONS = 12
@@ -2530,6 +2561,89 @@ def normalize_question_interaction(
     }
 
 
+def normalize_cursor_plan_mode_interaction(
+    tool_name: str,
+    raw_input: object,
+    *,
+    source: str,
+    interaction_id: object = "",
+) -> dict[str, object] | None:
+    """Normalize Cursor's approval-gated request to enter Plan mode."""
+    normalized_tool_name = re.sub(
+        r"[^a-z0-9]",
+        "",
+        tool_name.strip().casefold(),
+    )
+    if (
+        source.strip().casefold() != "cursor"
+        or normalized_tool_name not in _CURSOR_PLAN_MODE_TOOL_NAMES
+    ):
+        return None
+    payload = _json_mapping(raw_input)
+    target_mode = _bounded_interaction_text(
+        payload.get("toModeId")
+        or payload.get("to_mode_id")
+        or payload.get("to_mode"),
+        64,
+    )
+    if target_mode.casefold() != "plan":
+        return None
+    source_mode = _bounded_interaction_text(
+        payload.get("fromModeId")
+        or payload.get("from_mode_id")
+        or payload.get("from_mode"),
+        64,
+    )
+    explanation = _bounded_interaction_text(
+        payload.get("explanation"),
+        4096,
+    )
+    return {
+        "kind": "question",
+        "interaction_type": "mode_switch",
+        "id": _bounded_interaction_text(interaction_id, 512),
+        "source": "cursor",
+        "tool_name": _bounded_interaction_text(tool_name, 256),
+        "from_mode": source_mode,
+        "to_mode": "plan",
+        "questions": [{
+            "id": "enter-plan-mode",
+            "header": "Plan mode",
+            "prompt": explanation or "Cursor requested permission to enter Plan mode.",
+            "type": "single_select",
+            "allow_custom": False,
+            "options": [{
+                "id": "plan",
+                "label": "Enter Plan mode",
+            }],
+        }],
+    }
+
+
+def normalize_interaction(
+    tool_name: str,
+    raw_input: object,
+    *,
+    source: str,
+    interaction_id: object = "",
+) -> dict[str, object] | None:
+    """Normalize a supported human-response interaction."""
+    question = normalize_question_interaction(
+        tool_name,
+        raw_input,
+        source=source,
+        interaction_id=interaction_id,
+    )
+    if question is not None:
+        return question
+    return normalize_cursor_plan_mode_interaction(
+        tool_name,
+        raw_input,
+        source=source,
+        interaction_id=interaction_id,
+    )
+
+
 def _answer_texts(value: object) -> list[str]:
     if isinstance(value, dict):
         value = value.get("answers", value.get("answer", value.get("value")))
@@ -2688,6 +2802,75 @@ def build_cursor_question_response(
     return build_question_response(interaction, payload or text)
 
 
+def _is_cursor_plan_mode_interaction(interaction: dict[str, object]) -> bool:
+    tool_name = _coerce_text(interaction.get("tool_name"))
+    normalized_tool_name = re.sub(r"[^a-z0-9]", "", tool_name.casefold())
+    return (
+        interaction.get("source") == "cursor"
+        and interaction.get("interaction_type") == "mode_switch"
+        and normalized_tool_name in _CURSOR_PLAN_MODE_TOOL_NAMES
+        and _coerce_text(interaction.get("to_mode")).casefold() == "plan"
+    )
+
+
+def build_cursor_interaction_response(
+    interaction: dict[str, object],
+    content: object,
+    tool_status: object = "",
+    tool_status_reason: object = "",
+) -> dict[str, object] | None:
+    """Resolve Cursor questions and approval-gated mode-switch requests."""
+    if not _is_cursor_plan_mode_interaction(interaction):
+        return build_cursor_question_response(interaction, content, tool_status)
+
+    text = _coerce_text(content).strip()
+    status = (
+        _coerce_text(tool_status).strip().casefold()
+        or _status_prefix_from_tool_content(text).casefold()
+    )
+    if status in _CURSOR_PENDING_INTERACTION_STATUSES:
+        return None
+    reason = _bounded_interaction_text(tool_status_reason, 512)
+    rejected = bool(
+        re.search(r'"rejected"\s*:\s*true', text, re.IGNORECASE)
+        or "reject" in reason.casefold()
+    )
+    if status in _CURSOR_CANCELLED_INTERACTION_STATUSES or rejected:
+        raw_text = "Skipped"
+        if reason:
+            raw_text += f" ({reason})"
+        return {
+            "kind": "question_response",
+            "interaction_id": _bounded_interaction_text(interaction.get("id"), 512),
+            "status": "cancelled",
+            "answers": [],
+            "raw_text": raw_text,
+        }
+    if status not in _CURSOR_ANSWERED_INTERACTION_STATUSES:
+        return None
+
+    questions = interaction.get("questions")
+    question = (
+        questions[0]
+        if isinstance(questions, list)
+        and questions
+        and isinstance(questions[0], dict)
+        else {}
+    )
+    question_id = _bounded_interaction_text(question.get("id"), 256)
+    return {
+        "kind": "question_response",
+        "interaction_id": _bounded_interaction_text(interaction.get("id"), 512),
+        "status": "answered",
+        "answers": [{
+            "question_id": question_id,
+            "text": "Entered Plan mode",
+            "selected_option_ids": ["plan"],
+        }],
+        "raw_text": "Entered Plan mode",
+    }
+
+
 def normalize_tool_calls(value: object) -> list[dict[str, object]]:
     """Return the safe, bounded public representation of assistant tools.
 
@@ -2731,14 +2914,14 @@ def normalize_tool_calls(value: object) -> list[dict[str, object]]:
         }
         interaction = raw_call.get("interaction")
         if isinstance(interaction, dict):
-            interaction = normalize_question_interaction(
+            interaction = normalize_interaction(
                 _coerce_text(interaction.get("tool_name") or name),
-                {"questions": interaction.get("questions")},
+                interaction,
                 source=_coerce_text(interaction.get("source")),
                 interaction_id=interaction.get("id"),
             )
         else:
-            interaction = normalize_question_interaction(
+            interaction = normalize_interaction(
                 name,
                 raw_input,
                 source="cursor",
@@ -3128,18 +3311,40 @@ def _iter_cursor_conversation_messages(
             _attach_assistant_identity(message, identity)
             if message.role == "user" and pending_question is not None:
                 _pending_index, interaction = pending_question
-                message.interaction_response = build_question_response(
-                    interaction,
-                    message.content,
-                )
-                pending_question = None
+                if not _is_cursor_plan_mode_interaction(interaction):
+                    message.interaction_response = build_question_response(
+                        interaction,
+                        message.content,
+                    )
+                    pending_question = None
+            elif message.role == "tool" and pending_question is not None:
+                _pending_index, interaction = pending_question
+                if (
+                    message.tool_call_id
+                    and message.tool_call_id == _coerce_text(interaction.get("id"))
+                ):
+                    result_status = (
+                        "cancelled"
+                        if message.content == "(tool returned no textual output)"
+                        else "completed"
+                    )
+                    message.interaction_response = build_cursor_interaction_response(
+                        interaction,
+                        message.content,
+                        result_status,
+                    )
+                    if message.interaction_response is not None:
+                        pending_question = None
 
             if message.interaction is not None:
                 interaction_id = _coerce_text(message.interaction.get("id"))
                 if not interaction_id:
                     interaction_id = f"cursor:{record_index}:question"
                     message.interaction["id"] = interaction_id
-                pending_question = (record_index, message.interaction)
+                if message.interaction_response is None:
+                    pending_question = (record_index, message.interaction)
+                else:
+                    pending_question = None
 
             if message.source_id:
                 if message.source_id in seen_source_ids:

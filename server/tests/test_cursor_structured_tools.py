@@ -21,11 +21,144 @@ from server.services.conversation_parser import (  # noqa: E402
 from server.services.ingest_service import (  # noqa: E402
     _conversation_message_metadata,
     _pending_question_interactions,
+    _update_pending_question_ids,
     iter_stored_conversation_messages,
 )
 
 
 class CursorStructuredToolStorageTests(unittest.TestCase):
+    @staticmethod
+    def _plan_mode_record(
+        status: str,
+        *,
+        target_mode: str = "plan",
+        reason: str = "",
+    ) -> dict:
+        record = {
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "plan-1:tool",
+            "timestamp": "2026-07-26T22:42:27Z",
+            "tool_name": "switch_mode",
+            "tool_status": status,
+            "tool_input": json.dumps({
+                "fromModeId": "agent",
+                "toModeId": target_mode,
+                "explanation": "Confirm the architecture before editing.",
+            }),
+            "tool_call_id": "call-plan-1",
+            "content": f"Status: {status}\n\n{{}}",
+        }
+        if reason:
+            record["tool_status_reason"] = reason
+        return record
+
+    def test_cursor_plan_mode_request_is_pending_tool_interaction(self) -> None:
+        messages = list(iter_conversation_messages(
+            json.dumps(self._plan_mode_record("loading")),
+            "cursor",
+        ))
+
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
+        self.assertEqual(message.role, "tool")
+        self.assertIsNotNone(message.interaction)
+        self.assertEqual(message.interaction["interaction_type"], "mode_switch")
+        self.assertEqual(message.interaction["to_mode"], "plan")
+        self.assertFalse(message.interaction["questions"][0]["allow_custom"])
+        self.assertIsNone(message.interaction_response)
+
+        pending_ids: set[str] = set()
+        _update_pending_question_ids(pending_ids, message)
+        self.assertEqual(pending_ids, {"call-plan-1"})
+
+    def test_cursor_plan_mode_request_skipped_and_answered_states(self) -> None:
+        skipped = next(iter_conversation_messages(
+            json.dumps(self._plan_mode_record("cancelled", reason="timeout")),
+            "cursor",
+        ))
+        self.assertEqual(skipped.interaction_response["status"], "cancelled")
+        self.assertEqual(skipped.interaction_response["raw_text"], "Skipped (timeout)")
+
+        pending_ids = {"call-plan-1"}
+        _update_pending_question_ids(pending_ids, skipped)
+        self.assertEqual(pending_ids, set())
+
+        accepted_record = self._plan_mode_record("completed")
+        later_user = {
+            "type": "user",
+            "role": "user",
+            "id": "user-after-plan",
+            "timestamp": "2026-07-26T22:43:00Z",
+            "message": {"content": "Now continue with the implementation."},
+        }
+        accepted, user = list(iter_conversation_messages(
+            "\n".join((json.dumps(accepted_record), json.dumps(later_user))),
+            "cursor",
+        ))
+        self.assertEqual(accepted.interaction_response["status"], "answered")
+        self.assertEqual(
+            accepted.interaction_response["answers"][0]["selected_option_ids"],
+            ["plan"],
+        )
+        self.assertEqual(user.role, "user")
+        self.assertIsNone(user.interaction_response)
+
+    def test_cursor_switch_mode_non_plan_target_is_not_interaction(self) -> None:
+        message = next(iter_conversation_messages(
+            json.dumps(self._plan_mode_record("completed", target_mode="agent")),
+            "cursor",
+        ))
+
+        self.assertEqual(message.role, "tool")
+        self.assertIsNone(message.interaction)
+        self.assertIsNone(message.interaction_response)
+
+    def test_cursor_compat_plan_mode_tool_result_is_linked(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "role": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "toolCall",
+                        "call_id": "call-plan-1",
+                        "name": "switch_mode",
+                        "arguments": {
+                            "fromModeId": "agent",
+                            "toModeId": "plan",
+                            "explanation": "Confirm the architecture first.",
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "role": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "toolResult",
+                        "call_id": "call-plan-1",
+                        "output": "{}",
+                    }],
+                },
+            }),
+        ])
+
+        request, response = list(iter_conversation_messages(raw, "cursor"))
+
+        self.assertEqual(request.role, "tool")
+        self.assertEqual(request.interaction["interaction_type"], "mode_switch")
+        self.assertEqual(response.role, "tool")
+        self.assertEqual(response.interaction_response["status"], "answered")
+
+    def test_cursor_plan_mode_rejected_result_is_skipped(self) -> None:
+        record = self._plan_mode_record("completed")
+        record["content"] = '{"rejected": true}'
+
+        message = next(iter_conversation_messages(json.dumps(record), "cursor"))
+
+        self.assertEqual(message.interaction_response["status"], "cancelled")
+        self.assertEqual(message.interaction_response["raw_text"], "Skipped")
+
     def test_cursor_state_question_keeps_multiselect_and_inline_answer(self) -> None:
         record = {
             "type": "cursor_state_tool",

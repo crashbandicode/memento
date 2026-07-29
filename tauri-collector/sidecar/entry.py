@@ -9,10 +9,16 @@ from __future__ import annotations
 
 import sys
 
-from collector.main import main
-
 
 def cli() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "claude-hook":
+        from collector.claude_pending_hook import main as hook_main
+
+        sys.exit(hook_main([]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "install-claude-hooks":
+        from collector.claude_pending_hook import main as hook_main
+
+        sys.exit(hook_main(["--install"]))
     # Mimic `memento-collector run` — the only entry path the desktop app
     # uses. All other subcommands (setup, install, uninstall, status) are
     # owned by the Tauri shell; we never want the frozen binary to mess
@@ -24,6 +30,8 @@ def cli() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+    from collector.main import main
+
     main()
 
 

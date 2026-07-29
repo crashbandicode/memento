@@ -134,3 +134,110 @@ def test_codex_and_cursor_question_resolution(tmp_path: Path) -> None:
         )
     )
     assert cursor_signal["interaction_status"] == "answered"
+
+
+def test_cursor_state_plan_mode_request_tracks_native_lifecycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cursor-state.jsonl"
+    base = {
+        "type": "cursor_state_tool",
+        "role": "tool",
+        "id": "plan-1:tool",
+        "tool_name": "switch_mode",
+        "tool_call_id": "call-plan-1",
+        "tool_input": json.dumps({
+            "fromModeId": "agent",
+            "toModeId": "plan",
+            "explanation": "Confirm the design first.",
+        }),
+    }
+
+    for status, expected in (
+        ("loading", "pending"),
+        ("cancelled", "cancelled"),
+        ("completed", "answered"),
+    ):
+        _write(
+            path,
+            {
+                **base,
+                "tool_status": status,
+                "content": f"Status: {status}",
+            },
+        )
+        signal = next(iter(extract_conversation_interaction_updates(
+            path,
+            tool_name="cursor",
+            relative_path="projects/thread.jsonl",
+        ).values()))
+        assert signal["interaction_status"] == expected
+        assert signal["interaction_input"]["toModeId"] == "plan"
+
+
+def test_cursor_compat_plan_mode_request_and_non_plan_false_positive(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cursor.jsonl"
+    request = {
+        "role": "assistant",
+        "message": {
+            "content": [{
+                "type": "toolCall",
+                "call_id": "call-plan-1",
+                "name": "switch_mode",
+                "arguments": {
+                    "fromModeId": "agent",
+                    "toModeId": "plan",
+                    "explanation": "Confirm the design first.",
+                },
+            }],
+        },
+    }
+    _write(path, request)
+    signal = next(iter(extract_conversation_interaction_updates(
+        path,
+        tool_name="cursor",
+        relative_path="projects/thread.jsonl",
+    ).values()))
+    assert signal["interaction_status"] == "pending"
+
+    _write(
+        path,
+        request,
+        {
+            "role": "assistant",
+            "message": {
+                "content": [{
+                    "type": "toolResult",
+                    "call_id": "call-plan-1",
+                    "output": "{}",
+                }],
+            },
+        },
+    )
+    signal = next(iter(extract_conversation_interaction_updates(
+        path,
+        tool_name="cursor",
+        relative_path="projects/thread.jsonl",
+    ).values()))
+    assert signal["interaction_status"] == "answered"
+
+    not_plan = {
+        **request,
+        "message": {
+            "content": [{
+                **request["message"]["content"][0],
+                "arguments": {
+                    "fromModeId": "plan",
+                    "toModeId": "agent",
+                },
+            }],
+        },
+    }
+    _write(path, not_plan)
+    assert extract_conversation_interaction_updates(
+        path,
+        tool_name="cursor",
+        relative_path="projects/thread.jsonl",
+    ) == {}

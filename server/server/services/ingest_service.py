@@ -717,11 +717,11 @@ def _pending_question_interactions(
     recent_rows: list[ConversationMessage],
 ) -> list[dict[str, object]]:
     """Recover delta-boundary questions without reviving stale Cursor prompts."""
+    from .conversation_markdown import is_meaningful_human_turn
     from .conversation_parser import (
         CURSOR_QUESTION_RESPONSE_WINDOW,
-        build_cursor_question_response,
+        build_cursor_interaction_response,
     )
-    from .conversation_markdown import is_meaningful_human_turn
 
     if not recent_rows:
         return []
@@ -764,7 +764,7 @@ def _pending_question_interactions(
                 pending.pop(interaction_id, None)
         else:
             for interaction in interactions:
-                inferred = build_cursor_question_response(
+                inferred = build_cursor_interaction_response(
                     interaction,
                     getattr(recent, "content", ""),
                 )
@@ -790,7 +790,7 @@ def _advance_stored_pending_questions(
 ) -> tuple[set[str], str]:
     """Apply one canonical DB row to persisted pending-question state."""
     from .conversation_markdown import is_meaningful_human_turn
-    from .conversation_parser import build_cursor_question_response
+    from .conversation_parser import build_cursor_interaction_response
 
     metadata = stored.metadata_ if isinstance(stored.metadata_, dict) else {}
     direct = metadata.get("interaction")
@@ -829,7 +829,7 @@ def _advance_stored_pending_questions(
             pending.pop(interaction_id, None)
     else:
         for interaction in interactions:
-            inferred = build_cursor_question_response(
+            inferred = build_cursor_interaction_response(
                 interaction,
                 getattr(stored, "content", ""),
             )

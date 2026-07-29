@@ -20,6 +20,19 @@ _QUESTION_TOOLS = {
     "askuserquestion",
     "request_user_input",
 }
+_CURSOR_PLAN_MODE_TOOLS = {"switchmode", "switch_mode"}
+_PENDING_STATUSES = {"", "awaiting", "loading", "pending", "requested", "running"}
+_CANCELLED_STATUSES = {
+    "aborted",
+    "cancelled",
+    "canceled",
+    "dismissed",
+    "error",
+    "failed",
+    "rejected",
+    "skipped",
+    "timeout",
+}
 
 
 def _tail_lines(path: Path) -> list[bytes]:
@@ -45,6 +58,32 @@ def _mapping(value: object) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+def _is_cursor_plan_mode_request(tool_name: str, raw_input: object) -> bool:
+    if tool_name.casefold() not in _CURSOR_PLAN_MODE_TOOLS:
+        return False
+    payload = _mapping(raw_input)
+    target_mode = (
+        payload.get("toModeId")
+        or payload.get("to_mode_id")
+        or payload.get("to_mode")
+    )
+    return str(target_mode or "").strip().casefold() == "plan"
+
+
+def _cursor_state_interaction_status(record: dict[str, Any]) -> str:
+    status = str(record.get("tool_status") or "").strip().casefold()
+    if not status:
+        content = str(record.get("content") or "")
+        prefix = content.partition("\n")[0]
+        if prefix.casefold().startswith("status:"):
+            status = prefix.partition(":")[2].strip().casefold()
+    if status in _PENDING_STATUSES:
+        return "pending"
+    if status in _CANCELLED_STATUSES:
+        return "cancelled"
+    return "answered"
 
 
 def _message_parts(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -141,25 +180,42 @@ def extract_conversation_interaction_updates(
 
         for part in _message_parts(record):
             part_type = str(part.get("type") or "")
-            if part_type == "tool_use":
+            if part_type in {"tool_use", "toolCall"}:
                 question_tool = str(part.get("name") or "")
-                interaction_id = str(part.get("id") or "").strip()
-                if question_tool.casefold() in _QUESTION_TOOLS and interaction_id:
+                interaction_id = str(
+                    part.get("id") or part.get("call_id") or ""
+                ).strip()
+                raw_input = (
+                    part.get("input")
+                    if "input" in part
+                    else part.get("arguments", {})
+                )
+                is_question = question_tool.casefold() in _QUESTION_TOOLS
+                is_plan_mode = (
+                    tool_name == "cursor"
+                    and _is_cursor_plan_mode_request(question_tool, raw_input)
+                )
+                if (is_question or is_plan_mode) and interaction_id:
                     signals[interaction_id] = _signal_record(
                         tool_name=tool_name,
                         relative_path=relative_path,
                         interaction_id=interaction_id,
                         question_tool=question_tool,
-                        raw_input=part.get("input", {}),
+                        raw_input=raw_input,
                         timestamp=timestamp,
                         status="pending",
                     )
-                    if tool_name == "cursor":
+                    if tool_name == "cursor" and is_question:
                         open_cursor_ids.append(interaction_id)
-            elif part_type == "tool_result":
-                interaction_id = str(part.get("tool_use_id") or "").strip()
+            elif part_type in {"tool_result", "toolResult"}:
+                interaction_id = str(
+                    part.get("tool_use_id")
+                    or part.get("toolCallId")
+                    or part.get("call_id")
+                    or ""
+                ).strip()
                 if interaction_id and interaction_id in signals:
-                    output = part.get("content")
+                    output = part.get("content", part.get("output"))
                     status = "answered" if str(output or "").strip() else "cancelled"
                     signals[interaction_id]["interaction_status"] = status
                     signals[interaction_id]["timestamp"] = str(timestamp or "")[:128]
@@ -175,24 +231,28 @@ def extract_conversation_interaction_updates(
             open_cursor_ids.clear()
 
         # Synthetic Cursor state exports carry the question and status together.
+        record_tool = str(record.get("tool_name") or "")
+        record_input = _mapping(record.get("tool_input"))
+        is_state_interaction = (
+            record_tool.casefold() in _QUESTION_TOOLS
+            or _is_cursor_plan_mode_request(record_tool, record_input)
+        )
         if (
             str(record.get("type") or "") == "cursor_state_tool"
-            and str(record.get("tool_name") or "").casefold() in _QUESTION_TOOLS
+            and is_state_interaction
         ):
             interaction_id = str(
                 record.get("tool_call_id") or record.get("id") or ""
             ).strip()
             if interaction_id:
-                content = str(record.get("content") or "").casefold()
-                status = "pending" if "pending" in content else "answered"
                 signals[interaction_id] = _signal_record(
                     tool_name=tool_name,
                     relative_path=relative_path,
                     interaction_id=interaction_id,
                     question_tool=str(record.get("tool_name") or "AskQuestion"),
-                    raw_input=_mapping(record.get("tool_input")),
+                    raw_input=record_input,
                     timestamp=timestamp,
-                    status=status,
+                    status=_cursor_state_interaction_status(record),
                 )
 
     latest = list(signals.items())[-_MAX_SIGNALS:]

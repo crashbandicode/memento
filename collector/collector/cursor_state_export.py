@@ -25,6 +25,7 @@ from .tools.cursor import CursorTool
 
 _MAX_TOOL_FIELD_CHARS = 262_144
 _INTERRUPTED_STATES = {"aborted", "cancelled", "canceled", "interrupted"}
+_CURSOR_MODE_SWITCH_TOOLS = {"switch_mode", "switchmode"}
 _TOOL_LABELS = {
     "await": "Await",
     "edit_file_v2": "Edit",
@@ -257,7 +258,14 @@ def _tool_record(
 ) -> dict[str, object]:
     raw_name = _coerce_text(tool_data.get("name") or "Tool").strip() or "Tool"
     name = _TOOL_LABELS.get(raw_name.lower(), raw_name)
-    raw_input = tool_data.get("rawArgs") or tool_data.get("params") or ""
+    normalized_name = raw_name.lower()
+    # ``switch_mode`` stores its meaningful target and explanation in params
+    # while rawArgs is the literal string ``{}``. Prefer the native params or
+    # the projected interaction would lose everything shown to the user.
+    if normalized_name in _CURSOR_MODE_SWITCH_TOOLS:
+        raw_input = tool_data.get("params") or tool_data.get("rawArgs") or ""
+    else:
+        raw_input = tool_data.get("rawArgs") or tool_data.get("params") or ""
     status = _coerce_text(tool_data.get("status")).strip().lower()
     additional_data = tool_data.get("additionalData")
     if (
@@ -275,7 +283,7 @@ def _tool_record(
         content = f"Status: {status}"
     elif status and status not in {"completed", "success"}:
         content = f"Status: {status}\n\n{content}".strip()
-    return _record(
+    record = _record(
         record_type="cursor_state_tool",
         role="tool",
         source_id=source_id,
@@ -288,6 +296,17 @@ def _tool_record(
         tool_call_id=_bounded_text(tool_data.get("toolCallId"), 512),
         tool_status=status,
     )
+    if (
+        normalized_name in _CURSOR_MODE_SWITCH_TOOLS
+        and isinstance(additional_data, dict)
+    ):
+        status_reason = _bounded_text(
+            additional_data.get("skipReason") or additional_data.get("reason"),
+            512,
+        ).strip()
+        if status_reason:
+            record["tool_status_reason"] = status_reason
+    return record
 
 
 def _project_records(

@@ -12,6 +12,8 @@ import time
 import uuid
 from collections.abc import Callable
 
+from .claude_pending_hook import install_claude_pending_hooks
+from .claude_pending_questions import extract_claude_pending_interaction_updates
 from .config import CollectorConfig, SYSTEM, _default_data_dir
 from .cursor_state_export import (
     CursorStateExporter,
@@ -34,6 +36,7 @@ AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
 CURSOR_STATE_POLL_INTERVAL = 5  # Keep live state current without hot-looping SQLite
+CLAUDE_PENDING_POLL_INTERVAL = 5  # Surface live questions before JSONL flush
 
 
 def _load_saved_config() -> CollectorConfig:
@@ -357,8 +360,32 @@ def _check_and_update(logger: logging.Logger) -> None:
 
 
 _ag_export_lock = threading.Lock()
+_claude_pending_poll_lock = threading.Lock()
 _codex_metadata_poll_lock = threading.Lock()
 _cursor_state_poll_lock = threading.Lock()
+
+
+def _poll_claude_pending_questions(
+    tool: ClaudeCodeTool,
+    queue: SyncQueue,
+    logger: logging.Logger,
+) -> None:
+    """Queue AskUserQuestion state captured by the Claude Code hook."""
+    if not _claude_pending_poll_lock.acquire(blocking=False):
+        return
+    try:
+        records = extract_claude_pending_interaction_updates(tool)
+        queued = queue.enqueue_metadata_changes(
+            namespace="conversation_interactions",
+            tool_name="claude_code",
+            records=records,
+        )
+        if queued:
+            logger.info("Queued %d Claude pending-question update(s)", queued)
+    except Exception:
+        logger.exception("Claude pending-question poll failed")
+    finally:
+        _claude_pending_poll_lock.release()
 
 
 def _poll_codex_thread_titles(
@@ -527,13 +554,20 @@ def main() -> None:
         config.device_id[:8], config.device_name, config.platform,
     )
     _check_windows_task_health(logger)
+    try:
+        hook_settings, hooks_changed = install_claude_pending_hooks()
+        if hooks_changed:
+            logger.info("Installed Claude pending-question hooks in %s", hook_settings)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Could not install Claude pending-question hooks: %s", exc)
 
     # Initialize tools
+    claude_tool = ClaudeCodeTool()
     codex_tool = CodexTool()
     cursor_tool = CursorTool()
     cursor_exporter = CursorStateExporter(cursor_tool)
     tools = [
-        ClaudeCodeTool(), OpenClawTool(), codex_tool,
+        claude_tool, OpenClawTool(), codex_tool,
         AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path),
         cursor_tool,
         HermesTool(),
@@ -588,6 +622,13 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    if claude_tool in available:
+        threading.Thread(
+            target=_poll_claude_pending_questions,
+            args=(claude_tool, queue, logger),
+            daemon=True,
+        ).start()
+
     if cursor_tool in available and cursor_tool.state_database_path.is_file():
         threading.Thread(
             target=_poll_cursor_state,
@@ -617,6 +658,7 @@ def main() -> None:
     last_command_poll = time.time()
     last_update_check = time.time()
     last_codex_metadata_poll = time.time()
+    last_claude_pending_poll = time.time()
     last_cursor_state_poll = time.time()
 
     try:
@@ -659,6 +701,17 @@ def main() -> None:
                 threading.Thread(
                     target=_poll_codex_thread_titles,
                     args=(codex_tool, queue, logger),
+                    daemon=True,
+                ).start()
+
+            if (
+                claude_tool in available
+                and now - last_claude_pending_poll > CLAUDE_PENDING_POLL_INTERVAL
+            ):
+                last_claude_pending_poll = now
+                threading.Thread(
+                    target=_poll_claude_pending_questions,
+                    args=(claude_tool, queue, logger),
                     daemon=True,
                 ).start()
 

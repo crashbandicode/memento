@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import ConversationMessage, Document, Machine
 from .cache import cache_delete_prefix
 from .conversation_parser import (
-    normalize_question_interaction,
+    normalize_interaction,
     strip_terminal_sequences,
 )
 from .ingest_service import (
@@ -390,7 +390,7 @@ async def apply_conversation_interaction_update(
         metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY),
     )
     if status == "pending" and not stale_pending:
-        interaction = normalize_question_interaction(
+        interaction = normalize_interaction(
             question_tool,
             interaction_input,
             source=tool_id,

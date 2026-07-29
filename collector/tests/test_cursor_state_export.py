@@ -50,6 +50,57 @@ def test_pending_question_uses_cursor_interaction_status() -> None:
     assert "Which option?" in str(record["tool_input"])
 
 
+def test_plan_mode_request_projects_native_params_and_pending_status() -> None:
+    record = _tool_record(
+        {
+            "name": "switch_mode",
+            "status": "loading",
+            "params": json.dumps({
+                "fromModeId": "agent",
+                "toModeId": "plan",
+                "explanation": "Confirm the architecture before editing.",
+            }),
+            "rawArgs": "{}",
+            "result": "{}",
+            "toolCallId": "call-plan-1",
+        },
+        source_id="plan-1",
+        timestamp="2026-07-26T22:42:27Z",
+        model="grok-4.5",
+        reasoning_effort="high",
+    )
+
+    assert record["tool_status"] == "loading"
+    assert json.loads(str(record["tool_input"]))["toModeId"] == "plan"
+    assert "Confirm the architecture" in str(record["tool_input"])
+    assert record["content"].startswith("Status: loading")
+
+
+def test_skipped_plan_mode_request_projects_native_timeout_reason() -> None:
+    record = _tool_record(
+        {
+            "name": "switch_mode",
+            "status": "cancelled",
+            "additionalData": {"skipReason": "timeout"},
+            "params": json.dumps({
+                "fromModeId": "agent",
+                "toModeId": "plan",
+                "explanation": "Confirm the architecture before editing.",
+            }),
+            "rawArgs": "{}",
+            "result": "{}",
+            "toolCallId": "call-plan-1",
+        },
+        source_id="plan-1",
+        timestamp="2026-07-26T22:42:27Z",
+        model="grok-4.5",
+        reasoning_effort="high",
+    )
+
+    assert record["tool_status"] == "cancelled"
+    assert record["tool_status_reason"] == "timeout"
+
+
 def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:
     session_id = "18f25182-cddc-4102-81f9-408fecf0655c"
     root = tmp_path / ".cursor"
