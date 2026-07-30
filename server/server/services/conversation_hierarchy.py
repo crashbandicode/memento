@@ -329,6 +329,10 @@ def build_subagent_summaries(
             metadata = child.metadata or {}
             thread_id = current_thread_id(metadata)
             nickname = metadata.get("agent_nickname")
+            launch_description = (
+                str(metadata.get("agent_launch_description") or "").strip()
+                or None
+            )
             agent_path = metadata.get("agent_path")
             agent_path_label = (
                 str(agent_path).strip("/").rsplit("/", 1)[-1]
@@ -350,7 +354,8 @@ def build_subagent_summaries(
                 "id": str(child.document_id),
                 "session_id": thread_id,
                 "title": (
-                    agent_path_label
+                    launch_description
+                    or agent_path_label
                     or (str(nickname) if nickname else None)
                     or child.title
                     or (f"Subagent {thread_id[:8]}" if thread_id else "Subagent")

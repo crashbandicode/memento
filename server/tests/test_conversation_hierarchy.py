@@ -343,6 +343,49 @@ class ConversationHierarchyTests(unittest.TestCase):
 
         self.assertEqual(summaries["root"][0]["title"], "search pagination repair")
 
+    def test_subagent_summary_prefers_claude_launch_description(self) -> None:
+        root = _ref(
+            "root",
+            session_id="root-thread",
+            tool_id="claude_code",
+            path="projects/yoga/root-thread.jsonl",
+        )
+        child = _ref(
+            "child",
+            session_id="agent-afceda9d5a896fb52",
+            root_session_id="root-thread",
+            agent_path="/root/unrelated_path_label",
+            is_subagent=True,
+            tool_id="claude_code",
+            path=(
+                "projects/yoga/root-thread/subagents/"
+                "agent-afceda9d5a896fb52.jsonl"
+            ),
+        )
+        child = ConversationRef(
+            document_id=child.document_id,
+            tool_id=child.tool_id,
+            relative_path=child.relative_path,
+            metadata={
+                **(child.metadata or {}),
+                "agent_launch_description": (
+                    "Hoist wave engine into WaveDrainEngine mixin"
+                ),
+            },
+            title="TOOLING — HARD RULES...",
+            activity_at=child.activity_at,
+            synced_at=child.synced_at,
+            file_size_bytes=child.file_size_bytes,
+        )
+
+        hierarchy = fold_conversation_subagents([root, child])
+        summaries = build_subagent_summaries(hierarchy, [root, child])
+
+        self.assertEqual(
+            summaries["root"][0]["title"],
+            "Hoist wave engine into WaveDrainEngine mixin",
+        )
+
     def test_lifecycle_event_surfaces_child_before_document_ingest(self) -> None:
         summaries = merge_subagent_event_summaries([], [{
             "agent_thread_id": "child-thread",

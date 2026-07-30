@@ -94,8 +94,13 @@ PENDING_QUESTION_RECONCILIATION_VERSION = 3
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
     "agent_id",
+    "agent_launch_description",
+    "agent_launch_metadata_source",
+    "agent_launch_metadata_version",
     "agent_nickname",
     "agent_path",
+    "agent_tool_use_id",
+    "agent_type",
     "cascade_id",
     "codex_title_revision",
     "codex_title_revisions",
@@ -132,6 +137,11 @@ _ESSENTIAL_METADATA_KEYS = {
 
 _EMBEDDING_CATEGORIES = {"conversation", "memory", "learning", "plan", "identity"}
 _PROTECTED_DOCUMENT_METADATA_KEYS = {
+    "agent_launch_description",
+    "agent_launch_metadata_source",
+    "agent_launch_metadata_version",
+    "agent_tool_use_id",
+    "agent_type",
     "codex_title_revision",
     "codex_title_revisions",
     "memento_title_source",
@@ -147,6 +157,12 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "title_is_manual",
     "title_source",
 }
+_CLAUDE_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_CLAUDE_AGENT_SIDECAR_SOURCE = "claude_subagent_sidecar"
+_CLAUDE_AGENT_SIDECAR_VERSION = 1
+_CLAUDE_AGENT_DESCRIPTION_MAX_CHARS = 1_024
+_CLAUDE_AGENT_TOOL_USE_ID_MAX_CHARS = 256
+_CLAUDE_AGENT_TYPE_MAX_CHARS = 128
 
 
 def normalize_ingest_category(
@@ -164,6 +180,114 @@ def normalize_ingest_category(
     ):
         return "state"
     return category
+
+
+def _normalized_claude_relative_path(relative_path: str) -> str | None:
+    """Normalize separators without allowing a sibling lookup to escape its path."""
+    raw = str(relative_path or "").replace("\\", "/")
+    if not raw or raw.startswith("/") or "\x00" in raw:
+        return None
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    return "/".join(parts) or None
+
+
+def _claude_subagent_file_identity(
+    relative_path: str,
+    *,
+    sidecar: bool,
+) -> tuple[str, str] | None:
+    """Return the normalized path and filename-backed Claude agent ID."""
+    normalized = _normalized_claude_relative_path(relative_path)
+    if normalized is None or "/subagents/" not in f"/{normalized}":
+        return None
+    filename = normalized.rsplit("/", 1)[-1]
+    suffix = r"\.meta\.json" if sidecar else r"\.jsonl"
+    match = re.fullmatch(rf"agent-([A-Za-z0-9][A-Za-z0-9_-]{{0,127}}){suffix}", filename)
+    if match is None:
+        return None
+    return normalized, match.group(1)
+
+
+def _bounded_claude_sidecar_value(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    bounded = value.strip()
+    if not bounded or any(ord(char) < 32 for char in bounded):
+        return None
+    return bounded[:limit]
+
+
+def _claude_subagent_sidecar_evidence(
+    relative_path: str,
+    content: str | None,
+) -> tuple[str, dict[str, object]] | None:
+    """Validate one sidecar and return its exact sibling transcript metadata."""
+    identity = _claude_subagent_file_identity(relative_path, sidecar=True)
+    if identity is None or not content:
+        return None
+    sidecar_path, filename_agent_id = identity
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    agent_id = payload.get("agentId")
+    if (
+        not isinstance(agent_id, str)
+        or _CLAUDE_AGENT_ID_RE.fullmatch(agent_id) is None
+        or agent_id != filename_agent_id
+    ):
+        return None
+
+    metadata: dict[str, object] = {
+        "agent_id": agent_id,
+        "agent_launch_metadata_source": _CLAUDE_AGENT_SIDECAR_SOURCE,
+        "agent_launch_metadata_version": _CLAUDE_AGENT_SIDECAR_VERSION,
+    }
+    for source_key, target_key, limit in (
+        (
+            "description",
+            "agent_launch_description",
+            _CLAUDE_AGENT_DESCRIPTION_MAX_CHARS,
+        ),
+        ("toolUseId", "agent_tool_use_id", _CLAUDE_AGENT_TOOL_USE_ID_MAX_CHARS),
+        ("agentType", "agent_type", _CLAUDE_AGENT_TYPE_MAX_CHARS),
+    ):
+        value = _bounded_claude_sidecar_value(payload.get(source_key), limit)
+        if value is not None:
+            metadata[target_key] = value
+
+    transcript_path = f"{sidecar_path[:-len('.meta.json')]}.jsonl"
+    return transcript_path, metadata
+
+
+def _claude_subagent_sidecar_path(relative_path: str) -> str | None:
+    identity = _claude_subagent_file_identity(relative_path, sidecar=False)
+    if identity is None:
+        return None
+    transcript_path, _ = identity
+    return f"{transcript_path[:-len('.jsonl')]}.meta.json"
+
+
+def _claude_subagent_pair_transcript_path(
+    relative_path: str,
+    category: str,
+) -> str | None:
+    if category == "conversation":
+        identity = _claude_subagent_file_identity(relative_path, sidecar=False)
+        return identity[0] if identity is not None else None
+    if category == "state":
+        identity = _claude_subagent_file_identity(relative_path, sidecar=True)
+        if identity is not None:
+            return f"{identity[0][:-len('.meta.json')]}.jsonl"
+    return None
 
 
 def _conversation_search_index_needs_refresh(
@@ -1668,6 +1792,176 @@ def _scoped_document_select(
     return statement
 
 
+async def _reconcile_claude_subagent_launch_metadata(
+    db: AsyncSession,
+    document: Document,
+    *,
+    machine_id: str | None,
+    user_id: str | None,
+    pair_locked: bool = False,
+) -> Document | None:
+    """Enrich an exact Claude transcript/sidecar sibling pair once."""
+    if document.tool_id != "claude_code":
+        return None
+
+    normalized_path = _normalized_claude_relative_path(document.relative_path)
+    if normalized_path is None:
+        return None
+
+    sidecar_document: Document | None
+    transcript_document: Document | None
+    if document.category == "state":
+        evidence = _claude_subagent_sidecar_evidence(
+            normalized_path,
+            document.content,
+        )
+        if evidence is None:
+            return None
+        transcript_path, launch_metadata = evidence
+        sidecar_document = document
+        transcript_document = None
+    elif document.category == "conversation":
+        sidecar_path = _claude_subagent_sidecar_path(normalized_path)
+        if sidecar_path is None:
+            return None
+        transcript_path = normalized_path
+        sidecar_document = None
+        transcript_document = document
+        launch_metadata = {}
+    else:
+        return None
+
+    # Sidecar and transcript uploads have different source locks. A shared
+    # transaction lock closes the concurrent-arrival gap while retaining exact
+    # path/device/user scoping.
+    if not pair_locked:
+        await _lock_ingest_source(
+            db,
+            machine_id=machine_id,
+            user_id=user_id,
+            tool_id="claude_code",
+            relative_path=f"sidecar-pair:{transcript_path}",
+        )
+
+    if sidecar_document is None:
+        sidecar_document = (
+            await db.execute(
+                _scoped_document_select(
+                    "claude_code",
+                    sidecar_path,
+                    machine_id,
+                    user_id,
+                ).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if sidecar_document is None or sidecar_document.category != "state":
+            return None
+        evidence = _claude_subagent_sidecar_evidence(
+            sidecar_document.relative_path,
+            sidecar_document.content,
+        )
+        if evidence is None:
+            return None
+        evidence_transcript_path, launch_metadata = evidence
+        if evidence_transcript_path != transcript_path:
+            return None
+
+    if transcript_document is None:
+        transcript_document = (
+            await db.execute(
+                _scoped_document_select(
+                    "claude_code",
+                    transcript_path,
+                    machine_id,
+                    user_id,
+                ).with_for_update()
+            )
+        ).scalar_one_or_none()
+    if (
+        transcript_document is None
+        or transcript_document.category != "conversation"
+        or _normalized_claude_relative_path(transcript_document.relative_path)
+        != transcript_path
+    ):
+        return None
+
+    agent_id = str(launch_metadata["agent_id"])
+    session_id = (transcript_document.metadata_ or {}).get("session_id")
+    if session_id and str(session_id) != f"agent-{agent_id}":
+        return None
+
+    existing_metadata = dict(transcript_document.metadata_ or {})
+    if all(
+        existing_metadata.get(key) == value
+        for key, value in launch_metadata.items()
+    ):
+        return None
+    merged_metadata, _, _ = _prepare_document_metadata(
+        {**existing_metadata, **launch_metadata},
+        tool_id="claude_code",
+    )
+    transcript_document.metadata_ = merged_metadata
+    return transcript_document
+
+
+async def _invalidate_ingest_read_caches(
+    user_id: str | None,
+    project_id: object | None,
+) -> None:
+    if not user_id:
+        return
+    try:
+        from .cache import cache_delete_prefix
+
+        await cache_delete_prefix(f"daily:detail:{user_id}:")
+        await cache_delete_prefix(f"daily:dates:{user_id}:")
+        if project_id:
+            await cache_delete_prefix(f"project:conv:{user_id}:{project_id}:")
+    except Exception:
+        pass
+
+
+def _publish_file_synced_event(document: Document, user_id: str | None) -> None:
+    try:
+        from .sse_service import publish_event
+
+        publish_event(
+            "file_synced",
+            {
+                "document_id": str(document.id),
+                "tool_id": document.tool_id,
+                "category": document.category,
+                "relative_path": document.relative_path,
+                "title": document.title,
+            },
+            user_id=user_id,
+        )
+    except Exception:
+        pass
+
+
+async def _reconcile_idempotent_claude_ingest(
+    db: AsyncSession,
+    document: Document,
+    *,
+    machine_id: str | None,
+    user_id: str | None,
+    pair_locked: bool = False,
+) -> None:
+    enriched_child = await _reconcile_claude_subagent_launch_metadata(
+        db,
+        document,
+        machine_id=machine_id,
+        user_id=user_id,
+        pair_locked=pair_locked,
+    )
+    if enriched_child is None:
+        return
+    await db.flush()
+    await _invalidate_ingest_read_caches(user_id, enriched_child.project_id)
+    _publish_file_synced_event(enriched_child, user_id)
+
+
 def _scoped_sync_state_select(
     tool_id: str,
     relative_path: str,
@@ -1818,6 +2112,20 @@ async def ingest_file(
         relative_path=relative_path,
         source_identity=stable_source_identity,
     )
+    claude_pair_transcript_path = (
+        _claude_subagent_pair_transcript_path(relative_path, category)
+        if tool_id == "claude_code"
+        else None
+    )
+    claude_pair_locked = claude_pair_transcript_path is not None
+    if claude_pair_transcript_path is not None:
+        await _lock_ingest_source(
+            db,
+            machine_id=machine_id,
+            user_id=user_id,
+            tool_id="claude_code",
+            relative_path=f"sidecar-pair:{claude_pair_transcript_path}",
+        )
     # Fast-path dedup: if this exact (tool_id, relative_path, content_hash,
     # offset) was already ingested, skip everything. Common in multi-collector
     # setups where pip + Tauri sidecar both watch the same .jsonl and resend
@@ -1923,6 +2231,13 @@ async def ingest_file(
             doc.source_modified_at = max(
                 filter(None, (doc.source_modified_at, source_modified_at))
             )
+            await _reconcile_idempotent_claude_ingest(
+                db,
+                doc,
+                machine_id=machine_id,
+                user_id=user_id,
+                pair_locked=claude_pair_locked,
+            )
             setattr(doc, "_memento_ingest_disposition", "idempotent")
             return doc
 
@@ -1987,6 +2302,13 @@ async def ingest_file(
                 user_id,
                 mode=mode,
                 monotonic_offset=True,
+            )
+            await _reconcile_idempotent_claude_ingest(
+                db,
+                doc,
+                machine_id=machine_id,
+                user_id=user_id,
+                pair_locked=claude_pair_locked,
             )
             setattr(doc, "_memento_ingest_disposition", "idempotent")
             return doc
@@ -2274,6 +2596,15 @@ async def ingest_file(
     from sqlalchemy import update as _update
 
     await db.flush()
+    enriched_claude_child = await _reconcile_claude_subagent_launch_metadata(
+        db,
+        doc,
+        machine_id=machine_id,
+        user_id=user_id,
+        pair_locked=claude_pair_locked,
+    )
+    if enriched_claude_child is not None:
+        await db.flush()
 
     # Bump the parent project's updated_at so the projects list (sorted
     # by Project.updated_at desc) actually reorders when a new doc
@@ -2291,16 +2622,15 @@ async def ingest_file(
     # (30 s). Without these, shared daily / shared timeline / dashboard
     # "recent activity" lag actual sync by up to a minute. Redis down
     # → no-op, TTL handles it.
-    if user_id:
-        try:
-            from .cache import cache_delete_prefix
-
-            await cache_delete_prefix(f"daily:detail:{user_id}:")
-            await cache_delete_prefix(f"daily:dates:{user_id}:")
-            if doc.project_id:
-                await cache_delete_prefix(f"project:conv:{user_id}:{doc.project_id}:")
-        except Exception:
-            pass
+    await _invalidate_ingest_read_caches(user_id, doc.project_id)
+    if (
+        enriched_claude_child is not None
+        and enriched_claude_child.project_id != doc.project_id
+    ):
+        await _invalidate_ingest_read_caches(
+            user_id,
+            enriched_claude_child.project_id,
+        )
 
     # Existing-document appends dominate live sync. Updating the timestamp is
     # sufficient for those; only a new document changes the count, and that
@@ -2421,23 +2751,16 @@ async def ingest_file(
         except Exception:
             pass  # Celery may not be running in dev
 
-    # Publish SSE event
-    try:
-        from .sse_service import publish_event
-
-        publish_event(
-            "file_synced",
-            {
-                "document_id": str(doc.id),
-                "tool_id": tool_id,
-                "category": category,
-                "relative_path": relative_path,
-                "title": title,
-            },
-            user_id=user_id,
-        )
-    except Exception:
-        pass
+    # Publish the ordinary file event. If a sidecar enriched a previously
+    # ingested transcript, publish that child too so parent companion refresh
+    # logic sees a conversation-path event. A transcript that enriches itself
+    # already has the ordinary event and must not receive a duplicate.
+    _publish_file_synced_event(doc, user_id)
+    if (
+        enriched_claude_child is not None
+        and enriched_claude_child.id != doc.id
+    ):
+        _publish_file_synced_event(enriched_claude_child, user_id)
 
     # Generate embeddings + extract knowledge graph (async, non-blocking)
     # Must keep a reference to the task to prevent GC
