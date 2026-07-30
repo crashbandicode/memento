@@ -101,6 +101,41 @@ def test_skipped_plan_mode_request_projects_native_timeout_reason() -> None:
     assert record["tool_status_reason"] == "timeout"
 
 
+def test_subagent_task_projects_requested_model_and_exact_start_time() -> None:
+    record = _tool_record(
+        {
+            "name": "task_v2",
+            "status": "completed",
+            "params": {
+                "description": "Add Terra/Opus to allowlist",
+                "prompt": (
+                    "ADDITIONAL DIRECTIVE: Do NOT go off on tooling rabbit holes.\n\n"
+                    "Update the model allowlists."
+                ),
+                "subagentType": "unspecified",
+                "model": "gpt-5.6-sol-xhigh",
+                "name": "general-purpose",
+            },
+            "result": {
+                "agentId": "bc319435-7c07-4287-8428-f28257207520",
+                "isBackground": True,
+            },
+            "toolCallId": "call-628beaa1",
+        },
+        source_id="ba873814-11b5-451f-b5e1-556764456c40:tool",
+        timestamp="2026-07-30T12:50:50.840Z",
+        model="grok-4.5",
+        reasoning_effort="high",
+    )
+
+    params = json.loads(str(record["tool_input"]))
+    assert record["timestamp"] == "2026-07-30T12:50:50.840Z"
+    assert record["model"] == "grok-4.5"
+    assert params["model"] == "gpt-5.6-sol-xhigh"
+    assert params["prompt"].startswith("ADDITIONAL DIRECTIVE:")
+    assert json.loads(str(record["content"]))["isBackground"] is True
+
+
 def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:
     session_id = "18f25182-cddc-4102-81f9-408fecf0655c"
     root = tmp_path / ".cursor"

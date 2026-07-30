@@ -231,6 +231,9 @@ export interface ConversationSubagentSummary {
   document_ready?: boolean;
   status?: "running" | "completed" | "interrupted" | "failed" | "unknown";
   last_event_at?: string | null;
+  model?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 }
 
 export interface ConversationTask {
@@ -418,6 +421,9 @@ export interface ConversationAgentEvent {
   tool_call_id?: string;
   result_summary?: string;
   output_path?: string;
+  model?: string;
+  started_at?: string;
+  completed_at?: string;
   agents?: ConversationAgentStatus[];
 }
 

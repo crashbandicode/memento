@@ -345,6 +345,7 @@ def build_subagent_summaries(
                 agent_depth = None
             parent_thread_id = metadata.get("parent_thread_id")
             timestamp = effective_conversation_timestamp(child)
+            model = str(metadata.get("model") or "").strip() or None
             children.append({
                 "id": str(child.document_id),
                 "session_id": thread_id,
@@ -366,6 +367,9 @@ def build_subagent_summaries(
                 "synced_at": (
                     child.synced_at.isoformat() if child.synced_at else None
                 ),
+                "model": model,
+                "started_at": None,
+                "completed_at": None,
             })
         if children:
             summaries[parent_id] = children
@@ -405,6 +409,16 @@ def merge_subagent_event_summaries(
             "interrupted": "interrupted",
             "failed": "failed",
         }.get(kind, "unknown")
+        event_timestamp = item.get("timestamp")
+        event_model = str(item.get("model") or "").strip() or None
+        started_at = item.get("started_at") or (
+            event_timestamp if kind == "started" else None
+        )
+        completed_at = item.get("completed_at") or (
+            event_timestamp
+            if kind in {"completed", "interrupted", "failed"}
+            else None
+        )
         existing = by_thread.get(thread_id)
         if existing is None:
             label = str(item.get("label") or "").strip()
@@ -428,6 +442,9 @@ def merge_subagent_event_summaries(
                 "activity_at": item.get("timestamp"),
                 "synced_at": None,
                 "document_ready": False,
+                "model": event_model,
+                "started_at": started_at,
+                "completed_at": completed_at,
             }
             merged.append(existing)
             by_thread[thread_id] = existing
@@ -441,13 +458,22 @@ def merge_subagent_event_summaries(
                 label = str(item.get("label") or "").strip()
                 if label:
                     existing["title"] = label
+        if event_model and not existing.get("model"):
+            existing["model"] = event_model
+        if started_at and not existing.get("started_at"):
+            existing["started_at"] = started_at
+        if completed_at:
+            existing["completed_at"] = completed_at
         existing["status"] = status
-        existing["last_event_at"] = item.get("timestamp")
+        existing["last_event_at"] = event_timestamp
 
     for summary in merged:
         summary.setdefault("document_ready", bool(summary.get("id")))
         summary.setdefault("status", "unknown")
         summary.setdefault("last_event_at", None)
+        summary.setdefault("model", None)
+        summary.setdefault("started_at", None)
+        summary.setdefault("completed_at", None)
     return merged
 
 

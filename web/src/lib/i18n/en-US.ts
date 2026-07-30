@@ -180,6 +180,8 @@ const enUS: Translations = {
     expandAll: "Expand All",
     subagentDispatch: "Subagent dispatch",
     sessionContext: "Session context",
+    additionalDirectives: "Additional directives",
+    additionalDirectivesHint: "Product and session guidance for this task",
     scheduledAutomation: "Scheduled automation",
     attachments: "Attachments",
     imageAttachment: "Image",

@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 import { Icon } from "@/components/aurora/Icon";
 import { api } from "@/lib/api-client";
 import type { ConversationMessage, ConversationSubagentSummary } from "@/lib/api-client";
+import { formatAssistantModelLabel } from "@/components/viewers/AssistantIdentityBadge";
 import styles from "./SubagentBadge.module.css";
 
 const DEFAULT_VISIBLE_AGENTS = 80;
@@ -135,7 +136,7 @@ export default function SubagentBadge({
     const normalizedQuery = query.trim().toLocaleLowerCase();
     if (!normalizedQuery) return orderedSubagents;
     return orderedSubagents.filter((subagent) => (
-      `${subagent.title} ${subagent.agent_nickname || ""} ${subagent.agent_path || ""}`
+      `${subagent.title} ${subagent.agent_nickname || ""} ${subagent.agent_path || ""} ${subagent.model || ""}`
         .toLocaleLowerCase()
         .includes(normalizedQuery)
     ));
@@ -254,6 +255,9 @@ export default function SubagentBadge({
                   subagent.agent_nickname
                   && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
                 );
+                const modelLabel = formatAssistantModelLabel(subagent.model);
+                const startedAt = formatSubagentTime(subagent.started_at);
+                const completedAt = formatSubagentTime(subagent.completed_at);
                 return (
                   <div
                     key={key}
@@ -276,6 +280,36 @@ export default function SubagentBadge({
                           {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
                           {subagent.document_ready === false ? " · transcript syncing" : ""}
                         </span>
+                        {(modelLabel || startedAt || completedAt) && (
+                          <span className={styles.agentFacts}>
+                            {modelLabel && (
+                              <span className={styles.agentFact} title={`Model: ${subagent.model}`}>
+                                <Icon name="sparkles" size={10} />
+                                {modelLabel}
+                              </span>
+                            )}
+                            {startedAt && (
+                              <time
+                                className={styles.agentFact}
+                                dateTime={subagent.started_at || undefined}
+                                title={`Started ${startedAt.full}`}
+                              >
+                                <Icon name="clock" size={10} />
+                                Started {startedAt.short}
+                              </time>
+                            )}
+                            {completedAt && (
+                              <time
+                                className={styles.agentFact}
+                                dateTime={subagent.completed_at || undefined}
+                                title={`Completed ${completedAt.full}`}
+                              >
+                                <Icon name="check" size={10} />
+                                Completed {completedAt.short}
+                              </time>
+                            )}
+                          </span>
+                        )}
                       </span>
                       {isMatched && <span className={styles.matchLabel}>Match</span>}
                       <Icon name={expanded ? "chevron_up" : "chevron_down"} size={11} />
@@ -305,6 +339,21 @@ export default function SubagentBadge({
       )}
     </div>
   );
+}
+
+function formatSubagentTime(value?: string | null): { short: string; full: string } | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return {
+    short: parsed.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }),
+    full: parsed.toLocaleString(),
+  };
 }
 
 function SubagentPreview({

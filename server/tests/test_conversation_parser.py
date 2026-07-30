@@ -284,6 +284,7 @@ class ConversationParserTests(unittest.TestCase):
                 "task_kind": "subagent",
                 "task_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
                 "status": "completed",
+                "completed_at": "2026-07-21T12:00:00Z",
             },
         )
 
@@ -1941,6 +1942,7 @@ class ConversationParserTests(unittest.TestCase):
                 "task_kind": "shell",
                 "task_id": "15893",
                 "status": "success",
+                "completed_at": "2026-07-21T12:57:06Z",
             },
         )
 
@@ -2033,6 +2035,65 @@ class ConversationParserTests(unittest.TestCase):
             )
         )
 
+    def test_cursor_observed_additional_directives_are_context_not_prompt(self) -> None:
+        content = (
+            "<timestamp>Thursday, Jul 30, 2026, 9:11 AM (UTC-4)</timestamp>\n"
+            "<user_query>\n"
+            "ADDITIONAL DIRECTIVE: Do NOT chase unproven corner cases.\n\n"
+            "Own monitoring through completion:\n\n"
+            "1. Inspect `/home/pburton/fleet24_equiv/`.\n"
+            "2. Keep exactly one campaign chain.\n"
+            "</user_query>"
+        )
+        raw = json.dumps({
+            "role": "user",
+            "message": {"content": [{"type": "text", "text": content}]},
+        })
+
+        message = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(message)
+        assert message is not None
+        self.assertEqual(message.role, "system")
+        self.assertEqual(message.raw_type, "cursor_directives")
+        self.assertEqual(message.timestamp, "2026-07-30T09:11:00-04:00")
+        self.assertNotIn("ADDITIONAL DIRECTIVE:", message.content)
+        self.assertNotIn("<user_query>", message.content)
+        self.assertIn("`/home/pburton/fleet24_equiv/`", message.content)
+        self.assertFalse(
+            is_meaningful_human_prompt(message.content, {}, message.role)
+        )
+
+    def test_cursor_additional_directive_transports_dedupe_by_clean_body(self) -> None:
+        def directive(source_id: str, body: str) -> str:
+            return json.dumps({
+                "type": "user",
+                "role": "user",
+                "id": source_id,
+                "message": {"content": (
+                    "<additional_directives>"
+                    f"{body}"
+                    "</additional_directives>"
+                )},
+            })
+
+        messages = parse_conversation(
+            "\n".join((
+                directive("transport-a", "Use the proven path."),
+                directive("transport-b", "Use the proven path."),
+                directive("transport-c", "Keep one campaign runner."),
+            )),
+            "cursor",
+        )
+
+        self.assertEqual(
+            [message.content for message in messages],
+            ["Use the proven path.", "Keep one campaign runner."],
+        )
+        self.assertTrue(
+            all(message.raw_type == "cursor_directives" for message in messages)
+        )
+
     def test_cursor_completion_dedupes_same_task_but_keeps_distinct_tasks(self) -> None:
         def completion(source_id: str, task_id: str, title: str) -> str:
             return json.dumps({
@@ -2075,7 +2136,10 @@ class ConversationParserTests(unittest.TestCase):
             "timestamp": "2026-07-30T12:50:50Z",
             "tool_name": "task_v2",
             "tool_status": "completed",
-            "tool_input": json.dumps({"description": "Audit parser"}),
+            "tool_input": json.dumps({
+                "description": "Audit parser",
+                "model": "gpt-5.6-sol-xhigh",
+            }),
             "content": json.dumps({
                 "agentId": "agent-a",
                 "isBackground": True,
@@ -2108,6 +2172,18 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(
             [message.agent_event["task_id"] for message in messages],
             ["agent-a", "agent-a"],
+        )
+        self.assertEqual(
+            [message.agent_event["model"] for message in messages],
+            ["gpt-5.6-sol-xhigh", "gpt-5.6-sol-xhigh"],
+        )
+        self.assertEqual(
+            messages[0].agent_event["started_at"],
+            "2026-07-30T12:50:50Z",
+        )
+        self.assertEqual(
+            messages[1].agent_event["completed_at"],
+            "2026-07-30T12:51:53Z",
         )
 
     def test_cursor_malformed_completion_stays_system_context(self) -> None:

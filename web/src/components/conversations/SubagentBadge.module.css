@@ -167,6 +167,24 @@
 .agentText { display: grid; min-width: 0; flex: 1; gap: 2px; }
 .agentTitle { overflow: hidden; color: var(--aurora-fg1); font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .agentMeta { display: flex; min-width: 0; align-items: center; overflow: hidden; color: var(--aurora-fg4); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.agentFacts { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 4px; }
+.agentFact {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 5px;
+  border: 1px solid color-mix(in srgb, var(--aurora-accent) 12%, var(--aurora-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--aurora-surface-solid) 78%, transparent);
+  color: var(--aurora-fg3);
+  font-size: 8.5px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .statusDot { width: 6px; height: 6px; margin-right: 5px; flex: 0 0 auto; border-radius: 999px; background: var(--aurora-fg4); }
 .status_running { background: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1); }
 .status_completed { background: #059669; }
@@ -243,6 +261,7 @@
 
   .trigger { min-height: 32px; padding-inline: 10px; }
   .agentSummary { min-height: 50px; padding-block: 9px; }
+  .agentFact { max-width: min(100%, 240px); }
   .previewBody { padding-left: 13px; }
   .previewHeader { flex-direction: column; gap: 2px; }
   .previewRow {

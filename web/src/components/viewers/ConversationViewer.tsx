@@ -218,7 +218,7 @@ type ConversationVisibilityKey = keyof ConversationVisibility;
 
 function isSessionContextMessage(msg: ConversationMessage): boolean {
   const content = cleanTerminalText(msg.content);
-  return /(?:^|_)(?:(?:codex|claude|cursor)_context|(?:queued_)?scheduled_automation)$/i.test(
+  return /(?:^|_)(?:(?:codex|claude|cursor)_context|cursor_directives|(?:queued_)?scheduled_automation)$/i.test(
     msg.raw_type || msg.message_type || "",
   )
     || isScheduledSystemContent(content)
@@ -3086,23 +3086,37 @@ function sessionContextSummary(
 function ConversationContextCard({
   content,
   t,
+  kind = "context",
 }: {
   content: string;
   t: ReturnType<typeof useI18n>["t"];
+  kind?: "context" | "directives";
 }) {
   const [expanded, setExpanded] = useState(false);
-  const summary = sessionContextSummary(content, t);
+  const isDirectives = kind === "directives";
+  const summary = isDirectives
+    ? (
+        cleanTerminalText(content).trim().split(/\r?\n/, 1)[0]
+        || t.conversation.additionalDirectivesHint
+      ).slice(0, 180)
+    : sessionContextSummary(content, t);
   const isScheduled = isScheduledSystemContent(content);
+  const usesMarkdown = isScheduled || isDirectives;
 
   return (
     <div
       data-conversation-context
+      data-context-kind={kind}
       style={{
         width: "100%",
         minWidth: 0,
-        border: "1px dashed color-mix(in srgb, var(--aurora-fg4) 34%, var(--aurora-border))",
+        border: isDirectives
+          ? "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))"
+          : "1px dashed color-mix(in srgb, var(--aurora-fg4) 34%, var(--aurora-border))",
         borderRadius: 11,
-        background: "color-mix(in srgb, var(--aurora-chip) 52%, transparent)",
+        background: isDirectives
+          ? "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))"
+          : "color-mix(in srgb, var(--aurora-chip) 52%, transparent)",
         overflow: "hidden",
       }}
     >
@@ -3138,11 +3152,15 @@ function ConversationContextCard({
             color: "var(--aurora-accent)",
           }}
         >
-          <Icon name={isScheduled ? "clock" : "layers"} size={14} />
+          <Icon name={isScheduled ? "clock" : isDirectives ? "file_text" : "layers"} size={14} />
         </span>
         <span style={{ minWidth: 0, display: "grid", gap: 1 }}>
           <span style={{ fontSize: 11.5, fontWeight: 650 }}>
-            {isScheduled ? t.conversation.scheduledAutomation : t.conversation.sessionContext}
+            {isScheduled
+              ? t.conversation.scheduledAutomation
+              : isDirectives
+                ? t.conversation.additionalDirectives
+                : t.conversation.sessionContext}
           </span>
           <span
             style={{
@@ -3168,7 +3186,7 @@ function ConversationContextCard({
         />
       </button>
       {expanded && (
-        isScheduled ? (
+        usesMarkdown ? (
           <div
             className="prose prose-sm max-w-none"
             style={{
@@ -3575,7 +3593,15 @@ function MessageCopyFrame({
   );
 }
 
-function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
+function AgentActivityCard({
+  event,
+  timestamp,
+  locale,
+}: {
+  event: ConversationAgentEvent;
+  timestamp?: string | null;
+  locale: string;
+}) {
   if (event.kind === "snapshot") {
     const agents = [...(event.agents || [])].sort((left, right) => {
       const rank = { running: 0, failed: 1, interrupted: 2, completed: 3, unknown: 4 };
@@ -3692,7 +3718,12 @@ function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
     : event.activity_type === "task"
       ? "Task"
       : "Subagent";
-  const hasDetails = Boolean(event.result_summary || event.output_path);
+  const eventTimestamp = event.completed_at || event.started_at || timestamp || "";
+  const parsedEventTime = eventTimestamp ? new Date(eventTimestamp) : null;
+  const eventTime = parsedEventTime && !Number.isNaN(parsedEventTime.getTime())
+    ? parsedEventTime.toLocaleString(locale)
+    : "";
+  const hasDetails = Boolean(event.result_summary || event.output_path || event.model || eventTime);
 
   return (
     <div
@@ -3753,6 +3784,39 @@ function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
           <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
         </span>
       </div>
+      {(event.model || eventTime) && (
+        <div
+          data-agent-event-meta
+          style={{
+            display: "flex",
+            minWidth: 0,
+            flexWrap: "wrap",
+            alignItems: "center",
+            gap: 7,
+            paddingLeft: 30,
+          }}
+        >
+          {event.model && <AssistantIdentityBadge model={event.model} />}
+          {eventTime && (
+            <time
+              dateTime={eventTimestamp}
+              title={parsedEventTime?.toISOString()}
+              style={{
+                display: "inline-flex",
+                minWidth: 0,
+                alignItems: "center",
+                gap: 4,
+                color: "var(--aurora-fg4)",
+                fontSize: 10,
+                whiteSpace: "nowrap",
+              }}
+            >
+              <Icon name="clock" size={11} />
+              {eventTime}
+            </time>
+          )}
+        </div>
+      )}
       {event.result_summary && (
         <div
           data-agent-result-summary
@@ -3850,7 +3914,7 @@ export const ChatBubble = memo(function ChatBubble({
   const agentEvent = msg.agent_event;
   if (role === "tool" && agentEvent) {
     if (isTaskActivityEvent(agentEvent) ? !showTasks : !showAgents) return null;
-    return <AgentActivityCard event={agentEvent} />;
+    return <AgentActivityCard event={agentEvent} timestamp={msg.timestamp} locale={locale} />;
   }
   if (role === "tool" && taskState) {
     if (!showTasks) return null;
@@ -4292,7 +4356,13 @@ export const ChatBubble = memo(function ChatBubble({
 
   if (isSessionContextMessage(msg)) {
     if (!showContext) return null;
-    return withCopyControls(<ConversationContextCard content={content} t={t} />);
+    return withCopyControls(
+      <ConversationContextCard
+        content={content}
+        t={t}
+        kind={msg.raw_type === "cursor_directives" ? "directives" : "context"}
+      />,
+    );
   }
 
   // Other system notices remain compact and centered.

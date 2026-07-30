@@ -186,6 +186,8 @@ const zhCN = {
     expandAll: "展开全部",
     subagentDispatch: "子任务派发",
     sessionContext: "会话上下文",
+    additionalDirectives: "附加指令",
+    additionalDirectivesHint: "此任务的产品与会话指导",
     scheduledAutomation: "定时自动化",
     attachments: "附件",
     imageAttachment: "图片",

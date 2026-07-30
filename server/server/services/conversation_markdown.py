@@ -476,13 +476,24 @@ def _write_message(
     is_context = bool(
         role not in {"user", "assistant", "tool"}
         and (
-            re.search(r"(?:^|_)(?:codex|claude|cursor)_context$", message.message_type or "", re.I)
+            re.search(
+                r"(?:^|_)(?:(?:codex|claude|cursor)_context|cursor_directives)$",
+                message.message_type or "",
+                re.I,
+            )
             or re.search(r"^(?:\s*<(?:recommended_plugins|codex_internal_context)\b|\s*#\s*AGENTS\.md instructions)", message.content, re.I)
         )
     )
     if is_context or message.content.lstrip().startswith("[Subagent Context]"):
         if options.include_session_context:
-            _write_details(writer, "Subagent context" if "Subagent Context" in message.content else "Session context", message.content.strip())
+            label = (
+                "Additional directives"
+                if message.message_type == "cursor_directives"
+                else "Subagent context"
+                if "Subagent Context" in message.content
+                else "Session context"
+            )
+            _write_details(writer, label, message.content.strip())
             return True
         return False
 

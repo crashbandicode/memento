@@ -169,6 +169,14 @@ _CURSOR_TASK_RESPONSE_RE = re.compile(
     r"<response>\s*(?P<response>[\s\S]*?)\s*</response>",
     re.IGNORECASE,
 )
+_CURSOR_ADDITIONAL_DIRECTIVES_ENVELOPE_RE = re.compile(
+    r"\A\s*<additional_directives\b[^>]*>\s*(?P<content>[\s\S]*?)\s*"
+    r"</additional_directives>\s*\Z",
+    re.IGNORECASE,
+)
+_CURSOR_ADDITIONAL_DIRECTIVE_LABEL_RE = re.compile(
+    r"(?mi)^[ \t]*ADDITIONAL DIRECTIVES?\s*:[ \t]*"
+)
 _CURSOR_IMAGE_FILES_ENVELOPE_RE = re.compile(
     r"\A\s*(?P<markers>(?:\[Image\]\s*)*)<image_files\b[^>]*>"
     r"(?P<body>[\s\S]*?)</image_files>\s*",
@@ -489,6 +497,25 @@ def normalize_cursor_user_payload(content: str) -> tuple[str, str]:
     ):
         return content, ""
     return payload.content, payload.timestamp
+
+
+def normalize_cursor_additional_directives(content: str) -> str | None:
+    """Return clean product-provided Cursor directives, when present.
+
+    Cursor subagent transcripts serialize their dispatch as a user-shaped
+    ``<user_query>`` row.  Current builds mark product/developer additions with
+    a stable ``ADDITIONAL DIRECTIVE:`` paragraph; future/alternate transports
+    may use the equivalent XML envelope.  Neither form represents a human
+    prompt, so remove only the transport label/envelope and preserve the
+    Markdown body (including paths, lists, and code).
+    """
+    text = (content or "").strip()
+    envelope = _CURSOR_ADDITIONAL_DIRECTIVES_ENVELOPE_RE.fullmatch(text)
+    if envelope is not None:
+        return envelope.group("content").strip()
+    if _CURSOR_ADDITIONAL_DIRECTIVE_LABEL_RE.search(text) is None:
+        return None
+    return _CURSOR_ADDITIONAL_DIRECTIVE_LABEL_RE.sub("", text).strip()
 
 
 def _codex_uuid(value: object) -> str | None:
@@ -1080,6 +1107,14 @@ def normalize_task_spawn_agent_event(
             "task_id": thread_id,
             "status": _coerce_text(status_hint).strip().casefold(),
         })
+        requested_model = _bounded_interaction_text(
+            payload.get("model")
+            or payload.get("modelSlug")
+            or payload.get("model_slug"),
+            256,
+        ).strip()
+        if requested_model:
+            event["model"] = requested_model
     return event
 
 
@@ -1768,6 +1803,17 @@ def parse_conversation_object(
                 display_content = (
                     f"{agent_event['label']} {agent_event['kind']}"
                 )
+                if timestamp:
+                    event_time_key = (
+                        "completed_at"
+                        if agent_event.get("kind") in {
+                            "completed",
+                            "interrupted",
+                            "failed",
+                        }
+                        else "started_at"
+                    )
+                    agent_event[event_time_key] = timestamp
             return NormalizedMessage(
                 role="tool",
                 content=display_content,
@@ -1811,11 +1857,23 @@ def parse_conversation_object(
             # Preserve a native machine timestamp if a future Cursor version
             # adds one; current transcripts carry it only in the envelope.
             timestamp = timestamp or envelope_timestamp
+            directives = normalize_cursor_additional_directives(content)
+            if directives is not None:
+                return NormalizedMessage(
+                    role="system",
+                    content=directives,
+                    session_context=session_context,
+                    timestamp=timestamp,
+                    raw_type="cursor_directives",
+                    source_id=source_id,
+                )
             if session_context and not content.strip():
                 completion_event = normalize_cursor_task_completion_event(
                     session_context
                 )
                 if completion_event is not None:
+                    if timestamp:
+                        completion_event["completed_at"] = timestamp
                     summary = _coerce_text(
                         completion_event.get("result_summary")
                     ).strip()
@@ -3469,6 +3527,8 @@ def _iter_cursor_conversation_messages(
     identity = assistant_identity or AssistantIdentityState()
     task_tracker = TaskStateTracker("cursor")
     seen_source_ids: set[str] = set()
+    seen_directives: set[str] = set()
+    subagent_models: dict[str, str] = {}
     pending_question: tuple[int, dict[str, object]] | None = None
     for interaction in reversed(initial_question_interactions or []):
         if isinstance(interaction, dict) and interaction.get("source") == "cursor":
@@ -3487,6 +3547,24 @@ def _iter_cursor_conversation_messages(
 
         for message in _parse_cursor_record_messages(source_object):
             _attach_assistant_identity(message, identity)
+            if message.raw_type == "cursor_directives":
+                directive_key = hashlib.sha256(
+                    message.content.strip().encode("utf-8", "replace")
+                ).hexdigest()
+                if directive_key in seen_directives:
+                    continue
+                seen_directives.add(directive_key)
+            if message.agent_event is not None:
+                thread_id = _coerce_text(
+                    message.agent_event.get("agent_thread_id")
+                ).strip()
+                event_model = _coerce_text(
+                    message.agent_event.get("model")
+                ).strip()
+                if thread_id and event_model:
+                    subagent_models[thread_id] = event_model
+                elif thread_id and thread_id in subagent_models:
+                    message.agent_event["model"] = subagent_models[thread_id]
             if message.role == "user" and pending_question is not None:
                 _pending_index, interaction = pending_question
                 if not _is_cursor_plan_mode_interaction(interaction):

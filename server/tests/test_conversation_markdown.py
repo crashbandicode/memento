@@ -23,6 +23,7 @@ def message(
     *,
     metadata: dict | None = None,
     day: int = 1,
+    message_type: str = "",
 ) -> ExportMessage:
     return ExportMessage(
         line_number=line,
@@ -30,6 +31,7 @@ def message(
         content=content,
         metadata=metadata or {},
         timestamp=datetime(2026, 7, day, 12, tzinfo=timezone.utc),
+        message_type=message_type,
     )
 
 
@@ -246,6 +248,33 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertNotIn("task update", text)
         self.assertNotIn("agent spawned", text)
         self.assertNotIn("UTC", text.split("---", 1)[1])
+
+    def test_cursor_directives_render_as_optional_context_not_prompt(self) -> None:
+        items = [
+            message(
+                1,
+                "system",
+                "Keep `C:\\work\\repo` unchanged.\n\n- Preserve lists",
+                message_type="cursor_directives",
+            ),
+            message(2, "user", "Ship the requested fix"),
+        ]
+
+        text, stats = self.render(items)
+
+        self.assertIn("<summary>Additional directives</summary>", text)
+        self.assertIn("Keep `C:\\work\\repo` unchanged.", text)
+        self.assertNotIn("## Prompt 1 — System", text)
+        self.assertEqual(stats.prompts_seen, 1)
+
+        hidden_text, hidden_stats = self.render(
+            items,
+            MarkdownExportOptions(include_session_context=False),
+        )
+        self.assertNotIn("Additional directives", hidden_text)
+        self.assertNotIn("Keep `C:\\work\\repo` unchanged.", hidden_text)
+        self.assertIn("Ship the requested fix", hidden_text)
+        self.assertEqual(hidden_stats.prompts_seen, 1)
 
     def test_display_filter_parity_keeps_selected_categories(self) -> None:
         items = [

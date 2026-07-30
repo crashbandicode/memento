@@ -151,6 +151,9 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "status": "success",
                 "label": "Start batch 1 pull tlv02+rno",
                 "result_summary": "Batch 1 pull completed.",
+                "model": "gpt-5.6-sol-xhigh",
+                "started_at": "2026-07-30T12:50:50.840Z",
+                "completed_at": "2026-07-30T12:51:53.073Z",
             },
         })
         db = _Db(
@@ -181,6 +184,18 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             message["agent_event"]["result_summary"],
             "Batch 1 pull completed.",
+        )
+        self.assertEqual(
+            message["agent_event"]["model"],
+            "gpt-5.6-sol-xhigh",
+        )
+        self.assertEqual(
+            message["agent_event"]["started_at"],
+            "2026-07-30T12:50:50.840Z",
+        )
+        self.assertEqual(
+            message["agent_event"]["completed_at"],
+            "2026-07-30T12:51:53.073Z",
         )
 
     async def test_around_line_uses_index_and_reports_row_offset(self) -> None:

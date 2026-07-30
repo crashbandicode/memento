@@ -357,6 +357,10 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertFalse(summaries[0]["document_ready"])
         self.assertEqual(summaries[0]["session_id"], "child-thread")
         self.assertEqual(summaries[0]["status"], "running")
+        self.assertEqual(
+            summaries[0]["started_at"],
+            "2026-07-20T08:39:45+00:00",
+        )
 
     def test_lifecycle_event_enriches_ready_child_without_duplicate(self) -> None:
         summaries = merge_subagent_event_summaries([{
@@ -378,6 +382,55 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertTrue(summaries[0]["document_ready"])
         self.assertEqual(summaries[0]["agent_nickname"], "Franklin the 2nd")
         self.assertEqual(summaries[0]["status"], "completed")
+
+    def test_lifecycle_merge_carries_source_model_and_both_times(self) -> None:
+        summaries = merge_subagent_event_summaries([], [
+            {
+                "agent_thread_id": "cursor-child",
+                "agent_path": "/root/add_terra_opus_to_allowlist",
+                "label": "Add Terra/Opus to allowlist",
+                "kind": "started",
+                "timestamp": "2026-07-30T12:50:50.840+00:00",
+                "started_at": "2026-07-30T12:50:50.840Z",
+                "model": "gpt-5.6-sol-xhigh",
+            },
+            {
+                "agent_thread_id": "cursor-child",
+                "agent_path": "/root/add_terra_opus_to_allowlist",
+                "label": "Add Terra/Opus to allowlist",
+                "kind": "completed",
+                "timestamp": "2026-07-30T12:51:53.073+00:00",
+                "completed_at": "2026-07-30T12:51:53.073Z",
+            },
+        ])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["model"], "gpt-5.6-sol-xhigh")
+        self.assertEqual(
+            summaries[0]["started_at"],
+            "2026-07-30T12:50:50.840Z",
+        )
+        self.assertEqual(
+            summaries[0]["completed_at"],
+            "2026-07-30T12:51:53.073Z",
+        )
+        self.assertEqual(summaries[0]["status"], "completed")
+
+    def test_lifecycle_merge_omits_unobserved_model_and_start_time(self) -> None:
+        summaries = merge_subagent_event_summaries([], [{
+            "agent_thread_id": "cursor-child",
+            "agent_path": "/root/legacy_child",
+            "label": "Legacy child",
+            "kind": "completed",
+            "timestamp": "2026-07-30T12:51:53+00:00",
+        }])
+
+        self.assertIsNone(summaries[0]["model"])
+        self.assertIsNone(summaries[0]["started_at"])
+        self.assertEqual(
+            summaries[0]["completed_at"],
+            "2026-07-30T12:51:53+00:00",
+        )
 
     def test_lifecycle_event_fills_missing_path_linked_identity(self) -> None:
         summaries = merge_subagent_event_summaries([{
