@@ -35,7 +35,10 @@ export default function ConversationPage() {
   const metaRequestRef = useRef(0);
   const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
-  const { prompts, syncVersion } = useConversationPrompts(docId);
+  const { prompts, syncVersion } = useConversationPrompts(docId, {
+    toolId: meta?.tool_id,
+    relativePath: meta?.relative_path,
+  });
 
   const refreshMeta = useCallback(() => {
     const request = ++metaRequestRef.current;
