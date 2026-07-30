@@ -548,6 +548,8 @@ def iter_stored_conversation_messages(
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity=None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
 ):
     """Yield the exact normalized representation persisted during ingest.
 
@@ -566,6 +568,8 @@ def iter_stored_conversation_messages(
         tool_id,
         initial_question_interactions=initial_question_interactions,
         assistant_identity=assistant_identity,
+        initial_task_state=initial_task_state,
+        incremental=incremental,
     ):
         if normalized.role not in ("user", "assistant", "tool", "system"):
             continue
@@ -3033,6 +3037,16 @@ async def _extract_messages(
 
     tool_id = doc.tool_id
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
+    from .conversation_tasks import (
+        current_projected_task_state,
+        refresh_task_projection,
+    )
+
+    initial_task_state = (
+        await current_projected_task_state(db, doc.id)
+        if mode == "delta"
+        else None
+    )
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
     latest_human_timestamp = _latest_human_timestamp_for_ingest(doc, mode)
     canonical_interaction_ids: set[str] = set()
@@ -3104,6 +3118,8 @@ async def _extract_messages(
         tool_id,
         initial_question_interactions=initial_question_interactions,
         assistant_identity=assistant_identity,
+        initial_task_state=initial_task_state,
+        incremental=mode == "delta",
     ):
         pending_before = bool(pending_question_ids)
         latest_human_timestamp = _update_pending_question_ids(
@@ -3461,6 +3477,10 @@ async def _extract_messages(
                 add_search_text("user", clean_first_user)
                 await db.flush()
 
+    # The projection and normalized message history commit in the same ingest
+    # transaction. FULL replacement therefore cannot expose stale task state,
+    # and DELTA updates are seeded from the previously committed projection.
+    await refresh_task_projection(db, doc)
     await upsert_search_terms(db, search_terms)
     return "".join(search_parts)
 

@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import admin, auth, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tools
+from .api import admin, auth, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -339,6 +339,80 @@ def _run_migrations(conn) -> None:
                 "ON share_links (target_user_id)"
             ))
 
+    # Current task-list projection. ConversationMessage rows remain immutable
+    # history; this one-row-per-document table is the indexed query authority.
+    task_projection_dependencies_exist = {
+        "documents",
+        "conversation_messages",
+    }.issubset(tables)
+    if task_projection_dependencies_exist:
+        if "conversation_task_states" not in tables:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS conversation_task_states ("
+                "document_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, "
+                "machine_id UUID REFERENCES machines(id) ON DELETE CASCADE, "
+                "user_id UUID REFERENCES users(id) ON DELETE CASCADE, "
+                "tool_id VARCHAR(50) NOT NULL, "
+                "thread_id VARCHAR(512), "
+                "root_thread_id VARCHAR(512), "
+                "parent_thread_id VARCHAR(512), "
+                "agent_id VARCHAR(512), "
+                "agent_path TEXT, "
+                "agent_depth INTEGER NOT NULL DEFAULT 0, "
+                "source_message_id BIGINT REFERENCES conversation_messages(id) "
+                "ON DELETE SET NULL, "
+                "source_line_number INTEGER, "
+                "source_ids JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "revision INTEGER NOT NULL DEFAULT 0, "
+                "state JSONB NOT NULL, "
+                "state_hash VARCHAR(64) NOT NULL, "
+                "explicit_current BOOLEAN NOT NULL DEFAULT FALSE, "
+                "quality VARCHAR(32) NOT NULL DEFAULT 'partial', "
+                "projection_version INTEGER NOT NULL DEFAULT 1, "
+                "pending_count INTEGER NOT NULL DEFAULT 0, "
+                "in_progress_count INTEGER NOT NULL DEFAULT 0, "
+                "blocked_count INTEGER NOT NULL DEFAULT 0, "
+                "completed_count INTEGER NOT NULL DEFAULT 0, "
+                "cancelled_count INTEGER NOT NULL DEFAULT 0, "
+                "outstanding_count INTEGER NOT NULL DEFAULT 0, "
+                "total_count INTEGER NOT NULL DEFAULT 0, "
+                "observed_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "verified_at TIMESTAMPTZ, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ))
+        for task_index_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_task_state_machine "
+            "ON conversation_task_states (machine_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_user "
+            "ON conversation_task_states (user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_thread "
+            "ON conversation_task_states (machine_id, tool_id, thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_root "
+            "ON conversation_task_states (machine_id, tool_id, root_thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_parent "
+            "ON conversation_task_states (machine_id, tool_id, parent_thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_agent "
+            "ON conversation_task_states (machine_id, tool_id, agent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_outstanding "
+            "ON conversation_task_states "
+            "(machine_id, outstanding_count, observed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_status_counts "
+            "ON conversation_task_states (tool_id, outstanding_count)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_pending "
+            "ON conversation_task_states (machine_id, pending_count)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_in_progress "
+            "ON conversation_task_states (machine_id, in_progress_count)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_blocked "
+            "ON conversation_task_states (machine_id, blocked_count)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_completed "
+            "ON conversation_task_states (machine_id, completed_count)",
+            "CREATE INDEX IF NOT EXISTS idx_task_state_cancelled "
+            "ON conversation_task_states (machine_id, cancelled_count)",
+        ):
+            conn.execute(text(task_index_sql))
+
     # Data migration: assign owner token + bind existing machines to owner
     result = conn.execute(text(
         "SELECT id, collector_token FROM users WHERE role = 'owner' AND status = 'active' LIMIT 1"
@@ -652,6 +726,7 @@ app.include_router(admin.router)
 app.include_router(events.router)
 app.include_router(devices.router)
 app.include_router(hierarchy.router)
+app.include_router(tasks.router)
 app.include_router(memory.router)
 app.include_router(install_bootstrap.router)
 app.include_router(public.router)

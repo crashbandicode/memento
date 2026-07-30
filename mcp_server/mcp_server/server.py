@@ -7,6 +7,7 @@ Two modes:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -31,9 +32,12 @@ def init_server(server_url: str | None = None, token: str | None = None, db_url:
     if server_url and token:
         from .remote_client import RemoteClient
         _remote = RemoteClient(server_url, token)
+        _session_factory = None
+        _search_session_factory = None
         logger.info("MCP Memory Server initialized in remote mode: %s", server_url)
     elif db_url:
         from .db import create_engine_and_session, get_search_db_url
+        _remote = None
         _session_factory = create_engine_and_session(db_url)
         search_db_url = get_search_db_url(db_url)
         _search_session_factory = (
@@ -618,6 +622,71 @@ async def memory_conversation(
             parts.append(head)
             parts.append(m.content or "(no text)")
         return "\n\n".join(parts)
+
+
+@mcp.tool()
+async def memory_tasks(
+    document_id: str | None = None,
+    thread_id: str | None = None,
+    agent_id: str | None = None,
+    subagent_id: str | None = None,
+    tool: str | None = None,
+    status: str = "outstanding",
+    include_history: bool = False,
+    cursor: str | None = None,
+    limit: int = 10,
+    max_tasks: int = 100,
+    history_limit: int = 0,
+) -> str:
+    """Inspect current task lists by root thread, agent, and nested subagent.
+
+    Selectors intersect. ``status`` accepts outstanding, all, pending,
+    in_progress, blocked, completed, or cancelled. The returned string is
+    always schema-versioned JSON.
+    """
+    if _remote:
+        try:
+            result = await _remote.get_tasks(
+                document_id=document_id,
+                thread_id=thread_id,
+                agent_id=agent_id,
+                subagent_id=subagent_id,
+                tool=tool,
+                status=status,
+                include_history=include_history,
+                cursor=cursor,
+                limit=limit,
+                max_tasks=max_tasks,
+                history_limit=history_limit,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the JSON tool contract
+            result = {
+                "schema_version": 1,
+                "error": {
+                    "code": "task_query_failed",
+                    "message": str(exc),
+                },
+            }
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    # The standalone DB connection has no authenticated request principal.
+    # Existing direct tools predate multi-user isolation, but this new surface
+    # intentionally fails closed instead of guessing an owner or reading every
+    # user's tasks. Remote mode exchanges the collector token for a scoped JWT.
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "error": {
+                "code": "direct_mode_user_scope_required",
+                "message": (
+                    "memory_tasks requires remote mode with an authenticated "
+                    "Memento user. Direct database mode is intentionally disabled."
+                ),
+            },
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @mcp.tool()

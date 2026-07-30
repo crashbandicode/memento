@@ -212,6 +212,102 @@ class ConversationMessage(Base):
 
 
 # ---------------------------------------------------------------------------
+# Authoritative current conversation task state
+# ---------------------------------------------------------------------------
+class ConversationTaskState(Base):
+    """One canonical current task-list projection per conversation document."""
+
+    __tablename__ = "conversation_task_states"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    machine_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE")
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String(512))
+    root_thread_id: Mapped[str | None] = mapped_column(String(512))
+    parent_thread_id: Mapped[str | None] = mapped_column(String(512))
+    agent_id: Mapped[str | None] = mapped_column(String(512))
+    agent_path: Mapped[str | None] = mapped_column(Text)
+    agent_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    source_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversation_messages.id", ondelete="SET NULL")
+    )
+    source_line_number: Mapped[int | None] = mapped_column(Integer)
+    source_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    state: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    explicit_current: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    quality: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="partial"
+    )
+    projection_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+
+    pending_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_progress_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    blocked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    cancelled_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    outstanding_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_task_state_machine", "machine_id"),
+        Index("idx_task_state_user", "user_id"),
+        Index("idx_task_state_thread", "machine_id", "tool_id", "thread_id"),
+        Index("idx_task_state_root", "machine_id", "tool_id", "root_thread_id"),
+        Index("idx_task_state_parent", "machine_id", "tool_id", "parent_thread_id"),
+        Index("idx_task_state_agent", "machine_id", "tool_id", "agent_id"),
+        Index(
+            "idx_task_state_outstanding",
+            "machine_id",
+            "outstanding_count",
+            observed_at.desc(),
+        ),
+        Index("idx_task_state_status_counts", "tool_id", "outstanding_count"),
+        Index("idx_task_state_pending", "machine_id", "pending_count"),
+        Index("idx_task_state_in_progress", "machine_id", "in_progress_count"),
+        Index("idx_task_state_blocked", "machine_id", "blocked_count"),
+        Index("idx_task_state_completed", "machine_id", "completed_count"),
+        Index("idx_task_state_cancelled", "machine_id", "cancelled_count"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Conversation search spelling lexicon
 # ---------------------------------------------------------------------------
 class ConversationSearchTerm(Base):

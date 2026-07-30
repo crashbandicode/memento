@@ -7,7 +7,6 @@ Only needs: server URL + user's collector token (JWT or collector_token).
 from __future__ import annotations
 
 import logging
-from datetime import date
 
 import httpx
 
@@ -175,9 +174,69 @@ class RemoteClient:
             {"limit": limit, "offset": offset},
         )
 
+    async def get_tasks(
+        self,
+        *,
+        document_id: str | None = None,
+        thread_id: str | None = None,
+        agent_id: str | None = None,
+        subagent_id: str | None = None,
+        tool: str | None = None,
+        status: str = "outstanding",
+        include_history: bool = False,
+        cursor: str | None = None,
+        limit: int = 10,
+        max_tasks: int = 100,
+        history_limit: int = 0,
+    ) -> dict:
+        """Fetch user-scoped hierarchical tasks from a compatible server."""
+        params: dict[str, object] = {
+            "status": status,
+            "include_history": include_history,
+            "limit": limit,
+            "max_tasks": max_tasks,
+            "history_limit": history_limit,
+        }
+        for key, value in (
+            ("document_id", document_id),
+            ("thread_id", thread_id),
+            ("agent_id", agent_id),
+            ("subagent_id", subagent_id),
+            ("tool", tool),
+            ("cursor", cursor),
+        ):
+            if value is not None:
+                params[key] = value
+        try:
+            result = await self._get("/api/tasks", params)
+        except httpx.HTTPStatusError as exc:
+            try:
+                detail = exc.response.json().get("detail")
+            except (ValueError, AttributeError):
+                detail = None
+            if exc.response.status_code == 404 and detail == "Not Found":
+                return {
+                    "schema_version": 1,
+                    "error": {
+                        "code": "unsupported_server",
+                        "message": (
+                            "This Memento server does not expose /api/tasks. "
+                            "Upgrade the server before using memory_tasks."
+                        ),
+                    },
+                }
+            raise
+        return result if isinstance(result, dict) else {
+            "schema_version": 1,
+            "error": {
+                "code": "invalid_server_response",
+                "message": "The task endpoint did not return a JSON object.",
+            },
+        }
+
     # --- Daily ---
     async def get_daily(self, date_str: str) -> dict:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         tz = int(datetime.now(timezone.utc).astimezone().utcoffset().total_seconds() // 60)
         return await self._get(f"/api/daily/{date_str}", {"tz_offset": -tz})
 

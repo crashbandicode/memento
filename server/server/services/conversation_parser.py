@@ -2405,17 +2405,72 @@ def _normalized_task(
 class TaskStateTracker:
     """Build immutable task-list snapshots from each tool's native events."""
 
-    def __init__(self, source: str) -> None:
+    def __init__(
+        self,
+        source: str,
+        initial_state: dict[str, object] | None = None,
+        *,
+        incremental: bool = False,
+    ) -> None:
         self.source = source
         self.tasks: dict[str, dict[str, str]] = {}
         self.order: list[str] = []
         self.revision = 0
         self.pending_creates: list[str] = []
         self.pending_task_lists: set[str] = set()
+        self.source_ids: list[str] = []
+        self.partial = incremental
+        self.carry_explicit_current = False
+        if isinstance(initial_state, dict):
+            raw_tasks = initial_state.get("tasks")
+            if isinstance(raw_tasks, list):
+                normalized = [
+                    task
+                    for index, item in enumerate(raw_tasks[:_MAX_TASKS])
+                    if (
+                        task := _normalized_task(
+                            item,
+                            index=index,
+                            fallback_id=_coerce_text(
+                                item.get("id") if isinstance(item, dict) else ""
+                            ),
+                        )
+                    )
+                    is not None
+                ]
+                self.tasks = {task["id"]: task for task in normalized}
+                self.order = [task["id"] for task in normalized]
+                self.partial = str(initial_state.get("quality") or "") == "partial"
+                self.carry_explicit_current = bool(
+                    incremental
+                    and initial_state.get("is_current")
+                    and not self.partial
+                )
+            raw_revision = initial_state.get("revision")
+            try:
+                self.revision = (
+                    max(0, int(raw_revision))
+                    if isinstance(raw_revision, (str, int, float))
+                    else 0
+                )
+            except (TypeError, ValueError):
+                self.revision = 0
+            raw_source_ids = initial_state.get("source_ids")
+            if isinstance(raw_source_ids, list):
+                self.source_ids = [
+                    _bounded_interaction_text(value, 256)
+                    for value in raw_source_ids[-64:]
+                    if _bounded_interaction_text(value, 256)
+                ]
 
     def apply(self, message: NormalizedMessage) -> None:
         changed = False
         is_current = False
+        observed_source_ids = [
+            _bounded_interaction_text(value, 256)
+            for value in (message.source_id, message.tool_call_id)
+            if _bounded_interaction_text(value, 256)
+        ]
 
         if message.role == "tool" and message.tool_name:
             name = self._normalized_name(message.tool_name)
@@ -2485,15 +2540,28 @@ class TaskStateTracker:
                 continue
             name = self._normalized_name(call.get("name"))
             payload = _json_mapping(call.get("input"))
+            call_id = _coerce_text(call.get("id"))
+            if bounded_call_id := _bounded_interaction_text(call_id, 256):
+                observed_source_ids.append(bounded_call_id)
             changed = self._apply_event(
                 name,
                 payload,
-                source_id=_coerce_text(call.get("id")),
+                source_id=call_id,
             ) or changed
             is_current = bool(payload.get("is_current")) or is_current
 
         if not changed:
             return
+        # An explicitly-current projection is the authority for a live delta.
+        # Carry that marker onto each seeded mutation so the newer transition
+        # outranks the older snapshot. Full historical reparses deliberately
+        # do not carry it: an embedded current snapshot may precede later
+        # historical transport rows in the source export.
+        is_current = is_current or self.carry_explicit_current
+        for source_id in observed_source_ids:
+            if source_id and source_id not in self.source_ids:
+                self.source_ids.append(source_id)
+        self.source_ids = self.source_ids[-64:]
         self.revision += 1
         tasks = [self.tasks[task_id] for task_id in self.order if task_id in self.tasks]
         completed_count = sum(task["status"] == "completed" for task in tasks)
@@ -2506,6 +2574,14 @@ class TaskStateTracker:
             "source": self.source,
             "revision": self.revision,
             "is_current": is_current,
+            "quality": (
+                "explicit_current"
+                if is_current and not self.partial
+                else "partial"
+                if self.partial
+                else "authoritative"
+            ),
+            "source_ids": list(self.source_ids),
             "completed_count": completed_count,
             "total_count": len(tasks),
             "active_task_id": active["id"] if active else "",
@@ -2568,6 +2644,9 @@ class TaskStateTracker:
             if replace:
                 self.tasks = {task["id"]: task for task in normalized}
                 self.order = [task["id"] for task in normalized]
+                # Replacement tools carry a complete list, including an
+                # intentionally empty one, so they repair an unseeded delta.
+                self.partial = False
             else:
                 for task in normalized:
                     if task["id"] not in self.tasks:
@@ -2602,6 +2681,7 @@ class TaskStateTracker:
             existing = self.tasks.get(task_id)
             if task_id:
                 if existing is None:
+                    self.partial = True
                     existing = {
                         "id": task_id,
                         "content": f"Task #{task_id}",
@@ -2634,11 +2714,18 @@ class TaskStateTracker:
                 payload.get("taskId") or payload.get("task_id") or payload.get("id"),
                 256,
             )
-            if task_id and task_id in self.tasks:
-                self.tasks[task_id] = {
-                    **self.tasks[task_id],
-                    "status": "cancelled",
-                }
+            if task_id:
+                existing = self.tasks.get(task_id)
+                if existing is None:
+                    self.partial = True
+                    existing = {
+                        "id": task_id,
+                        "content": f"Task #{task_id}",
+                        "status": "pending",
+                        "active_form": "",
+                    }
+                    self.order.append(task_id)
+                self.tasks[task_id] = {**existing, "status": "cancelled"}
                 return True
         return False
 
@@ -3628,10 +3715,16 @@ def _iter_claude_conversation_messages(
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity: AssistantIdentityState | None = None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
 ) -> Iterator[NormalizedMessage]:
     """Yield Claude semantic rows with queue and question correlation."""
     identity = assistant_identity or AssistantIdentityState()
-    task_tracker = TaskStateTracker("claude_code")
+    task_tracker = TaskStateTracker(
+        "claude_code",
+        initial_task_state,
+        incremental=incremental,
+    )
     seen_source_ids: set[str] = set()
     pending_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
     pending_questions = {
@@ -3809,10 +3902,16 @@ def _iter_cursor_conversation_messages(
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity: AssistantIdentityState | None = None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
 ) -> Iterator[NormalizedMessage]:
     """Yield Cursor semantic rows while linking interactive answers."""
     identity = assistant_identity or AssistantIdentityState()
-    task_tracker = TaskStateTracker("cursor")
+    task_tracker = TaskStateTracker(
+        "cursor",
+        initial_task_state,
+        incremental=incremental,
+    )
     seen_source_ids: set[str] = set()
     seen_directives: set[str] = set()
     subagent_models: dict[str, str] = {}
@@ -4243,6 +4342,8 @@ def iter_conversation_messages(
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity: AssistantIdentityState | None = None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
 ) -> Iterator[NormalizedMessage]:
     """Yield semantic messages once, using identities supplied by each tool.
 
@@ -4265,6 +4366,8 @@ def iter_conversation_messages(
             raw_content,
             initial_question_interactions=initial_question_interactions,
             assistant_identity=identity,
+            initial_task_state=initial_task_state,
+            incremental=incremental,
         )
         return
     if tool_id == "claude_code":
@@ -4272,6 +4375,8 @@ def iter_conversation_messages(
             raw_content,
             initial_question_interactions=initial_question_interactions,
             assistant_identity=identity,
+            initial_task_state=initial_task_state,
+            incremental=incremental,
         )
         return
 
@@ -4281,7 +4386,11 @@ def iter_conversation_messages(
     pending_codex_assistant: tuple[int, NormalizedMessage] | None = None
     pending_codex_reasoning: tuple[int, NormalizedMessage] | None = None
     current_codex_turn_id = ""
-    task_tracker = TaskStateTracker(tool_id)
+    task_tracker = TaskStateTracker(
+        tool_id,
+        initial_task_state,
+        incremental=incremental,
+    )
     pending_questions = {
         _coerce_text(interaction.get("id")): interaction
         for interaction in (initial_question_interactions or [])
@@ -4536,6 +4645,9 @@ def parse_conversation(
     tool_id: str,
     offset: int = 0,
     limit: int | None = None,
+    *,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
 ) -> list[NormalizedMessage]:
     """Parse a conversation into the same semantic sequence used by ingest."""
     if tool_id == "hermes":
@@ -4543,7 +4655,14 @@ def parse_conversation(
     if limit is not None and limit <= 0:
         return []
     messages: list[NormalizedMessage] = []
-    for index, message in enumerate(iter_conversation_messages(raw_content, tool_id)):
+    for index, message in enumerate(
+        iter_conversation_messages(
+            raw_content,
+            tool_id,
+            initial_task_state=initial_task_state,
+            incremental=incremental,
+        )
+    ):
         if index < offset:
             continue
         messages.append(message)

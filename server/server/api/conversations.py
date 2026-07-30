@@ -10,7 +10,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, load_only
 
-from ..db.models import ConversationMessage, Document, Machine, Project, User
+from ..db.models import (
+    ConversationMessage,
+    ConversationTaskState,
+    Document,
+    Machine,
+    Project,
+    User,
+)
 from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
@@ -240,35 +247,13 @@ async def get_conversation(
         select(func.count()).where(ConversationMessage.document_id == doc_id)
     )
     message_count = count_result.scalar() or 0
-    active_task_state = None
-    if message_count > 0:
-        # Cursor's authoritative current snapshot is intentionally stored at a
-        # stable prefix so ordinary live growth can stay append-only. Fetch it
-        # directly; other tools fall back to their newest transition. This
-        # avoids hydrating hundreds of historical checklist JSON values on
-        # every live conversation metadata refresh.
-        current_task_metadata = (
-            await db.execute(
-                select(ConversationMessage.metadata_)
-                .where(
-                    ConversationMessage.document_id == doc_id,
-                    ConversationMessage.metadata_.op("?")("task_state"),
-                )
-                .order_by(
-                    (
-                        func.jsonb_extract_path_text(
-                            ConversationMessage.metadata_,
-                            "task_state",
-                            "is_current",
-                        )
-                        == "true"
-                    ).desc(),
-                    ConversationMessage.line_number.desc(),
-                )
-                .limit(1)
+    active_task_state = (
+        await db.execute(
+            select(ConversationTaskState.state).where(
+                ConversationTaskState.document_id == doc_id
             )
-        ).scalar_one_or_none()
-        active_task_state = _stored_task_state(current_task_metadata)
+        )
+    ).scalar_one_or_none()
     if message_count == 0:
         raw_content = (
             await db.execute(select(Document.content).where(Document.id == doc_id))

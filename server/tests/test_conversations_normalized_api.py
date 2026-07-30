@@ -663,11 +663,9 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         task_statement = db.statements[2]
         compiled_task = task_statement.compile(dialect=postgresql.dialect())
         task_sql = str(compiled_task)
-        task_params = compiled_task.params.values()
-        self.assertTrue(any(value == "task_state" for value in task_params))
-        self.assertTrue(any(value == "is_current" for value in task_params))
-        self.assertIn("jsonb_extract_path_text", task_sql)
-        self.assertNotIn(" #>> ", task_sql)
+        self.assertIn("conversation_task_states", task_sql)
+        self.assertNotIn("conversation_messages", task_sql)
+        self.assertNotIn("jsonb_extract_path_text", task_sql)
         hierarchy_statement = db.statements[3]
         hierarchy_sql = str(hierarchy_statement.compile())
         hierarchy_params = hierarchy_statement.compile().params.values()

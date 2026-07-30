@@ -9,6 +9,7 @@ import logging
 import os
 
 logger = logging.getLogger("mcp_mount")
+HTTP_MCP_EXCLUDED_TOOLS = frozenset({"memory_tasks"})
 
 
 def mount_mcp(app):
@@ -46,6 +47,9 @@ def mount_mcp(app):
         mcp.tool()(memory_context)
         mcp.tool()(memory_store)
         mcp.tool()(daily_summary)
+        # memory_tasks is intentionally omitted. This shared direct-DB mount
+        # has no per-request MCP user principal; exposing hierarchical tasks
+        # here would bypass the authenticated, user-scoped /api/tasks route.
         mcp.resource("memory://projects")(list_projects)
         mcp.resource("memory://projects/{name}")(get_project)
         mcp.resource("memory://identity/{tool}")(get_identity)
