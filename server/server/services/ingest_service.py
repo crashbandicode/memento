@@ -1329,6 +1329,7 @@ def _conversation_title_needs_derivation(
     if tool_id == "cursor":
         from .conversation_parser import (
             has_cursor_session_context_prefix,
+            normalize_cursor_additional_directives,
             split_cursor_user_payload,
         )
 
@@ -1337,6 +1338,7 @@ def _conversation_title_needs_derivation(
             bool(context)
             or normalized != candidate
             or has_cursor_session_context_prefix(candidate)
+            or normalize_cursor_additional_directives(candidate) is not None
         )
     return False
 
@@ -1356,9 +1358,15 @@ def _friendly_conversation_title(
         if role != "user":
             return None
     elif tool_id == "cursor":
-        from .conversation_parser import split_cursor_user_payload
+        from .conversation_parser import (
+            normalize_cursor_additional_directives,
+            split_cursor_user_payload,
+        )
 
         text, _timestamp, _context = split_cursor_user_payload(text)
+        directives = normalize_cursor_additional_directives(text)
+        if directives is not None:
+            text = directives
     if not text or text.lower().startswith(_CLAUDE_LOCAL_COMMAND_PREFIXES):
         return None
 
@@ -1465,6 +1473,17 @@ async def _apply_friendly_conversation_title(
             return agent_title
     if not _conversation_title_needs_derivation(doc.title, doc.tool_id):
         return doc.title
+    if doc.tool_id == "cursor":
+        from .conversation_parser import normalize_cursor_additional_directives
+
+        if normalize_cursor_additional_directives(doc.title or "") is not None:
+            friendly = _friendly_conversation_title(
+                doc.title or "",
+                tool_id="cursor",
+            )
+            if friendly:
+                doc.title = friendly
+                return friendly
 
     result = await db.execute(
         select(ConversationMessage.content)

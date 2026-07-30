@@ -78,6 +78,32 @@ class ConversationTitleTests(unittest.TestCase):
 
         self.assertEqual(title, "Diagnose the queue race.")
 
+    def test_cursor_directive_title_is_cleaned_without_querying_prompt_rows(
+        self,
+    ) -> None:
+        raw_title = (
+            "ADDITIONAL DIRECTIVE: Do NOT chase unproven corner cases. "
+            "Continue the verified campaign."
+        )
+        doc = SimpleNamespace(
+            tool_id="cursor",
+            title=raw_title,
+            metadata_={},
+        )
+
+        self.assertTrue(_conversation_title_needs_derivation(raw_title, "cursor"))
+        self.assertEqual(
+            _friendly_conversation_title(raw_title, tool_id="cursor"),
+            "Do NOT chase unproven corner cases. Continue the verified campaign.",
+        )
+        title = asyncio.run(_apply_friendly_conversation_title(None, doc))
+
+        self.assertEqual(
+            title,
+            "Do NOT chase unproven corner cases. Continue the verified campaign.",
+        )
+        self.assertEqual(doc.title, title)
+
     def test_codex_metadata_candidates_are_normalized_before_ingest(self) -> None:
         metadata, history, first_prompt = _prepare_document_metadata(
             {
