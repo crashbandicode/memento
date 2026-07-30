@@ -28,6 +28,12 @@ name: Release to PyPI
 # `password:` line in each publish step and add PYPI_API_TOKEN to repo secrets.
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to publish (for example, 0.0.26)"
+        required: true
+        type: string
   push:
     tags:
       # PyPI releases use `pypi-v*` prefix to leave the bare `v*` namespace
@@ -50,13 +56,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: extract
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME#pypi-v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$DISPATCH_VERSION"
+          else
+            TAG="${GITHUB_REF_NAME#pypi-v}"
+          fi
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
           echo "Tag version: $TAG"
       - name: Check pyproject versions all match tag
+        env:
+          TAG: ${{ steps.extract.outputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME#pypi-v}"
           fail=0
           for pkg in collector mcp_server memento_brain; do
             ver=$(grep -E '^version = ' "$pkg/pyproject.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -147,7 +160,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
-    needs: publish-meta
+    needs: [verify-version, publish-meta]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -164,6 +177,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: pypi-v${{ needs.verify-version.outputs.version }}
+          name: pypi-v${{ needs.verify-version.outputs.version }}
           generate_release_notes: true
           files: release-assets/*
