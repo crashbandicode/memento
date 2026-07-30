@@ -18,6 +18,7 @@ from server.services.conversation_parser import (  # noqa: E402
     iter_conversation_messages,
     normalize_codex_user_payload,
     normalize_cursor_user_payload,
+    normalize_interaction,
     parse_conversation,
     parse_conversation_line,
     pop_matching_claude_queue_user,
@@ -26,6 +27,67 @@ from server.services.conversation_parser import (  # noqa: E402
 
 
 class ConversationParserTests(unittest.TestCase):
+    def test_claude_permission_request_is_normalized_as_prompt(self) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "interaction_type": "permission_request",
+                "requested_tool": "PowerShell",
+                "tool_input": {
+                    "command": "git push fork main",
+                    "description": "Push changes",
+                },
+            },
+            source="claude_code",
+            interaction_id="permission-1",
+        )
+
+        assert interaction is not None
+        self.assertEqual(interaction["id"], "permission-1")
+        self.assertEqual(interaction["interaction_type"], "permission_request")
+        self.assertEqual(interaction["requested_tool"], "PowerShell")
+        question = interaction["questions"][0]
+        self.assertEqual(question["header"], "PowerShell")
+        self.assertEqual(question["options"][0]["id"], "allow")
+        self.assertEqual(
+            question["options"][0]["description"],
+            "git push fork main",
+        )
+
+    def test_claude_mcp_elicitation_schema_is_normalized(self) -> None:
+        interaction = normalize_interaction(
+            "Elicitation",
+            {
+                "interaction_type": "elicitation",
+                "mcp_server_name": "github",
+                "message": "Choose a repository",
+                "requested_schema": {
+                    "type": "object",
+                    "required": ["repository"],
+                    "properties": {
+                        "repository": {
+                            "title": "Repository",
+                            "description": "Target repository",
+                            "type": "string",
+                            "enum": ["one", "two"],
+                        }
+                    },
+                },
+            },
+            source="claude_code",
+            interaction_id="elicitation-1",
+        )
+
+        assert interaction is not None
+        self.assertEqual(interaction["interaction_type"], "elicitation")
+        question = interaction["questions"][0]
+        self.assertEqual(question["header"], "Repository")
+        self.assertEqual(question["prompt"], "Target repository (required)")
+        self.assertEqual(
+            [option["label"] for option in question["options"]],
+            ["one", "two"],
+        )
+
     def test_codex_assistant_identity_tracks_turn_context_switches(self) -> None:
         raw = "\n".join([
             json.dumps({
@@ -287,6 +349,61 @@ class ConversationParserTests(unittest.TestCase):
                 "completed_at": "2026-07-21T12:00:00Z",
             },
         )
+
+    def test_cursor_state_thinking_keeps_exact_native_bubble_time(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "user",
+                "role": "user",
+                "id": "subagent-user",
+                "timestamp": "2026-07-30T02:34:33.625Z",
+                "message": {"content": "Investigate"},
+            }),
+            json.dumps({
+                "type": "cursor_state_thinking",
+                "role": "assistant",
+                "id": (
+                    "eed14e37-1842-434a-8aa7-9271f86ac661:thinking"
+                ),
+                "timestamp": "2026-07-30T02:34:42.569Z",
+                "message": {"content": [{
+                    "type": "thinking",
+                    "thinking": (
+                        "**Investigating tool paths**\n\n"
+                        "I need to locate artifacts."
+                    ),
+                }]},
+                "thinking_duration_ms": 933,
+            }),
+            json.dumps({
+                "type": "cursor_state_tool",
+                "role": "tool",
+                "id": "tool-bubble:tool",
+                "timestamp": "2026-07-30T02:34:43.500Z",
+                "tool_name": "Ripgrep",
+                "tool_input": '{"pattern":"handoff"}',
+                "content": '{"matches":2}',
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(
+            [message.timestamp for message in messages],
+            [
+                "2026-07-30T02:34:33.625Z",
+                "2026-07-30T02:34:42.569Z",
+                "2026-07-30T02:34:43.500Z",
+            ],
+        )
+        self.assertEqual(messages[1].role, "assistant")
+        self.assertEqual(
+            messages[1].source_id,
+            "eed14e37-1842-434a-8aa7-9271f86ac661:thinking",
+        )
+        self.assertIn("Investigating tool paths", messages[1].thinking)
+        self.assertEqual(messages[2].tool_name, "Ripgrep")
 
     def test_cursor_cancelled_task_without_agent_id_is_not_an_agent_event(self) -> None:
         raw = json.dumps({

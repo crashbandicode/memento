@@ -136,6 +136,51 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
 
+    async def test_messages_return_exact_cursor_native_timestamp(self) -> None:
+        self.doc.tool_id = "cursor"
+        observed = self.message(6, "assistant")
+        observed.message_type = "cursor_state_thinking"
+        observed.content = ""
+        observed.timestamp = datetime(
+            2026,
+            7,
+            30,
+            2,
+            34,
+            42,
+            569000,
+            tzinfo=timezone.utc,
+        )
+        observed.metadata_.update({
+            "source_id": (
+                "eed14e37-1842-434a-8aa7-9271f86ac661:thinking"
+            ),
+            "thinking": "**Investigating tool paths**",
+        })
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=1),
+            _Result(rows=[observed]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        message = payload["messages"][0]
+        self.assertEqual(
+            message["timestamp"],
+            "2026-07-30T02:34:42.569000+00:00",
+        )
+        self.assertEqual(message["thinking"], "**Investigating tool paths**")
+        self.assertEqual(message["raw_type"], "cursor_state_thinking")
+
     async def test_messages_expose_task_completion_as_agent_event(self) -> None:
         completion = self.message(2, "tool")
         completion.message_type = "agent_event"

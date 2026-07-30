@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
@@ -50,8 +51,10 @@ class CursorStateSnapshot:
 class _ComposerHeader:
     composer_id: str
     workspace_id: str
+    created_at: object
     last_updated_at: object
     checkpoint_at: object
+    is_subagent: bool
     value: object
 
     @property
@@ -101,7 +104,7 @@ def _serialized_field(value: object) -> str:
 
 
 def _timestamp_seconds(value: object) -> float | None:
-    if value in (None, ""):
+    if value in (None, "") or isinstance(value, bool):
         return None
     try:
         numeric = float(value)
@@ -115,21 +118,104 @@ def _timestamp_seconds(value: object) -> float | None:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.timestamp()
-    if numeric > 10_000_000_000:
+    if not math.isfinite(numeric):
+        return None
+    # Cursor currently uses epoch milliseconds in composer headers and ISO
+    # strings in bubble rows. Accept seconds as well, and safely normalize
+    # micro/nanosecond values seen in older experimental builds.
+    while abs(numeric) > 10_000_000_000:
         numeric /= 1000
+    try:
+        datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
     return numeric
 
 
 def _iso_timestamp(value: object) -> str:
-    text = _coerce_text(value).strip()
-    if "T" in text:
-        return text
     seconds = _timestamp_seconds(value)
     if seconds is None:
         return ""
-    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
+    parsed = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    if parsed.microsecond == 0:
+        timespec = "seconds"
+    elif parsed.microsecond % 1000 == 0:
+        timespec = "milliseconds"
+    else:
+        timespec = "microseconds"
+    return parsed.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _compatibility_source_id(record: dict[str, object]) -> str:
+    message = record.get("message")
+    message_map = message if isinstance(message, dict) else {}
+    return _coerce_text(
+        record.get("id")
+        or record.get("uuid")
+        or record.get("bubbleId")
+        or message_map.get("id")
+        or message_map.get("uuid")
+        or message_map.get("bubbleId")
+    ).strip()
+
+
+def _compatibility_timestamps(path: Path | None) -> dict[str, str]:
+    """Return exact transcript timestamps keyed only by stable source IDs.
+
+    Cursor's sparse compatibility transcript usually omits both fields. Some
+    releases include a bubble ID and timestamp, though, and that exact pair is
+    a safe fallback when the authoritative bubble projection lacks createdAt.
+    Positional or content matching is intentionally forbidden: repeated tool
+    calls and prose are valid distinct events.
+    """
+    if path is None:
+        return {}
+    timestamps: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return timestamps
+    for line in lines:
+        if not line.strip():
+            continue
+        record = _decode_json(line)
+        if not isinstance(record, dict):
+            continue
+        source_id = _compatibility_source_id(record)
+        if not source_id or source_id in timestamps:
+            continue
+        message = record.get("message")
+        message_map = message if isinstance(message, dict) else {}
+        for value in (
+            record.get("createdAt"),
+            record.get("timestamp"),
+            record.get("updatedAt"),
+            message_map.get("createdAt"),
+            message_map.get("timestamp"),
+            message_map.get("updatedAt"),
+        ):
+            timestamp = _iso_timestamp(value)
+            if timestamp:
+                timestamps[source_id] = timestamp
+                break
+    return timestamps
+
+
+def _bubble_timestamp(
+    bubble: dict[str, object],
+    compatibility_timestamps: dict[str, str],
+) -> str:
+    """Resolve one bubble's source-backed timestamp in strict precedence."""
+    for value in (
+        bubble.get("createdAt"),
+        bubble.get("timestamp"),
+        bubble.get("updatedAt"),
+    ):
+        timestamp = _iso_timestamp(value)
+        if timestamp:
+            return timestamp
+    bubble_id = _coerce_text(bubble.get("bubbleId")).strip()
+    return compatibility_timestamps.get(bubble_id, "")
 
 
 def _model_selection(config: object) -> tuple[str, str]:
@@ -313,7 +399,10 @@ def _project_records(
     composer: dict[str, object],
     bubbles: list[dict[str, object]],
     header: _ComposerHeader,
+    *,
+    compatibility_timestamps: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
+    compatibility_timestamps = compatibility_timestamps or {}
     fallback_model, fallback_effort = _model_selection(composer.get("modelConfig"))
     active_model = fallback_model
     active_effort = fallback_effort
@@ -328,7 +417,10 @@ def _project_records(
         records.append(_task_record(
             current_todos,
             source_id=f"{header.composer_id}:tasks:current",
-            timestamp=_iso_timestamp(composer.get("createdAt")),
+            timestamp=(
+                _iso_timestamp(composer.get("createdAt"))
+                or _iso_timestamp(header.created_at)
+            ),
             model=active_model,
             reasoning_effort=active_effort,
             is_current=True,
@@ -338,7 +430,7 @@ def _project_records(
         bubble_id = _coerce_text(bubble.get("bubbleId")).strip()
         if not bubble_id:
             continue
-        timestamp = _iso_timestamp(bubble.get("createdAt"))
+        timestamp = _bubble_timestamp(bubble, compatibility_timestamps)
         active_model, active_effort = _bubble_model(
             bubble,
             active_model or fallback_model,
@@ -416,7 +508,10 @@ def _project_records(
             record_type="cursor_state_status",
             role="tool",
             source_id=f"{header.composer_id}:status:{status}",
-            timestamp=_iso_timestamp(header.last_updated_at),
+            timestamp=(
+                _iso_timestamp(header.last_updated_at)
+                or _iso_timestamp(header.checkpoint_at)
+            ),
             model=active_model,
             reasoning_effort=active_effort,
             tool_name="Turn interrupted",
@@ -478,19 +573,21 @@ class CursorStateExporter:
     def _composer_headers(connection: sqlite3.Connection) -> list[_ComposerHeader]:
         rows = connection.execute(
             """
-            SELECT composerId, workspaceId, lastUpdatedAt, checkpointAt, value
+            SELECT composerId, workspaceId, createdAt, lastUpdatedAt,
+                   checkpointAt, COALESCE(isSubagent, 0), value
             FROM composerHeaders
-            WHERE COALESCE(isSubagent, 0)=0
-            ORDER BY lastUpdatedAt DESC
+            ORDER BY COALESCE(lastUpdatedAt, checkpointAt, createdAt) DESC
             """
         )
         return [
             _ComposerHeader(
                 composer_id=_coerce_text(row[0]),
                 workspace_id=_coerce_text(row[1]),
-                last_updated_at=row[2],
-                checkpoint_at=row[3],
-                value=row[4],
+                created_at=row[2],
+                last_updated_at=row[3],
+                checkpoint_at=row[4],
+                is_subagent=bool(row[5]),
+                value=row[6],
             )
             for row in rows
             if row and row[0]
@@ -547,14 +644,24 @@ class CursorStateExporter:
             )
         )
 
-        records = _project_records(composer, ordered, header)
+        transcript = self._transcript_path(header.composer_id)
+        records = _project_records(
+            composer,
+            ordered,
+            header,
+            compatibility_timestamps=_compatibility_timestamps(transcript),
+        )
         if not records:
             return None
         content = "\n".join(
             json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
             for record in records
         )
-        metadata, relative_path = self._metadata_and_path(header, composer)
+        metadata, relative_path = self._metadata_and_path(
+            header,
+            composer,
+            transcript=transcript,
+        )
         return CursorStateSnapshot(
             relative_path=relative_path,
             content=content,
@@ -571,16 +678,27 @@ class CursorStateExporter:
         self,
         header: _ComposerHeader,
         composer: dict[str, object],
+        *,
+        transcript: Path | None = None,
     ) -> tuple[dict[str, object], str]:
-        transcript = self._transcript_path(header.composer_id)
         classification = (
             self.tool.classify_transcript_source(transcript) if transcript else None
         )
         metadata = dict(classification.metadata) if classification else {
             "session_id": header.composer_id,
-            "is_subagent": False,
+            "is_subagent": header.is_subagent,
         }
         relative_path = classification.relative_path if classification else ""
+
+        header_value = _decode_json(header.value)
+        header_map = header_value if isinstance(header_value, dict) else {}
+        subagent_info = header_map.get("subagentInfo")
+        subagent_map = subagent_info if isinstance(subagent_info, dict) else {}
+        is_subagent = bool(
+            header.is_subagent
+            or metadata.get("is_subagent")
+            or subagent_map
+        )
 
         workspace = self._workspace_path(header.workspace_id)
         if workspace:
@@ -588,13 +706,21 @@ class CursorStateExporter:
             metadata["project_hash"] = re.split(r"[\\/]", workspace.rstrip("\\/"))[-1]
         if not relative_path:
             project_hash = self._project_hash(workspace) if workspace else "cursor-state"
-            relative_path = (
-                f"projects/{project_hash}/agent-transcripts/"
-                f"{header.composer_id}/{header.composer_id}.jsonl"
-            )
+            root_id = _coerce_text(
+                subagent_map.get("rootParentConversationId")
+                or subagent_map.get("parentComposerId")
+            ).strip()
+            if is_subagent and root_id:
+                relative_path = (
+                    f"projects/{project_hash}/agent-transcripts/{root_id}/"
+                    f"subagents/{header.composer_id}.jsonl"
+                )
+            else:
+                relative_path = (
+                    f"projects/{project_hash}/agent-transcripts/"
+                    f"{header.composer_id}/{header.composer_id}.jsonl"
+                )
 
-        header_value = _decode_json(header.value)
-        header_map = header_value if isinstance(header_value, dict) else {}
         title = _coerce_text(
             composer.get("name")
             or header_map.get("name")
@@ -606,9 +732,19 @@ class CursorStateExporter:
             "source": "cursor_state_v1",
             "doc_type": "full_conversation",
             "session_id": header.composer_id,
-            "is_subagent": False,
+            "is_subagent": is_subagent,
             "composer_status": _coerce_text(composer.get("status")),
         })
+        if is_subagent:
+            parent_id = _coerce_text(subagent_map.get("parentComposerId")).strip()
+            root_id = _coerce_text(
+                subagent_map.get("rootParentConversationId") or parent_id
+            ).strip()
+            if parent_id:
+                metadata.setdefault("parent_thread_id", parent_id)
+            if root_id:
+                metadata.setdefault("root_session_id", root_id)
+            metadata.setdefault("agent_depth", 1)
         model, effort = _model_selection(composer.get("modelConfig"))
         if model:
             metadata["model"] = model
@@ -623,20 +759,42 @@ class CursorStateExporter:
             if root.is_dir():
                 for path in root.glob("**/*.jsonl"):
                     parts = path.parts
-                    priority = ("subagents" in parts, len(parts), len(str(path)))
+                    # Cursor can mirror a child transcript at a top-level path.
+                    # The nested path carries its authoritative parent identity.
+                    priority = ("subagents" not in parts, len(parts), len(str(path)))
                     current = paths.get(path.stem)
                     if current is None:
                         paths[path.stem] = path
                         continue
                     current_priority = (
-                        "subagents" in current.parts,
+                        "subagents" not in current.parts,
                         len(current.parts),
                         len(str(current)),
                     )
                     if priority < current_priority:
                         paths[path.stem] = path
             self._transcript_paths = paths
-        return self._transcript_paths.get(session_id)
+        transcript = self._transcript_paths.get(session_id)
+        if transcript is not None:
+            return transcript
+
+        # The cache is initialized before some live subagents create their
+        # compatibility file. Refresh just the missing session to retain the
+        # native hierarchy path without rescanning every transcript.
+        root = self.tool.root_path / "projects"
+        if root.is_dir():
+            candidates = list(root.glob(f"**/{session_id}.jsonl"))
+            if candidates:
+                transcript = min(
+                    candidates,
+                    key=lambda path: (
+                        "subagents" not in path.parts,
+                        len(path.parts),
+                        len(str(path)),
+                    ),
+                )
+                self._transcript_paths[session_id] = transcript
+        return transcript
 
     def _workspace_path(self, workspace_id: str) -> str:
         if not workspace_id:

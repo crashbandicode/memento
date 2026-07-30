@@ -355,6 +355,8 @@ export interface QuestionInteraction {
   id: string;
   source: string;
   tool_name: string;
+  interaction_type?: "permission_request" | "elicitation" | "agent_needs_input" | "mode_switch" | string;
+  requested_tool?: string;
   questions: QuestionItem[];
 }
 

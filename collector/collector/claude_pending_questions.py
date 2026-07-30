@@ -1,9 +1,10 @@
-"""Read live AskUserQuestion state written by the Claude Code hook."""
+"""Read live prompt state written by the Claude Code hook."""
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,68 @@ def _read_side_file(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _timestamp_millis(value: object) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def _session_state(root: Path, session_id: str) -> dict[str, Any]:
+    sessions_directory = root / "sessions"
+    try:
+        paths = sorted(
+            (
+                path
+                for path in sessions_directory.iterdir()
+                if path.is_file() and path.suffix.casefold() == ".json"
+            ),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return {}
+    for path in paths:
+        state = _read_side_file(path)
+        if str(state.get("sessionId") or "").strip() == session_id:
+            return state
+    return {}
+
+
+def _effective_status(
+    root: Path,
+    side_record: dict[str, Any],
+    session_id: str,
+    question_tool: str,
+    status: str,
+) -> str:
+    """Close permission previews once Claude leaves its permission wait."""
+    if status != "pending" or question_tool.casefold() != "permissionrequest":
+        return status
+    state = _session_state(root, session_id)
+    if not state:
+        return status
+    interaction_at = _timestamp_millis(side_record.get("timestamp"))
+    session_updated_at = _timestamp_millis(state.get("updatedAt"))
+    if (
+        interaction_at is not None
+        and session_updated_at is not None
+        and session_updated_at < interaction_at
+    ):
+        return status
+    session_status = str(state.get("status") or "").casefold()
+    waiting_for = str(state.get("waitingFor") or "").casefold()
+    if session_status == "waiting" and "permission" in waiting_for:
+        return status
+    return "answered"
+
+
 def extract_claude_pending_interaction_updates(
     tool: ClaudeCodeTool | Path,
 ) -> dict[str, dict[str, Any]]:
@@ -118,8 +181,20 @@ def extract_claude_pending_interaction_updates(
         question_tool = str(
             side_record.get("question_tool") or "AskUserQuestion"
         ).strip()
-        if question_tool.casefold() != "askuserquestion":
+        if question_tool.casefold() not in {
+            "askuserquestion",
+            "permissionrequest",
+            "elicitation",
+            "notificationprompt",
+        }:
             continue
+        status = _effective_status(
+            root,
+            side_record,
+            session_id,
+            question_tool,
+            status,
+        )
         raw_input = side_record.get("interaction_input")
         if not isinstance(raw_input, dict):
             raw_input = {}

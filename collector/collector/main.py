@@ -370,7 +370,7 @@ def _poll_claude_pending_questions(
     queue: SyncQueue,
     logger: logging.Logger,
 ) -> None:
-    """Queue AskUserQuestion state captured by the Claude Code hook."""
+    """Queue live prompt state captured by the Claude Code hook."""
     if not _claude_pending_poll_lock.acquire(blocking=False):
         return
     try:
@@ -381,9 +381,9 @@ def _poll_claude_pending_questions(
             records=records,
         )
         if queued:
-            logger.info("Queued %d Claude pending-question update(s)", queued)
+            logger.info("Queued %d Claude prompt interaction update(s)", queued)
     except Exception:
-        logger.exception("Claude pending-question poll failed")
+        logger.exception("Claude prompt interaction poll failed")
     finally:
         _claude_pending_poll_lock.release()
 
@@ -557,9 +557,9 @@ def main() -> None:
     try:
         hook_settings, hooks_changed = install_claude_pending_hooks()
         if hooks_changed:
-            logger.info("Installed Claude pending-question hooks in %s", hook_settings)
+            logger.info("Installed Claude prompt hooks in %s", hook_settings)
     except (OSError, TypeError, ValueError) as exc:
-        logger.warning("Could not install Claude pending-question hooks: %s", exc)
+        logger.warning("Could not install Claude prompt hooks: %s", exc)
 
     # Initialize tools
     claude_tool = ClaudeCodeTool()

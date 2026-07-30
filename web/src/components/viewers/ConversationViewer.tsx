@@ -2770,6 +2770,16 @@ function QuestionInteractionCard({
     : response
       ? "#059669"
       : "var(--aurora-fg4)";
+  const interactionLabel = interaction.interaction_type === "permission_request"
+    ? t.conversation.permissionRequest
+    : interaction.interaction_type === "elicitation"
+      ? t.conversation.elicitationRequest
+      : interaction.interaction_type === "agent_needs_input"
+        ? t.conversation.agentNeedsInput
+        : t.conversation.interactiveQuestion;
+  const interactionIcon = interaction.interaction_type === "permission_request"
+    ? "lock" as const
+    : "message" as const;
 
   return (
     <div
@@ -2818,10 +2828,10 @@ function QuestionInteractionCard({
               background: "color-mix(in srgb, var(--aurora-accent) 13%, var(--aurora-surface-solid))",
             }}
           >
-            <Icon name="message" size={15} />
+            <Icon name={interactionIcon} size={15} />
           </span>
           <span style={{ fontSize: 12, fontWeight: 700, color: "var(--aurora-fg1)" }}>
-            {t.conversation.interactiveQuestion}
+            {interactionLabel}
           </span>
           <span
             style={{

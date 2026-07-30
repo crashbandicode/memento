@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from collector.cursor_state_export import (
     CursorStateExporter,
+    _iso_timestamp,
     _tool_record,
     enqueue_cursor_state_snapshots,
 )
@@ -290,10 +291,171 @@ def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:
     return FixtureCursorTool(root, database), transcript, session_id
 
 
+def _add_subagent_state_fixture(
+    tool: FixtureCursorTool,
+    root_session_id: str,
+) -> tuple[Path, str]:
+    session_id = "subagent-id"
+    nested_transcript = (
+        tool.root_path
+        / "projects"
+        / "c-Users-intpa-demo"
+        / "agent-transcripts"
+        / root_session_id
+        / "subagents"
+        / f"{session_id}.jsonl"
+    )
+    nested_transcript.parent.mkdir(parents=True)
+    observed_thinking = (
+        "**Investigating tool paths**\n\n"
+        "I need to locate artifacts, which involves searching for specific strings."
+    )
+    nested_transcript.write_text(
+        "\n".join([
+            json.dumps({
+                "role": "user",
+                "message": {
+                    "content": (
+                        "<timestamp>Wednesday, Jul 29, 2026, 10:34 PM "
+                        "(UTC-4)</timestamp>\n<user_query>Investigate</user_query>"
+                    )
+                },
+            }),
+            # Exact production shape: no outer ID or timestamp, and prose plus
+            # tool calls flattened into one compatibility record.
+            json.dumps({
+                "role": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": observed_thinking},
+                    {
+                        "type": "tool_use",
+                        "name": "rg",
+                        "input": {"pattern": "handoff"},
+                    },
+                ]},
+            }),
+            json.dumps({
+                "role": "assistant",
+                "bubbleId": "compatibility-fallback",
+                "timestamp": "2026-07-30T02:35:10.123Z",
+                "message": {"content": "Compatibility timestamp fallback"},
+            }),
+        ]),
+        encoding="utf-8",
+    )
+    # Cursor can mirror a child at a top-level path. The exporter must prefer
+    # the nested path because it carries the hierarchy identity.
+    top_level_copy = (
+        tool.root_path
+        / "projects"
+        / "c-Users-intpa-demo"
+        / "agent-transcripts"
+        / session_id
+        / f"{session_id}.jsonl"
+    )
+    top_level_copy.parent.mkdir(parents=True)
+    top_level_copy.write_text(nested_transcript.read_text(encoding="utf-8"))
+
+    headers = [
+        {"bubbleId": "subagent-user", "type": 1},
+        {"bubbleId": "observed-thinking", "type": 2},
+        {"bubbleId": "subagent-tool", "type": 2},
+        {"bubbleId": "updated-assistant", "type": 2},
+        {"bubbleId": "compatibility-fallback", "type": 2},
+        {"bubbleId": "malformed-time", "type": 2},
+    ]
+    composer = {
+        "name": "RC num_alloc USUSP",
+        "status": "completed",
+        "fullConversationHeadersOnly": headers,
+        "modelConfig": {"modelName": "gpt-5.6-sol-xhigh"},
+    }
+    bubbles = {
+        "subagent-user": {
+            "bubbleId": "subagent-user",
+            "type": 1,
+            "createdAt": 1_785_378_873_625,
+            "text": "Investigate",
+        },
+        "observed-thinking": {
+            "bubbleId": "observed-thinking",
+            "type": 2,
+            "createdAt": "2026-07-30T02:34:42.569Z",
+            "thinking": {"text": observed_thinking},
+            "thinkingDurationMs": 933,
+        },
+        "subagent-tool": {
+            "bubbleId": "subagent-tool",
+            "type": 2,
+            "createdAt": 1_785_378_883.5,
+            "toolFormerData": {
+                "name": "ripgrep_raw_search",
+                "status": "completed",
+                "params": {"pattern": "handoff"},
+                "result": {"matches": 2},
+                "toolCallId": "call-subagent-rg",
+            },
+        },
+        "updated-assistant": {
+            "bubbleId": "updated-assistant",
+            "type": 2,
+            "updatedAt": "2026-07-29T22:35:00-04:00",
+            "text": "Native updated time fallback",
+        },
+        "compatibility-fallback": {
+            "bubbleId": "compatibility-fallback",
+            "type": 2,
+            "text": "Compatibility timestamp fallback",
+        },
+        "malformed-time": {
+            "bubbleId": "malformed-time",
+            "type": 2,
+            "createdAt": "not-a-time",
+            "updatedAt": "NaN",
+            "text": "No legitimate source time",
+        },
+    }
+    connection = sqlite3.connect(tool.state_database_path)
+    connection.execute(
+        """
+        UPDATE composerHeaders
+        SET checkpointAt=?, value=?
+        WHERE composerId=?
+        """,
+        (
+            1_785_379_816_738,
+            json.dumps({
+                "name": "RC num_alloc USUSP",
+                "subagentInfo": {
+                    "parentComposerId": root_session_id,
+                    "rootParentConversationId": root_session_id,
+                    "subagentTypeName": "generalPurpose",
+                },
+            }),
+            session_id,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO cursorDiskKV VALUES (?,?)",
+        (f"composerData:{session_id}", json.dumps(composer)),
+    )
+    connection.executemany(
+        "INSERT INTO cursorDiskKV VALUES (?,?)",
+        [
+            (f"bubbleId:{session_id}:{bubble_id}", json.dumps(bubble))
+            for bubble_id, bubble in bubbles.items()
+        ],
+    )
+    connection.commit()
+    connection.close()
+    return nested_transcript, session_id
+
+
 def test_live_state_supersedes_sparse_transcript_and_projects_whitelist(tmp_path):
     tool, transcript, session_id = _write_state_fixture(tmp_path)
 
     assert session_id in tool.authoritative_session_ids(max_age=0)
+    assert "subagent-id" not in tool.authoritative_session_ids(max_age=0)
     assert tool.classify_file(transcript) is None
     source_classification = tool.classify_transcript_source(transcript)
     assert source_classification is not None
@@ -331,6 +493,67 @@ def test_live_state_supersedes_sparse_transcript_and_projects_whitelist(tmp_path
     assert snapshot.metadata["title"] == "Readable renamed thread"
     assert snapshot.metadata["project_path"] == "C:/Users/intpa/demo"
     assert snapshot.metadata["source"] == "cursor_state_v1"
+
+
+def test_subagent_state_supersedes_timestamp_free_compatibility_transcript(
+    tmp_path,
+):
+    tool, _transcript, root_session_id = _write_state_fixture(tmp_path)
+    nested_transcript, session_id = _add_subagent_state_fixture(
+        tool,
+        root_session_id,
+    )
+
+    assert session_id in tool.authoritative_session_ids(max_age=0)
+    assert tool.classify_file(nested_transcript) is None
+
+    snapshots = CursorStateExporter(tool).export_changed(limit=20)
+    snapshot = next(
+        item for item in snapshots
+        if item.metadata["session_id"] == session_id
+    )
+    records = [json.loads(line) for line in snapshot.content.splitlines()]
+
+    assert [record["type"] for record in records] == [
+        "user",
+        "cursor_state_thinking",
+        "cursor_state_tool",
+        "assistant",
+        "assistant",
+        "assistant",
+    ]
+    assert [record["timestamp"] for record in records] == [
+        "2026-07-30T02:34:33.625Z",
+        "2026-07-30T02:34:42.569Z",
+        "2026-07-30T02:34:43.500Z",
+        "2026-07-30T02:35:00Z",
+        "2026-07-30T02:35:10.123Z",
+        "",
+    ]
+    observed = records[1]
+    assert observed["id"] == "observed-thinking:thinking"
+    assert observed["thinking_duration_ms"] == 933
+    assert "Investigating tool paths" in (
+        observed["message"]["content"][0]["thinking"]
+    )
+    assert records[2]["tool_name"] == "Ripgrep"
+    assert snapshot.relative_path.endswith(
+        f"/{root_session_id}/subagents/{session_id}.jsonl"
+    )
+    assert snapshot.metadata["is_subagent"] is True
+    assert snapshot.metadata["parent_thread_id"] == root_session_id
+    assert snapshot.metadata["root_session_id"] == root_session_id
+
+
+def test_cursor_timestamp_normalization_rejects_malformed_values() -> None:
+    assert _iso_timestamp(1_785_378_883.5) == "2026-07-30T02:34:43.500Z"
+    assert _iso_timestamp(1_785_378_883_500) == "2026-07-30T02:34:43.500Z"
+    assert _iso_timestamp("2026-07-29T22:34:43.500-04:00") == (
+        "2026-07-30T02:34:43.500Z"
+    )
+    assert _iso_timestamp("not-a-time") == ""
+    assert _iso_timestamp(float("inf")) == ""
+    assert _iso_timestamp(True) == ""
 
 
 def test_exporter_emits_only_changed_revisions_and_resync_can_invalidate(tmp_path):

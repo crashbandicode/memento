@@ -272,6 +272,43 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(PENDING_QUESTION_COUNT_KEY, document.metadata_)
         self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
 
+    async def test_live_claude_permission_request_is_stored(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            result = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-1",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input={
+                    "interaction_type": "permission_request",
+                    "requested_tool": "PowerShell",
+                    "tool_input": {"command": "git push fork main"},
+                },
+                timestamp="2026-07-30T16:06:52Z",
+            )
+
+        self.assertEqual((result.matched, result.updated), (1, 1))
+        signal = document.metadata_[LIVE_INTERACTION_SIGNALS_KEY]["permission-1"]
+        self.assertEqual(
+            signal["interaction"]["interaction_type"],
+            "permission_request",
+        )
+        self.assertEqual(
+            signal["interaction"]["questions"][0]["options"][0]["description"],
+            "git push fork main",
+        )
+
     async def test_live_interaction_does_not_reopen_before_latest_human_turn(
         self,
     ) -> None:

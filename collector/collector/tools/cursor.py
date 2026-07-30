@@ -115,12 +115,12 @@ class CursorTool(BaseTool):
         return home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
 
     def authoritative_session_ids(self, *, max_age: float = 2.0) -> frozenset[str]:
-        """Return normal composers backed by Cursor's live state database.
+        """Return composers backed by Cursor's live state database.
 
         The file transcript is a sparse compatibility export in recent Cursor
-        releases.  Once a normal composer is present in ``state.vscdb``, the
-        collector's state projector owns that session and the file watcher must
-        not overwrite its richer snapshot with the sparse JSONL source.
+        releases. Once a normal or subagent composer has materialized data in
+        ``state.vscdb``, the state projector owns that session and the file
+        watcher must not overwrite its richer snapshot with sparse JSONL.
         """
         now = time.monotonic()
         if now - self._state_session_ids_checked_at < max_age:
@@ -139,8 +139,15 @@ class CursorTool(BaseTool):
                 connection.execute("PRAGMA query_only=ON")
                 try:
                     rows = connection.execute(
-                        "SELECT composerId FROM composerHeaders "
-                        "WHERE COALESCE(isSubagent, 0)=0"
+                        """
+                        SELECT h.composerId
+                        FROM composerHeaders AS h
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM cursorDiskKV AS kv
+                            WHERE kv.key='composerData:' || h.composerId
+                        )
+                        """
                     )
                 except sqlite3.OperationalError:
                     rows = connection.execute("SELECT composerId FROM composerHeaders")

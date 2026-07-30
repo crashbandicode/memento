@@ -2151,6 +2151,11 @@ _QUESTION_TOOL_NAMES = {
     "askuserquestion",
     "requestuserinput",
 }
+_CLAUDE_LIVE_PROMPT_TOOL_NAMES = {
+    "elicitation",
+    "notificationprompt",
+    "permissionrequest",
+}
 _CURSOR_PLAN_MODE_TOOL_NAMES = {"switchmode"}
 _CURSOR_PENDING_INTERACTION_STATUSES = {
     "",
@@ -2797,6 +2802,189 @@ def normalize_question_interaction(
     }
 
 
+def _claude_permission_detail(
+    requested_tool: str,
+    tool_input: dict,
+) -> str:
+    normalized_tool = re.sub(r"[^a-z0-9]", "", requested_tool.casefold())
+    preferred_keys = (
+        ("description", "prompt")
+        if normalized_tool in {"agent", "task"}
+        else (
+            "command",
+            "description",
+            "file_path",
+            "path",
+            "url",
+            "query",
+            "prompt",
+        )
+    )
+    for key in preferred_keys:
+        detail = _bounded_interaction_text(tool_input.get(key), 4096)
+        if detail:
+            return detail
+    if not tool_input:
+        return ""
+    return _bounded_interaction_text(
+        _serialize_tool_input(tool_input),
+        4096,
+    )
+
+
+def normalize_claude_live_prompt_interaction(
+    tool_name: str,
+    raw_input: object,
+    *,
+    source: str,
+    interaction_id: object = "",
+) -> dict[str, object] | None:
+    """Normalize hook-only Claude prompts that are absent from JSONL."""
+    normalized_tool_name = re.sub(
+        r"[^a-z0-9]",
+        "",
+        tool_name.strip().casefold(),
+    )
+    if (
+        source.strip().casefold() != "claude_code"
+        or normalized_tool_name not in _CLAUDE_LIVE_PROMPT_TOOL_NAMES
+    ):
+        return None
+    payload = _json_mapping(raw_input)
+
+    if normalized_tool_name == "permissionrequest":
+        requested_tool = _bounded_interaction_text(
+            payload.get("requested_tool") or payload.get("tool_name"),
+            256,
+        ) or "tool"
+        tool_input = _json_mapping(payload.get("tool_input"))
+        detail = _claude_permission_detail(requested_tool, tool_input)
+        allow_option = {"id": "allow", "label": "Allow"}
+        if detail:
+            allow_option["description"] = detail
+        questions = [{
+            "id": "permission-decision",
+            "header": requested_tool,
+            "prompt": f"Claude Code wants permission to use {requested_tool}.",
+            "type": "single_select",
+            "allow_custom": False,
+            "options": [
+                allow_option,
+                {"id": "deny", "label": "Deny"},
+            ],
+        }]
+        interaction_type = "permission_request"
+        requested_tool_name = requested_tool
+    elif normalized_tool_name == "elicitation":
+        server_name = _bounded_interaction_text(
+            payload.get("mcp_server_name"),
+            256,
+        )
+        message = _bounded_interaction_text(
+            payload.get("message"),
+            4096,
+        ) or "An MCP server is requesting input."
+        url = _bounded_interaction_text(payload.get("url"), 2048)
+        if url:
+            message = f"{message}\n{url}"
+        schema = _json_mapping(payload.get("requested_schema"))
+        properties = schema.get("properties")
+        required = schema.get("required")
+        required_names = {
+            str(value)
+            for value in required
+            if value
+        } if isinstance(required, list) else set()
+        questions = []
+        if isinstance(properties, dict):
+            for index, (field_name, raw_field) in enumerate(
+                list(properties.items())[:_MAX_INTERACTION_QUESTIONS]
+            ):
+                field = raw_field if isinstance(raw_field, dict) else {}
+                header = _bounded_interaction_text(
+                    field.get("title") or field_name,
+                    512,
+                )
+                prompt = _bounded_interaction_text(
+                    field.get("description")
+                    or field.get("title")
+                    or field_name,
+                    4096,
+                )
+                if str(field_name) in required_names:
+                    prompt = f"{prompt} (required)"
+                raw_options = field.get("enum")
+                if isinstance(raw_options, list):
+                    options = [
+                        {
+                            "id": _bounded_interaction_text(option, 512),
+                            "label": _bounded_interaction_text(option, 1024),
+                        }
+                        for option in raw_options[:_MAX_INTERACTION_OPTIONS]
+                        if _bounded_interaction_text(option, 1024)
+                    ]
+                elif field.get("type") == "boolean":
+                    options = [
+                        {"id": "yes", "label": "Yes"},
+                        {"id": "no", "label": "No"},
+                    ]
+                else:
+                    options = []
+                questions.append({
+                    "id": _bounded_interaction_text(
+                        field_name or f"field-{index + 1}",
+                        256,
+                    ),
+                    "header": header,
+                    "prompt": prompt,
+                    "type": "single_select" if options else "free_text",
+                    "allow_custom": not options,
+                    "options": options,
+                })
+        if not questions:
+            questions = [{
+                "id": "elicitation-decision",
+                "header": server_name or "MCP request",
+                "prompt": message,
+                "type": "single_select",
+                "allow_custom": False,
+                "options": [
+                    {"id": "continue", "label": "Continue"},
+                    {"id": "decline", "label": "Decline"},
+                ],
+            }]
+        interaction_type = "elicitation"
+        requested_tool_name = server_name
+    else:
+        title = _bounded_interaction_text(payload.get("title"), 512)
+        message = _bounded_interaction_text(payload.get("message"), 4096)
+        if not message:
+            message = "A Claude Code agent is waiting for your input."
+        questions = [{
+            "id": "agent-input",
+            "header": title or "Agent needs input",
+            "prompt": message,
+            "type": "single_select",
+            "allow_custom": True,
+            "options": [
+                {"id": "respond", "label": "Respond"},
+                {"id": "dismiss", "label": "Dismiss"},
+            ],
+        }]
+        interaction_type = "agent_needs_input"
+        requested_tool_name = ""
+
+    return {
+        "kind": "question",
+        "interaction_type": interaction_type,
+        "id": _bounded_interaction_text(interaction_id, 512),
+        "source": "claude_code",
+        "tool_name": _bounded_interaction_text(tool_name, 256),
+        "requested_tool": requested_tool_name,
+        "questions": questions,
+    }
+
+
 def normalize_cursor_plan_mode_interaction(
     tool_name: str,
     raw_input: object,
@@ -2872,6 +3060,14 @@ def normalize_interaction(
     )
     if question is not None:
         return question
+    claude_prompt = normalize_claude_live_prompt_interaction(
+        tool_name,
+        raw_input,
+        source=source,
+        interaction_id=interaction_id,
+    )
+    if claude_prompt is not None:
+        return claude_prompt
     return normalize_cursor_plan_mode_interaction(
         tool_name,
         raw_input,
