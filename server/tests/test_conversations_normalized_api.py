@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.conversations import (  # noqa: E402
+    _conversation_location,
     get_conversation,
     get_conversation_messages,
     get_conversation_prompts,
@@ -66,10 +67,13 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             title="Large thread",
             relative_path="sessions/root.jsonl",
             metadata_={
+                "project_path": r"C:\Users\intpa\memento",
                 "session_id": str(uuid.uuid4()),
                 "thread_id": str(uuid.uuid4()),
                 "thread_source": "user",
             },
+            machine=SimpleNamespace(name="dreamland-yoga (Windows)"),
+            project=SimpleNamespace(source_path="/home/patrick/services/memento"),
             source_modified_at=self.now,
             activity_at=self.now,
             synced_at=self.now,
@@ -131,6 +135,53 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(db.statements), 3)
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
+
+    async def test_messages_expose_task_completion_as_agent_event(self) -> None:
+        completion = self.message(2, "tool")
+        completion.message_type = "agent_event"
+        completion.content = "Start batch 1 pull tlv02+rno completed"
+        completion.metadata_.update({
+            "source_id": "native-task-notification",
+            "tool_name": "Task completion",
+            "agent_event": {
+                "kind": "completed",
+                "activity_type": "shell",
+                "task_kind": "shell",
+                "task_id": "913821",
+                "status": "success",
+                "label": "Start batch 1 pull tlv02+rno",
+                "result_summary": "Batch 1 pull completed.",
+            },
+        })
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=1),
+                _Result(rows=[completion]),
+            ]
+        )
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        message = payload["messages"][0]
+        self.assertEqual(message["role"], "tool")
+        self.assertEqual(message["raw_type"], "agent_event")
+        self.assertEqual(message["tool_name"], "Task completion")
+        self.assertEqual(message["agent_event"]["kind"], "completed")
+        self.assertEqual(message["agent_event"]["activity_type"], "shell")
+        self.assertEqual(message["agent_event"]["task_id"], "913821")
+        self.assertEqual(
+            message["agent_event"]["result_summary"],
+            "Batch 1 pull completed.",
+        )
 
     async def test_around_line_uses_index_and_reports_row_offset(self) -> None:
         db = _Db(
@@ -541,6 +592,13 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 1)
+        self.assertEqual(
+            payload["location"],
+            {
+                "host": "dreamland-yoga",
+                "path": r"C:\Users\intpa\memento",
+            },
+        )
         self.assertNotIn("documents.content", str(db.statements[0].compile()))
         task_statement = db.statements[2]
         compiled_task = task_statement.compile(dialect=postgresql.dialect())
@@ -556,6 +614,30 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(hierarchy_sql.count("documents.metadata ->>"), 3)
         self.assertTrue(any(value == "root_session_id" for value in hierarchy_params))
         self.assertTrue(any(value == "session_id" for value in hierarchy_params))
+
+    def test_location_falls_back_to_absolute_project_source_path(self) -> None:
+        document = SimpleNamespace(
+            machine=SimpleNamespace(name="butterbridge (Linux)"),
+            metadata_={"project_path": "home-patrick-services-memento"},
+            project=SimpleNamespace(source_path="/home/patrick/services/memento"),
+        )
+
+        self.assertEqual(
+            _conversation_location(document),
+            {
+                "host": "butterbridge",
+                "path": "/home/patrick/services/memento",
+            },
+        )
+
+    def test_location_omits_hash_like_paths(self) -> None:
+        document = SimpleNamespace(
+            machine=SimpleNamespace(name="dreamland-yoga (Windows)"),
+            metadata_={"project_path": "C--Users-intpa-memento"},
+            project=SimpleNamespace(source_path="memento"),
+        )
+
+        self.assertIsNone(_conversation_location(document))
 
 
 if __name__ == "__main__":

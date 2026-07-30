@@ -145,8 +145,28 @@ _CURSOR_SESSION_CONTEXT_PREFIX_RE = re.compile(
 # It is product instruction to the model, not a human turn.
 _CURSOR_TASK_RESULT_FOLLOWUP_RE = re.compile(
     r"\A\s*<user_query>\s*"
-    r"Briefly inform the user about the task result\b[\s\S]*?"
+    r"(?:"
+    r"Briefly inform the user about the task result\b"
+    r"|Perform any necessary follow-up actions in response to the "
+    r"(?:subagent|task) completion above\b"
+    r")[\s\S]*?"
     r"</user_query>\s*\Z",
+    re.IGNORECASE,
+)
+_CURSOR_TASK_COMPLETION_RE = re.compile(
+    r"<system_notification\b[^>]*>\s*"
+    r"The following task has finished\b[\s\S]*?"
+    r"<task>\s*(?P<body>[\s\S]*?)\s*</task>\s*"
+    r"</system_notification>",
+    re.IGNORECASE,
+)
+_CURSOR_TASK_SUMMARY_RE = re.compile(
+    r"<user_visible_high_level_summary>\s*(?P<summary>[\s\S]*?)\s*"
+    r"</user_visible_high_level_summary>",
+    re.IGNORECASE,
+)
+_CURSOR_TASK_RESPONSE_RE = re.compile(
+    r"<response>\s*(?P<response>[\s\S]*?)\s*</response>",
     re.IGNORECASE,
 )
 _CURSOR_IMAGE_FILES_ENVELOPE_RE = re.compile(
@@ -347,50 +367,55 @@ def parse_cursor_user_payload(content: str) -> CursorUserPayload:
     text = original
     context_parts: list[str] = []
     attachments: list[dict[str, str]] = []
-    while True:
-        context_match = _CURSOR_SESSION_CONTEXT_RE.match(text)
-        if context_match is not None:
-            context_parts.append(context_match.group(0).strip())
-            text = text[context_match.end():]
-            continue
-        image_match = _CURSOR_IMAGE_FILES_ENVELOPE_RE.match(text)
-        if image_match is not None:
-            paths = [
-                match.group("path")
-                for match in _CURSOR_IMAGE_PATH_RE.finditer(
-                    image_match.group("body")
-                )
-            ]
-            if paths:
-                attachments.extend(
-                    {
-                        "type": "image",
-                        "name": _cursor_attachment_name(path),
-                    }
-                    for path in paths[:32]
-                )
-            else:
+
+    def consume_context() -> None:
+        nonlocal text
+        while True:
+            context_match = _CURSOR_SESSION_CONTEXT_RE.match(text)
+            if context_match is not None:
+                context_parts.append(context_match.group(0).strip())
+                text = text[context_match.end():]
+                continue
+            image_match = _CURSOR_IMAGE_FILES_ENVELOPE_RE.match(text)
+            if image_match is not None:
+                paths = [
+                    match.group("path")
+                    for match in _CURSOR_IMAGE_PATH_RE.finditer(
+                        image_match.group("body")
+                    )
+                ]
+                if paths:
+                    attachments.extend(
+                        {
+                            "type": "image",
+                            "name": _cursor_attachment_name(path),
+                        }
+                        for path in paths[:32]
+                    )
+                else:
+                    marker_count = len(
+                        re.findall(r"\[Image\]", image_match.group("markers"), re.I)
+                    )
+                    attachments.extend(
+                        {"type": "image", "name": f"Image {index + 1}"}
+                        for index in range(max(1, marker_count))
+                    )
+                text = text[image_match.end():]
+                continue
+            marker_match = _CURSOR_IMAGE_MARKERS_RE.match(text)
+            if marker_match is not None:
                 marker_count = len(
-                    re.findall(r"\[Image\]", image_match.group("markers"), re.I)
+                    re.findall(r"\[Image\]", marker_match.group("markers"), re.I)
                 )
                 attachments.extend(
                     {"type": "image", "name": f"Image {index + 1}"}
-                    for index in range(max(1, marker_count))
+                    for index in range(marker_count)
                 )
-            text = text[image_match.end():]
-            continue
-        marker_match = _CURSOR_IMAGE_MARKERS_RE.match(text)
-        if marker_match is not None:
-            marker_count = len(
-                re.findall(r"\[Image\]", marker_match.group("markers"), re.I)
-            )
-            attachments.extend(
-                {"type": "image", "name": f"Image {index + 1}"}
-                for index in range(marker_count)
-            )
-            text = text[marker_match.end():]
-            continue
-        break
+                text = text[marker_match.end():]
+                continue
+            break
+
+    consume_context()
 
     timestamp_match = _CURSOR_TIMESTAMP_ENVELOPE_RE.match(text)
     if timestamp_match is None:
@@ -422,6 +447,10 @@ def parse_cursor_user_payload(content: str) -> CursorUserPayload:
             attachments=tuple(attachments),
         )
     text = text[timestamp_match.end():]
+    # Cursor completion bubbles currently put their timestamp first and their
+    # system_notification second. Accept the same context allowlist on either
+    # side of a valid timestamp; malformed timestamps remain literal user text.
+    consume_context()
 
     followup_match = _CURSOR_TASK_RESULT_FOLLOWUP_RE.fullmatch(text)
     if followup_match is not None and context_parts:
@@ -843,6 +872,107 @@ def build_agent_lifecycle_event(
     }
 
 
+def normalize_cursor_task_completion_event(
+    value: object,
+) -> dict[str, object] | None:
+    """Extract Cursor's synthetic task-finished envelope as a safe event."""
+    match = _CURSOR_TASK_COMPLETION_RE.search(_coerce_text(value))
+    if match is None:
+        return None
+    body = match.group("body")
+    header = re.split(
+        r"(?mi)^(?:detail\s*:|<response>)",
+        body,
+        maxsplit=1,
+    )[0]
+    fields: dict[str, str] = {}
+    for key in (
+        "kind",
+        "status",
+        "task_id",
+        "title",
+        "tool_call_id",
+        "agent_id",
+    ):
+        field_match = re.search(
+            rf"(?msi)^{key}\s*:\s*(?P<value>.*?)"
+            r"(?=^[a-z_][a-z0-9_]*\s*:|^<|\Z)",
+            header,
+        )
+        if field_match is not None:
+            fields[key] = field_match.group("value").strip()
+
+    task_id = _bounded_interaction_text(fields.get("task_id"), 512).strip()
+    task_kind = _bounded_interaction_text(fields.get("kind"), 80).strip().casefold()
+    raw_status = _bounded_interaction_text(fields.get("status"), 80).strip().casefold()
+    if not task_id or not task_kind or not raw_status:
+        return None
+    label = (
+        _bounded_interaction_text(fields.get("title"), 256).strip()
+        or f"{task_kind.title()} task"
+    )
+    activity_type = "subagent" if task_kind == "subagent" else (
+        "shell" if task_kind == "shell" else "task"
+    )
+    event: dict[str, object]
+    if activity_type == "subagent":
+        thread_id = _bounded_interaction_text(
+            fields.get("agent_id") or task_id,
+            512,
+        ).strip()
+        event = build_agent_lifecycle_event(
+            agent_path=_agent_path_from_label(label) or f"/root/{thread_id[:8]}",
+            agent_thread_id=thread_id,
+            kind=raw_status,
+            label=label,
+        ) or {}
+        if not event:
+            return None
+    else:
+        event = {
+            "version": 1,
+            "label": label,
+            "kind": _normalized_agent_activity_kind(raw_status),
+        }
+    event.update({
+        "activity_type": activity_type,
+        "task_kind": task_kind,
+        "task_id": task_id,
+        "status": raw_status,
+    })
+
+    tool_call_id = _bounded_interaction_text(
+        fields.get("tool_call_id"),
+        512,
+    ).strip()
+    if tool_call_id:
+        event["tool_call_id"] = tool_call_id
+    summary_match = _CURSOR_TASK_SUMMARY_RE.search(body)
+    response_match = _CURSOR_TASK_RESPONSE_RE.search(body)
+    summary = _bounded_interaction_text(
+        summary_match.group("summary")
+        if summary_match is not None
+        else response_match.group("response")
+        if response_match is not None
+        else "",
+        4_000,
+    ).strip()
+    if summary:
+        event["result_summary"] = summary
+    output_match = re.search(
+        r"(?mi)^output_path\s*:\s*(?P<path>[^\r\n]+?)\s*$",
+        body,
+    )
+    if output_match is not None:
+        output_path = _bounded_interaction_text(
+            output_match.group("path"),
+            4_096,
+        ).strip()
+        if output_path:
+            event["output_path"] = output_path
+    return event
+
+
 def _is_task_spawn_tool_name(value: object) -> bool:
     """Recognize Cursor Task spawn tools without matching todo Task* tools."""
     compact = re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
@@ -927,12 +1057,30 @@ def normalize_task_spawn_agent_event(
         or _status_prefix_from_tool_content(_coerce_text(content))
         or "completed"
     )
-    return build_agent_lifecycle_event(
+    if (
+        result.get("isBackground") is True
+        and _normalized_agent_activity_kind(status_hint) not in {
+            "failed",
+            "interrupted",
+        }
+    ):
+        # The task_v2 tool call completed after enqueueing the child; the child
+        # itself is only started until Cursor emits its completion notification.
+        status_hint = "started"
+    event = build_agent_lifecycle_event(
         agent_path=agent_path,
         agent_thread_id=thread_id,
         kind=status_hint,
         label=label,
     )
+    if event is not None:
+        event.update({
+            "activity_type": "subagent",
+            "task_kind": "subagent",
+            "task_id": thread_id,
+            "status": _coerce_text(status_hint).strip().casefold(),
+        })
+    return event
 
 
 def normalize_codex_agent_snapshot(value: object) -> dict[str, object] | None:
@@ -1664,6 +1812,36 @@ def parse_conversation_object(
             # adds one; current transcripts carry it only in the envelope.
             timestamp = timestamp or envelope_timestamp
             if session_context and not content.strip():
+                completion_event = normalize_cursor_task_completion_event(
+                    session_context
+                )
+                if completion_event is not None:
+                    summary = _coerce_text(
+                        completion_event.get("result_summary")
+                    ).strip()
+                    display_content = (
+                        f"{completion_event['label']} "
+                        f"{completion_event['kind']}"
+                    )
+                    if summary:
+                        display_content += f"\n\n{summary}"
+                    task_key = ":".join((
+                        _coerce_text(completion_event.get("task_kind")),
+                        _coerce_text(completion_event.get("task_id")),
+                        _coerce_text(completion_event.get("kind")),
+                    ))
+                    return NormalizedMessage(
+                        role="tool",
+                        content=display_content,
+                        tool_name="Task completion",
+                        tool_call_id=_coerce_text(
+                            completion_event.get("tool_call_id")
+                        ),
+                        timestamp=timestamp,
+                        raw_type="agent_event",
+                        source_id=f"cursor-task-completion:{task_key}",
+                        agent_event=completion_event,
+                    )
                 return NormalizedMessage(
                     role="system",
                     content=session_context,

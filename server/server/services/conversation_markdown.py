@@ -432,8 +432,13 @@ def _write_message(
         )
 
     if role == "tool":
-        if isinstance(metadata.get("agent_event"), dict):
-            if not options.include_agents:
+        agent_event = metadata.get("agent_event")
+        if isinstance(agent_event, dict):
+            is_task_activity = agent_event.get("activity_type") in {"shell", "task"}
+            if (
+                (is_task_activity and not options.include_tasks)
+                or (not is_task_activity and not options.include_agents)
+            ):
                 return False
         elif isinstance(metadata.get("task_state"), dict):
             if not options.include_tasks:
@@ -449,12 +454,15 @@ def _write_message(
             if interaction_id:
                 rendered_interactions.add(interaction_id)
         else:
-            label = "Agent activity" if isinstance(metadata.get("agent_event"), dict) else (
+            label = "Task activity" if (
+                isinstance(agent_event, dict)
+                and agent_event.get("activity_type") in {"shell", "task"}
+            ) else "Agent activity" if isinstance(agent_event, dict) else (
                 "Task" if isinstance(metadata.get("task_state"), dict) else (
                     str(metadata.get("tool_name") or "Tool result")
                 )
             )
-            if isinstance(metadata.get("agent_event"), dict) or isinstance(metadata.get("task_state"), dict):
+            if isinstance(agent_event, dict) or isinstance(metadata.get("task_state"), dict):
                 _write_details(writer, label, message.content.strip() or "_Empty message._")
             else:
                 _write_tool(

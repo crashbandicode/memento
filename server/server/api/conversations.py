@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import joinedload, load_only
 
-from ..db.models import ConversationMessage, Document, User
+from ..db.models import ConversationMessage, Document, Machine, Project, User
 from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
@@ -48,6 +49,61 @@ from ..services.message_search import (
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+_MACHINE_PLATFORM_SUFFIX_RE = re.compile(
+    r"\s+\((?:darwin|linux|windows)\)\s*$",
+    re.IGNORECASE,
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _absolute_project_path(value: object) -> str | None:
+    """Return an existing absolute path without decoding project hashes."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 4096
+        or re.search(r"[\x00-\x1f\x7f-\x9f]", candidate)
+    ):
+        return None
+    if (
+        candidate.startswith("/")
+        or candidate.startswith("\\\\")
+        or _WINDOWS_ABSOLUTE_PATH_RE.match(candidate)
+    ):
+        return candidate
+    return None
+
+
+def _conversation_location(document: Document) -> dict[str, str] | None:
+    """Build the compact, authorized host/path pair for one document."""
+    machine = getattr(document, "machine", None)
+    raw_host = str(getattr(machine, "name", "") or "").strip()
+    host = _MACHINE_PLATFORM_SUFFIX_RE.sub("", raw_host).strip()
+    if not host or re.search(r"[\x00-\x1f\x7f-\x9f]", host):
+        return None
+
+    metadata = (
+        document.metadata_
+        if isinstance(getattr(document, "metadata_", None), dict)
+        else {}
+    )
+    project = getattr(document, "project", None)
+    path = next(
+        (
+            candidate
+            for candidate in (
+                _absolute_project_path(metadata.get("project_path")),
+                _absolute_project_path(metadata.get("cwd")),
+                _absolute_project_path(getattr(project, "source_path", None)),
+            )
+            if candidate
+        ),
+        None,
+    )
+    return {"host": host[:255], "path": path} if path else None
 
 
 def _parsed_tool_calls(message: object) -> list[dict[str, object]]:
@@ -156,6 +212,7 @@ async def get_conversation(
             load_only(
                 Document.id,
                 Document.machine_id,
+                Document.project_id,
                 Document.tool_id,
                 Document.title,
                 Document.relative_path,
@@ -164,7 +221,9 @@ async def get_conversation(
                 Document.activity_at,
                 Document.synced_at,
                 Document.file_size_bytes,
-            )
+            ),
+            joinedload(Document.machine).load_only(Machine.name),
+            joinedload(Document.project).load_only(Project.source_path),
         )
         .where(Document.id == doc_id)
     )
@@ -382,6 +441,7 @@ async def get_conversation(
         "title": doc.title,
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
+        "location": _conversation_location(doc),
         "active_task_state": active_task_state,
         "pending_question_count": _pending_question_count(doc.metadata_),
         "agent_mode": (

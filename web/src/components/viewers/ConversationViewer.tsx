@@ -258,6 +258,10 @@ function messageOwnsQuestionResponse(msg: ConversationMessage): boolean {
   );
 }
 
+function isTaskActivityEvent(event: ConversationAgentEvent | null | undefined): boolean {
+  return event?.activity_type === "shell" || event?.activity_type === "task";
+}
+
 function messageVisibilityGroups(
   msg: ConversationMessage,
   toolId: string,
@@ -283,7 +287,9 @@ function messageVisibilityGroups(
     return Array.from(groups);
   }
   if (role === "tool") {
-    if (msg.agent_event) return ["agents"];
+    if (msg.agent_event) {
+      return [isTaskActivityEvent(msg.agent_event) ? "tasks" : "agents"];
+    }
     if (msg.task_state) return ["tasks"];
     if (msg.interaction) {
       return questionResponses.has(msg.interaction.id)
@@ -3681,56 +3687,105 @@ function AgentActivityCard({ event }: { event: ConversationAgentEvent }) {
     interrupted: { action: "interrupted", color: "#D97706", icon: "minus" as const },
     failed: { action: "failed", color: "#DC2626", icon: "close" as const },
   }[event.kind] || { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const };
+  const activityLabel = event.activity_type === "shell"
+    ? "Shell task"
+    : event.activity_type === "task"
+      ? "Task"
+      : "Subagent";
+  const hasDetails = Boolean(event.result_summary || event.output_path);
 
   return (
     <div
       data-agent-event
       data-agent-kind={event.kind}
-      title={event.agent_path}
+      data-agent-task-id={event.task_id}
+      data-agent-activity-type={event.activity_type || "subagent"}
+      title={event.agent_path || event.output_path}
       style={{
         width: "fit-content",
         maxWidth: "100%",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 8,
+        display: "grid",
+        gap: hasDetails ? 7 : 0,
         minHeight: 34,
-        padding: "6px 10px 6px 7px",
+        padding: hasDetails ? "8px 11px 9px 8px" : "6px 10px 6px 7px",
         border: "1px solid color-mix(in srgb, var(--aurora-accent) 18%, var(--aurora-border))",
-        borderRadius: 999,
+        borderRadius: hasDetails ? 13 : 999,
         background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
         boxShadow: "0 2px 8px rgba(15,23,42,0.035)",
         color: "var(--aurora-fg2)",
       }}
     >
-      <span
-        aria-hidden="true"
+      <div
         style={{
-          width: 22,
-          height: 22,
-          flex: "0 0 auto",
-          display: "inline-flex",
+          display: "flex",
           alignItems: "center",
-          justifyContent: "center",
-          borderRadius: 999,
-          background: `color-mix(in srgb, ${presentation.color} 13%, transparent)`,
-          color: presentation.color,
-        }}
-      >
-        <Icon name={presentation.icon} size={12} strokeWidth={2} />
-      </span>
-      <span
-        style={{
+          gap: 8,
           minWidth: 0,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-          fontSize: 11.5,
         }}
       >
-        <span style={{ color: "var(--aurora-fg4)", fontSize: 9.5, fontWeight: 650, textTransform: "uppercase", letterSpacing: "0.04em" }}>Subagent</span>{" "}
-        <strong style={{ color: "var(--aurora-fg1)", fontWeight: 750 }}>{event.label || "Activity"}</strong>{" "}
-        <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
-      </span>
+        <span
+          aria-hidden="true"
+          style={{
+            width: 22,
+            height: 22,
+            flex: "0 0 auto",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: 999,
+            background: `color-mix(in srgb, ${presentation.color} 13%, transparent)`,
+            color: presentation.color,
+          }}
+        >
+          <Icon name={presentation.icon} size={12} strokeWidth={2} />
+        </span>
+        <span
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            fontSize: 11.5,
+          }}
+        >
+          <span style={{ color: "var(--aurora-fg4)", fontSize: 9.5, fontWeight: 650, textTransform: "uppercase", letterSpacing: "0.04em" }}>{activityLabel}</span>{" "}
+          <strong style={{ color: "var(--aurora-fg1)", fontWeight: 750 }}>{event.label || "Activity"}</strong>{" "}
+          <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
+        </span>
+      </div>
+      {event.result_summary && (
+        <div
+          data-agent-result-summary
+          style={{
+            maxWidth: 680,
+            paddingLeft: 30,
+            color: "var(--aurora-fg3)",
+            fontSize: 11,
+            lineHeight: 1.45,
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {event.result_summary}
+        </div>
+      )}
+      {event.output_path && (
+        <code
+          data-agent-output-path
+          title={event.output_path}
+          style={{
+            maxWidth: 680,
+            marginLeft: 30,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            color: "var(--aurora-fg4)",
+            fontSize: 9.5,
+          }}
+        >
+          {event.output_path}
+        </code>
+      )}
     </div>
   );
 }
@@ -3794,7 +3849,7 @@ export const ChatBubble = memo(function ChatBubble({
   const taskState = msg.task_state;
   const agentEvent = msg.agent_event;
   if (role === "tool" && agentEvent) {
-    if (!showAgents) return null;
+    if (isTaskActivityEvent(agentEvent) ? !showTasks : !showAgents) return null;
     return <AgentActivityCard event={agentEvent} />;
   }
   if (role === "tool" && taskState) {

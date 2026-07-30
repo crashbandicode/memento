@@ -251,12 +251,18 @@ export interface ConversationTaskState {
   tasks: ConversationTask[];
 }
 
+export interface ConversationLocation {
+  host: string;
+  path: string;
+}
+
 export interface ConversationMeta {
   id: string;
   tool_id: string;
   title: string | null;
   relative_path: string;
   metadata: Record<string, unknown>;
+  location?: ConversationLocation | null;
   active_task_state?: ConversationTaskState | null;
   pending_question_count?: number;
   agent_mode?: string | null;
@@ -405,6 +411,13 @@ export interface ConversationAgentEvent {
   agent_thread_id?: string;
   label?: string;
   kind: "started" | "updated" | "completed" | "interrupted" | "failed" | "snapshot";
+  activity_type?: "subagent" | "shell" | "task";
+  task_kind?: string;
+  task_id?: string;
+  status?: string;
+  tool_call_id?: string;
+  result_summary?: string;
+  output_path?: string;
   agents?: ConversationAgentStatus[];
 }
 

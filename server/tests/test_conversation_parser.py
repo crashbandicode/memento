@@ -8,6 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
+from server.services.conversation_markdown import (  # noqa: E402
+    is_meaningful_human_prompt,
+)
 from server.services.conversation_parser import (  # noqa: E402
     AssistantIdentityState,
     count_conversation_messages,
@@ -277,6 +280,10 @@ class ConversationParserTests(unittest.TestCase):
                 "agent_thread_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
                 "label": "RNO API Mongo diagnosis",
                 "kind": "completed",
+                "activity_type": "subagent",
+                "task_kind": "subagent",
+                "task_id": "94d64099-e015-4fdb-848a-efaf7acc1695",
+                "status": "completed",
             },
         )
 
@@ -1893,7 +1900,7 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.timestamp, "2026-06-26T12:35:00-04:00")
         self.assertIn("Potentially Relevant Websearch Results", msg.session_context)
 
-    def test_cursor_system_notification_is_context_not_human_input(self) -> None:
+    def test_cursor_task_completion_is_visible_event_not_human_input(self) -> None:
         content = (
             "<system_notification>\n"
             "The following task has finished. If you were already aware, "
@@ -1921,11 +1928,209 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertIsNotNone(msg)
         assert msg is not None
+        self.assertEqual(msg.role, "tool")
+        self.assertEqual(msg.raw_type, "agent_event")
+        self.assertEqual(msg.tool_name, "Task completion")
+        self.assertEqual(
+            msg.agent_event,
+            {
+                "version": 1,
+                "label": "Measure BAN runtime footprint",
+                "kind": "completed",
+                "activity_type": "shell",
+                "task_kind": "shell",
+                "task_id": "15893",
+                "status": "success",
+            },
+        )
+
+    def test_cursor_failed_and_cancelled_task_completions_keep_status(self) -> None:
+        for status, expected_kind in (
+            ("failed", "failed"),
+            ("cancelled", "interrupted"),
+        ):
+            with self.subTest(status=status):
+                raw = json.dumps({
+                    "type": "user",
+                    "role": "user",
+                    "id": f"notif-{status}",
+                    "message": {"content": (
+                        "<system_notification>"
+                        "The following task has finished."
+                        f"<task>\nkind: shell\nstatus: {status}\n"
+                        f"task_id: {status}-task\n"
+                        f"title: {status.title()} shell task\n</task>"
+                        "</system_notification>"
+                    )},
+                })
+
+                msg = parse_conversation_line(raw, "cursor")
+
+                self.assertIsNotNone(msg)
+                assert msg is not None
+                self.assertEqual(msg.role, "tool")
+                self.assertEqual(msg.agent_event["status"], status)
+                self.assertEqual(msg.agent_event["kind"], expected_kind)
+
+    def test_cursor_observed_timestamped_subagent_completion_is_normalized(self) -> None:
+        content = (
+            "<timestamp>Thursday, Jul 30, 2026, 8:51 AM (UTC-4)</timestamp>\n"
+            "<system_notification>\n"
+            "The following task has finished. If you were already aware, "
+            "ignore this notification and do not restate prior responses.\n\n"
+            "<task>\n"
+            "kind: subagent\n"
+            "status: success\n"
+            "task_id: bc319435-7c07-4287-8428-f28257207520\n"
+            "title: Add Terra/Opus to allowlist\n"
+            "tool_call_id: call-628beaa1-6c4b-438b-a412-43d9371617b5-99\n"
+            "fc_2e8532fe-2c02-9f8b-b572-9440e8fdc099_0\n"
+            "agent_id: bc319435-7c07-4287-8428-f28257207520\n"
+            "detail: <user_visible_high_level_summary>\n"
+            "Updated all eight requested files and preserved other settings.\n"
+            "</user_visible_high_level_summary>\n"
+            "<response>Updated all requested files.</response>\n"
+            "output_path: c:\\Users\\intpa\\.cursor\\projects\\demo\\subagents\\"
+            "bc319435-7c07-4287-8428-f28257207520.jsonl\n"
+            "</task>\n"
+            "</system_notification>\n"
+            "<user_query>Perform any necessary follow-up actions in response "
+            "to the subagent completion above.</user_query>"
+        )
+        raw = json.dumps({
+            "type": "user",
+            "role": "user",
+            "id": "completion-bubble",
+            "timestamp": "2026-07-30T12:51:53.073Z",
+            "message": {"content": content},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
+        self.assertEqual(msg.role, "tool")
+        self.assertEqual(msg.raw_type, "agent_event")
+        self.assertEqual(msg.timestamp, "2026-07-30T12:51:53.073Z")
+        self.assertEqual(msg.agent_event["kind"], "completed")
+        self.assertEqual(msg.agent_event["activity_type"], "subagent")
+        self.assertEqual(
+            msg.agent_event["agent_thread_id"],
+            "bc319435-7c07-4287-8428-f28257207520",
+        )
+        self.assertEqual(
+            msg.agent_event["result_summary"],
+            "Updated all eight requested files and preserved other settings.",
+        )
+        self.assertTrue(str(msg.agent_event["output_path"]).endswith(".jsonl"))
+        self.assertIn("fc_2e8532fe", msg.agent_event["tool_call_id"])
+        self.assertNotIn("<system_notification>", msg.content)
+        self.assertFalse(
+            is_meaningful_human_prompt(
+                msg.content,
+                {"agent_event": msg.agent_event},
+                msg.role,
+            )
+        )
+
+    def test_cursor_completion_dedupes_same_task_but_keeps_distinct_tasks(self) -> None:
+        def completion(source_id: str, task_id: str, title: str) -> str:
+            return json.dumps({
+                "type": "user",
+                "role": "user",
+                "id": source_id,
+                "timestamp": "2026-07-30T12:51:53Z",
+                "message": {"content": (
+                    "<timestamp>Thursday, Jul 30, 2026, 8:51 AM (UTC-4)</timestamp>"
+                    "<system_notification>"
+                    "The following task has finished."
+                    f"<task>\nkind: subagent\nstatus: success\ntask_id: {task_id}\n"
+                    f"title: {title}\nagent_id: {task_id}\n</task>"
+                    "</system_notification>"
+                    "<user_query>Perform any necessary follow-up actions in response "
+                    "to the subagent completion above.</user_query>"
+                )},
+            })
+
+        messages = list(iter_conversation_messages(
+            "\n".join((
+                completion("transport-a", "task-a", "First task"),
+                completion("transport-b", "task-a", "First task"),
+                completion("transport-c", "task-b", "Second task"),
+            )),
+            "cursor",
+        ))
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(
+            [message.agent_event["task_id"] for message in messages],
+            ["task-a", "task-b"],
+        )
+
+    def test_cursor_background_subagent_transitions_started_to_completed(self) -> None:
+        spawn = {
+            "type": "cursor_state_tool",
+            "role": "tool",
+            "id": "spawn:tool",
+            "timestamp": "2026-07-30T12:50:50Z",
+            "tool_name": "task_v2",
+            "tool_status": "completed",
+            "tool_input": json.dumps({"description": "Audit parser"}),
+            "content": json.dumps({
+                "agentId": "agent-a",
+                "isBackground": True,
+            }),
+        }
+        completion = {
+            "type": "user",
+            "role": "user",
+            "id": "completion",
+            "timestamp": "2026-07-30T12:51:53Z",
+            "message": {"content": (
+                "<system_notification>The following task has finished."
+                "<task>\nkind: subagent\nstatus: success\ntask_id: agent-a\n"
+                "title: Audit parser\nagent_id: agent-a\n</task>"
+                "</system_notification>"
+                "<user_query>Perform any necessary follow-up actions in response "
+                "to the subagent completion above.</user_query>"
+            )},
+        }
+
+        messages = list(iter_conversation_messages(
+            "\n".join((json.dumps(spawn), json.dumps(completion))),
+            "cursor",
+        ))
+
+        self.assertEqual(
+            [message.agent_event["kind"] for message in messages],
+            ["started", "completed"],
+        )
+        self.assertEqual(
+            [message.agent_event["task_id"] for message in messages],
+            ["agent-a", "agent-a"],
+        )
+
+    def test_cursor_malformed_completion_stays_system_context(self) -> None:
+        raw = json.dumps({
+            "type": "user",
+            "role": "user",
+            "id": "malformed",
+            "message": {"content": (
+                "<timestamp>Thursday, Jul 30, 2026, 8:51 AM (UTC-4)</timestamp>"
+                "<system_notification>The following task has finished."
+                "<task>\nstatus: success\ntitle: Missing identity\n</task>"
+                "</system_notification>"
+                "<user_query>Briefly inform the user about the task result.</user_query>"
+            )},
+        })
+
+        msg = parse_conversation_line(raw, "cursor")
+
+        self.assertIsNotNone(msg)
+        assert msg is not None
         self.assertEqual(msg.role, "system")
         self.assertEqual(msg.raw_type, "cursor_context")
-        self.assertIn("system_notification", msg.content)
-        self.assertIn("Measure BAN runtime footprint", msg.content)
-        self.assertIn("Briefly inform the user about the task result", msg.content)
+        self.assertIsNone(msg.agent_event)
 
     def test_cursor_image_attachments_do_not_block_prompt_or_timestamp(self) -> None:
         content = (

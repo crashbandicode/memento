@@ -23,7 +23,10 @@ from typing import Any
 import asyncpg
 
 from server.scripts.reparse_conversations import _database_dsn
-from server.services.conversation_parser import parse_cursor_user_payload
+from server.services.conversation_parser import (
+    normalize_cursor_task_completion_event,
+    parse_cursor_user_payload,
+)
 
 
 def plan_notification_context_update(
@@ -50,6 +53,28 @@ def plan_notification_context_update(
         for key, value in dict(metadata or {}).items()
         if key != "session_context"
     }
+    completion_event = normalize_cursor_task_completion_event(context)
+    if completion_event is not None:
+        task_key = ":".join((
+            str(completion_event.get("task_kind") or ""),
+            str(completion_event.get("task_id") or ""),
+            str(completion_event.get("kind") or ""),
+        ))
+        next_metadata.update({
+            "source_id": f"cursor-task-completion:{task_key}",
+            "tool_name": "Task completion",
+            "agent_event": completion_event,
+        })
+        tool_call_id = str(completion_event.get("tool_call_id") or "").strip()
+        if tool_call_id:
+            next_metadata["tool_call_id"] = tool_call_id
+        summary = str(completion_event.get("result_summary") or "").strip()
+        display_content = (
+            f"{completion_event['label']} {completion_event['kind']}"
+        )
+        if summary:
+            display_content += f"\n\n{summary}"
+        return "tool", "agent_event", display_content, next_metadata
     if (
         message_type == "cursor_context"
         and content == context
@@ -90,6 +115,7 @@ async def run(
         )
         planned = 0
         applied = 0
+        seen_completion_keys: set[tuple[uuid.UUID, str, str, str]] = set()
         async with conn.transaction():
             for row in rows:
                 metadata = row["metadata"]
@@ -104,10 +130,36 @@ async def run(
                 )
                 if update is None:
                     continue
+                role, message_type, content, next_metadata = update
+                event = next_metadata.get("agent_event")
+                if isinstance(event, dict):
+                    event_key = (
+                        row["document_id"],
+                        str(event.get("task_kind") or ""),
+                        str(event.get("task_id") or ""),
+                        str(event.get("kind") or ""),
+                    )
+                    if event_key in seen_completion_keys:
+                        payload = parse_cursor_user_payload(str(row["content"] or ""))
+                        duplicate_metadata = {
+                            key: value
+                            for key, value in dict(metadata or {}).items()
+                            if key not in {
+                                "agent_event",
+                                "session_context",
+                                "tool_call_id",
+                                "tool_name",
+                            }
+                        }
+                        role = "system"
+                        message_type = "cursor_context"
+                        content = (payload.session_context or "").strip()
+                        next_metadata = duplicate_metadata
+                    else:
+                        seen_completion_keys.add(event_key)
                 planned += 1
                 if not apply:
                     continue
-                role, message_type, content, next_metadata = update
                 result = await conn.execute(
                     """
                     UPDATE conversation_messages

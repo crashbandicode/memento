@@ -650,6 +650,58 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
             [{"name": "Read", "input": '{"path": "/tmp/a"}'}],
         )
 
+    def test_cursor_task_completion_is_stored_as_agent_event(self) -> None:
+        content = json.dumps(
+            {
+                "type": "user",
+                "role": "user",
+                "id": "native-task-notification",
+                "timestamp": "2026-07-30T12:59:09.690Z",
+                "message": {
+                    "content": (
+                        "<timestamp>Thursday, Jul 30, 2026, 8:59 AM "
+                        "(UTC-4)</timestamp>"
+                        "<system_notification>"
+                        "The following task has finished."
+                        "<task>\nkind: shell\nstatus: success\n"
+                        "task_id: 913821\n"
+                        "title: Start batch 1 pull tlv02+rno\n"
+                        "detail: <user_visible_high_level_summary>"
+                        "Batch 1 pull completed."
+                        "</user_visible_high_level_summary>\n"
+                        "output_path: C:\\Users\\intpa\\.cursor\\projects\\demo\\"
+                        "terminals\\913821.txt\n"
+                        "</task>"
+                        "</system_notification>"
+                        "<user_query>Briefly inform the user about the task result."
+                        "</user_query>"
+                    )
+                },
+            }
+        )
+
+        rows = list(iter_stored_conversation_messages(content, "cursor"))
+
+        self.assertEqual(len(rows), 1)
+        normalized, display_content, metadata, timestamp = rows[0]
+        self.assertEqual(normalized.role, "tool")
+        self.assertEqual(normalized.raw_type, "agent_event")
+        self.assertEqual(timestamp.isoformat(), "2026-07-30T12:59:09.690000+00:00")
+        self.assertEqual(
+            metadata["source_id"],
+            "cursor-task-completion:shell:913821:completed",
+        )
+        self.assertEqual(metadata["tool_name"], "Task completion")
+        self.assertEqual(metadata["agent_event"]["activity_type"], "shell")
+        self.assertEqual(metadata["agent_event"]["task_id"], "913821")
+        self.assertEqual(metadata["agent_event"]["kind"], "completed")
+        self.assertEqual(
+            metadata["agent_event"]["result_summary"],
+            "Batch 1 pull completed.",
+        )
+        self.assertIn("completed", display_content)
+        self.assertNotIn("<system_notification>", display_content)
+
     def test_delta_lookback_does_not_revive_stale_cursor_question(self) -> None:
         interaction = {
             "kind": "question",

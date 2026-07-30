@@ -420,3 +420,73 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
     assert item["base_hash"] == initial.content_hash
     assert "The resources are free." in item["content"]
     assert "Free the resources" not in item["content"]
+
+
+def test_state_export_captures_task_notification_without_compat_transcript(tmp_path):
+    tool, transcript, session_id = _write_state_fixture(tmp_path)
+    transcript.unlink()
+    notification_id = "native-task-notification"
+    notification = (
+        "<timestamp>Thursday, Jul 30, 2026, 8:59 AM (UTC-4)</timestamp>\n"
+        "<system_notification>\n"
+        "The following task has finished. If you were already aware, "
+        "ignore this notification and do not restate prior responses.\n\n"
+        "<task>\n"
+        "kind: shell\n"
+        "status: success\n"
+        "task_id: 913821\n"
+        "title: Start batch 1 pull tlv02+rno\n"
+        "output_path: C:\\Users\\intpa\\.cursor\\projects\\demo\\"
+        "terminals\\913821.txt\n"
+        "</task>\n"
+        "</system_notification>\n"
+        "<user_query>Briefly inform the user about the task result and "
+        "perform any follow-up actions (if needed).</user_query>"
+    )
+
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["fullConversationHeadersOnly"].append({
+        "bubbleId": notification_id,
+        "type": 1,
+    })
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.execute(
+        "INSERT INTO cursorDiskKV VALUES (?,?)",
+        (
+            f"bubbleId:{session_id}:{notification_id}",
+            json.dumps({
+                "bubbleId": notification_id,
+                "type": 1,
+                "createdAt": "2026-07-30T12:59:09.690Z",
+                "text": notification,
+            }),
+        ),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-30T12:59:10Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+
+    exporter = CursorStateExporter(tool)
+    snapshots = exporter.export_changed(limit=20)
+    records = [
+        json.loads(line)
+        for snapshot in snapshots
+        for line in snapshot.content.splitlines()
+    ]
+    projected = next(record for record in records if record["id"] == notification_id)
+
+    assert projected["type"] == "user"
+    assert projected["role"] == "user"
+    assert projected["timestamp"] == "2026-07-30T12:59:09.690Z"
+    assert projected["message"]["content"] == notification
+    assert exporter.export_changed(limit=20) == []

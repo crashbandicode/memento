@@ -315,6 +315,88 @@ body {
   color: var(--aurora-accent);
 }
 
+.conversation-location-row {
+  width: 100%;
+  min-width: 0;
+  margin-top: 9px;
+}
+.conversation-location {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px 4px 5px;
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--aurora-accent) 16%, var(--aurora-border));
+  border-radius: 10px;
+  background:
+    linear-gradient(105deg, var(--aurora-accent-soft), transparent 48%),
+    var(--aurora-surface);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.42) inset;
+  color: var(--aurora-fg2);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  backdrop-filter: var(--aurora-blur);
+  -webkit-backdrop-filter: var(--aurora-blur);
+  transition: border-color .16s ease, background-color .16s ease, transform .16s ease;
+}
+.conversation-location:hover {
+  border-color: color-mix(in srgb, var(--aurora-accent) 30%, var(--aurora-border));
+  background-color: var(--aurora-surface-solid);
+  transform: translateY(-1px);
+}
+.conversation-location:focus-visible {
+  outline: 2px solid var(--aurora-accent);
+  outline-offset: 2px;
+}
+.conversation-location[data-copy-status="error"] {
+  border-color: rgba(239, 68, 68, 0.35);
+}
+.conversation-location-glyph {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: var(--aurora-surface-solid);
+  box-shadow: 0 0 0 1px var(--aurora-border) inset;
+  color: var(--aurora-accent);
+}
+.conversation-location-host {
+  max-width: min(180px, 38%);
+  overflow: hidden;
+  color: var(--aurora-accent);
+  font-weight: 650;
+  text-overflow: ellipsis;
+}
+.conversation-location-separator {
+  flex: none;
+  color: var(--aurora-fg5);
+}
+.conversation-location-path {
+  min-width: 48px;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--aurora-fg3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 640px) {
+  .conversation-location {
+    display: flex;
+    width: 100%;
+  }
+}
+
 .aurora-btn {
   display: inline-flex;
   align-items: center;
