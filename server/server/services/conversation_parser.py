@@ -2832,6 +2832,92 @@ def _claude_permission_detail(
     )
 
 
+def _claude_permission_suggestion_option(
+    suggestions: object,
+    requested_tool: str,
+) -> dict[str, str]:
+    entries = (
+        [entry for entry in suggestions if isinstance(entry, dict)]
+        if isinstance(suggestions, list)
+        else []
+    )
+    targets: list[str] = []
+    destinations: set[str] = set()
+    changes: list[str] = []
+    for entry in entries[:_MAX_INTERACTION_OPTIONS]:
+        destination = _bounded_interaction_text(
+            entry.get("destination"),
+            64,
+        )
+        if destination:
+            destinations.add(destination)
+        update_type = _bounded_interaction_text(entry.get("type"), 64)
+        if update_type in {"addRules", "replaceRules"}:
+            rules = entry.get("rules")
+            if isinstance(rules, list):
+                for raw_rule in rules[:_MAX_INTERACTION_OPTIONS]:
+                    if not isinstance(raw_rule, dict):
+                        continue
+                    rule_tool = _bounded_interaction_text(
+                        raw_rule.get("toolName"),
+                        256,
+                    )
+                    rule_content = _bounded_interaction_text(
+                        raw_rule.get("ruleContent"),
+                        1024,
+                    )
+                    if rule_tool:
+                        targets.append(
+                            f"{rule_tool}({rule_content})"
+                            if rule_content
+                            else rule_tool
+                        )
+            behavior = _bounded_interaction_text(entry.get("behavior"), 64)
+            if behavior:
+                changes.append(f"{update_type}: {behavior}")
+        elif update_type == "setMode":
+            mode = _bounded_interaction_text(entry.get("mode"), 64)
+            if mode:
+                targets.append(f"{mode} mode")
+                changes.append(f"setMode: {mode}")
+        elif update_type in {"addDirectories", "removeDirectories"}:
+            directories = entry.get("directories")
+            if isinstance(directories, list):
+                paths = [
+                    _bounded_interaction_text(path, 1024)
+                    for path in directories[:_MAX_INTERACTION_OPTIONS]
+                    if _bounded_interaction_text(path, 1024)
+                ]
+                targets.extend(paths)
+                if paths:
+                    changes.append(f"{update_type}: {', '.join(paths)}")
+
+    unique_targets = list(dict.fromkeys(target for target in targets if target))
+    target_label = ", ".join(unique_targets) or requested_tool
+    if destinations == {"session"} or not destinations:
+        scope = "for this session"
+    elif destinations <= {"localSettings", "projectSettings"}:
+        scope = "in this project"
+    elif destinations == {"userSettings"}:
+        scope = "in all projects"
+    else:
+        scope = "without asking again"
+    label = _bounded_interaction_text(
+        f"Yes, and allow Claude to use {target_label} {scope}",
+        1024,
+    )
+    description = (
+        "Future matching requests will be allowed without asking again."
+    )
+    if changes:
+        description = f"{description} {'; '.join(changes)}."
+    return {
+        "id": "allow-always",
+        "label": label,
+        "description": _bounded_interaction_text(description, 4096),
+    }
+
+
 def normalize_claude_live_prompt_interaction(
     tool_name: str,
     raw_input: object,
@@ -2859,9 +2945,13 @@ def normalize_claude_live_prompt_interaction(
         ) or "tool"
         tool_input = _json_mapping(payload.get("tool_input"))
         detail = _claude_permission_detail(requested_tool, tool_input)
-        allow_option = {"id": "allow", "label": "Allow"}
+        allow_option = {"id": "allow", "label": "Yes"}
         if detail:
             allow_option["description"] = detail
+        suggestion_option = _claude_permission_suggestion_option(
+            payload.get("permission_suggestions"),
+            requested_tool,
+        )
         questions = [{
             "id": "permission-decision",
             "header": requested_tool,
@@ -2870,7 +2960,8 @@ def normalize_claude_live_prompt_interaction(
             "allow_custom": False,
             "options": [
                 allow_option,
-                {"id": "deny", "label": "Deny"},
+                suggestion_option,
+                {"id": "deny", "label": "No"},
             ],
         }]
         interaction_type = "permission_request"

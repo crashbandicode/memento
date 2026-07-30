@@ -255,6 +255,15 @@ def test_hook_writes_permission_request_with_stable_id(tmp_path: Path) -> None:
             "description": "Push the release",
         },
         "permission_mode": "default",
+        "permission_suggestions": [{
+            "type": "addRules",
+            "rules": [{
+                "toolName": "PowerShell",
+                "ruleContent": "git push *",
+            }],
+            "behavior": "allow",
+            "destination": "session",
+        }],
         "cwd": "/home/test/project",
     }
     environment = os.environ.copy()
@@ -296,6 +305,9 @@ def test_hook_writes_permission_request_with_stable_id(tmp_path: Path) -> None:
     assert side_record["interaction_input"]["requested_tool"] == "PowerShell"
     assert side_record["interaction_input"]["tool_input"]["command"] == (
         "git push fork main"
+    )
+    assert side_record["interaction_input"]["permission_suggestions"] == (
+        payload["permission_suggestions"]
     )
 
 

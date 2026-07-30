@@ -53,6 +53,47 @@ class ConversationParserTests(unittest.TestCase):
             question["options"][0]["description"],
             "git push fork main",
         )
+        self.assertEqual(
+            [option["label"] for option in question["options"]],
+            [
+                "Yes",
+                "Yes, and allow Claude to use PowerShell for this session",
+                "No",
+            ],
+        )
+
+    def test_claude_permission_request_preserves_always_allow_rule(self) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "interaction_type": "permission_request",
+                "requested_tool": "PowerShell",
+                "tool_input": {"command": "git push fork main"},
+                "permission_suggestions": [{
+                    "type": "addRules",
+                    "rules": [{
+                        "toolName": "PowerShell",
+                        "ruleContent": "git push *",
+                    }],
+                    "behavior": "allow",
+                    "destination": "session",
+                }],
+            },
+            source="claude_code",
+            interaction_id="permission-2",
+        )
+
+        assert interaction is not None
+        always_allow = interaction["questions"][0]["options"][1]
+        self.assertEqual(always_allow["id"], "allow-always")
+        self.assertEqual(
+            always_allow["label"],
+            (
+                "Yes, and allow Claude to use "
+                "PowerShell(git push *) for this session"
+            ),
+        )
+        self.assertIn("addRules: allow", always_allow["description"])
 
     def test_claude_mcp_elicitation_schema_is_normalized(self) -> None:
         interaction = normalize_interaction(
