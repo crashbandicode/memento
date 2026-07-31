@@ -17,7 +17,11 @@ import test from "node:test";
 
 import { resolveConversationRoute, pathnameOf } from "./mock-router.mjs";
 import {
+  canvasScenarios,
+  claudeCanvas,
+  codexCanvas,
   codexSmartLinks,
+  cursorCanvas,
   FIXTURE_USER,
   claudeSmartLinks,
   cursorSmartLinks,
@@ -189,6 +193,28 @@ test("smart-link fixtures cover the shared Claude, Cursor, and Codex render laye
     assert.match(markdown, /github\.com\/.+\/commit\/9c216b8/);
     assert.match(markdown, /memento\.babypotatofarm\.com\/status/);
   }
+});
+
+test("canvas fixtures cover source, embed, and unsupported across three tools", () => {
+  assert.deepEqual(
+    canvasScenarios.map((scenario) => scenario.meta.tool_id),
+    ["cursor", "codex", "claude_code"],
+  );
+
+  // Cursor: transcript embeds the TSX source → read-only source preview.
+  const cursorArtifact = cursorCanvas.messages[1].canvases[0];
+  assert.equal(cursorArtifact.source_kind, "source");
+  assert.match(cursorArtifact.path, /\.canvas\.tsx$/);
+  assert.match(cursorArtifact.source, /export default function BillingReview/);
+
+  // Codex: a self-contained HTML export → sandboxed embed.
+  const codexArtifact = codexCanvas.messages[1].canvases[0];
+  assert.equal(codexArtifact.source_kind, "embed");
+  assert.match(codexArtifact.html, /codex-canvas-marker/);
+
+  // Claude: only a link, no server descriptor → link-only unsupported fallback.
+  assert.equal(claudeCanvas.messages[1].canvases, undefined);
+  assert.match(claudeCanvas.messages[1].content, /security-audit\.canvas\.tsx/);
 });
 
 test("every registered scenario has the endpoints a spec will request", () => {

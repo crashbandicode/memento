@@ -7,6 +7,8 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import MermaidDiagram from "./MermaidDiagram";
 import { SmartCode, SmartLink } from "./SmartLink";
+import { CanvasArtifactProvider } from "@/lib/canvas-context";
+import type { CanvasArtifact } from "@/lib/canvas-artifact.mjs";
 import "highlight.js/styles/github-dark.min.css";
 
 function nodeText(node: ReactNode): string {
@@ -114,8 +116,15 @@ const markdownComponents: Components = {
   ),
 };
 
-export default function MarkdownViewer({ content }: { content: string }) {
+export default function MarkdownViewer({
+  content,
+  canvases,
+}: {
+  content: string;
+  canvases?: CanvasArtifact[] | null;
+}) {
   return (
+    <CanvasArtifactProvider artifacts={canvases}>
     <div
       className={[
         "prose prose-sm max-w-none",
@@ -153,5 +162,6 @@ export default function MarkdownViewer({ content }: { content: string }) {
         {content}
       </ReactMarkdown>
     </div>
+    </CanvasArtifactProvider>
   );
 }

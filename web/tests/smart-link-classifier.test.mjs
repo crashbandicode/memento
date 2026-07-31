@@ -65,3 +65,46 @@ test("inline paths and SHAs become semantic chips without linkifying prose", () 
   );
   assert.deepEqual(classifyInlineCode("npm test"), { kind: "plain", value: "npm test" });
 });
+
+test("canvas links become a distinct canvas kind, not a generic file", () => {
+  const info = classifySmartLink(
+    "/Users/p/.cursor/projects/ws/canvases/billing-review.canvas.tsx",
+    "billing-review",
+  );
+  assert.equal(info.kind, "canvas");
+  assert.equal(info.name, "billing-review");
+  assert.equal(info.path, "/Users/p/.cursor/projects/ws/canvases/billing-review.canvas.tsx");
+});
+
+test("http canvas links expose the host as a domain", () => {
+  const info = classifySmartLink(
+    "https://canvas.example.com/artifacts/report.canvas.tsx",
+    "report",
+  );
+  assert.equal(info.kind, "canvas");
+  assert.equal(info.domain, "canvas.example.com");
+  assert.equal(info.name, "report");
+});
+
+test("plain .tsx files stay file links (only .canvas.tsx is a canvas)", () => {
+  assert.equal(classifySmartLink("src/App.tsx", "src/App.tsx").kind, "file");
+});
+
+test("inline canvas paths become a canvas chip", () => {
+  assert.deepEqual(
+    classifyInlineCode("canvases/audit.canvas.tsx"),
+    { kind: "canvas", value: "canvases/audit.canvas.tsx", display: "audit", path: "canvases/audit.canvas.tsx" },
+  );
+});
+
+test("unsafe canvas targets never resolve to the canvas kind", () => {
+  // `canvas` is the only kind that opens the in-app viewer / iframe embed, so an
+  // unsafe target must degrade to any other (inert) kind — never `canvas`.
+  assert.notEqual(classifySmartLink("../../secret.canvas.tsx", "secret").kind, "canvas");
+  assert.notEqual(classifySmartLink("a/../../b.canvas.tsx", "b").kind, "canvas");
+  assert.notEqual(classifySmartLink("javascript:evil.canvas.tsx", "evil").kind, "canvas");
+  assert.notEqual(classifyInlineCode("../secret.canvas.tsx").kind, "canvas");
+  assert.notEqual(classifyInlineCode("a\\..\\b.canvas.tsx").kind, "canvas");
+  // A safe target still resolves to a canvas chip.
+  assert.equal(classifyInlineCode("canvases/ok.canvas.tsx").kind, "canvas");
+});

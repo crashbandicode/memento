@@ -46,6 +46,38 @@
   color: #2784bd;
 }
 
+.canvas {
+  border-color: color-mix(in srgb, var(--aurora-accent) 34%, var(--aurora-border));
+  background: var(--aurora-accent-soft);
+  color: var(--aurora-accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.88em;
+  font-weight: 570;
+}
+
+.canvas:hover {
+  border-color: color-mix(in srgb, var(--aurora-accent) 52%, var(--aurora-border));
+  background: color-mix(in srgb, var(--aurora-accent) 14%, var(--aurora-surface-solid));
+  color: var(--aurora-accent);
+}
+
+.canvas .icon {
+  color: var(--aurora-accent);
+}
+
+.canvasTag {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--aurora-accent) 20%, transparent);
+  color: var(--aurora-accent);
+  font-size: 0.82em;
+  font-weight: 680;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
 .provider {
   flex-wrap: wrap;
   padding-right: 6px;

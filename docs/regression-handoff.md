@@ -3,7 +3,7 @@
 **Date:** 2026-07-31
 **Covered versions:** v0.1.44 → v0.1.53
 **HEAD:** see release tag `v0.1.53`
-**Status:** v0.1.53 includes shared smart links, Slack-like inline code, and the post-v0.1.50 Claude lifecycle fix.
+**Status:** v0.1.53 includes shared smart links, Slack-like inline code, and the post-v0.1.50 Claude lifecycle fix. The `feat/canvas-viewer` branch adds secure Canvas artifact detection and preview.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -17,7 +17,7 @@ Node 24 is installed for `patrick` at `~/.local/node-current`, `@playwright/test
 /usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File ./web/run-playwright.ps1
 ```
 
-This durable user-owned setup was validated with the full hermetic Chromium suite: **11/11 passed**.
+This durable user-owned setup was validated with the full hermetic Chromium suite: **16/16 passed**.
 
 ---
 
@@ -155,6 +155,15 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 - **Why all three tools are covered:** Claude, Cursor, and Codex message prose uses the shared `MarkdownViewer` / `SmartCode` renderer.
 - **Tests:** `web/e2e/smart-links.spec.mjs` checks computed light/dark inline-chip styling for all three tools and separately verifies fenced code keeps its syntax-highlighted block layout.
 
+### 16. `feat/canvas-viewer` — secure Canvas artifact preview
+
+- **Need:** Conversation transcripts can reference `*.canvas.tsx` artifacts, but Memento previously rendered them as ordinary file links with no artifact-specific presentation.
+- **Feasibility contract:** Self-contained HTML exports render in a locked-down iframe; validated `http(s)` artifact URLs use the same opaque-origin sandbox; transcript-carried TSX is inert read-only text; link-only artifacts show an honest unsupported fallback. Memento does not compile TSX and does not claim access to Cursor's Canvas runtime.
+- **Security:** Server descriptors are bounded by path, scheme, type, source/HTML size, and per-message count checks and never read files from disk. Inline HTML gets a fresh security head before all untrusted markup, `default-src 'none'` plus explicit no-connect/frame/object/worker directives, and an iframe sandbox containing only `allow-scripts` (no same-origin or popup permission). A remote URL necessarily performs its requested network navigation; because cross-origin HTML cannot accept an injected CSP, URL mode is separately protected by strict `http(s)` validation, opaque origin, no referrer, and denied browser capabilities.
+- **Key files:** `server/server/services/canvas_artifacts.py`, `server/server/api/conversations.py`, `web/src/lib/canvas-artifact.mjs`, `web/src/lib/canvas-context.tsx`, `web/src/components/viewers/CanvasViewer.tsx`, `web/src/components/viewers/SmartLink.tsx`
+- **Tests:** `server/tests/test_canvas_artifacts.py`; `web/tests/canvas-artifact.test.mjs`; classifier/router fixture tests; `web/e2e/canvas-viewer.spec.mjs` covers Claude, Cursor, and Codex plus desktop modal, mobile sheet, source, HTML embed, unsupported fallback, focus restoration, sandbox, capability policy, and CSP placement.
+- **Screenshots:** `artifacts/canvas-viewer/cursor-source-desktop.png`, `artifacts/canvas-viewer/cursor-source-mobile.png`, `artifacts/canvas-viewer/codex-embed-desktop.png`, `artifacts/canvas-viewer/claude-unsupported-desktop.png`
+
 ---
 
 ## Test coverage matrix
@@ -184,7 +193,8 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 | Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run verified on Node 24) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
 | Inline code chips across Claude, Cursor, and Codex (v0.1.53) | `smart-links.spec.mjs` | Playwright | covered (computed style + fenced-block regression) |
-| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (11/11 hermetic Chromium tests on Node 24) |
+| Secure Canvas artifact viewer (`feat/canvas-viewer`) | `test_canvas_artifacts.py`, `canvas-artifact.test.mjs`, `canvas-viewer.spec.mjs` | unit / Playwright | covered (source, HTML/URL policy, fallback, desktop/mobile, security attributes) |
+| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (16/16 hermetic Chromium tests on Node 24) |
 
 ---
 
@@ -195,7 +205,7 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
 3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
 4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (11/11) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
+5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes, and the full Chromium suite passes (16/16) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
 6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
 7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 

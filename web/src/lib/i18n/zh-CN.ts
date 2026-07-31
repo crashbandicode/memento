@@ -183,6 +183,18 @@ const zhCN = {
     offlineVscdbFallback: "已从本地 Antigravity 会话状态补回内容",
     offlinePbFallback: "已从本地 protobuf 缓存补回内容",
     collapse: "收起",
+    canvas: {
+      chip: "画布",
+      eyebrow: "Cursor 画布",
+      close: "关闭画布查看器",
+      copySource: "复制源代码",
+      openExternal: "在新标签页打开",
+      loading: "正在加载画布…",
+      loadError: "画布内容加载失败。",
+      unavailableTitle: "无法预览此画布",
+      unavailableBody:
+        "Memento 保存的是对话记录，而非已编译的 Cursor 画布。渲染 .canvas.tsx 需要 Cursor 编辑器及其画布 SDK，因此此处无法交互式呈现。以下为对话中记录的画布位置。",
+    },
     expandAll: "展开全部",
     subagentDispatch: "子任务派发",
     parentAgent: "父代理",

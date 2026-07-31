@@ -453,6 +453,179 @@ export const cursorSmartLinks = smartLinkScenario("cursor", "cursor");
 export const codexSmartLinks = smartLinkScenario("codex", "codex");
 export const smartLinkScenarios = [claudeSmartLinks, cursorSmartLinks, codexSmartLinks];
 
+/**
+ * Canvas artifacts across the three tools. Each scenario exercises a different
+ * viewer mode so the shared detection + secure-viewer layer is covered end to
+ * end:
+ *   - Cursor  → read-only SOURCE preview (transcript embedded the TSX).
+ *   - Codex   → sandboxed EMBED of a self-contained HTML export.
+ *   - Claude  → link-only, no server descriptor → UNSUPPORTED fallback.
+ * These are simulated snapshots, not live data.
+ */
+const CURSOR_CANVAS_PATH =
+  "/Users/patrick/.cursor/projects/memento/canvases/billing-review.canvas.tsx";
+const CURSOR_CANVAS_SOURCE = [
+  'import { Canvas, Card, Metric } from "cursor/canvas";',
+  "",
+  "export default function BillingReview() {",
+  "  return (",
+  "    <Canvas>",
+  '      <Card title="Monthly recurring revenue">',
+  '        <Metric label="MRR" value="$48,200" />',
+  "      </Card>",
+  "    </Canvas>",
+  "  );",
+  "}",
+].join("\n");
+
+export const cursorCanvas = {
+  docId: "conv-canvas-cursor",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-canvas-cursor",
+    tool_id: "cursor",
+    title: "Billing review canvas",
+    relative_path: "cursor/sessions/billing-canvas.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Summarize the billing numbers in a canvas.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "assistant",
+      model: "cursor-fixture-model",
+      content: `I built the canvas at [billing-review](${CURSOR_CANVAS_PATH}). Open it beside the chat.`,
+      canvases: [
+        {
+          name: "billing-review",
+          path: CURSOR_CANVAS_PATH,
+          href: CURSOR_CANVAS_PATH,
+          source_kind: "source",
+          source: CURSOR_CANVAS_SOURCE,
+          source_language: "tsx",
+        },
+      ],
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Summarize the billing numbers in a canvas.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
+const CODEX_CANVAS_PATH =
+  "/Users/patrick/.cursor/projects/memento/canvases/latency-report.canvas.tsx";
+const CODEX_CANVAS_HTML = [
+  "<!doctype html>",
+  "<html><head><title>Latency report</title></head>",
+  '<body><main id="codex-canvas-marker">Codex canvas rendered</main>',
+  "<script>document.getElementById('codex-canvas-marker').dataset.ready='1';</script>",
+  "</body></html>",
+].join("\n");
+
+export const codexCanvas = {
+  docId: "conv-canvas-codex",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-canvas-codex",
+    tool_id: "codex",
+    title: "Latency report canvas",
+    relative_path: "codex/sessions/latency-canvas.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Render the latency report as a canvas.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "assistant",
+      model: "codex-fixture-model",
+      content: `Exported the interactive report to [latency-report](${CODEX_CANVAS_PATH}).`,
+      canvases: [
+        {
+          name: "latency-report",
+          path: CODEX_CANVAS_PATH,
+          href: CODEX_CANVAS_PATH,
+          source_kind: "embed",
+          html: CODEX_CANVAS_HTML,
+        },
+      ],
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Render the latency report as a canvas.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
+const CLAUDE_CANVAS_PATH =
+  "/Users/patrick/.cursor/projects/memento/canvases/security-audit.canvas.tsx";
+
+export const claudeCanvas = {
+  docId: "conv-canvas-claude",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-canvas-claude",
+    tool_id: "claude_code",
+    title: "Security audit canvas",
+    relative_path: "claude/sessions/audit-canvas.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Put the audit findings in a canvas.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "assistant",
+      model: "claude-opus-4-1",
+      // No `canvases` descriptor: the transcript only references the artifact,
+      // so the chip resolves link-only and the viewer must show the honest
+      // "preview unavailable" fallback.
+      content: `Findings are in the canvas at [security-audit](${CLAUDE_CANVAS_PATH}).`,
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Put the audit findings in a canvas.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
+export const canvasScenarios = [cursorCanvas, codexCanvas, claudeCanvas];
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -462,4 +635,7 @@ export const scenarios = {
   [claudeSmartLinks.docId]: claudeSmartLinks,
   [cursorSmartLinks.docId]: cursorSmartLinks,
   [codexSmartLinks.docId]: codexSmartLinks,
+  [cursorCanvas.docId]: cursorCanvas,
+  [codexCanvas.docId]: codexCanvas,
+  [claudeCanvas.docId]: claudeCanvas,
 };
