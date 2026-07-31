@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   contextBeforeIncludingTarget,
+  isMirroredActiveTaskMessage,
   mergeMessagesChronologically,
   placeTargetWindow,
 } from "../src/lib/conversation-message-order.ts";
@@ -97,5 +98,43 @@ test("an overlapping target window extends the contiguous range", () => {
       [11, "new-11"],
       [12, "new-12"],
     ],
+  );
+});
+
+test("the current Cursor task carrier is not rendered twice", () => {
+  const current = {
+    source: "cursor",
+    is_current: true,
+    total_count: 2,
+    tasks: [
+      { id: "1", content: "Audit source", status: "completed" },
+      { id: "2", content: "Verify UI", status: "in_progress" },
+    ],
+  };
+
+  assert.equal(
+    isMirroredActiveTaskMessage({ task_state: current }, current),
+    true,
+  );
+  assert.equal(
+    isMirroredActiveTaskMessage({
+      task_state: {
+        ...current,
+        is_current: false,
+      },
+    }, current),
+    false,
+  );
+  assert.equal(
+    isMirroredActiveTaskMessage({
+      task_state: {
+        ...current,
+        tasks: [
+          current.tasks[0],
+          { id: "2", content: "Verify UI", status: "completed" },
+        ],
+      },
+    }, current),
+    false,
   );
 });

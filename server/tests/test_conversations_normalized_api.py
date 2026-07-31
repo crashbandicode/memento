@@ -169,6 +169,39 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["messages"][0]["role"], "user")
         self.assertEqual(payload["messages"][0]["origin"], "parent_agent")
 
+    async def test_cursor_child_messages_expose_parent_agent_origin(self) -> None:
+        self.doc.tool_id = "cursor"
+        self.doc.relative_path = (
+            "projects/demo/agent-transcripts/root-thread/"
+            "subagents/cursor-child.jsonl"
+        )
+        self.doc.metadata_.update({
+            "is_subagent": True,
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "cursor-child",
+        })
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=1),
+                _Result(rows=[self.message(1, "user")]),
+            ]
+        )
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["messages"][0]["role"], "user")
+        self.assertEqual(payload["messages"][0]["origin"], "parent_agent")
+
     async def test_root_claude_historical_answered_interaction_is_preserved(
         self,
     ) -> None:
@@ -834,6 +867,29 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             "root_session_id": "root-thread",
             "parent_thread_id": "root-thread",
             "session_id": "agent-child",
+        })
+        db = _Db([_Result(scalar_value=self.doc)])
+
+        payload = await get_conversation_prompts(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload, {"prompts": []})
+        self.assertEqual(len(db.statements), 1)
+
+    async def test_cursor_child_parent_messages_are_not_prompt_navigation(self) -> None:
+        self.doc.tool_id = "cursor"
+        self.doc.relative_path = (
+            "projects/demo/agent-transcripts/root-thread/"
+            "subagents/cursor-child.jsonl"
+        )
+        self.doc.metadata_.update({
+            "is_subagent": True,
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "cursor-child",
         })
         db = _Db([_Result(scalar_value=self.doc)])
 
