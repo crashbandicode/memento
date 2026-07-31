@@ -51,15 +51,30 @@ test.describe("file-type icon chips", () => {
       const chipList = page.locator("ul").filter({ hasText: "engine.py" }).first();
       await expect(chipList).toBeVisible();
 
-      // The distinctive glyphs must be present (symbol, not only color).
-      await expect(
-        page.getByTestId("smart-link-file").filter({ hasText: "engine.py" })
-          .locator('[data-file-icon="python"]'),
-      ).toHaveText("PY");
+      // The distinctive glyphs must be present as real vector icons (symbol, not
+      // only color) — a labelled <svg>, never a two-letter monogram.
+      const pythonIcon = page.getByTestId("smart-link-file").filter({ hasText: "engine.py" })
+        .locator('[data-file-icon="python"]');
+      await expect(pythonIcon).toHaveAttribute("role", "img");
+      await expect(pythonIcon).toHaveAttribute("aria-label", "Python file");
+      await expect(pythonIcon.locator("svg")).toHaveCount(1);
+      await expect(pythonIcon).toHaveText("");
       await expect(
         page.getByTestId("smart-code-file").filter({ hasText: "components" })
-          .locator('[data-file-icon="directory"]'),
+          .locator('[data-file-icon="directory"] svg'),
       ).toBeVisible();
+
+      // No chip anywhere may render a text monogram: assert every type glyph is a
+      // labelled <svg> with empty text content across the whole showcase.
+      const typeIcons = page.locator("[data-file-icon]");
+      const iconCount = await typeIcons.count();
+      expect(iconCount).toBeGreaterThan(6);
+      for (let index = 0; index < iconCount; index++) {
+        const icon = typeIcons.nth(index);
+        await expect(icon).toHaveText("");
+        await expect(icon.locator("svg")).toHaveCount(1);
+        expect((await icon.getAttribute("aria-label"))?.length ?? 0).toBeGreaterThan(3);
+      }
 
       /** @type {[string, Buffer][]} */
       const shots = [];

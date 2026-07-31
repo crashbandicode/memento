@@ -1,4 +1,5 @@
 import {
+  createElement,
   isValidElement,
   useMemo,
   useState,
@@ -7,21 +8,10 @@ import {
 } from "react";
 import {
   FiArrowRight,
-  FiBook,
-  FiBox,
-  FiDatabase,
   FiExternalLink,
-  FiFile,
-  FiFileText,
-  FiFolder,
   FiGlobe,
   FiGrid,
-  FiImage,
   FiLink,
-  FiLock,
-  FiPackage,
-  FiSettings,
-  FiTerminal,
 } from "react-icons/fi";
 import { SiGithub, SiGitlab } from "react-icons/si";
 import {
@@ -30,7 +20,8 @@ import {
 } from "@/lib/smart-link-classifier.mjs";
 import { canvasArtifactFromLink } from "@/lib/canvas-artifact.mjs";
 import { useCanvasArtifactResolver } from "@/lib/canvas-context";
-import { fileIconKind } from "@/lib/file-icon.mjs";
+import { fileIconComponent } from "@/lib/file-icon-icons.mjs";
+import { fileIconKind, fileIconLabel } from "@/lib/file-icon.mjs";
 import { useI18n } from "@/lib/i18n";
 import { CanvasViewer } from "./CanvasViewer";
 import styles from "./SmartLink.module.css";
@@ -51,94 +42,30 @@ function providerIcon(provider: "github" | "gitlab") {
 
 type FileIconKind = ReturnType<typeof fileIconKind>;
 
-// Programming / markup languages get a distinctive letter monogram so related
-// kinds are separated by *symbol* first — color is only a secondary cue, never
-// the sole identifier. Conceptual / binary kinds keep pictographic line icons.
-const FILE_ICON_MONOGRAMS: Partial<Record<FileIconKind, string>> = {
-  typescript: "TS",
-  javascript: "JS",
-  python: "PY",
-  rust: "RS",
-  go: "GO",
-  java: "JV",
-  kotlin: "KT",
-  csharp: "C#",
-  native: "C",
-  ruby: "RB",
-  php: "PHP",
-  lua: "LU",
-  swift: "SW",
-  vue: "VUE",
-  html: "<>",
-  stylesheet: "CSS",
-  markdown: "MD",
-  json: "{ }",
-  xml: "XML",
-  protobuf: "PB",
-  pdf: "PDF",
-};
-
+// Every file kind maps to a real vector icon (brand logo or conceptual
+// pictogram) from `react-icons` — never a two-letter text monogram. The glyph
+// carries a `role="img"` accessible type label so assistive tech announces the
+// *type* while the visible chip text stays the unchanged filename; color is only
+// a secondary cue. The `data-file-icon` kind is exposed for tests/tooling.
 function FileTypeIcon({ kind, size }: { kind: FileIconKind; size: number }) {
-  const monogram = FILE_ICON_MONOGRAMS[kind];
-  if (monogram) {
-    return (
-      <span
-        className={[styles.icon, styles.fileTypeIcon, styles.monogram].join(" ")}
-        data-file-icon={kind}
-        aria-hidden="true"
-      >
-        {monogram}
-      </span>
-    );
-  }
-
-  let glyph: ReactNode;
-  switch (kind) {
-    case "package":
-      glyph = <FiPackage size={size} />;
-      break;
-    case "docker":
-      glyph = <FiBox size={size} />;
-      break;
-    case "config":
-      glyph = <FiSettings size={size} />;
-      break;
-    case "shell":
-    case "build":
-      glyph = <FiTerminal size={size} />;
-      break;
-    case "sql":
-    case "data":
-      glyph = <FiDatabase size={size} />;
-      break;
-    case "image":
-      glyph = <FiImage size={size} />;
-      break;
-    case "lock":
-      glyph = <FiLock size={size} />;
-      break;
-    case "notebook":
-      glyph = <FiBook size={size} />;
-      break;
-    case "directory":
-      glyph = <FiFolder size={size} />;
-      break;
-    case "text":
-      glyph = <FiFileText size={size} />;
-      break;
-    case "file":
-    default:
-      glyph = <FiFile size={size} />;
-      break;
-  }
-
+  const label = fileIconLabel(kind);
+  // `fileIconComponent` returns a stable, module-level react-icons component
+  // (a registry lookup, not a component created during render), so it is drawn
+  // via `createElement`. The wrapping span carries the accessible type label and
+  // `data-file-icon` kind; the SVG glyph itself stays decorative (aria-hidden).
   return (
     <span
       className={[styles.icon, styles.fileTypeIcon].join(" ")}
       data-file-icon={kind}
-      aria-hidden="true"
+      role="img"
+      aria-label={label}
+      title={label}
     >
-      {glyph}
+      {createElement(fileIconComponent(kind), {
+        size,
+        "aria-hidden": true,
+        focusable: "false",
+      })}
     </span>
   );
 }
