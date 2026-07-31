@@ -556,6 +556,75 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["interactions"][0]["line_number"], 0)
 
+    async def test_live_claude_preview_repairs_stored_option_mojibake(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.metadata_["_live_interaction_signals"] = {
+            "toolu-side-tail": {
+                "timestamp": "2026-07-31T17:46:17Z",
+                "interaction": {
+                    "id": "toolu-side-tail",
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "AskUserQuestion",
+                    "questions": [
+                        {
+                            "id": "Side-tail",
+                            "header": "Side-tail",
+                            "prompt": (
+                                "Proceed to eliminate the accept/switch side-tail "
+                                "and source forwarding from JOB_START?"
+                            ),
+                            "type": "single_select",
+                            "allow_custom": True,
+                            "options": [
+                                {
+                                    "id": "Yes â€” delete it now",
+                                    "label": "Yes â€” delete it now",
+                                },
+                                {
+                                    "id": "Not yet â€” keep side-tail",
+                                    "label": "Not yet â€” keep side-tail",
+                                },
+                            ],
+                        },
+                        {
+                            "id": "Queue freshness",
+                            "header": "Queue freshness",
+                            "prompt": (
+                                "JOB_SWITCH queue freshness once the side-tail "
+                                "is gone?"
+                            ),
+                            "type": "single_select",
+                            "allow_custom": True,
+                            "options": [],
+                        },
+                    ],
+                },
+            }
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        item = payload["interactions"][0]
+        self.assertEqual(item["line_number"], 0)
+        self.assertEqual(len(item["interaction"]["questions"]), 2)
+        options = item["interaction"]["questions"][0]["options"]
+        self.assertEqual(
+            [option["label"] for option in options],
+            ["Yes — delete it now", "Not yet — keep side-tail"],
+        )
+        self.assertNotIn("â€”", json.dumps(item, ensure_ascii=False))
+
     async def test_root_claude_pending_permission_preview_is_visible(self) -> None:
         self.doc.tool_id = "claude_code"
         self.doc.relative_path = "projects/demo/root-thread.jsonl"

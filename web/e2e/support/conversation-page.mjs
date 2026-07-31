@@ -57,6 +57,12 @@ export async function installConversationMocks(page, scenario) {
     });
 
     if (result.action === "abort") {
+      if (new URL(request.url()).pathname.endsWith("/api/events/stream")) {
+        // A 204 is the EventSource-defined clean stop signal. It keeps the
+        // fixture stream inert without generating a browser console error.
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
       await route.abort();
       return;
     }

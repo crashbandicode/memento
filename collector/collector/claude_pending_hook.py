@@ -174,6 +174,29 @@ def _write_atomic(path: Path, record: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _read_stdin_payload(stream: object | None = None) -> object:
+    """Decode Claude's hook pipe as UTF-8, independent of Windows ANSI locale."""
+    input_stream = sys.stdin if stream is None else stream
+    binary_stream = getattr(input_stream, "buffer", None)
+    if binary_stream is not None:
+        raw_payload = binary_stream.read()
+        if isinstance(raw_payload, bytes):
+            text = raw_payload.decode("utf-8-sig")
+        else:
+            text = str(raw_payload)
+    else:
+        reader = getattr(input_stream, "read", None)
+        if not callable(reader):
+            raise TypeError("Hook input stream is not readable")
+        raw_payload = reader()
+        text = (
+            raw_payload.decode("utf-8-sig")
+            if isinstance(raw_payload, bytes)
+            else str(raw_payload)
+        )
+    return json.loads(text)
+
+
 def process_payload(payload: object) -> None:
     """Update one pending-interaction side file, ignoring malformed payloads."""
     if not isinstance(payload, dict):
@@ -499,7 +522,7 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
 def _hook_main() -> int:
     try:
         try:
-            payload = json.load(sys.stdin)
+            payload = _read_stdin_payload()
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             payload = {}
         process_payload(payload)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ from collector.claude_pending_questions import (
     extract_claude_pending_interaction_updates,
 )
 
+from collector import claude_pending_hook as hook_module
 from collector import claude_pending_questions as pending_module
 
 
@@ -85,6 +87,69 @@ def test_pending_side_file_emits_interaction_update(
         },
         "timestamp": "2026-07-29T14:00:00Z",
     }
+
+
+def test_utf8_question_survives_windows_hook_pipe_and_collector(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo-project" / "session-utf8.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "session-utf8",
+        "transcript_path": str(transcript),
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu-side-tail",
+        "tool_input": {
+            "questions": [
+                {
+                    "header": "Side-tail",
+                    "question": (
+                        "Proceed to eliminate the accept/switch side-tail and "
+                        "source forwarding from JOB_START?"
+                    ),
+                    "options": [
+                        {"label": "Yes — delete it, verify on real data first"},
+                        {"label": "Not yet — keep side-tail"},
+                    ],
+                },
+                {
+                    "header": "Queue freshness",
+                    "question": (
+                        "JOB_SWITCH queue freshness once the side-tail is gone?"
+                    ),
+                    "options": [
+                        {"label": "Accept STATUS2-cadence queue"},
+                        {"label": "Keep switch-instant precision"},
+                    ],
+                },
+            ]
+        },
+    }
+    raw_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    windows_ansi_stream = io.TextIOWrapper(
+        io.BytesIO(raw_payload),
+        encoding="cp1252",
+    )
+
+    decoded = hook_module._read_stdin_payload(windows_ansi_stream)
+    hook_module.process_payload(decoded)
+    records = extract_claude_pending_interaction_updates(claude_root)
+
+    record = records[
+        "claude_code:projects/demo-project/session-utf8.jsonl:toolu-side-tail"
+    ]
+    questions = record["interaction_input"]["questions"]
+    assert questions[0]["options"][0]["label"] == (
+        "Yes — delete it, verify on real data first"
+    )
+    assert questions[0]["options"][1]["label"] == "Not yet — keep side-tail"
+    assert len(questions) == 2
 
 
 def test_answered_side_file_emits_answered_update(

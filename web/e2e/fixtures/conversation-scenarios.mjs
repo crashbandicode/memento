@@ -388,6 +388,124 @@ export const parentAgentLabeling = {
   latestAgentLine: 2,
 };
 
+/**
+ * Live Claude AskUserQuestion payload captured from dreamland-yoga.
+ *
+ * It deliberately models a metadata-only pending prompt: message_id/line_number
+ * are zero until the corresponding transcript row is persisted.
+ */
+export const claudeSideTailLivePrompt = {
+  docId: "conv-claude-side-tail-live",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-claude-side-tail-live",
+    tool_id: "claude_code",
+    title: "Compare bjobs active jobs with event log collections",
+    relative_path: "claude/sessions/side-tail-live.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    pending_question_count: 1,
+    synced_at: T3,
+    activity_at: T3,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Investigate whether the accept/switch side-tail is still needed.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "assistant",
+      model: "claude-opus-4-8",
+      reasoning_effort: "xhigh",
+      content: "I traced JOB_ACCEPT, JOB_SWITCH, and JOB_START forwarding.",
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    {
+      id: 1,
+      line_number: 1,
+      content: "Investigate whether the accept/switch side-tail is still needed.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      content: "Review the live queue evidence before changing the parser.",
+      timestamp: T1,
+    },
+  ],
+  pending: /** @type {PendingConversationInteractionsResponse} */ ({
+    count: 1,
+    inferred_responses: [],
+    interactions: [{
+      document_id: "conv-claude-side-tail-live",
+      message_id: 0,
+      line_number: 0,
+      model: "claude-opus-4-8",
+      reasoning_effort: "xhigh",
+      timestamp: T2,
+      interaction: {
+        kind: "question",
+        id: "toolu-side-tail",
+        source: "claude_code",
+        tool_name: "AskUserQuestion",
+        questions: [
+          {
+            id: "Side-tail",
+            header: "Side-tail",
+            prompt: "Proceed to eliminate the accept/switch side-tail and source forwarding from JOB_START?",
+            type: "single_select",
+            allow_custom: true,
+            options: [
+              {
+                id: "Yes — delete it, verify on real data first",
+                label: "Yes — delete it, verify on real data first",
+                description: "Delete the accept_only reader, {site}.job_accept cursor, EOF-seed, durable-snapshot gate, and the JOB_ACCEPT/JOB_SWITCH handlers. Source forwarding from JOB_START. But first confirm on real ETL/master lsb.stream that JOB_START src/dst cluster populate for forwarded jobs and STATUS2 queue reflects a bswitch.",
+              },
+              {
+                id: "Yes — delete it now",
+                label: "Yes — delete it now",
+                description: "Same deletion, but proceed on the struct/parser evidence without the live-data pre-check (verify after via SLO queue/cluster match%).",
+              },
+              {
+                id: "Not yet — keep side-tail",
+                label: "Not yet — keep side-tail",
+                description: "Leave the side-tail as-is for now (D's un-routing stands); revisit the elimination later. Ship E + the MODIFY2 guard fix only.",
+              },
+            ],
+          },
+          {
+            id: "Queue freshness",
+            header: "Queue freshness",
+            prompt: "JOB_SWITCH queue freshness once the side-tail is gone?",
+            type: "single_select",
+            allow_custom: true,
+            options: [
+              {
+                id: "Accept STATUS2-cadence queue",
+                label: "Accept STATUS2-cadence queue",
+                description: "Rely on JOB_STATUS2/FINISH2 for the current queue (verify match% via SLO). Simplest; small freshness loss on bswitch'd jobs between status samples.",
+              },
+              {
+                id: "Keep switch-instant precision",
+                label: "Keep switch-instant precision",
+                description: "Retain a mechanism for switch-time queue precision rather than waiting for the next STATUS2. More code; preserves exact bswitch timing.",
+              },
+            ],
+          },
+        ],
+      },
+    }],
+  }),
+  latestAgentLine: 2,
+};
+
 const SMART_LINK_MARKDOWN = [
   "This intentionally long fixture keeps the rich links behind the conversation expand control. ".repeat(7),
   "",
@@ -459,6 +577,7 @@ export const scenarios = {
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
   [parentAgentLabeling.docId]: parentAgentLabeling,
+  [claudeSideTailLivePrompt.docId]: claudeSideTailLivePrompt,
   [claudeSmartLinks.docId]: claudeSmartLinks,
   [cursorSmartLinks.docId]: cursorSmartLinks,
   [codexSmartLinks.docId]: codexSmartLinks,

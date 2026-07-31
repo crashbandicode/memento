@@ -155,6 +155,14 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 - **Why all three tools are covered:** Claude, Cursor, and Codex message prose uses the shared `MarkdownViewer` / `SmartCode` renderer.
 - **Tests:** `web/e2e/smart-links.spec.mjs` checks computed light/dark inline-chip styling for all three tools and separately verifies fenced code keeps its syntax-highlighted block layout.
 
+### 16. Claude live prompt Unicode and mobile clearance
+
+- **Symptom:** The dreamland-yoga live AskUserQuestion card for session `c2badf82-0183-4c85-9191-d76222f66ede` rendered em dashes as `â€”`, exposed the metadata-only placeholder `Line 0`, and let the fixed mobile Prompt navigator cover the second question.
+- **Root cause:** On Windows, the Claude hook parsed `sys.stdin` through the process ANSI text codec even though Claude writes UTF-8 JSON bytes. The side file, collector signal, server normalization, and JSON response then faithfully preserved that already-corrupted string. Live metadata intentionally uses nonpositive message/line placeholders before transcript persistence, but the viewer rendered the placeholder as a jump target. The floating mobile navigator had safe-area positioning without corresponding pending-card/transcript scroll clearance.
+- **Fix:** Decode the hook's binary stdin as UTF-8 (BOM-tolerant) before JSON parsing. Repair only safely detectable UTF-8-as-CP1252 prompt fields on server normalization/read paths so already-stored live metadata recovers without globally reinterpreting Unicode. Hide nonpositive live line locations, retain positive-line navigation, and add shared responsive bottom/scroll clearance for the navigator.
+- **Key files:** `collector/collector/claude_pending_hook.py`, `server/server/services/conversation_parser.py`, `web/src/components/viewers/ConversationViewer.tsx`
+- **Tests:** `collector/tests/test_claude_pending_questions.py` covers UTF-8 bytes through the Windows-codec simulation, side file, and collector signal; `server/tests/test_conversation_parser.py` and `test_conversations_normalized_api.py` cover correct/repaired em dashes plus legitimate-Unicode negative cases; `web/e2e/claude-live-prompt-mobile.spec.mjs` uses the two-question payload in real Chromium at desktop and 472×1024 mobile sizes, including navigator operation, overlap geometry, and zero console/page errors.
+
 ---
 
 ## Test coverage matrix
@@ -165,6 +173,7 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 | Scheduled automations as context (`8ac973e`) | `test_conversation_parser.py`, `test_conversation_markdown.py` | unit | covered |
 | Adjacent page scroll load (`8ac973e`) | — | — | **GAP** |
 | Claude live AskUserQuestion hook (`99192ab`) | `collector/tests/test_claude_pending_questions.py` | unit | covered |
+| Claude live prompt Unicode / mobile clearance | collector + parser/API tests + `claude-live-prompt-mobile.spec.mjs` | unit / API / Chromium | covered |
 | Cursor Plan-mode approvals (`99192ab`) | `test_cursor_structured_tools.py`, `test_thread_metadata_service.py`, collector state/signal tests | unit / API | covered |
 | Cursor task completions (`d77e480`) | `test_conversation_parser.py`, `test_conversations_normalized_api.py`, `test_cursor_state_export.py` | unit / API | covered |
 | Conversation location header (`d77e480`) | normalized API location helpers | API | covered (UI **GAP**) |
