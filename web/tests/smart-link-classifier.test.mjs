@@ -5,6 +5,7 @@ import {
   classifyInlineCode,
   classifySmartLink,
   displayFileName,
+  looksLikeDirectoryPath,
   looksLikeFilePath,
 } from "../src/lib/smart-link-classifier.mjs";
 
@@ -19,6 +20,40 @@ test("repo paths become file links with a compact filename", () => {
       label: "HANDOFF.md",
       path: "docs/HANDOFF.md",
     },
+  );
+});
+
+test("documents and notebooks classify as file chips", () => {
+  assert.equal(looksLikeFilePath("docs/architecture-review.pdf"), true);
+  assert.equal(looksLikeFilePath("analysis/model.ipynb"), true);
+  assert.deepEqual(
+    classifyInlineCode("analysis/model.ipynb"),
+    { kind: "file", value: "analysis/model.ipynb", display: "model.ipynb" },
+  );
+});
+
+test("trailing-slash local paths are directory-aware file chips", () => {
+  assert.equal(looksLikeDirectoryPath("src/components/"), true);
+  assert.equal(looksLikeDirectoryPath("C:\\repo\\dist\\"), true);
+  assert.equal(displayFileName("src/components/"), "components");
+  assert.deepEqual(
+    classifyInlineCode("src/components/"),
+    { kind: "file", value: "src/components/", display: "components" },
+  );
+  assert.equal(
+    classifySmartLink("src/components/", "src/components/").kind,
+    "file",
+  );
+});
+
+test("bare domains and URL directory paths never become directory file chips", () => {
+  // A bare domain with a trailing slash is a domain, not a local directory.
+  assert.equal(looksLikeDirectoryPath("example.com/"), false);
+  assert.equal(looksLikeDirectoryPath("/"), false);
+  // An http(s) URL whose pathname ends in a slash stays a web link.
+  assert.equal(
+    classifySmartLink("https://memento.babypotatofarm.com/docs/", "Docs").kind,
+    "web",
   );
 });
 

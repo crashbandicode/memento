@@ -7,13 +7,13 @@ import {
 } from "react";
 import {
   FiArrowRight,
-  FiBookOpen,
+  FiBook,
   FiBox,
-  FiCode,
   FiDatabase,
   FiExternalLink,
   FiFile,
   FiFileText,
+  FiFolder,
   FiGlobe,
   FiGrid,
   FiImage,
@@ -51,12 +51,49 @@ function providerIcon(provider: "github" | "gitlab") {
 
 type FileIconKind = ReturnType<typeof fileIconKind>;
 
+// Programming / markup languages get a distinctive letter monogram so related
+// kinds are separated by *symbol* first — color is only a secondary cue, never
+// the sole identifier. Conceptual / binary kinds keep pictographic line icons.
+const FILE_ICON_MONOGRAMS: Partial<Record<FileIconKind, string>> = {
+  typescript: "TS",
+  javascript: "JS",
+  python: "PY",
+  rust: "RS",
+  go: "GO",
+  java: "JV",
+  kotlin: "KT",
+  csharp: "C#",
+  native: "C",
+  ruby: "RB",
+  php: "PHP",
+  lua: "LU",
+  swift: "SW",
+  vue: "VUE",
+  html: "<>",
+  stylesheet: "CSS",
+  markdown: "MD",
+  json: "{ }",
+  xml: "XML",
+  protobuf: "PB",
+  pdf: "PDF",
+};
+
 function FileTypeIcon({ kind, size }: { kind: FileIconKind; size: number }) {
+  const monogram = FILE_ICON_MONOGRAMS[kind];
+  if (monogram) {
+    return (
+      <span
+        className={[styles.icon, styles.fileTypeIcon, styles.monogram].join(" ")}
+        data-file-icon={kind}
+        aria-hidden="true"
+      >
+        {monogram}
+      </span>
+    );
+  }
+
   let glyph: ReactNode;
   switch (kind) {
-    case "markdown":
-      glyph = <FiBookOpen size={size} />;
-      break;
     case "package":
       glyph = <FiPackage size={size} />;
       break;
@@ -80,14 +117,18 @@ function FileTypeIcon({ kind, size }: { kind: FileIconKind; size: number }) {
     case "lock":
       glyph = <FiLock size={size} />;
       break;
+    case "notebook":
+      glyph = <FiBook size={size} />;
+      break;
+    case "directory":
+      glyph = <FiFolder size={size} />;
+      break;
     case "text":
       glyph = <FiFileText size={size} />;
       break;
     case "file":
-      glyph = <FiFile size={size} />;
-      break;
     default:
-      glyph = <FiCode size={size} />;
+      glyph = <FiFile size={size} />;
       break;
   }
 

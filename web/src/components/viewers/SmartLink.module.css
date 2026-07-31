@@ -51,6 +51,19 @@
   color: color-mix(in srgb, var(--file-icon-color) 76%, var(--aurora-fg2));
 }
 
+/* Language monograms (PY, TS, MD, …) share the fixed icon slot so chips never
+   grow taller; a compact monospace letterform keeps them crisp and legible. */
+.monogram {
+  min-width: 16px;
+  height: 14px;
+  padding: 0 1px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 8.5px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
 .fileTypeIcon[data-file-icon="typescript"] {
   --file-icon-color: #3178c6;
 }
@@ -120,6 +133,18 @@
 .fileTypeIcon[data-file-icon="protobuf"],
 .fileTypeIcon[data-file-icon="xml"] {
   --file-icon-color: #537c87;
+}
+
+.fileTypeIcon[data-file-icon="pdf"] {
+  --file-icon-color: #b0413a;
+}
+
+.fileTypeIcon[data-file-icon="notebook"] {
+  --file-icon-color: #b5651d;
+}
+
+.fileTypeIcon[data-file-icon="directory"] {
+  --file-icon-color: #5b7a9b;
 }
 
 .fileTypeIcon[data-file-icon="lock"],
@@ -274,6 +299,12 @@
 :global(html[data-theme="dark"]) .link {
   color: #6db7ed;
   box-shadow: none;
+}
+
+/* On dark surfaces the family accents are lifted toward the brightest text so
+   each icon keeps an accessible contrast ratio while retaining its hue. */
+:global(html[data-theme="dark"]) .fileTypeIcon {
+  color: color-mix(in srgb, var(--file-icon-color) 62%, var(--aurora-fg1));
 }
 
 :global(html[data-theme="dark"]) .inlineCode {

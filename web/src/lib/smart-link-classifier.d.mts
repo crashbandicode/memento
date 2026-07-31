@@ -34,6 +34,7 @@ export type SmartCodeInfo =
   | { kind: "canvas"; value: string; display: string; path: string };
 
 export function looksLikeFilePath(value: string): boolean;
+export function looksLikeDirectoryPath(value: string): boolean;
 export function displayFileName(value: string): string;
 export function classifySmartLink(href: string, label?: string): SmartLinkInfo;
 export function classifyInlineCode(value: string): SmartCodeInfo;
