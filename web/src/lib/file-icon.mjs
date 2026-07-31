@@ -4,7 +4,8 @@
  *   | "rust" | "go" | "java" | "kotlin" | "csharp" | "native" | "ruby"
  *   | "php" | "lua" | "swift" | "html" | "stylesheet" | "vue" | "json"
  *   | "data" | "config" | "shell" | "sql" | "image" | "package"
- *   | "docker" | "lock" | "protobuf" | "xml" | "build"
+ *   | "docker" | "lock" | "protobuf" | "xml" | "build" | "pdf"
+ *   | "notebook" | "directory"
  * } FileIconKind
  */
 
@@ -35,6 +36,16 @@ function fileBasename(value) {
  * @returns {FileIconKind}
  */
 export function fileIconKind(value) {
+  const bare = safeDecode(String(value))
+    .trim()
+    .replace(/^file:\/\//i, "")
+    .split("#", 1)[0]
+    .split("?", 1)[0];
+  // A trailing separator (e.g. `src/components/`) marks a directory reference.
+  if (/[/\\]$/.test(bare) && bare.replace(/[/\\]+$/, "")) {
+    return "directory";
+  }
+
   const basename = fileBasename(value);
 
   if (
@@ -44,7 +55,7 @@ export function fileIconKind(value) {
   ) {
     return "package";
   }
-  if (/^(?:dockerfile(?:\.[\w.-]+)?|(?:docker-)?compose(?:\.[\w.-]+)?\.ya?ml)$/.test(basename)) {
+  if (/^(?:(?:docker|container)file(?:\.[\w.-]+)?|(?:docker-)?compose(?:\.[\w.-]+)?\.ya?ml)$/.test(basename)) {
     return "docker";
   }
   if (/^tsconfig(?:\.[\w.-]+)?\.json$/.test(basename)) return "typescript";
@@ -111,6 +122,10 @@ export function fileIconKind(value) {
     case "json":
     case "jsonl":
       return "json";
+    case "ipynb":
+      return "notebook";
+    case "pdf":
+      return "pdf";
     case "csv":
       return "data";
     case "yaml":

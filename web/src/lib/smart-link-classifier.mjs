@@ -4,8 +4,8 @@ import {
   looksLikeCanvasArtifact,
 } from "./canvas-artifact.mjs";
 
-const FILE_EXTENSION = /\.(?:c|cc|cpp|cs|css|csv|dockerfile|go|h|hpp|html?|ini|java|js|jsx|json|jsonl|kt|kts|lock|log|lua|md|mdx|mjs|mts|php|plist|properties|proto|ps1|py|rb|rs|scss|sh|sql|svg|swift|toml|ts|tsx|txt|vue|xml|ya?ml)(?:[?#].*)?$/i;
-const SPECIAL_FILE = /(?:^|[/\\])(?:AGENTS\.md|Dockerfile|Gemfile|HANDOFF\.md|LICENSE|Makefile|Procfile|README|Tiltfile)(?:[?#].*)?$/i;
+const FILE_EXTENSION = /\.(?:c|cc|cpp|cs|css|csv|dockerfile|containerfile|go|h|hpp|html?|ini|ipynb|java|js|jsx|json|jsonl|kt|kts|lock|log|lua|md|mdx|mjs|mts|pdf|php|plist|properties|proto|ps1|py|rb|rs|scss|sh|sql|svg|swift|toml|ts|tsx|txt|vue|xml|ya?ml)(?:[?#].*)?$/i;
+const SPECIAL_FILE = /(?:^|[/\\])(?:AGENTS\.md|Containerfile|Dockerfile|Gemfile|HANDOFF\.md|LICENSE|Makefile|Procfile|README|Tiltfile)(?:[?#].*)?$/i;
 const SHA = /^[0-9a-f]{7,40}$/i;
 const HTTP = /^https?:\/\//i;
 
@@ -39,6 +39,30 @@ export function looksLikeFilePath(value) {
     || /^[A-Za-z]:[\\/]/.test(candidate)
     || /^[\w@-]+\.[\w.-]+$/.test(candidate)
   );
+}
+
+/**
+ * A trailing separator on a local path (`src/components/`, `C:\repo\dist\`)
+ * marks a directory reference. This is intentionally *not* folded into
+ * {@link looksLikeFilePath} so that http(s) URL pathnames that happen to end in
+ * a slash are never mistaken for local directory chips. A bare `example.com/`
+ * is treated as a domain, not a directory.
+ */
+export function looksLikeDirectoryPath(value) {
+  const candidate = normalizedCandidate(value);
+  if (
+    !candidate
+    || candidate.length > 320
+    || /[\r\n]/.test(candidate)
+    || HTTP.test(candidate)
+    || !/[/\\]$/.test(candidate)
+  ) {
+    return false;
+  }
+  const body = candidate.replace(/[/\\]+$/, "");
+  if (!body) return false;
+  const bareDomain = !/[/\\]/.test(body) && /^[\w-]+(?:\.[\w-]+)+$/.test(body);
+  return !bareDomain;
 }
 
 export function displayFileName(value) {
@@ -104,8 +128,10 @@ export function classifySmartLink(href, label = "") {
         path: canvasTarget || normalizedLabel,
       };
     }
-    if (looksLikeFilePath(path) || looksLikeFilePath(normalizedLabel)) {
-      const labelIsPath = !normalizedLabel || looksLikeFilePath(normalizedLabel);
+    const pathIsFileish = (candidate) =>
+      looksLikeFilePath(candidate) || looksLikeDirectoryPath(candidate);
+    if (pathIsFileish(path) || pathIsFileish(normalizedLabel)) {
+      const labelIsPath = !normalizedLabel || pathIsFileish(normalizedLabel);
       return {
         kind: "file",
         href: normalizedHref,
@@ -200,7 +226,7 @@ export function classifyInlineCode(value) {
       path: normalized,
     };
   }
-  if (looksLikeFilePath(normalized)) {
+  if (looksLikeFilePath(normalized) || looksLikeDirectoryPath(normalized)) {
     return { kind: "file", value: normalized, display: displayFileName(normalized) };
   }
   return { kind: "plain", value };

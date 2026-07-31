@@ -38,8 +38,17 @@ test.describe("smart conversation links", () => {
       await expect(imageLink).toHaveAttribute("data-file-type", "image");
       await expect(imageLink.locator('[data-file-icon="image"]')).toBeVisible();
 
+      // Languages render a distinctive letter monogram, so the symbol (not just
+      // the color) tells related source kinds apart.
+      const pythonLink = page.getByTestId("smart-link-file").filter({ hasText: "engine.py" });
+      await expect(pythonLink).toHaveAttribute("data-file-type", "python");
+      const pythonIcon = pythonLink.locator('[data-file-icon="python"]');
+      await expect(pythonIcon).toBeVisible();
+      await expect(pythonIcon).toHaveText("PY");
+      await expect(sourceLink.locator('[data-file-icon="typescript"]')).toHaveText("TS");
+
       const iconColors = await Promise.all(
-        [fileLink, sourceLink, packageLink, dockerLink, imageLink].map(
+        [fileLink, sourceLink, packageLink, dockerLink, imageLink, pythonLink].map(
           (link) => link.locator("[data-file-icon]").evaluate(
             (element) => window.getComputedStyle(element).color,
           ),
@@ -57,6 +66,12 @@ test.describe("smart conversation links", () => {
       const shellChip = page.getByTestId("smart-code-file").filter({ hasText: "release.ps1" });
       await expect(shellChip).toHaveAttribute("data-file-type", "shell");
       await expect(shellChip.locator('[data-file-icon="shell"]')).toBeVisible();
+
+      const directoryChip = page.getByTestId("smart-code-file").filter({ hasText: "components" });
+      await expect(directoryChip).toBeVisible();
+      await expect(directoryChip).toHaveText("components");
+      await expect(directoryChip).toHaveAttribute("data-file-type", "directory");
+      await expect(directoryChip.locator('[data-file-icon="directory"]')).toBeVisible();
 
       const compare = page.getByTestId("smart-link-git-compare");
       await expect(compare).toBeVisible();
@@ -137,6 +152,7 @@ test.describe("smart conversation links", () => {
       for (const [label, kind] of [
         ["HANDOFF.md", "markdown"],
         ["SmartLink.tsx", "typescript"],
+        ["engine.py", "python"],
         ["package.json", "package"],
         ["Dockerfile", "docker"],
         ["logo.svg", "image"],
