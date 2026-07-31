@@ -964,7 +964,14 @@ def _claude_agent_result_kind(
         return "failed", raw_status
     if raw_status in {"completed", "complete", "finished", "success", "succeeded", "done"}:
         return "completed", raw_status
-    if raw_status in {"running", "started", "pending", "in_progress", "background"}:
+    if raw_status in {
+        "running",
+        "started",
+        "pending",
+        "in_progress",
+        "background",
+        "async_launched",
+    }:
         return "started", raw_status
     if (
         result_item.get("is_error") is True
