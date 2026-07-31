@@ -17,7 +17,7 @@ Node 24 is installed for `patrick` at `~/.local/node-current`, `@playwright/test
 /usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File ./web/run-playwright.ps1
 ```
 
-This durable user-owned setup was validated with the full hermetic Chromium suite: **11/11 passed**.
+This durable user-owned setup was validated with the full hermetic Chromium suite: **14/14 passed**.
 
 ---
 
