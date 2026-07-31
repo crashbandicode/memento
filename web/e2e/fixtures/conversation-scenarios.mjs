@@ -756,7 +756,7 @@ export const smartLinkScenarios = [claudeSmartLinks, cursorSmartLinks, codexSmar
  * These are simulated snapshots, not live data.
  */
 const CURSOR_CANVAS_PATH =
-  "/Users/patrick/.cursor/projects/memento/canvases/billing-review.canvas.tsx";
+  "C:/Users/patrick/.cursor/projects/memento/canvases/billing-review.canvas.tsx";
 const CURSOR_CANVAS_SOURCE = [
   'import { Canvas, Card, Metric } from "cursor/canvas";',
   "",
