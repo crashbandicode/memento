@@ -3006,6 +3006,32 @@ def _bounded_interaction_text(value: object, limit: int) -> str:
     return _bounded_tool_text(_coerce_text(value).strip(), limit)
 
 
+_UTF8_CP1252_MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "ðŸ", "ï¿")
+
+
+def _repair_detectable_utf8_cp1252_mojibake(value: str) -> str:
+    """Undo one UTF-8-as-CP1252 decode only when strong markers improve."""
+    marker_count = sum(value.count(marker) for marker in _UTF8_CP1252_MOJIBAKE_MARKERS)
+    if marker_count == 0:
+        return value
+    try:
+        repaired = value.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    repaired_marker_count = sum(
+        repaired.count(marker) for marker in _UTF8_CP1252_MOJIBAKE_MARKERS
+    )
+    return repaired if repaired_marker_count < marker_count else value
+
+
+def _bounded_question_text(value: object, limit: int) -> str:
+    text = _coerce_text(value).strip()
+    return _bounded_tool_text(
+        _repair_detectable_utf8_cp1252_mojibake(text),
+        limit,
+    )
+
+
 def normalize_question_interaction(
     tool_name: str,
     raw_input: object,
@@ -3030,19 +3056,19 @@ def normalize_question_interaction(
     for index, raw_question in enumerate(raw_questions[:_MAX_INTERACTION_QUESTIONS]):
         if not isinstance(raw_question, dict):
             continue
-        prompt = _bounded_interaction_text(
+        prompt = _bounded_question_text(
             raw_question.get("prompt") or raw_question.get("question"),
             4096,
         )
         if not prompt:
             continue
-        question_id = _bounded_interaction_text(
+        question_id = _bounded_question_text(
             raw_question.get("id")
             or raw_question.get("header")
             or f"question-{index + 1}",
             256,
         )
-        header = _bounded_interaction_text(
+        header = _bounded_question_text(
             raw_question.get("header") or raw_question.get("label_short"),
             512,
         )
@@ -3062,19 +3088,19 @@ def normalize_question_interaction(
                     raw_option = {"label": raw_option}
                 if not isinstance(raw_option, dict):
                     continue
-                label = _bounded_interaction_text(raw_option.get("label"), 1024)
+                label = _bounded_question_text(raw_option.get("label"), 1024)
                 if not label:
                     continue
-                option_id = _bounded_interaction_text(
+                option_id = _bounded_question_text(
                     raw_option.get("id") or label or f"option-{option_index + 1}",
                     512,
                 )
                 option = {"id": option_id, "label": label}
-                description = _bounded_interaction_text(
+                description = _bounded_question_text(
                     raw_option.get("description") or raw_option.get("preview"),
                     4096,
                 )
-                short_label = _bounded_interaction_text(
+                short_label = _bounded_question_text(
                     raw_option.get("label_short"),
                     512,
                 )
@@ -3583,15 +3609,74 @@ def _recover_ask_user_question_from_permission_interaction(
     return None
 
 
+def _repair_claude_question_interaction_text(
+    interaction: dict[str, object],
+) -> dict[str, object]:
+    """Repair safely-detectable legacy mojibake in stored Claude prompt fields."""
+    if _normalized_interaction_name(interaction.get("source")) != "claudecode":
+        return interaction
+    raw_questions = interaction.get("questions")
+    if not isinstance(raw_questions, list):
+        return interaction
+
+    changed = False
+    repaired_questions: list[object] = []
+    for raw_question in raw_questions:
+        if not isinstance(raw_question, dict):
+            repaired_questions.append(raw_question)
+            continue
+        question = dict(raw_question)
+        for field in ("id", "header", "prompt"):
+            value = question.get(field)
+            if not isinstance(value, str):
+                continue
+            repaired = _repair_detectable_utf8_cp1252_mojibake(value)
+            if repaired != value:
+                question[field] = repaired
+                changed = True
+
+        raw_options = question.get("options")
+        if isinstance(raw_options, list):
+            repaired_options: list[object] = []
+            for raw_option in raw_options:
+                if not isinstance(raw_option, dict):
+                    repaired_options.append(raw_option)
+                    continue
+                option = dict(raw_option)
+                for field in ("id", "label", "short_label", "description"):
+                    value = option.get(field)
+                    if not isinstance(value, str):
+                        continue
+                    repaired = _repair_detectable_utf8_cp1252_mojibake(value)
+                    if repaired != value:
+                        option[field] = repaired
+                        changed = True
+                repaired_options.append(option)
+            question["options"] = repaired_options
+        repaired_questions.append(question)
+
+    if not changed:
+        return interaction
+    repaired_interaction = dict(interaction)
+    repaired_interaction["questions"] = repaired_questions
+    return repaired_interaction
+
+
 def coerce_claude_live_interaction(
     interaction: object,
 ) -> dict[str, object] | None:
     """Return a display-safe live interaction, recovering AskUserQuestion wrappers."""
     if not isinstance(interaction, dict):
         return None
-    if not is_claude_ask_user_permission_wrapper(interaction):
-        return interaction
-    return _recover_ask_user_question_from_permission_interaction(interaction)
+    candidate = interaction
+    if is_claude_ask_user_permission_wrapper(interaction):
+        recovered = _recover_ask_user_question_from_permission_interaction(
+            interaction,
+        )
+        if recovered is None:
+            return None
+        candidate = recovered
+    return _repair_claude_question_interaction_text(candidate)
 
 
 def _answer_texts(value: object) -> list[str]:

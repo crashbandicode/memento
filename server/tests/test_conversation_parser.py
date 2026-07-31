@@ -264,6 +264,102 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertEqual(coerce_claude_live_interaction(interaction), interaction)
 
+    def test_claude_question_repairs_detectable_cp1252_mojibake(self) -> None:
+        interaction = normalize_interaction(
+            "AskUserQuestion",
+            {
+                "questions": [
+                    {
+                        "header": "Side-tail",
+                        "question": (
+                            "Proceed to eliminate the accept/switch side-tail "
+                            "and source forwarding from JOB_START?"
+                        ),
+                        "options": [
+                            {
+                                "label": (
+                                    "Yes â€” delete it, verify on real data first"
+                                )
+                            },
+                            {"label": "Not yet â€” keep side-tail"},
+                        ],
+                    },
+                    {
+                        "header": "Queue freshness",
+                        "question": (
+                            "JOB_SWITCH queue freshness once the side-tail is gone?"
+                        ),
+                        "options": [
+                            {"label": "Accept STATUS2-cadence queue"},
+                            {"label": "Keep switch-instant precision"},
+                        ],
+                    },
+                ]
+            },
+            source="claude_code",
+            interaction_id="toolu-side-tail",
+        )
+
+        assert interaction is not None
+        self.assertEqual(len(interaction["questions"]), 2)
+        first_options = interaction["questions"][0]["options"]
+        self.assertEqual(
+            [option["label"] for option in first_options],
+            [
+                "Yes — delete it, verify on real data first",
+                "Not yet — keep side-tail",
+            ],
+        )
+        self.assertEqual(
+            [option["id"] for option in first_options],
+            [
+                "Yes — delete it, verify on real data first",
+                "Not yet — keep side-tail",
+            ],
+        )
+
+    def test_claude_live_repair_is_narrow_and_does_not_mutate_input(self) -> None:
+        malformed = {
+            "kind": "question",
+            "id": "toolu-side-tail",
+            "source": "claude_code",
+            "tool_name": "AskUserQuestion",
+            "questions": [{
+                "id": "Side-tail",
+                "header": "Side-tail",
+                "prompt": "Choose a valid Unicode label.",
+                "type": "single_select",
+                "allow_custom": True,
+                "options": [
+                    {
+                        "id": "Yes â€” delete it now",
+                        "label": "Yes â€” delete it now",
+                    },
+                    {
+                        "id": "unicode",
+                        "label": "Résumé — déjà vu",
+                        "description": "Ângela keeps this legitimate text.",
+                    },
+                ],
+            }],
+        }
+
+        repaired = coerce_claude_live_interaction(malformed)
+
+        assert repaired is not None
+        options = repaired["questions"][0]["options"]
+        self.assertEqual(options[0]["label"], "Yes — delete it now")
+        self.assertEqual(options[0]["id"], "Yes — delete it now")
+        self.assertEqual(options[1]["label"], "Résumé — déjà vu")
+        self.assertEqual(
+            options[1]["description"],
+            "Ângela keeps this legitimate text.",
+        )
+        self.assertEqual(
+            malformed["questions"][0]["options"][0]["label"],
+            "Yes â€” delete it now",
+        )
+
     def test_claude_mcp_elicitation_schema_is_normalized(self) -> None:
         interaction = normalize_interaction(
             "Elicitation",

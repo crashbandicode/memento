@@ -1,9 +1,9 @@
 # Regression handoff — conversation UX & live interactions
 
 **Date:** 2026-07-31
-**Covered versions:** v0.1.44 → v0.1.53
-**HEAD:** see release tag `v0.1.53`
-**Status:** v0.1.53 includes shared smart links, Slack-like inline code, and the post-v0.1.50 Claude lifecycle fix. The `feat/canvas-viewer` branch adds secure Canvas artifact detection and preview.
+**Covered versions:** v0.1.44 → v0.1.54
+**HEAD:** see release tag `v0.1.54`
+**Status:** v0.1.54 integrates secure Canvas previews, Cursor child/task projection fixes, and Claude live-prompt Unicode/mobile fixes.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -17,11 +17,7 @@ Node 24 is installed for `patrick` at `~/.local/node-current`, `@playwright/test
 /usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File ./web/run-playwright.ps1
 ```
 
-<<<<<<< HEAD
-This durable user-owned setup was validated with the full hermetic Chromium suite: **16/16 passed**.
-=======
-This durable user-owned setup was validated with the full hermetic Chromium suite: **15/15 passed**.
->>>>>>> 66779a70308a4288b82926407ccd60692e4f1098
+The integrated Chromium release-candidate count is recorded after the required full rerun.
 
 ---
 
@@ -178,6 +174,14 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 - **Key files:** `server/server/services/conversation_hierarchy.py`, `web/src/lib/conversation-message-order.ts`, `web/src/components/viewers/ConversationViewer.tsx`
 - **Tests:** 47 focused server tests + 6 subtests; 15 focused Cursor collector tests; 41 browser-free web tests (including 7 message-order tests); six focused real-Chromium scenarios (desktop 1440×1000 and mobile 472×1024 included); full hermetic Playwright suite 15/15. The deterministic `cursorThreadProjection` fixture preserves the line-1 task carrier and interleaved child completion order from the production shape.
 
+### 18. Claude live prompt Unicode and mobile clearance
+
+- **Symptom:** The dreamland-yoga live AskUserQuestion card for session `c2badf82-0183-4c85-9191-d76222f66ede` rendered em dashes as `â€”`, exposed the metadata-only placeholder `Line 0`, and let the fixed mobile Prompt navigator cover the second question.
+- **Root cause:** On Windows, the Claude hook parsed `sys.stdin` through the process ANSI text codec even though Claude writes UTF-8 JSON bytes. The side file, collector signal, server normalization, and JSON response then faithfully preserved that already-corrupted string. Live metadata intentionally uses nonpositive message/line placeholders before transcript persistence, but the viewer rendered the placeholder as a jump target. The floating mobile navigator had safe-area positioning without corresponding pending-card/transcript scroll clearance.
+- **Fix:** Decode the hook's binary stdin as UTF-8 (BOM-tolerant) before JSON parsing. Repair only safely detectable UTF-8-as-CP1252 prompt fields on server normalization/read paths so already-stored live metadata recovers without globally reinterpreting Unicode. Hide nonpositive live line locations, retain positive-line navigation, and dock the mobile navigator after pending interactions.
+- **Key files:** `collector/collector/claude_pending_hook.py`, `server/server/services/conversation_parser.py`, `web/src/components/viewers/ConversationViewer.tsx`
+- **Tests:** `collector/tests/test_claude_pending_questions.py` covers UTF-8 bytes through the Windows-codec simulation, side file, and collector signal; `server/tests/test_conversation_parser.py` and `test_conversations_normalized_api.py` cover correct/repaired em dashes plus legitimate-Unicode negative cases; `web/e2e/claude-live-prompt-mobile.spec.mjs` uses the two-question payload in real Chromium at desktop and 472×1024 mobile sizes, including navigator operation, overlap geometry, and zero console/page errors.
+
 ---
 
 ## Test coverage matrix
@@ -188,6 +192,7 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 | Scheduled automations as context (`8ac973e`) | `test_conversation_parser.py`, `test_conversation_markdown.py` | unit | covered |
 | Adjacent page scroll load (`8ac973e`) | — | — | **GAP** |
 | Claude live AskUserQuestion hook (`99192ab`) | `collector/tests/test_claude_pending_questions.py` | unit | covered |
+| Claude live prompt Unicode / mobile clearance | collector + parser/API tests + `claude-live-prompt-mobile.spec.mjs` | unit / API / Chromium | covered |
 | Cursor Plan-mode approvals (`99192ab`) | `test_cursor_structured_tools.py`, `test_thread_metadata_service.py`, collector state/signal tests | unit / API | covered |
 | Cursor task completions (`d77e480`) | `test_conversation_parser.py`, `test_conversations_normalized_api.py`, `test_cursor_state_export.py` | unit / API | covered |
 | Conversation location header (`d77e480`) | normalized API location helpers | API | covered (UI **GAP**) |

@@ -1027,11 +1027,10 @@ export default function ConversationViewer({
       {pendingInteractions.length > 0 && (
         <section
           data-pending-interactions
-          className="max-w-4xl mx-auto"
+          className="max-w-4xl mx-auto mb-3"
           style={{
             display: "grid",
             gap: 10,
-            marginBottom: 12,
             padding: 12,
             borderRadius: 14,
             border: "1px solid color-mix(in srgb, #F59E0B 35%, var(--aurora-border))",
@@ -1045,41 +1044,65 @@ export default function ConversationViewer({
               {pendingInteractions.length}
             </span>
           </div>
-          {pendingInteractions.map((item) => (
-            <div key={`${item.document_id}:${item.interaction.id}`} style={{ display: "grid", gap: 6 }}>
-              <div style={{ display: "flex", justifyContent: "flex-end", fontSize: 10.5 }}>
-                {item.document_id === documentId ? (
-                  <button
-                    type="button"
-                    onClick={() => void navigateToLine(item.line_number)}
-                    style={{
-                      border: 0,
-                      padding: 0,
-                      background: "transparent",
-                      color: "var(--aurora-accent)",
-                      cursor: "pointer",
-                    }}
-                  >
-                    {`Line ${item.line_number}`}
-                  </button>
-                ) : (
-                  <Link
-                    href={`/conversations/${item.document_id}`}
-                    style={{ color: "var(--aurora-accent)" }}
-                  >
-                    {item.source_title || `Subagent · line ${item.line_number}`}
-                  </Link>
+          {pendingInteractions.map((item) => {
+            const hasNavigableLine = Number.isInteger(item.line_number)
+              && item.line_number > 0;
+            const showLocation = hasNavigableLine || item.document_id !== documentId;
+            return (
+              <div key={`${item.document_id}:${item.interaction.id}`} style={{ display: "grid", gap: 6 }}>
+                {showLocation && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", fontSize: 10.5 }}>
+                    {item.document_id === documentId && hasNavigableLine ? (
+                      <button
+                        type="button"
+                        onClick={() => void navigateToLine(item.line_number)}
+                        style={{
+                          border: 0,
+                          padding: 0,
+                          background: "transparent",
+                          color: "var(--aurora-accent)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {`Line ${item.line_number}`}
+                      </button>
+                    ) : (
+                      <Link
+                        href={`/conversations/${item.document_id}`}
+                        style={{ color: "var(--aurora-accent)" }}
+                      >
+                        {item.source_title || (
+                          hasNavigableLine
+                            ? `Subagent · line ${item.line_number}`
+                            : "Subagent"
+                        )}
+                      </Link>
+                    )}
+                  </div>
                 )}
+                <QuestionInteractionCard
+                  interaction={item.interaction}
+                  identity={item}
+                  t={t}
+                />
               </div>
-              <QuestionInteractionCard
-                interaction={item.interaction}
-                identity={item}
-                t={t}
-              />
-            </div>
-          ))}
+            );
+          })}
         </section>
       )}
+      <PromptNavigator
+        key={documentId}
+        documentId={documentId}
+        prompts={prompts}
+        activeLine={activePromptLine}
+        loadingLine={navigatingPromptLine}
+        latestAgentLoading={latestAgentLoading}
+        label={t.conversation.promptNavigator}
+        loadingLabel={t.loading}
+        mobileDocked={pendingInteractions.length > 0}
+        onSelect={navigateToPrompt}
+        onLatestAgent={navigateToLatestAgent}
+      />
       <div
         ref={containerRef}
         data-conversation-viewer
@@ -1096,7 +1119,7 @@ export default function ConversationViewer({
           {fmt(t.conversation.messagesTotal, { total: knownTotal ?? "…", loaded: visibleMessages.length })}
         </div>
 
-        <div className="space-y-3 max-w-4xl mx-auto pb-24 xl:pb-8">
+        <div className="space-y-3 max-w-4xl mx-auto pb-[calc(6rem+env(safe-area-inset-bottom))] xl:pb-8">
           {hasEarlier && (
             <div style={{ display: "flex", justifyContent: "center" }}>
               <button
@@ -1194,18 +1217,6 @@ export default function ConversationViewer({
         )}
       </div>
 
-      <PromptNavigator
-        key={documentId}
-        documentId={documentId}
-        prompts={prompts}
-        activeLine={activePromptLine}
-        loadingLine={navigatingPromptLine}
-        latestAgentLoading={latestAgentLoading}
-        label={t.conversation.promptNavigator}
-        loadingLabel={t.loading}
-        onSelect={navigateToPrompt}
-        onLatestAgent={navigateToLatestAgent}
-      />
     </div>
   );
 }
@@ -1753,6 +1764,7 @@ function PromptNavigator({
   latestAgentLoading,
   label,
   loadingLabel,
+  mobileDocked,
   onSelect,
   onLatestAgent,
 }: {
@@ -1763,6 +1775,7 @@ function PromptNavigator({
   latestAgentLoading: boolean;
   label: string;
   loadingLabel: string;
+  mobileDocked: boolean;
   onSelect: (prompt: ConversationPrompt) => void | Promise<void>;
   onLatestAgent: () => Promise<boolean>;
 }) {
@@ -2251,36 +2264,44 @@ function PromptNavigator({
         </div>
       </aside>
 
-      <button
-        ref={triggerRef}
-        type="button"
-        data-mobile-prompt-trigger
-        className={`${mobileOpen ? "hidden" : "inline-flex"} xl:hidden`}
-        aria-haspopup="dialog"
-        aria-expanded={mobileOpen}
-        aria-controls="mobile-prompt-navigator"
-        aria-busy={navigationBusy}
-        disabled={navigationBusy}
-        onClick={() => setMobileOpen(true)}
-        style={{
-          position: "fixed",
-          right: 16,
-          bottom: "calc(14px + env(safe-area-inset-bottom))",
-          zIndex: 24,
-          minHeight: 46,
-          maxWidth: "calc(100vw - 32px)",
-          alignItems: "center",
-          gap: 9,
-          padding: "9px 12px",
-          border: "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))",
-          borderRadius: 999,
-          background: "color-mix(in srgb, var(--aurora-surface-solid) 94%, transparent)",
-          color: "var(--aurora-fg1)",
-          boxShadow: "0 12px 32px -12px rgba(15,23,42,0.38)",
-          backdropFilter: "blur(18px)",
-          cursor: navigationBusy ? "wait" : "pointer",
-        }}
+      <div
+        data-mobile-prompt-dock={mobileDocked ? "true" : "false"}
+        className={mobileDocked
+          ? `${mobileOpen ? "hidden" : "flex"} justify-end px-4 pb-3 xl:hidden`
+          : "contents"}
       >
+        <button
+          ref={triggerRef}
+          type="button"
+          data-mobile-prompt-trigger
+          className={`${mobileOpen ? "hidden" : "inline-flex"} xl:hidden`}
+          aria-haspopup="dialog"
+          aria-expanded={mobileOpen}
+          aria-controls="mobile-prompt-navigator"
+          aria-busy={navigationBusy}
+          disabled={navigationBusy}
+          onClick={() => setMobileOpen(true)}
+          style={{
+            position: mobileDocked ? "relative" : "fixed",
+            right: mobileDocked ? undefined : 16,
+            bottom: mobileDocked
+              ? undefined
+              : "calc(14px + env(safe-area-inset-bottom))",
+            zIndex: 24,
+            minHeight: 46,
+            maxWidth: "calc(100vw - 32px)",
+            alignItems: "center",
+            gap: 9,
+            padding: "9px 12px",
+            border: "1px solid color-mix(in srgb, var(--aurora-accent) 24%, var(--aurora-border))",
+            borderRadius: 999,
+            background: "color-mix(in srgb, var(--aurora-surface-solid) 94%, transparent)",
+            color: "var(--aurora-fg1)",
+            boxShadow: "0 12px 32px -12px rgba(15,23,42,0.38)",
+            backdropFilter: "blur(18px)",
+            cursor: navigationBusy ? "wait" : "pointer",
+          }}
+        >
         <span
           style={{
             width: 28,
@@ -2325,7 +2346,8 @@ function PromptNavigator({
         >
           {prompts.length === 0 ? 0 : activeIndex >= 0 ? activeIndex + 1 : 1}/{prompts.length}
         </span>
-      </button>
+        </button>
+      </div>
 
       {mobileOpen && (
         <div
@@ -2933,10 +2955,12 @@ function QuestionInteractionCard({
             return (
               <section
                 key={`${question.id}-${questionIndex}`}
+                data-question-index={questionIndex}
                 style={{
                   minWidth: 0,
                   paddingTop: questionIndex ? 14 : 0,
                   borderTop: questionIndex ? "1px solid var(--aurora-border)" : undefined,
+                  scrollMarginBottom: "calc(5rem + env(safe-area-inset-bottom))",
                 }}
               >
                 <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 7, marginBottom: 6 }}>
