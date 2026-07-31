@@ -23,8 +23,8 @@ test.describe("smart conversation links", () => {
       await expect(page.getByTestId("smart-file-stats")).toHaveText("+40-0");
 
       const sourceLink = page.getByTestId("smart-link-file").filter({ hasText: "SmartLink.tsx" });
-      await expect(sourceLink).toHaveAttribute("data-file-type", "typescript");
-      await expect(sourceLink.locator('[data-file-icon="typescript"]')).toBeVisible();
+      await expect(sourceLink).toHaveAttribute("data-file-type", "react");
+      await expect(sourceLink.locator('[data-file-icon="react"]')).toBeVisible();
 
       const packageLink = page.getByTestId("smart-link-file").filter({ hasText: "package.json" });
       await expect(packageLink).toHaveAttribute("data-file-type", "package");
@@ -38,14 +38,34 @@ test.describe("smart conversation links", () => {
       await expect(imageLink).toHaveAttribute("data-file-type", "image");
       await expect(imageLink.locator('[data-file-icon="image"]')).toBeVisible();
 
-      // Languages render a distinctive letter monogram, so the symbol (not just
-      // the color) tells related source kinds apart.
+      // Each type renders a real vector glyph (brand logo or conceptual
+      // pictogram) — an <svg> with a role="img" accessible type label, never a
+      // two-letter monogram. The symbol (not just color) tells kinds apart.
       const pythonLink = page.getByTestId("smart-link-file").filter({ hasText: "engine.py" });
       await expect(pythonLink).toHaveAttribute("data-file-type", "python");
       const pythonIcon = pythonLink.locator('[data-file-icon="python"]');
       await expect(pythonIcon).toBeVisible();
-      await expect(pythonIcon).toHaveText("PY");
-      await expect(sourceLink.locator('[data-file-icon="typescript"]')).toHaveText("TS");
+      await expect(pythonIcon).toHaveAttribute("role", "img");
+      await expect(pythonIcon).toHaveAttribute("aria-label", "Python file");
+      await expect(pythonIcon.locator("svg")).toHaveCount(1);
+      await expect(pythonIcon).toHaveText("");
+      const reactIcon = sourceLink.locator('[data-file-icon="react"]');
+      await expect(reactIcon).toHaveAttribute("aria-label", "React component");
+      await expect(reactIcon.locator("svg")).toHaveCount(1);
+      await expect(reactIcon).toHaveText("");
+
+      // No file chip may fall back to a text monogram: every type glyph is a
+      // labelled <svg> with empty text content (PY/MD/TS/… are gone for good).
+      const typeIcons = page.locator("[data-file-icon]");
+      const iconCount = await typeIcons.count();
+      expect(iconCount).toBeGreaterThan(6);
+      for (let index = 0; index < iconCount; index++) {
+        const icon = typeIcons.nth(index);
+        await expect(icon).toHaveText("");
+        await expect(icon.locator("svg")).toHaveCount(1);
+        await expect(icon).toHaveAttribute("role", "img");
+        expect((await icon.getAttribute("aria-label"))?.length ?? 0).toBeGreaterThan(3);
+      }
 
       const iconColors = await Promise.all(
         [fileLink, sourceLink, packageLink, dockerLink, imageLink, pythonLink].map(
@@ -60,8 +80,8 @@ test.describe("smart conversation links", () => {
       await expect(fileChip).toBeVisible();
       await expect(fileChip).toHaveText("prod.toml");
       await expect(fileChip).toHaveAttribute("title", "config/prod.toml");
-      await expect(fileChip).toHaveAttribute("data-file-type", "config");
-      await expect(fileChip.locator('[data-file-icon="config"]')).toBeVisible();
+      await expect(fileChip).toHaveAttribute("data-file-type", "toml");
+      await expect(fileChip.locator('[data-file-icon="toml"]')).toBeVisible();
 
       const shellChip = page.getByTestId("smart-code-file").filter({ hasText: "release.ps1" });
       await expect(shellChip).toHaveAttribute("data-file-type", "shell");
@@ -151,15 +171,24 @@ test.describe("smart conversation links", () => {
 
       for (const [label, kind] of [
         ["HANDOFF.md", "markdown"],
-        ["SmartLink.tsx", "typescript"],
+        ["SmartLink.tsx", "react"],
         ["engine.py", "python"],
+        ["mod.rs", "rust"],
+        ["main.go", "go"],
         ["package.json", "package"],
         ["Dockerfile", "docker"],
         ["logo.svg", "image"],
+        ["ci.yaml", "yaml"],
+        ["analysis.ipynb", "notebook"],
+        ["architecture.pdf", "pdf"],
       ]) {
         const link = page.getByTestId("smart-link-file").filter({ hasText: label });
         await expect(link).toBeVisible();
         await expect(link).toHaveAttribute("data-file-type", kind);
+        // The glyph is a labelled SVG, never a text monogram, even on mobile.
+        const icon = link.locator(`[data-file-icon="${kind}"]`);
+        await expect(icon.locator("svg")).toHaveCount(1);
+        await expect(icon).toHaveText("");
         const box = await link.boundingBox();
         expect(box?.x ?? -1).toBeGreaterThanOrEqual(0);
         expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual(390);

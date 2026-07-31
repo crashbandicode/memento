@@ -46,26 +46,25 @@
   color: #2784bd;
 }
 
+/* Every file kind renders a real vector glyph (brand logo or conceptual
+   pictogram) in the fixed icon slot, so chips never grow taller and the SVG is
+   sized purely by its `size` prop. A subtle, theme-aware per-family tint is only
+   a secondary cue — the glyph shape plus accessible label identify the type. */
 .fileTypeIcon {
   --file-icon-color: var(--aurora-fg3);
   color: color-mix(in srgb, var(--file-icon-color) 76%, var(--aurora-fg2));
 }
 
-/* Language monograms (PY, TS, MD, …) share the fixed icon slot so chips never
-   grow taller; a compact monospace letterform keeps them crisp and legible. */
-.monogram {
-  min-width: 16px;
-  height: 14px;
-  padding: 0 1px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 8.5px;
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  line-height: 1;
+.fileTypeIcon > svg {
+  display: block;
 }
 
 .fileTypeIcon[data-file-icon="typescript"] {
   --file-icon-color: #3178c6;
+}
+
+.fileTypeIcon[data-file-icon="react"] {
+  --file-icon-color: #22a7c9;
 }
 
 .fileTypeIcon[data-file-icon="javascript"] {
@@ -120,6 +119,14 @@
 .fileTypeIcon[data-file-icon="json"],
 .fileTypeIcon[data-file-icon="config"] {
   --file-icon-color: #927039;
+}
+
+.fileTypeIcon[data-file-icon="yaml"] {
+  --file-icon-color: #8a5a9b;
+}
+
+.fileTypeIcon[data-file-icon="toml"] {
+  --file-icon-color: #9a5433;
 }
 
 .fileTypeIcon[data-file-icon="package"] {

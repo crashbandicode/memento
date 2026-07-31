@@ -1,11 +1,11 @@
 /**
  * @typedef {
- *   "file" | "text" | "markdown" | "typescript" | "javascript" | "python"
- *   | "rust" | "go" | "java" | "kotlin" | "csharp" | "native" | "ruby"
- *   | "php" | "lua" | "swift" | "html" | "stylesheet" | "vue" | "json"
- *   | "data" | "config" | "shell" | "sql" | "image" | "package"
- *   | "docker" | "lock" | "protobuf" | "xml" | "build" | "pdf"
- *   | "notebook" | "directory"
+ *   "file" | "text" | "markdown" | "typescript" | "javascript" | "react"
+ *   | "python" | "rust" | "go" | "java" | "kotlin" | "csharp" | "native"
+ *   | "ruby" | "php" | "lua" | "swift" | "html" | "stylesheet" | "vue"
+ *   | "json" | "yaml" | "toml" | "data" | "config" | "shell" | "sql"
+ *   | "image" | "package" | "docker" | "lock" | "protobuf" | "xml" | "build"
+ *   | "pdf" | "notebook" | "directory"
  * } FileIconKind
  */
 
@@ -71,13 +71,17 @@ export function fileIconKind(value) {
 
   const extension = basename.includes(".") ? basename.split(".").at(-1) : "";
   switch (extension) {
-    case "ts":
+    // `.tsx`/`.jsx` are React components; give them the React mark so a JSX view
+    // reads as React, not as plain TS/JS. (`*.canvas.tsx` never reaches here — it
+    // is classified as the dedicated Canvas chip before the file kind.)
     case "tsx":
+    case "jsx":
+      return "react";
+    case "ts":
     case "mts":
     case "cts":
       return "typescript";
     case "js":
-    case "jsx":
     case "mjs":
     case "cjs":
       return "javascript";
@@ -130,7 +134,9 @@ export function fileIconKind(value) {
       return "data";
     case "yaml":
     case "yml":
+      return "yaml";
     case "toml":
+      return "toml";
     case "ini":
     case "plist":
     case "properties":
@@ -162,4 +168,71 @@ export function fileIconKind(value) {
     default:
       return "file";
   }
+}
+
+/**
+ * Human-readable type label for every {@link FileIconKind}. Used as the icon's
+ * accessible name (`role="img"` / `aria-label`) so assistive tech announces the
+ * *type* — never a two-letter monogram — alongside the unchanged filename text.
+ *
+ * @type {Record<FileIconKind, string>}
+ */
+export const FILE_ICON_LABELS = {
+  file: "File",
+  text: "Text file",
+  markdown: "Markdown file",
+  typescript: "TypeScript file",
+  javascript: "JavaScript file",
+  react: "React component",
+  python: "Python file",
+  rust: "Rust file",
+  go: "Go file",
+  java: "Java file",
+  kotlin: "Kotlin file",
+  csharp: "C# file",
+  native: "C / C++ file",
+  ruby: "Ruby file",
+  php: "PHP file",
+  lua: "Lua file",
+  swift: "Swift file",
+  html: "HTML file",
+  stylesheet: "Stylesheet",
+  vue: "Vue component",
+  json: "JSON file",
+  yaml: "YAML file",
+  toml: "TOML file",
+  data: "Data file",
+  config: "Config file",
+  shell: "Shell script",
+  sql: "SQL / database file",
+  image: "Image file",
+  package: "Package manifest",
+  docker: "Docker / container file",
+  lock: "Lock file",
+  protobuf: "Protocol Buffers file",
+  xml: "XML file",
+  build: "Build file",
+  pdf: "PDF document",
+  notebook: "Jupyter notebook",
+  directory: "Directory",
+};
+
+/**
+ * Every {@link FileIconKind}, derived from the label map so the two never drift.
+ * Tests iterate this to assert full icon/label coverage.
+ *
+ * @type {FileIconKind[]}
+ */
+export const FILE_ICON_KINDS = /** @type {FileIconKind[]} */ (
+  Object.keys(FILE_ICON_LABELS)
+);
+
+/**
+ * Accessible type label for a kind, with a safe fallback for unknown values.
+ *
+ * @param {FileIconKind | string} kind
+ * @returns {string}
+ */
+export function fileIconLabel(kind) {
+  return FILE_ICON_LABELS[/** @type {FileIconKind} */ (kind)] ?? FILE_ICON_LABELS.file;
 }
