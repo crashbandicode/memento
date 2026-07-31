@@ -90,6 +90,9 @@ def _document(
     return SimpleNamespace(
         id=uuid.uuid4(),
         machine_id=machine_id or uuid.uuid4(),
+        tool_id="claude_code",
+        category="conversation",
+        relative_path="projects/thread.jsonl",
         title=title,
         metadata_=metadata or {},
         project_id=uuid.uuid4(),
@@ -307,6 +310,249 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             signal["interaction"]["questions"][0]["options"][0]["description"],
             "git push fork main",
+        )
+
+    async def test_live_ask_user_permission_wrapper_is_question_and_closes(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        wrapper_input = {
+            "interaction_type": "permission_request",
+            "requested_tool": "AskUserQuestion",
+            "tool_input": {
+                "questions": [{
+                    "question": "Choose the fleet approach.",
+                    "header": "Fleet approach",
+                    "options": [
+                        {
+                            "label": "Fresh-venv sweep",
+                            "description": "Roll in verified waves.",
+                        },
+                        {
+                            "label": "Fix fleet_deploy first",
+                            "description": "Harden the deployment tool first.",
+                        },
+                    ],
+                }]
+            },
+        }
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            pending = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="wrapper-question-1",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input=wrapper_input,
+                timestamp="2026-07-31T03:05:21Z",
+            )
+
+        self.assertEqual((pending.matched, pending.updated), (1, 1))
+        signal = document.metadata_[LIVE_INTERACTION_SIGNALS_KEY][
+            "wrapper-question-1"
+        ]
+        interaction = signal["interaction"]
+        self.assertNotIn("interaction_type", interaction)
+        self.assertEqual(interaction["questions"][0]["header"], "Fleet approach")
+        self.assertEqual(
+            [
+                option["label"]
+                for option in interaction["questions"][0]["options"]
+            ],
+            ["Fresh-venv sweep", "Fix fleet_deploy first"],
+        )
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            answered = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="wrapper-question-1",
+                interaction_status="answered",
+                question_tool="PermissionRequest",
+                interaction_input=wrapper_input,
+            )
+
+        self.assertEqual((answered.matched, answered.updated), (1, 1))
+        self.assertNotIn(CURRENT_PENDING_QUESTIONS_KEY, document.metadata_)
+        self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
+
+    async def test_live_question_prunes_duplicate_ask_user_permission_wrapper(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(
+            machine_id=machine_id,
+            metadata={
+                LIVE_INTERACTION_SIGNALS_KEY: {
+                    "memento-permission-fleet": {
+                        "timestamp": "2026-07-31T03:05:20Z",
+                        "tool_name": "PermissionRequest",
+                        "interaction": {
+                            "id": "memento-permission-fleet",
+                            "kind": "question",
+                            "interaction_type": "permission_request",
+                            "source": "claude_code",
+                            "tool_name": "PermissionRequest",
+                            "requested_tool": "AskUserQuestion",
+                            "questions": [{
+                                "id": "permission-decision",
+                                "header": "AskUserQuestion",
+                                "prompt": (
+                                    "Claude Code wants permission to use "
+                                    "AskUserQuestion."
+                                ),
+                                "type": "single_select",
+                                "allow_custom": False,
+                                "options": [
+                                    {
+                                        "id": "allow",
+                                        "label": "Yes",
+                                        "description": (
+                                            '{"questions":[{"header":'
+                                            '"Fleet approach","question":'
+                                            '"Choose the fleet approach.",'
+                                            '"options":[{"label":'
+                                            '"Fresh-venv sweep"}]}]}'
+                                        ),
+                                    },
+                                    {
+                                        "id": "allow-always",
+                                        "label": (
+                                            "Yes, and allow Claude to use "
+                                            "AskUserQuestion for this session"
+                                        ),
+                                    },
+                                    {"id": "deny", "label": "No"},
+                                ],
+                            }],
+                        },
+                    }
+                },
+                CURRENT_PENDING_QUESTIONS_KEY: ["memento-permission-fleet"],
+                PENDING_QUESTION_COUNT_KEY: 1,
+            },
+        )
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            pending = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="toolu-fleet",
+                interaction_status="pending",
+                question_tool="AskUserQuestion",
+                interaction_input={
+                    "questions": [{
+                        "header": "Fleet approach",
+                        "question": "Choose the fleet approach.",
+                        "options": [{"label": "Fresh-venv sweep"}],
+                    }]
+                },
+                timestamp="2026-07-31T03:05:21Z",
+            )
+
+        self.assertEqual((pending.matched, pending.updated), (1, 1))
+        signals = document.metadata_[LIVE_INTERACTION_SIGNALS_KEY]
+        self.assertIn("toolu-fleet", signals)
+        self.assertNotIn("memento-permission-fleet", signals)
+        self.assertEqual(
+            signals["toolu-fleet"]["interaction"]["questions"][0]["header"],
+            "Fleet approach",
+        )
+
+    async def test_question_before_permission_wrapper_stays_single_and_publishes(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        question_input = {
+            "questions": [{
+                "question": "How should the drift monitor be set?",
+                "header": "Drift monitor",
+                "options": [
+                    {"label": "WARN 300s / CRIT 900s"},
+                    {"label": "Leave drift as-is"},
+                ],
+            }]
+        }
+        wrapper_input = {
+            "interaction_type": "permission_request",
+            "requested_tool": "AskUserQuestion",
+            "tool_input": question_input,
+        }
+
+        with (
+            patch(
+                "server.services.thread_metadata_service.cache_delete_prefix",
+                new=AsyncMock(),
+            ),
+            patch("server.services.sse_service.publish_event") as publish_event,
+        ):
+            question = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="toolu-drift",
+                interaction_status="pending",
+                question_tool="AskUserQuestion",
+                interaction_input=question_input,
+                timestamp="2026-07-31T10:40:30Z",
+            )
+            wrapper = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="memento-permission-drift",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input=wrapper_input,
+                timestamp="2026-07-31T10:40:32Z",
+            )
+
+        self.assertEqual((question.matched, question.updated), (1, 1))
+        self.assertEqual((wrapper.matched, wrapper.updated), (1, 0))
+        self.assertEqual(
+            document.metadata_[CURRENT_PENDING_QUESTIONS_KEY],
+            ["toolu-drift"],
+        )
+        self.assertEqual(document.metadata_[PENDING_QUESTION_COUNT_KEY], 1)
+        self.assertEqual(
+            list(document.metadata_[LIVE_INTERACTION_SIGNALS_KEY]),
+            ["toolu-drift"],
+        )
+        publish_event.assert_called_once()
+        event_type, event_data = publish_event.call_args.args
+        self.assertEqual(event_type, "file_synced")
+        self.assertEqual(event_data["document_id"], str(document.id))
+        self.assertEqual(
+            publish_event.call_args.kwargs["user_id"],
+            str(user_id),
         )
 
     async def test_live_interaction_does_not_reopen_before_latest_human_turn(

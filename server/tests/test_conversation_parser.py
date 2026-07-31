@@ -13,8 +13,10 @@ from server.services.conversation_markdown import (  # noqa: E402
 )
 from server.services.conversation_parser import (  # noqa: E402
     AssistantIdentityState,
+    coerce_claude_live_interaction,
     count_conversation_messages,
     extract_codex_session_metadata,
+    is_claude_ask_user_permission_wrapper,
     iter_conversation_messages,
     normalize_codex_user_payload,
     normalize_cursor_user_payload,
@@ -94,6 +96,173 @@ class ConversationParserTests(unittest.TestCase):
             ),
         )
         self.assertIn("addRules: allow", always_allow["description"])
+
+    def test_claude_ask_user_permission_wrapper_is_underlying_question(self) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "interaction_type": "permission_request",
+                "requested_tool": "ASK_User-Question",
+                "tool_input": {
+                    "questions": [{
+                        "id": "fleet",
+                        "header": "Fleet approach",
+                        "prompt": "How should I roll the remaining schedulers?",
+                        "allowMultiple": True,
+                        "options": [
+                            {
+                                "id": "waves",
+                                "label": "Fresh-venv sweep",
+                                "label_short": "Waves",
+                                "description": "Recreate every environment.",
+                            },
+                            {
+                                "id": "tooling",
+                                "label": "Fix fleet_deploy first",
+                                "preview": "Add a reusable fresh-venv path.",
+                            },
+                        ],
+                    }]
+                },
+                "permission_suggestions": [{
+                    "type": "addRules",
+                    "rules": [{"toolName": "AskUserQuestion"}],
+                }],
+            },
+            source="claude_code",
+            interaction_id="toolu-fleet",
+        )
+
+        assert interaction is not None
+        self.assertNotIn("interaction_type", interaction)
+        self.assertNotIn("requested_tool", interaction)
+        self.assertEqual(interaction["tool_name"], "AskUserQuestion")
+        self.assertEqual(interaction["id"], "toolu-fleet")
+        question = interaction["questions"][0]
+        self.assertEqual(question["id"], "fleet")
+        self.assertEqual(question["header"], "Fleet approach")
+        self.assertEqual(
+            question["prompt"],
+            "How should I roll the remaining schedulers?",
+        )
+        self.assertEqual(question["type"], "multi_select")
+        self.assertTrue(question["allow_custom"])
+        self.assertEqual(
+            question["options"],
+            [
+                {
+                    "id": "waves",
+                    "label": "Fresh-venv sweep",
+                    "short_label": "Waves",
+                    "description": "Recreate every environment.",
+                },
+                {
+                    "id": "tooling",
+                    "label": "Fix fleet_deploy first",
+                    "description": "Add a reusable fresh-venv path.",
+                },
+            ],
+        )
+
+    def test_claude_ask_user_permission_wrapper_rejects_nested_questions(
+        self,
+    ) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "requested_tool": "AskUserQuestion",
+                "tool_input": {
+                    "payload": {
+                        "questions": [{"question": "Do not trust this nesting."}]
+                    }
+                },
+            },
+            source="claude_code",
+            interaction_id="permission-malformed",
+        )
+
+        assert interaction is not None
+        self.assertEqual(interaction["interaction_type"], "permission_request")
+        self.assertEqual(interaction["requested_tool"], "AskUserQuestion")
+        self.assertEqual(
+            [option["id"] for option in interaction["questions"][0]["options"]],
+            ["allow", "allow-always", "deny"],
+        )
+
+    def test_coerce_recovers_ask_user_question_from_permission_yes_dump(
+        self,
+    ) -> None:
+        malformed = {
+            "kind": "question",
+            "id": "memento-permission-fleet",
+            "interaction_type": "permission_request",
+            "source": "claude_code",
+            "tool_name": "PermissionRequest",
+            "requested_tool": "AskUserQuestion",
+            "questions": [{
+                "id": "permission-decision",
+                "header": "AskUserQuestion",
+                "prompt": "Claude Code wants permission to use AskUserQuestion.",
+                "type": "single_select",
+                "allow_custom": False,
+                "options": [
+                    {
+                        "id": "allow",
+                        "label": "Yes",
+                        "description": json.dumps({
+                            "questions": [{
+                                "header": "Fleet approach",
+                                "question": (
+                                    "How should I roll the remaining schedulers?"
+                                ),
+                                "options": [
+                                    {
+                                        "label": "Fresh-venv sweep",
+                                        "description": "Roll in verified waves.",
+                                    },
+                                    {
+                                        "label": "Fix fleet_deploy first",
+                                        "description": "Harden the tool first.",
+                                    },
+                                ],
+                            }]
+                        }),
+                    },
+                    {
+                        "id": "allow-always",
+                        "label": (
+                            "Yes, and allow Claude to use "
+                            "AskUserQuestion for this session"
+                        ),
+                    },
+                    {"id": "deny", "label": "No"},
+                ],
+            }],
+        }
+
+        self.assertTrue(is_claude_ask_user_permission_wrapper(malformed))
+        recovered = coerce_claude_live_interaction(malformed)
+        assert recovered is not None
+        self.assertNotIn("interaction_type", recovered)
+        self.assertEqual(recovered["tool_name"], "AskUserQuestion")
+        self.assertEqual(recovered["questions"][0]["header"], "Fleet approach")
+        self.assertEqual(
+            [option["label"] for option in recovered["questions"][0]["options"]],
+            ["Fresh-venv sweep", "Fix fleet_deploy first"],
+        )
+
+    def test_coerce_leaves_genuine_permission_request_unchanged(self) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "requested_tool": "PowerShell",
+                "tool_input": {"command": "git push fork main"},
+            },
+            source="claude_code",
+            interaction_id="permission-real",
+        )
+
+        self.assertEqual(coerce_claude_live_interaction(interaction), interaction)
 
     def test_claude_mcp_elicitation_schema_is_normalized(self) -> None:
         interaction = normalize_interaction(
@@ -655,6 +824,61 @@ class ConversationParserTests(unittest.TestCase):
         assert response is not None
         self.assertEqual(response["interaction_id"], "toolu-1")
         self.assertEqual(response["answers"][0]["selected_option_ids"], ["Deploy now"])
+
+    def test_claude_historical_permission_wrapper_reparses_as_question(
+        self,
+    ) -> None:
+        raw = json.dumps({
+            "type": "assistant",
+            "uuid": "assistant-wrapper",
+            "timestamp": "2026-07-31T03:05:21Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu-wrapper",
+                    "name": "PermissionRequest",
+                    "input": {
+                        "requested_tool": "AskUserQuestion",
+                        "tool_input": {
+                            "questions": [{
+                                "question": "Choose the fleet approach.",
+                                "header": "Fleet approach",
+                                "multiSelect": False,
+                                "options": [
+                                    {
+                                        "label": "Fresh-venv sweep",
+                                        "description": "Roll in verified waves.",
+                                    },
+                                    {
+                                        "label": "Fix fleet_deploy first",
+                                        "description": "Harden the tool first.",
+                                    },
+                                ],
+                            }]
+                        },
+                    },
+                }],
+            },
+        })
+
+        message = parse_conversation_line(raw, "claude_code")
+
+        assert message is not None
+        assert message.interaction is not None
+        self.assertEqual(message.interaction["id"], "toolu-wrapper")
+        self.assertEqual(
+            message.interaction["questions"][0]["header"],
+            "Fleet approach",
+        )
+        self.assertEqual(
+            [
+                option["label"]
+                for option in message.interaction["questions"][0]["options"]
+            ],
+            ["Fresh-venv sweep", "Fix fleet_deploy first"],
+        )
+        self.assertNotIn("interaction_type", message.interaction)
 
     def test_cursor_question_response_supports_multiple_selection(self) -> None:
         raw = "\n".join([

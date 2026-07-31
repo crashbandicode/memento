@@ -27,6 +27,15 @@ FOLDABLE_CONVERSATION_TOOLS = frozenset({
 _PATH_LINKED_SUBAGENT_TOOLS = frozenset({"claude_code", "cursor"})
 
 
+def _metadata_flag_is_true(value: object) -> bool:
+    """Accept JSON booleans and their serialized equivalents without truthiness."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().casefold() == "true"
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationRef:
     """The small subset of a conversation document needed for presentation."""
@@ -119,7 +128,7 @@ def is_conversation_subagent(
         tool_id in _PATH_LINKED_SUBAGENT_TOOLS
         and explicit_subagent_parent_thread_id(relative_path) is not None
         and (
-            bool(values.get("is_subagent"))
+            _metadata_flag_is_true(values.get("is_subagent"))
             or "/subagents/" in (relative_path or "").replace("\\", "/")
         )
     )
@@ -138,7 +147,7 @@ def conversation_display_title(
         and (
             is_conversation_subagent(tool_id, relative_path, values)
             or (
-                bool(values.get("is_subagent"))
+                _metadata_flag_is_true(values.get("is_subagent"))
                 and bool(
                     values.get("parent_thread_id")
                     or values.get("root_session_id")
@@ -165,7 +174,7 @@ def conversation_user_role_origin(
         and (
             is_conversation_subagent(tool_id, relative_path, metadata)
             or (
-                bool((metadata or {}).get("is_subagent"))
+                _metadata_flag_is_true((metadata or {}).get("is_subagent"))
                 and bool(
                     (metadata or {}).get("parent_thread_id")
                     or (metadata or {}).get("root_session_id")

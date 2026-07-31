@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 import uuid
@@ -167,6 +168,79 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["messages"][0]["role"], "user")
         self.assertEqual(payload["messages"][0]["origin"], "parent_agent")
+
+    async def test_root_claude_historical_answered_interaction_is_preserved(
+        self,
+    ) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = "projects/demo/root-thread.jsonl"
+        self.doc.metadata_.update({
+            "is_subagent": False,
+            "session_id": "root-thread",
+        })
+        question = self.message(27426, "tool")
+        question.message_type = "tool_use"
+        question.content = "[AskUserQuestion]"
+        question.metadata_ = {
+            "tool_name": "AskUserQuestion",
+            "interaction": {
+                "id": "toolu-question",
+                "kind": "question",
+                "source": "claude_code",
+                "tool_name": "AskUserQuestion",
+                "questions": [{
+                    "id": "next",
+                    "header": "Next step",
+                    "prompt": "How should I proceed?",
+                    "type": "single_select",
+                    "allow_custom": True,
+                    "options": [
+                        {"id": "hold", "label": "Hold"},
+                        {"id": "continue", "label": "Continue"},
+                    ],
+                }],
+            },
+        }
+        response = self.message(27427, "tool")
+        response.message_type = "tool_result"
+        response.metadata_ = {
+            "interaction_response": {
+                "interaction_id": "toolu-question",
+                "status": "answered",
+                "answers": [{
+                    "question_id": "next",
+                    "text": "Continue",
+                    "selected_option_ids": ["continue"],
+                }],
+                "raw_text": "Continue",
+            }
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=2),
+            _Result(rows=[question, response]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            payload["messages"][0]["interaction"]["id"],
+            "toolu-question",
+        )
+        self.assertEqual(
+            payload["messages"][1]["interaction_response"]["interaction_id"],
+            "toolu-question",
+        )
+        self.assertIsNone(payload["messages"][0]["origin"])
+        self.assertIsNone(payload["messages"][1]["origin"])
 
     async def test_messages_return_exact_cursor_native_timestamp(self) -> None:
         self.doc.tool_id = "cursor"
@@ -482,6 +556,160 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["interactions"][0]["line_number"], 0)
 
+    async def test_root_claude_pending_permission_preview_is_visible(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = "projects/demo/root-thread.jsonl"
+        self.doc.metadata_.update({
+            "is_subagent": "false",
+            "root_session_id": "root-thread",
+            "_live_interaction_signals": {
+                "permission-1": {
+                    "timestamp": "2026-07-30T16:06:52Z",
+                    "interaction": {
+                        "id": "permission-1",
+                        "kind": "question",
+                        "interaction_type": "permission_request",
+                        "source": "claude_code",
+                        "tool_name": "PermissionRequest",
+                        "requested_tool": "PowerShell",
+                        "questions": [{
+                            "id": "permission-decision",
+                            "header": "PowerShell",
+                            "prompt": (
+                                "Claude Code wants permission to use PowerShell."
+                            ),
+                            "type": "single_select",
+                            "allow_custom": False,
+                            "options": [
+                                {"id": "allow", "label": "Yes"},
+                                {
+                                    "id": "allow-always",
+                                    "label": (
+                                        "Yes, and allow Claude to use "
+                                        "PowerShell for this session"
+                                    ),
+                                },
+                                {"id": "deny", "label": "No"},
+                            ],
+                        }],
+                    },
+                }
+            },
+        })
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(
+                rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]
+            ),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        interaction = payload["interactions"][0]["interaction"]
+        self.assertEqual(interaction["interaction_type"], "permission_request")
+        self.assertEqual(
+            [option["id"] for option in interaction["questions"][0]["options"]],
+            ["allow", "allow-always", "deny"],
+        )
+
+    async def test_pending_interactions_recover_ask_user_permission_wrapper(
+        self,
+    ) -> None:
+        good = {
+            "id": "toolu-drift",
+            "kind": "question",
+            "source": "claude_code",
+            "tool_name": "AskUserQuestion",
+            "questions": [{
+                "id": "drift",
+                "header": "Drift monitor",
+                "prompt": "How should I tune drift?",
+                "type": "single_select",
+                "allow_custom": True,
+                "options": [
+                    {"id": "two-tier", "label": "Two-tier"},
+                    {"id": "leave", "label": "Leave as-is"},
+                ],
+            }],
+        }
+        malformed = {
+            "id": "memento-permission-drift",
+            "kind": "question",
+            "interaction_type": "permission_request",
+            "source": "claude_code",
+            "tool_name": "PermissionRequest",
+            "requested_tool": "AskUserQuestion",
+            "questions": [{
+                "id": "permission-decision",
+                "header": "AskUserQuestion",
+                "prompt": "Claude Code wants permission to use AskUserQuestion.",
+                "type": "single_select",
+                "allow_custom": False,
+                "options": [
+                    {
+                        "id": "allow",
+                        "label": "Yes",
+                        "description": json.dumps({
+                            "questions": [{
+                                "header": "Drift monitor",
+                                "question": "How should I tune drift?",
+                                "options": [
+                                    {"label": "Two-tier"},
+                                    {"label": "Leave as-is"},
+                                ],
+                            }]
+                        }),
+                    },
+                    {
+                        "id": "allow-always",
+                        "label": (
+                            "Yes, and allow Claude to use "
+                            "AskUserQuestion for this session"
+                        ),
+                    },
+                    {"id": "deny", "label": "No"},
+                ],
+            }],
+        }
+        self.doc.metadata_["_live_interaction_signals"] = {
+            "memento-permission-drift": {
+                "timestamp": "2026-07-31T10:00:00Z",
+                "interaction": malformed,
+            },
+            "toolu-drift": {
+                "timestamp": "2026-07-31T10:00:01Z",
+                "interaction": good,
+            },
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(
+                rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]
+            ),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        interaction = payload["interactions"][0]["interaction"]
+        self.assertNotIn("interaction_type", interaction)
+        self.assertEqual(interaction["questions"][0]["header"], "Drift monitor")
+        self.assertNotIn(
+            "Permission request",
+            interaction["questions"][0]["prompt"],
+        )
+
     async def test_pending_interactions_ignore_question_replayed_after_human_turn(
         self,
     ) -> None:
@@ -617,6 +845,32 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload, {"prompts": []})
         self.assertEqual(len(db.statements), 1)
+
+    async def test_root_claude_false_string_remains_prompt_navigation(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = "projects/demo/root-thread.jsonl"
+        self.doc.metadata_.update({
+            "is_subagent": "false",
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "root-thread",
+        })
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=1),
+            _Result(rows=[(7, 12, "A root prompt", self.now, {})]),
+        ])
+
+        payload = await get_conversation_prompts(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            [(item["line_number"], item["content"]) for item in payload["prompts"]],
+            [(12, "A root prompt")],
+        )
 
     @patch(
         "server.api.conversations.suggest_corrected_query",

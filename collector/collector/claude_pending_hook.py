@@ -47,6 +47,79 @@ def _tool_name(payload: dict[str, Any]) -> str:
     return str(payload.get("tool_name", payload.get("toolName", ""))).strip()
 
 
+def _normalized_tool_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().casefold())
+
+
+def _question_input(value: object) -> dict[str, Any] | None:
+    """Return a narrowly validated AskUserQuestion input mapping."""
+    if not isinstance(value, dict):
+        return None
+    questions = value.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    if not any(
+        isinstance(question, dict)
+        and bool(str(
+            question.get("prompt") or question.get("question") or ""
+        ).strip())
+        for question in questions
+    ):
+        return None
+    return value
+
+
+def _existing_question_input(record: dict[str, Any]) -> dict[str, Any] | None:
+    raw_input = record.get("interaction_input")
+    if _normalized_tool_name(record.get("question_tool")) == "askuserquestion":
+        return _question_input(raw_input)
+    if (
+        _normalized_tool_name(record.get("question_tool")) == "permissionrequest"
+        and isinstance(raw_input, dict)
+        and _normalized_tool_name(
+            raw_input.get("requested_tool") or raw_input.get("tool_name")
+        ) == "askuserquestion"
+    ):
+        return _question_input(raw_input.get("tool_input"))
+    return None
+
+
+def _same_question(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    def identity(value: dict[str, Any]) -> list[dict[str, str]]:
+        return [
+            {
+                "id": str(
+                    question.get("id")
+                    or question.get("header")
+                    or question.get("prompt")
+                    or question.get("question")
+                    or ""
+                ).strip(),
+                "header": str(question.get("header") or "").strip(),
+                "prompt": str(
+                    question.get("prompt") or question.get("question") or ""
+                ).strip(),
+            }
+            for question in value.get("questions", [])
+            if isinstance(question, dict)
+        ]
+
+    return identity(left) == identity(right)
+
+
+def _richer_question_input(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    existing_size = len(json.dumps(existing, ensure_ascii=False, default=str))
+    incoming_size = len(json.dumps(incoming, ensure_ascii=False, default=str))
+    return incoming if incoming_size > existing_size else existing
+
+
 def _interaction_id(payload: dict[str, Any]) -> str:
     for field in ("tool_use_id", "toolUseId", "tool_call_id", "id"):
         value = str(payload.get(field) or "").strip()
@@ -109,11 +182,23 @@ def process_payload(payload: object) -> None:
     event_name = _event_name(payload)
     tool_name = _tool_name(payload)
     notification_type = str(payload.get("notification_type") or "").casefold()
-    is_question = (
-        tool_name.casefold() == "askuserquestion"
+    is_question_tool = _normalized_tool_name(tool_name) == "askuserquestion"
+    is_question_event = (
+        is_question_tool
         and event_name in {"pretooluse", "posttooluse", "posttoolusefailure"}
     )
-    is_permission = event_name == "permissionrequest" and bool(tool_name)
+    is_wrapped_question = (
+        event_name == "permissionrequest"
+        and is_question_tool
+        and _question_input(payload.get("tool_input")) is not None
+    )
+    is_question = is_question_event or is_wrapped_question
+    is_permission = (
+        event_name == "permissionrequest"
+        and bool(tool_name)
+        and not is_wrapped_question
+        and not is_question_tool
+    )
     is_elicitation = event_name in {"elicitation", "elicitationresult"}
     is_agent_notification = (
         event_name == "notification"
@@ -140,27 +225,65 @@ def process_payload(payload: object) -> None:
     existing_id = str(existing.get("interaction_id") or "").strip()
 
     if is_question:
-        interaction_id = _interaction_id(payload)
-        if (
-            event_name != "pretooluse"
-            and existing_id
-            and interaction_id
-            and existing_id != interaction_id
-        ):
+        incoming_id = _interaction_id(payload)
+        incoming_input = _question_input(payload.get("tool_input"))
+        existing_input = _existing_question_input(existing)
+        same_as_existing = (
+            incoming_input is not None
+            and existing_input is not None
+            and _same_question(existing_input, incoming_input)
+        )
+        existing_aliases = existing.get("interaction_alias_ids")
+        aliases = {
+            str(value).strip()
+            for value in existing_aliases
+            if str(value).strip()
+        } if isinstance(existing_aliases, list) else set()
+
+        if event_name in {"posttooluse", "posttoolusefailure"}:
+            if not existing_id:
+                return
+            if (
+                incoming_id
+                and incoming_id != existing_id
+                and incoming_id not in aliases
+                and not same_as_existing
+            ):
+                return
+            interaction_id = existing_id
+        elif existing_id and existing_input is not None and same_as_existing:
+            interaction_id = existing_id
+        else:
+            interaction_id = incoming_id
+            if (
+                not interaction_id
+                and is_wrapped_question
+                and incoming_input is not None
+            ):
+                interaction_id = _synthetic_interaction_id(
+                    "question",
+                    session_id,
+                    incoming_input.get("questions"),
+                )
+        if not interaction_id or (incoming_input is None and existing_input is None):
             return
-        interaction_id = interaction_id or existing_id
-        if not interaction_id:
+        if incoming_id and incoming_id != interaction_id:
+            aliases.add(incoming_id)
+        if same_as_existing:
+            raw_input = _richer_question_input(existing_input, incoming_input)
+        elif event_name in {"posttooluse", "posttoolusefailure"}:
+            raw_input = existing_input
+        else:
+            raw_input = incoming_input
+        if raw_input is None:
             return
-        raw_input = payload.get("tool_input")
-        if not isinstance(raw_input, dict):
-            raw_input = existing.get("interaction_input")
-        if not isinstance(raw_input, dict):
-            raw_input = {}
+        interaction_alias_ids = sorted(aliases)[:16]
         question_tool = "AskUserQuestion"
         status = {
             "pretooluse": "pending",
             "posttooluse": "answered",
             "posttoolusefailure": "cancelled",
+            "permissionrequest": "pending",
         }[event_name]
     elif is_permission:
         tool_input = payload.get("tool_input")
@@ -181,6 +304,7 @@ def process_payload(payload: object) -> None:
         }
         question_tool = "PermissionRequest"
         status = "pending"
+        interaction_alias_ids = []
     elif is_elicitation:
         interaction_id = (
             str(payload.get("elicitation_id") or "").strip()
@@ -214,6 +338,7 @@ def process_payload(payload: object) -> None:
             action = str(payload.get("action") or "").casefold()
             status = "answered" if action == "accept" else "cancelled"
         question_tool = "Elicitation"
+        interaction_alias_ids = []
     else:
         if notification_type == "agent_needs_input":
             raw_input = {
@@ -242,22 +367,23 @@ def process_payload(payload: object) -> None:
                 existing.get("question_tool") or "NotificationPrompt"
             )
             status = "answered"
+        interaction_alias_ids = []
 
-    _write_atomic(
-        path,
-        {
-            "session_id": session_id,
-            "transcript_path": str(
-                payload.get("transcript_path") or existing.get("transcript_path") or ""
-            ),
-            "interaction_id": interaction_id,
-            "question_tool": question_tool,
-            "interaction_input": raw_input,
-            "interaction_status": status,
-            "timestamp": _event_timestamp(payload),
-            "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
-        },
-    )
+    record = {
+        "session_id": session_id,
+        "transcript_path": str(
+            payload.get("transcript_path") or existing.get("transcript_path") or ""
+        ),
+        "interaction_id": interaction_id,
+        "question_tool": question_tool,
+        "interaction_input": raw_input,
+        "interaction_status": status,
+        "timestamp": _event_timestamp(payload),
+        "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
+    }
+    if interaction_alias_ids:
+        record["interaction_alias_ids"] = interaction_alias_ids
+    _write_atomic(path, record)
 
 
 def _settings_path() -> Path:

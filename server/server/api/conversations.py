@@ -41,7 +41,9 @@ from ..services.conversation_markdown import (
 )
 from ..services.conversation_parser import (
     build_cursor_question_response,
+    coerce_claude_live_interaction,
     count_conversation_messages,
+    interaction_question_fingerprint,
     normalize_message_attachments,
     normalize_tool_calls,
     parse_conversation,
@@ -823,6 +825,11 @@ async def get_pending_conversation_interactions(
     )
     pending = pending[-64:]
     live_pending: list[dict] = []
+    seen_question_fingerprints = {
+        interaction_question_fingerprint(interaction)
+        for _message, interaction in pending
+        if interaction_question_fingerprint(interaction)
+    }
     for source_document_id, metadata in source_metadata.items():
         if not isinstance(metadata, dict):
             continue
@@ -840,9 +847,14 @@ async def get_pending_conversation_interactions(
                 )
             ):
                 continue
-            interaction = signal.get("interaction")
+            interaction = coerce_claude_live_interaction(signal.get("interaction"))
             if not isinstance(interaction, dict):
                 continue
+            fingerprint = interaction_question_fingerprint(interaction)
+            if fingerprint and fingerprint in seen_question_fingerprints:
+                continue
+            if fingerprint:
+                seen_question_fingerprints.add(fingerprint)
             live_pending.append(
                 {
                     "document_id": str(source_document_id),

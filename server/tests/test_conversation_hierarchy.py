@@ -439,6 +439,55 @@ class ConversationHierarchyTests(unittest.TestCase):
             )
         )
 
+    def test_claude_origin_uses_explicit_subagent_boolean_values(self) -> None:
+        root_path = "projects/demo/root-thread.jsonl"
+        child_metadata = {
+            "parent_thread_id": "root-thread",
+            "root_session_id": "root-thread",
+            "agent_launch_description": "Inspect the parser",
+        }
+
+        for false_value in (False, "false", " FALSE "):
+            with self.subTest(root_is_subagent=false_value):
+                metadata = {**child_metadata, "is_subagent": false_value}
+                self.assertIsNone(
+                    conversation_user_role_origin(
+                        "claude_code",
+                        root_path,
+                        metadata,
+                    )
+                )
+                self.assertEqual(
+                    conversation_display_title(
+                        "claude_code",
+                        root_path,
+                        metadata,
+                        "Root title",
+                    ),
+                    "Root title",
+                )
+
+        for true_value in (True, "true", " TRUE "):
+            with self.subTest(child_is_subagent=true_value):
+                metadata = {**child_metadata, "is_subagent": true_value}
+                self.assertEqual(
+                    conversation_user_role_origin(
+                        "claude_code",
+                        root_path,
+                        metadata,
+                    ),
+                    "parent_agent",
+                )
+                self.assertEqual(
+                    conversation_display_title(
+                        "claude_code",
+                        root_path,
+                        metadata,
+                        "Raw first prompt",
+                    ),
+                    "Inspect the parser",
+                )
+
     def test_lifecycle_event_surfaces_child_before_document_ingest(self) -> None:
         summaries = merge_subagent_event_summaries([], [{
             "agent_thread_id": "child-thread",

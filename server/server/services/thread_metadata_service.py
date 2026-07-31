@@ -12,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import ConversationMessage, Document, Machine
 from .cache import cache_delete_prefix
 from .conversation_parser import (
+    coerce_claude_live_interaction,
+    interaction_question_fingerprint,
+    is_claude_ask_user_permission_wrapper,
     normalize_interaction,
     strip_terminal_sequences,
 )
@@ -23,6 +26,7 @@ from .ingest_service import (
     PENDING_QUESTION_COUNT_KEY,
     _bounded_message_text,
     _conversation_title_needs_derivation,
+    _publish_file_synced_event,
     interaction_at_or_before_human,
 )
 from .tokenize import tokenize_for_index
@@ -398,12 +402,84 @@ async def apply_conversation_interaction_update(
         )
         if interaction is None:
             return ThreadTitleUpdateResult(1, 0, 1, valid=False)
-        signals[interaction_id] = {
-            "interaction": interaction,
-            "timestamp": _bounded_message_text(str(timestamp or ""), 128),
-            "tool_name": _bounded_message_text(str(question_tool or ""), 256),
-        }
-        pending_ids.add(interaction_id)
+        # Recover already-normalized AskUserQuestion permission wrappers when a
+        # collector re-emits them before the side-file rewrite lands.
+        if is_claude_ask_user_permission_wrapper(interaction):
+            recovered = coerce_claude_live_interaction(interaction)
+            if recovered is None:
+                return ThreadTitleUpdateResult(1, 0, 1, valid=False)
+            interaction = recovered
+        fingerprint = interaction_question_fingerprint(interaction)
+        normalized_question_tool = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(question_tool or "").casefold(),
+        )
+        normalized_interaction_tool = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(interaction.get("tool_name") or "").casefold(),
+        )
+        duplicate_question_ids: list[str] = []
+        if (
+            tool_id == "claude_code"
+            and fingerprint
+            and normalized_interaction_tool == "askuserquestion"
+        ):
+            for sibling_id, sibling in list(signals.items()):
+                if sibling_id == interaction_id or not isinstance(sibling, dict):
+                    continue
+                sibling_interaction = sibling.get("interaction")
+                recovered_sibling = coerce_claude_live_interaction(
+                    sibling_interaction,
+                )
+                sibling_fp = interaction_question_fingerprint(
+                    recovered_sibling or sibling_interaction,
+                )
+                if sibling_fp == fingerprint:
+                    duplicate_question_ids.append(sibling_id)
+
+        # Claude can emit a real AskUserQuestion followed by a synthetic
+        # PermissionRequest wrapper for the exact same prompt. Keep the
+        # canonical tool-use id when it already exists; if the wrapper arrived
+        # first, replace it when the canonical event follows.
+        skip_duplicate_wrapper = (
+            normalized_question_tool != "askuserquestion"
+            and bool(duplicate_question_ids)
+        )
+        if not skip_duplicate_wrapper:
+            if normalized_question_tool == "askuserquestion":
+                for sibling_id in duplicate_question_ids:
+                    signals.pop(sibling_id, None)
+                    pending_ids.discard(sibling_id)
+            signals[interaction_id] = {
+                "interaction": interaction,
+                "timestamp": _bounded_message_text(str(timestamp or ""), 128),
+                "tool_name": _bounded_message_text(
+                    str(interaction.get("tool_name") or question_tool or ""),
+                    256,
+                ),
+            }
+            pending_ids.add(interaction_id)
+
+            # Also prune legacy malformed wrappers that cannot be recovered
+            # well enough to fingerprint.
+            if fingerprint and not is_claude_ask_user_permission_wrapper(interaction):
+                for sibling_id, sibling in list(signals.items()):
+                    if sibling_id == interaction_id or not isinstance(sibling, dict):
+                        continue
+                    sibling_interaction = sibling.get("interaction")
+                    if not is_claude_ask_user_permission_wrapper(sibling_interaction):
+                        continue
+                    recovered_sibling = coerce_claude_live_interaction(
+                        sibling_interaction,
+                    )
+                    sibling_fp = interaction_question_fingerprint(
+                        recovered_sibling or sibling_interaction,
+                    )
+                    if sibling_fp == fingerprint or recovered_sibling is None:
+                        signals.pop(sibling_id, None)
+                        pending_ids.discard(sibling_id)
     else:
         signals.pop(interaction_id, None)
         pending_ids.discard(interaction_id)
@@ -428,4 +504,5 @@ async def apply_conversation_interaction_update(
     await cache_delete_prefix(f"daily:detail:{user_id}:")
     if document.project_id:
         await cache_delete_prefix(f"project:conv:{user_id}:{document.project_id}:")
+    _publish_file_synced_event(document, str(user_id))
     return ThreadTitleUpdateResult(1, 1, 0)

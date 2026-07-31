@@ -240,6 +240,256 @@ def test_hook_writes_pending_side_file(tmp_path: Path) -> None:
     assert side_record["interaction_input"] == payload["tool_input"]
 
 
+def test_permission_wrapper_does_not_replace_ask_user_question(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    question_payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "session-question-permission",
+        "transcript_path": (
+            "/home/test/.claude/projects/demo/"
+            "session-question-permission.jsonl"
+        ),
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu-real-question",
+        "tool_input": {
+            "questions": [{
+                "question": "How should I proceed?",
+                "header": "Next step",
+                "options": [
+                    {"label": "Hold"},
+                    {"label": "Continue"},
+                ],
+            }]
+        },
+    }
+    permission_wrapper = {
+        "hook_event_name": "PermissionRequest",
+        "session_id": question_payload["session_id"],
+        "transcript_path": question_payload["transcript_path"],
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+            "questions": [{
+                **question_payload["tool_input"]["questions"][0],
+                "options": [
+                    {
+                        "label": "Hold",
+                        "description": "Pause at the current step.",
+                    },
+                    {
+                        "label": "Continue",
+                        "description": "Proceed with the rollout.",
+                    },
+                ],
+            }]
+        },
+        "permission_mode": "acceptEdits",
+    }
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+
+    for payload in (question_payload, permission_wrapper):
+        result = subprocess.run(
+            [sys.executable, "-m", "collector.claude_pending_hook"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "{}"
+
+    side_record = json.loads(
+        (
+            home
+            / ".memento"
+            / "claude-pending"
+            / "session-question-permission.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert side_record["interaction_id"] == "toolu-real-question"
+    assert side_record["question_tool"] == "AskUserQuestion"
+    assert side_record["interaction_status"] == "pending"
+    assert side_record["interaction_input"] == permission_wrapper["tool_input"]
+
+
+def test_permission_wrapper_before_question_keeps_one_stable_id_through_answer(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    question_input = {
+        "questions": [{
+            "question": "How should I roll the remaining schedulers?",
+            "header": "Fleet approach",
+            "multiSelect": False,
+            "options": [
+                {
+                    "label": "Fresh-venv sweep",
+                    "description": "Recreate every environment in waves.",
+                },
+                {
+                    "label": "Fix fleet_deploy first",
+                    "description": "Add the reusable fresh-venv path first.",
+                },
+            ],
+        }]
+    }
+    common = {
+        "session_id": "session-wrapper-first",
+        "transcript_path": (
+            "/home/test/.claude/projects/demo/session-wrapper-first.jsonl"
+        ),
+        "tool_name": "AskUserQuestion",
+        "tool_input": question_input,
+    }
+    payloads = [
+        {"hook_event_name": "PermissionRequest", **common},
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_use_id": "toolu-wrapper-first",
+            **common,
+        },
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_use_id": "toolu-wrapper-first",
+            **common,
+        },
+    ]
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    side_path = (
+        home / ".memento" / "claude-pending" / "session-wrapper-first.json"
+    )
+
+    stable_id = ""
+    for index, payload in enumerate(payloads):
+        result = subprocess.run(
+            [sys.executable, "-m", "collector.claude_pending_hook"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        side_record = json.loads(side_path.read_text(encoding="utf-8"))
+        if index == 0:
+            stable_id = side_record["interaction_id"]
+            assert stable_id.startswith("memento-question-")
+        assert side_record["interaction_id"] == stable_id
+
+    assert side_record["question_tool"] == "AskUserQuestion"
+    assert side_record["interaction_status"] == "answered"
+    assert side_record["interaction_alias_ids"] == ["toolu-wrapper-first"]
+    assert side_record["interaction_input"] == question_input
+
+
+def test_valid_permission_wrapper_alone_preserves_exact_question_input(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    question_input = {
+        "questions": [{
+            "id": "fleet",
+            "prompt": "Choose a rollout.",
+            "header": "Fleet approach",
+            "allowMultiple": True,
+            "options": [{
+                "id": "wave",
+                "label": "Wave rollout",
+                "label_short": "Waves",
+                "description": "Verify each wave.",
+                "preview": "Do not replace the description.",
+            }],
+        }]
+    }
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "session-wrapper-only",
+        "transcript_path": (
+            "/home/test/.claude/projects/demo/session-wrapper-only.jsonl"
+        ),
+        "tool_name": "ASK_User-Question",
+        "tool_input": question_input,
+    }
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "collector.claude_pending_hook"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    side_record = json.loads(
+        (
+            home
+            / ".memento"
+            / "claude-pending"
+            / "session-wrapper-only.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert side_record["question_tool"] == "AskUserQuestion"
+    assert side_record["interaction_status"] == "pending"
+    assert side_record["interaction_input"] == question_input
+
+
+def test_malformed_nested_ask_user_permission_wrapper_is_ignored(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "session-malformed-wrapper",
+        "transcript_path": (
+            "/home/test/.claude/projects/demo/session-malformed-wrapper.jsonl"
+        ),
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+            "tool_input": {
+                "questions": [{"question": "Do not trust nested input."}]
+            }
+        },
+    }
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "collector.claude_pending_hook"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=environment,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert not (
+        home
+        / ".memento"
+        / "claude-pending"
+        / "session-malformed-wrapper.json"
+    ).exists()
+
+
 def test_hook_writes_permission_request_with_stable_id(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

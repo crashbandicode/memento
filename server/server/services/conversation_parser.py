@@ -2273,7 +2273,7 @@ def _extract_tool_use(
             item.get("id") or item.get("call_id"),
             512,
         )
-        interaction = normalize_question_interaction(
+        interaction = normalize_interaction(
             name,
             value,
             source="claude_code",
@@ -3242,6 +3242,20 @@ def normalize_claude_live_prompt_interaction(
             payload.get("requested_tool") or payload.get("tool_name"),
             256,
         ) or "tool"
+        normalized_requested_tool = re.sub(
+            r"[^a-z0-9]",
+            "",
+            requested_tool.casefold(),
+        )
+        if normalized_requested_tool == "askuserquestion":
+            question = normalize_question_interaction(
+                "AskUserQuestion",
+                payload.get("tool_input"),
+                source=source,
+                interaction_id=interaction_id,
+            )
+            if question is not None:
+                return question
         tool_input = _json_mapping(payload.get("tool_input"))
         detail = _claude_permission_detail(requested_tool, tool_input)
         allow_option = {"id": "allow", "label": "Yes"}
@@ -3464,6 +3478,113 @@ def normalize_interaction(
         source=source,
         interaction_id=interaction_id,
     )
+
+
+def _normalized_interaction_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().casefold())
+
+
+def is_claude_ask_user_permission_wrapper(interaction: object) -> bool:
+    """True when a live/persisted card is a PermissionRequest for AskUserQuestion."""
+    if not isinstance(interaction, dict):
+        return False
+    if _normalized_interaction_name(interaction.get("interaction_type")) != (
+        "permissionrequest"
+    ):
+        return False
+    requested = _normalized_interaction_name(interaction.get("requested_tool"))
+    if requested == "askuserquestion":
+        return True
+    questions = interaction.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return False
+    header = questions[0].get("header") if isinstance(questions[0], dict) else ""
+    return _normalized_interaction_name(header) == "askuserquestion"
+
+
+def interaction_question_fingerprint(interaction: object) -> str:
+    """Stable fingerprint used to dedupe duplicate pending question cards."""
+    if not isinstance(interaction, dict):
+        return ""
+    questions = interaction.get("questions")
+    if not isinstance(questions, list):
+        return ""
+    compact = []
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        options = question.get("options")
+        option_labels = []
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict):
+                    label = _bounded_interaction_text(option.get("label"), 1024)
+                else:
+                    label = _bounded_interaction_text(option, 1024)
+                if label:
+                    option_labels.append(label)
+        compact.append({
+            "header": _bounded_interaction_text(question.get("header"), 512),
+            "prompt": _bounded_interaction_text(
+                question.get("prompt") or question.get("question"),
+                4096,
+            ),
+            "options": option_labels,
+        })
+    if not compact:
+        return ""
+    return json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _recover_ask_user_question_from_permission_interaction(
+    interaction: dict[str, object],
+) -> dict[str, object] | None:
+    """Rebuild an AskUserQuestion card from a malformed permission Yes dump."""
+    questions = interaction.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    first = questions[0] if isinstance(questions[0], dict) else {}
+    options = first.get("options") if isinstance(first.get("options"), list) else []
+    source = _bounded_interaction_text(
+        interaction.get("source") or "claude_code",
+        64,
+    ) or "claude_code"
+    interaction_id = interaction.get("id")
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        payload = _json_mapping(option.get("description"))
+        if not payload:
+            continue
+        recovered = normalize_question_interaction(
+            "AskUserQuestion",
+            payload,
+            source=source,
+            interaction_id=interaction_id,
+        )
+        if recovered is not None:
+            return recovered
+        if isinstance(payload.get("question") or payload.get("prompt"), str):
+            recovered = normalize_question_interaction(
+                "AskUserQuestion",
+                {"questions": [payload]},
+                source=source,
+                interaction_id=interaction_id,
+            )
+            if recovered is not None:
+                return recovered
+    return None
+
+
+def coerce_claude_live_interaction(
+    interaction: object,
+) -> dict[str, object] | None:
+    """Return a display-safe live interaction, recovering AskUserQuestion wrappers."""
+    if not isinstance(interaction, dict):
+        return None
+    if not is_claude_ask_user_permission_wrapper(interaction):
+        return interaction
+    return _recover_ask_user_question_from_permission_interaction(interaction)
 
 
 def _answer_texts(value: object) -> list[str]:
