@@ -19,13 +19,20 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from .tools.base import Category, ContentType
 from .tools.cursor import CursorTool
 
 _MAX_TOOL_FIELD_CHARS = 262_144
 _INTERRUPTED_STATES = {"aborted", "cancelled", "canceled", "interrupted"}
+_TERMINAL_COMPOSER_STATES = _INTERRUPTED_STATES | {
+    "complete",
+    "completed",
+    "done",
+    "error",
+    "failed",
+}
 _CURSOR_MODE_SWITCH_TOOLS = {"switch_mode", "switchmode"}
 _TOOL_LABELS = {
     "await": "Await",
@@ -247,6 +254,34 @@ def _model_selection(config: object) -> tuple[str, str]:
             if effort:
                 break
     return model, effort
+
+
+def _workspace_folder_path(value: object) -> str:
+    """Decode Cursor workspace URIs, including Windows-hosted WSL folders."""
+    folder = _coerce_text(value).strip()
+    try:
+        parsed = urlsplit(folder)
+    except ValueError:
+        return ""
+
+    scheme = parsed.scheme.casefold()
+    host = parsed.netloc.casefold()
+    path = unquote(parsed.path)
+    if scheme == "file":
+        if host in {"wsl.localhost", "wsl$"}:
+            # file://wsl.localhost/<distro>/home/... is Cursor's Windows-side
+            # URI for a WSL workspace. The distro is transport identity, not
+            # part of the Linux filesystem path shown to the user.
+            parts = path.lstrip("/").split("/", 1)
+            return f"/{parts[1]}" if len(parts) == 2 and parts[1] else ""
+        if host:
+            return ""
+        if re.match(r"^/[A-Za-z]:/", path):
+            return path[1:]
+        return path if path.startswith("/") else ""
+    if scheme == "vscode-remote" and host.startswith("wsl+"):
+        return path if path.startswith("/") else ""
+    return ""
 
 
 def _bubble_model(
@@ -634,15 +669,27 @@ class CursorStateExporter:
                 if bubble is not None and bubble_id not in seen:
                     ordered.append(bubble)
                     seen.add(bubble_id)
-        ordered.extend(
-            sorted(
-                (bubble for bubble_id, bubble in by_id.items() if bubble_id not in seen),
-                key=lambda item: (
-                    _coerce_text(item.get("createdAt")),
-                    _coerce_text(item.get("bubbleId")),
-                ),
+        composer_status = _coerce_text(composer.get("status")).strip().casefold()
+        # Cursor can retain hundreds of superseded checkpoint bubbles under a
+        # completed composer. Their IDs are unique, so content dedupe cannot
+        # distinguish them from legitimate repeated turns. Once the composer
+        # is terminal, fullConversationHeadersOnly is the authoritative order;
+        # retain unlisted bubbles only while a live composer may still be
+        # publishing a bubble before its header entry.
+        if not seen or composer_status not in _TERMINAL_COMPOSER_STATES:
+            ordered.extend(
+                sorted(
+                    (
+                        bubble
+                        for bubble_id, bubble in by_id.items()
+                        if bubble_id not in seen
+                    ),
+                    key=lambda item: (
+                        _coerce_text(item.get("createdAt")),
+                        _coerce_text(item.get("bubbleId")),
+                    ),
+                )
             )
-        )
 
         transcript = self._transcript_path(header.composer_id)
         records = _project_records(
@@ -810,9 +857,7 @@ class CursorStateExporter:
         except (OSError, ValueError, json.JSONDecodeError):
             return ""
         folder = _coerce_text(data.get("folder")) if isinstance(data, dict) else ""
-        if folder.startswith("file:///"):
-            return unquote(folder[8:])
-        return ""
+        return _workspace_folder_path(folder)
 
     @staticmethod
     def _project_hash(workspace: str) -> str:

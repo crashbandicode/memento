@@ -9,6 +9,7 @@ from collector.cursor_state_export import (
     CursorStateExporter,
     _iso_timestamp,
     _tool_record,
+    _workspace_folder_path,
     enqueue_cursor_state_snapshots,
 )
 from collector.tools.cursor import CursorTool
@@ -493,6 +494,92 @@ def test_live_state_supersedes_sparse_transcript_and_projects_whitelist(tmp_path
     assert snapshot.metadata["title"] == "Readable renamed thread"
     assert snapshot.metadata["project_path"] == "C:/Users/intpa/demo"
     assert snapshot.metadata["source"] == "cursor_state_v1"
+
+
+def test_workspace_folder_path_decodes_windows_hosted_wsl_uris() -> None:
+    assert _workspace_folder_path(
+        "file://wsl.localhost/Ubuntu/home/patrick/services/memento"
+    ) == "/home/patrick/services/memento"
+    assert _workspace_folder_path(
+        "vscode-remote://wsl+Ubuntu/home/patrick/My%20Project"
+    ) == "/home/patrick/My Project"
+    assert _workspace_folder_path("file:///C:/Users/intpa/demo") == (
+        "C:/Users/intpa/demo"
+    )
+
+
+def test_terminal_composer_ignores_unreferenced_checkpoint_bubbles(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["status"] = "completed"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.execute(
+        "INSERT INTO cursorDiskKV VALUES (?,?)",
+        (
+            f"bubbleId:{session_id}:superseded-checkpoint-copy",
+            json.dumps({
+                "bubbleId": "superseded-checkpoint-copy",
+                "type": 2,
+                "createdAt": "2026-07-18T14:19:02Z",
+                "text": "Stopping it now.",
+            }),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = CursorStateExporter(tool).export_changed(limit=20)[0]
+    records = [json.loads(line) for line in snapshot.content.splitlines()]
+
+    assert "superseded-checkpoint-copy" not in {
+        record.get("id") for record in records
+    }
+    assert sum(
+        record.get("message", {}).get("content") == "Stopping it now."
+        for record in records
+    ) == 1
+
+
+def test_live_composer_keeps_unreferenced_inflight_bubble(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["status"] = "generating"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.execute(
+        "INSERT INTO cursorDiskKV VALUES (?,?)",
+        (
+            f"bubbleId:{session_id}:inflight",
+            json.dumps({
+                "bubbleId": "inflight",
+                "type": 2,
+                "createdAt": "2026-07-18T14:19:05Z",
+                "text": "Still working.",
+            }),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = CursorStateExporter(tool).export_changed(limit=20)[0]
+
+    assert any(
+        json.loads(line).get("id") == "inflight"
+        for line in snapshot.content.splitlines()
+    )
 
 
 def test_subagent_state_supersedes_timestamp_free_compatibility_transcript(
