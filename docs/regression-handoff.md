@@ -17,7 +17,7 @@ Node 24 is installed for `patrick` at `~/.local/node-current`, `@playwright/test
 /usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File ./web/run-playwright.ps1
 ```
 
-This durable user-owned setup was validated with the full hermetic Chromium suite: **11/11 passed**.
+This durable user-owned setup was validated with the full hermetic Chromium suite: **15/15 passed**.
 
 ---
 
@@ -155,6 +155,16 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 - **Why all three tools are covered:** Claude, Cursor, and Codex message prose uses the shared `MarkdownViewer` / `SmartCode` renderer.
 - **Tests:** `web/e2e/smart-links.spec.mjs` checks computed light/dark inline-chip styling for all three tools and separately verifies fenced code keeps its syntax-highlighted block layout.
 
+### 16. Pending — Cursor child origin and current-task carrier projection
+
+- **Symptom:** In production Cursor thread `32034817-ddef-4d00-a871-6d041f8b94bc`, child dispatches were labeled/countable as human prompts and the mutable current-task state appeared twice: once as the pinned **Active task list** and again as a historical **Task update** before the first real prompt. This made an otherwise complete thread look tangled.
+- **Data-loss audit:** No root messages were missing. At the 17:09 UTC snapshot, the raw export, normalized rows, and API each had 182 records/messages with contiguous lines 1–182 and 182 unique normalized source IDs; 170 source IDs were preserved byte-for-byte and 12 were intentionally transformed into stable task-completion IDs. The root later grew normally while the Cursor session remained active (243 messages in the desktop/mobile browser snapshot and 257 in the final API capture). All seven child documents had complete API totals matching their stored normalized rows. Four raw-vs-normalized child count differences were repeated shell-finished notifications correctly deduplicated to four stable completion events, not lost user/assistant turns.
+- **Root cause:** `conversation_user_role_origin` recognized only Claude children even though Cursor `/subagents/` documents use the same parent-dispatch semantics. Their API `origin` remained null and `/prompts` returned one or two parent directives per child. Separately, Cursor state export intentionally transports one mutable `cursor_state_task` record at stable line 1 so task projection can update incrementally; `ConversationViewer` rendered that carrier row after already rendering the same projected state in the pinned task card.
+- **Fix:** Classify path/metadata-linked Cursor children as `parent_agent`, which also removes their parent directives from child prompt navigation. Suppress only a `task_state.is_current` message whose ordered task payload exactly matches the pinned active state; historical task transitions remain visible. Source/export and stored normalized rows stay unchanged.
+- **Repair:** No targeted reparse/re-export was run because stored projection was complete and correctly ordered. Both fixes are request/render-time and take effect for historical documents without mutating production rows.
+- **Key files:** `server/server/services/conversation_hierarchy.py`, `web/src/lib/conversation-message-order.ts`, `web/src/components/viewers/ConversationViewer.tsx`
+- **Tests:** 47 focused server tests + 6 subtests; 15 focused Cursor collector tests; 41 browser-free web tests (including 7 message-order tests); six focused real-Chromium scenarios (desktop 1440×1000 and mobile 472×1024 included); full hermetic Playwright suite 15/15. The deterministic `cursorThreadProjection` fixture preserves the line-1 task carrier and interleaved child completion order from the production shape.
+
 ---
 
 ## Test coverage matrix
@@ -179,12 +189,14 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 | Hierarchical tasks API/MCP (`d7d89df`) | `test_conversation_tasks.py`, `test_tasks_api.py`, `test_task_projection_integration.py`, `test_mcp_tasks.py` | unit / API | covered (UI **GAP**) |
 | Message order / prompt-jump windows (`83951fb`) | `web/tests/conversation-message-order.test.mjs` | unit (web) | covered |
 | Parent-agent origin / sticky lifecycle (`83951fb`) | hierarchy + parser + normalized API tests | unit / API | covered |
+| Cursor child parent-agent origin / prompt suppression (pending) | hierarchy + normalized API tests; `parent-agent-labeling.spec.mjs` | unit / API / Playwright | covered |
+| Cursor current-task carrier rendered once (pending) | `conversation-message-order.test.mjs`; `cursor-thread-projection.spec.mjs` | unit / Playwright | covered (desktop + mobile) |
 | AskUserQuestion vs PermissionRequest wrapper (`7cb05b0`) | collector + parser + thread_metadata + normalized API tests | unit / API | covered |
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
 | Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run verified on Node 24) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
 | Inline code chips across Claude, Cursor, and Codex (v0.1.53) | `smart-links.spec.mjs` | Playwright | covered (computed style + fenced-block regression) |
-| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (11/11 hermetic Chromium tests on Node 24) |
+| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (15/15 hermetic Chromium tests on Node 24) |
 
 ---
 
@@ -195,7 +207,7 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
 3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
 4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (11/11) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
+5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. The full browser-free web suite passes (41/41), and the full Chromium suite passes (15/15) on Node 24. Remaining UI gaps: path-linked companion refresh and directive title-cleaning.
 6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
 7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 

@@ -13,6 +13,20 @@ export interface DetachedServerMessageWindow<T extends ServerOrderedMessage>
   endOffset: number;
 }
 
+interface TaskSnapshotTask {
+  id: string;
+  content: string;
+  status: string;
+  active_form?: string;
+}
+
+interface TaskSnapshot {
+  source: string;
+  is_current?: boolean;
+  total_count: number;
+  tasks: TaskSnapshotTask[];
+}
+
 /**
  * Merge refreshed pages by the server's stable within-document identity.
  *
@@ -72,4 +86,36 @@ export function placeTargetWindow<T extends ServerOrderedMessage>(
       messages: incoming.messages,
     },
   };
+}
+
+/**
+ * The mutable Cursor task snapshot is intentionally transported as message
+ * line 1 so the server can project active task state. Once that same state is
+ * rendered in the pinned task card, rendering its carrier row again produces
+ * a misleading historical "Task update" duplicate.
+ */
+export function isMirroredActiveTaskMessage(
+  message: { task_state?: TaskSnapshot | null },
+  activeTaskState?: TaskSnapshot | null,
+): boolean {
+  const messageState = message.task_state;
+  if (
+    !messageState?.is_current
+    || !activeTaskState
+    || messageState.source !== activeTaskState.source
+    || messageState.total_count !== activeTaskState.total_count
+    || messageState.tasks.length !== activeTaskState.tasks.length
+  ) {
+    return false;
+  }
+  return messageState.tasks.every((task, index) => {
+    const activeTask = activeTaskState.tasks[index];
+    return Boolean(
+      activeTask
+      && task.id === activeTask.id
+      && task.content === activeTask.content
+      && task.status === activeTask.status
+      && (task.active_form || "") === (activeTask.active_form || ""),
+    );
+  });
 }

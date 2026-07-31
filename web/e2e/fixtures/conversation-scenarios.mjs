@@ -388,6 +388,174 @@ export const parentAgentLabeling = {
   latestAgentLine: 2,
 };
 
+export const cursorParentAgentLabeling = {
+  ...parentAgentLabeling,
+  docId: "conv-cursor-parent-agent",
+  meta: {
+    ...parentAgentLabeling.meta,
+    id: "conv-cursor-parent-agent",
+    tool_id: "cursor",
+    relative_path: (
+      "projects/demo/agent-transcripts/root-thread/"
+      + "subagents/cursor-child.jsonl"
+    ),
+  },
+};
+
+const CURSOR_CURRENT_TASK_STATE = {
+  version: 1,
+  source: "cursor",
+  revision: 1,
+  is_current: true,
+  completed_count: 1,
+  total_count: 2,
+  active_task_id: "2",
+  tasks: [
+    { id: "1", content: "Audit source and API identities", status: "completed" },
+    { id: "2", content: "Verify desktop and mobile UI", status: "in_progress" },
+  ],
+};
+
+/**
+ * Distilled from Cursor thread 32034817: a mutable current-task carrier at
+ * line 1 plus interleaved child launches/completions. The task carrier powers
+ * the pinned card but must not render as a second historical update; child
+ * events must retain their own thread IDs even when completion order differs.
+ */
+export const cursorThreadProjection = {
+  docId: "conv-cursor-thread-projection",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-cursor-thread-projection",
+    tool_id: "cursor",
+    title: "Cursor thread projection",
+    relative_path: (
+      "projects/demo/agent-transcripts/root-thread/root-thread.jsonl"
+    ),
+    metadata: { session_id: "root-thread", is_subagent: false },
+    active_task_state: CURSOR_CURRENT_TASK_STATE,
+    message_count: 7,
+    subagent_count: 2,
+    is_subagent_orphan: false,
+    subagents: [
+      {
+        id: "cursor-child-doc-a",
+        session_id: "cursor-child-a",
+        title: "Audit source ordering",
+        parent_thread_id: "root-thread",
+        status: "completed",
+        document_ready: true,
+        user_role_origin: "parent_agent",
+        completed_at: T3,
+      },
+      {
+        id: "cursor-child-doc-b",
+        session_id: "cursor-child-b",
+        title: "Audit UI projection",
+        parent_thread_id: "root-thread",
+        status: "completed",
+        document_ready: true,
+        user_role_origin: "parent_agent",
+        completed_at: T2,
+      },
+    ],
+    synced_at: T3,
+    activity_at: T3,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      message_type: "cursor_state_task",
+      raw_type: "cursor_state_task",
+      role: "tool",
+      content: "1 of 2 tasks complete",
+      tool_name: "Task progress 1/2",
+      task_state: CURSOR_CURRENT_TASK_STATE,
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "user",
+      content: "Launch parallel source and UI audits.",
+      timestamp: T0,
+    },
+    {
+      id: 3,
+      line_number: 3,
+      role: "tool",
+      content: "[Subagent]",
+      agent_event: {
+        version: 1,
+        kind: "started",
+        activity_type: "subagent",
+        agent_thread_id: "cursor-child-a",
+        label: "Audit source ordering",
+      },
+      timestamp: T1,
+    },
+    {
+      id: 4,
+      line_number: 4,
+      role: "tool",
+      content: "[Subagent]",
+      agent_event: {
+        version: 1,
+        kind: "started",
+        activity_type: "subagent",
+        agent_thread_id: "cursor-child-b",
+        label: "Audit UI projection",
+      },
+      timestamp: T1,
+    },
+    {
+      id: 5,
+      line_number: 5,
+      role: "assistant",
+      content: "Both audits are running in parallel.",
+      timestamp: T1,
+    },
+    {
+      id: 6,
+      line_number: 6,
+      role: "tool",
+      content: "[Subagent completed]",
+      agent_event: {
+        version: 1,
+        kind: "completed",
+        activity_type: "subagent",
+        agent_thread_id: "cursor-child-b",
+        label: "Audit UI projection",
+      },
+      timestamp: T2,
+    },
+    {
+      id: 7,
+      line_number: 7,
+      role: "tool",
+      content: "[Subagent completed]",
+      agent_event: {
+        version: 1,
+        kind: "completed",
+        activity_type: "subagent",
+        agent_thread_id: "cursor-child-a",
+        label: "Audit source ordering",
+      },
+      timestamp: T3,
+    },
+  ]),
+  prompts: [
+    {
+      id: 2,
+      line_number: 2,
+      content: "Launch parallel source and UI audits.",
+      timestamp: T0,
+    },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 7,
+};
+
 const SMART_LINK_MARKDOWN = [
   "This intentionally long fixture keeps the rich links behind the conversation expand control. ".repeat(7),
   "",
@@ -459,6 +627,8 @@ export const scenarios = {
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
   [parentAgentLabeling.docId]: parentAgentLabeling,
+  [cursorParentAgentLabeling.docId]: cursorParentAgentLabeling,
+  [cursorThreadProjection.docId]: cursorThreadProjection,
   [claudeSmartLinks.docId]: claudeSmartLinks,
   [cursorSmartLinks.docId]: cursorSmartLinks,
   [codexSmartLinks.docId]: codexSmartLinks,

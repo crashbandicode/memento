@@ -236,6 +236,21 @@ class ConversationHierarchyTests(unittest.TestCase):
 
         self.assertEqual(result.visible_document_ids, {"cursor-root"})
         self.assertEqual(result.subagent_counts, {"cursor-root": 1})
+        self.assertEqual(
+            conversation_user_role_origin(
+                "cursor",
+                (
+                    "projects/sample/agent-transcripts/cursor-thread/"
+                    "subagents/cursor-child-thread.jsonl"
+                ),
+                {
+                    "is_subagent": True,
+                    "root_session_id": "cursor-thread",
+                    "parent_thread_id": "cursor-thread",
+                },
+            ),
+            "parent_agent",
+        )
 
     def test_cursor_root_copies_are_canonicalized_across_hosts(self) -> None:
         old = _ref(

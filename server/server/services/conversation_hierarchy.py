@@ -168,9 +168,9 @@ def conversation_user_role_origin(
     relative_path: str | None,
     metadata: Mapping[str, Any] | None,
 ) -> str | None:
-    """Identify native Claude child user turns as parent-agent messages."""
+    """Identify child-thread user turns that were dispatched by a parent agent."""
     if (
-        tool_id == "claude_code"
+        tool_id in {"claude_code", "cursor"}
         and (
             is_conversation_subagent(tool_id, relative_path, metadata)
             or (

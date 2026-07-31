@@ -46,6 +46,7 @@ import {
 } from "@/lib/search-history";
 import {
   contextBeforeIncludingTarget,
+  isMirroredActiveTaskMessage,
   mergeMessagesChronologically,
   placeTargetWindow,
 } from "@/lib/conversation-message-order";
@@ -938,6 +939,9 @@ export default function ConversationViewer({
   };
 
   const renderMessage = (msg: ConversationMessage) => {
+    if (isMirroredActiveTaskMessage(msg, activeTaskState)) {
+      return null;
+    }
     if (
       msg.interaction_response?.interaction_id
       && questionIds.has(msg.interaction_response.interaction_id)
