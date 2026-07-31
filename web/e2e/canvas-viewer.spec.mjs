@@ -33,15 +33,17 @@ function trackErrors(page) {
 }
 
 test.describe("canvas viewer", () => {
-  test("renders a distinctive canvas chip for Claude, Cursor, and Codex", async ({ page }) => {
-    for (const scenario of canvasScenarios) {
+  for (const scenario of canvasScenarios) {
+    test(`renders a distinctive canvas chip for ${scenario.meta.tool_id}`, async ({ page }) => {
       await openConversation(page, scenario);
       const chip = page.getByTestId("smart-link-canvas");
       await expect(chip).toBeVisible();
       await expect(chip).toContainText("Canvas");
       await expect(chip).toHaveAttribute("aria-haspopup", "dialog");
-    }
-  });
+      await expect(chip).not.toHaveAttribute("data-file-type");
+      await expect(chip.locator("[data-file-icon]")).toHaveCount(0);
+    });
+  }
 
   test("Cursor canvas expands into an accessible source viewer", async ({ page }) => {
     const errors = trackErrors(page);

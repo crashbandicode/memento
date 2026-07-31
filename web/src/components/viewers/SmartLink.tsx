@@ -7,11 +7,21 @@ import {
 } from "react";
 import {
   FiArrowRight,
+  FiBookOpen,
+  FiBox,
+  FiCode,
+  FiDatabase,
   FiExternalLink,
+  FiFile,
   FiFileText,
   FiGlobe,
   FiGrid,
+  FiImage,
   FiLink,
+  FiLock,
+  FiPackage,
+  FiSettings,
+  FiTerminal,
 } from "react-icons/fi";
 import { SiGithub, SiGitlab } from "react-icons/si";
 import {
@@ -20,6 +30,7 @@ import {
 } from "@/lib/smart-link-classifier.mjs";
 import { canvasArtifactFromLink } from "@/lib/canvas-artifact.mjs";
 import { useCanvasArtifactResolver } from "@/lib/canvas-context";
+import { fileIconKind } from "@/lib/file-icon.mjs";
 import { useI18n } from "@/lib/i18n";
 import { CanvasViewer } from "./CanvasViewer";
 import styles from "./SmartLink.module.css";
@@ -36,6 +47,59 @@ function nodeText(node: ReactNode): string {
 
 function providerIcon(provider: "github" | "gitlab") {
   return provider === "gitlab" ? <SiGitlab size={14} /> : <SiGithub size={14} />;
+}
+
+type FileIconKind = ReturnType<typeof fileIconKind>;
+
+function FileTypeIcon({ kind, size }: { kind: FileIconKind; size: number }) {
+  let glyph: ReactNode;
+  switch (kind) {
+    case "markdown":
+      glyph = <FiBookOpen size={size} />;
+      break;
+    case "package":
+      glyph = <FiPackage size={size} />;
+      break;
+    case "docker":
+      glyph = <FiBox size={size} />;
+      break;
+    case "config":
+      glyph = <FiSettings size={size} />;
+      break;
+    case "shell":
+    case "build":
+      glyph = <FiTerminal size={size} />;
+      break;
+    case "sql":
+    case "data":
+      glyph = <FiDatabase size={size} />;
+      break;
+    case "image":
+      glyph = <FiImage size={size} />;
+      break;
+    case "lock":
+      glyph = <FiLock size={size} />;
+      break;
+    case "text":
+      glyph = <FiFileText size={size} />;
+      break;
+    case "file":
+      glyph = <FiFile size={size} />;
+      break;
+    default:
+      glyph = <FiCode size={size} />;
+      break;
+  }
+
+  return (
+    <span
+      className={[styles.icon, styles.fileTypeIcon].join(" ")}
+      data-file-icon={kind}
+      aria-hidden="true"
+    >
+      {glyph}
+    </span>
+  );
 }
 
 function fileLabelParts(label: string): {
@@ -144,14 +208,16 @@ export function SmartLink({
   }
 
   if (info.kind === "file") {
+    const fileType = fileIconKind(info.path || info.label);
     return (
       <a
         {...shared}
         className={[styles.link, className].filter(Boolean).join(" ")}
         data-testid="smart-link-file"
+        data-file-type={fileType}
         title={title ?? info.path}
       >
-        <span className={styles.icon} aria-hidden="true"><FiFileText size={14} /></span>
+        <FileTypeIcon kind={fileType} size={14} />
         <span className={styles.label}>{info.label}</span>
         {fileParts.additions !== undefined && fileParts.deletions !== undefined && (
           <span className={styles.fileStats} data-testid="smart-file-stats" aria-label={`${fileParts.additions} additions, ${fileParts.deletions} deletions`}>
@@ -284,13 +350,15 @@ export function SmartCode({
     return <CanvasChip href="" label={info.display} name={info.display} path={info.path} inline />;
   }
 
+  const fileType = fileIconKind(info.value);
   return (
     <span
       className={[styles.inlineChip, styles.inlineFile].join(" ")}
       data-testid="smart-code-file"
+      data-file-type={fileType}
       title={info.value}
     >
-      <FiFileText size={12} aria-hidden="true" />
+      <FileTypeIcon kind={fileType} size={12} />
       <span className={styles.label}>{info.display}</span>
     </span>
   );

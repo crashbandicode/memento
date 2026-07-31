@@ -46,6 +46,87 @@
   color: #2784bd;
 }
 
+.fileTypeIcon {
+  --file-icon-color: var(--aurora-fg3);
+  color: color-mix(in srgb, var(--file-icon-color) 76%, var(--aurora-fg2));
+}
+
+.fileTypeIcon[data-file-icon="typescript"] {
+  --file-icon-color: #3178c6;
+}
+
+.fileTypeIcon[data-file-icon="javascript"] {
+  --file-icon-color: #9b7800;
+}
+
+.fileTypeIcon[data-file-icon="python"] {
+  --file-icon-color: #3472a4;
+}
+
+.fileTypeIcon[data-file-icon="rust"],
+.fileTypeIcon[data-file-icon="ruby"] {
+  --file-icon-color: #9a513b;
+}
+
+.fileTypeIcon[data-file-icon="go"],
+.fileTypeIcon[data-file-icon="sql"],
+.fileTypeIcon[data-file-icon="data"] {
+  --file-icon-color: #287d94;
+}
+
+.fileTypeIcon[data-file-icon="java"],
+.fileTypeIcon[data-file-icon="kotlin"],
+.fileTypeIcon[data-file-icon="swift"],
+.fileTypeIcon[data-file-icon="html"] {
+  --file-icon-color: #b25d36;
+}
+
+.fileTypeIcon[data-file-icon="csharp"],
+.fileTypeIcon[data-file-icon="native"],
+.fileTypeIcon[data-file-icon="php"],
+.fileTypeIcon[data-file-icon="lua"] {
+  --file-icon-color: #6963a3;
+}
+
+.fileTypeIcon[data-file-icon="stylesheet"],
+.fileTypeIcon[data-file-icon="image"] {
+  --file-icon-color: #7a56a1;
+}
+
+.fileTypeIcon[data-file-icon="vue"],
+.fileTypeIcon[data-file-icon="shell"],
+.fileTypeIcon[data-file-icon="build"] {
+  --file-icon-color: #39805d;
+}
+
+.fileTypeIcon[data-file-icon="markdown"],
+.fileTypeIcon[data-file-icon="text"] {
+  --file-icon-color: #55728b;
+}
+
+.fileTypeIcon[data-file-icon="json"],
+.fileTypeIcon[data-file-icon="config"] {
+  --file-icon-color: #927039;
+}
+
+.fileTypeIcon[data-file-icon="package"] {
+  --file-icon-color: #a55a2c;
+}
+
+.fileTypeIcon[data-file-icon="docker"] {
+  --file-icon-color: #287aab;
+}
+
+.fileTypeIcon[data-file-icon="protobuf"],
+.fileTypeIcon[data-file-icon="xml"] {
+  --file-icon-color: #537c87;
+}
+
+.fileTypeIcon[data-file-icon="lock"],
+.fileTypeIcon[data-file-icon="file"] {
+  --file-icon-color: #68717e;
+}
+
 .canvas {
   border-color: color-mix(in srgb, var(--aurora-accent) 34%, var(--aurora-border));
   background: var(--aurora-accent-soft);
