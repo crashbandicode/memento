@@ -1,14 +1,18 @@
 "use client";
 
 import { Children, isValidElement, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
-import type { Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import type { Components, UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import MermaidDiagram from "./MermaidDiagram";
 import { SmartCode, SmartLink } from "./SmartLink";
 import { CanvasArtifactProvider } from "@/lib/canvas-context";
-import type { CanvasArtifact } from "@/lib/canvas-artifact.mjs";
+import {
+  isSafeCanvasPath,
+  looksLikeCanvasArtifact,
+  type CanvasArtifact,
+} from "@/lib/canvas-artifact.mjs";
 import "highlight.js/styles/github-dark.min.css";
 
 function nodeText(node: ReactNode): string {
@@ -26,6 +30,11 @@ function mermaidSource(children: ReactNode): string | null {
   if (!/(?:^|\s)language-mermaid(?:\s|$)/i.test(child.props.className ?? "")) return null;
   return nodeText(child.props.children).replace(/\n$/, "");
 }
+
+const canvasAwareUrlTransform: UrlTransform = (url) => {
+  if (looksLikeCanvasArtifact(url) && isSafeCanvasPath(url)) return url;
+  return defaultUrlTransform(url);
+};
 
 const markdownComponents: Components = {
   a: SmartLink,
@@ -158,6 +167,7 @@ export default function MarkdownViewer({
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeHighlight, { plainText: ["mermaid"] }]]}
         components={markdownComponents}
+        urlTransform={canvasAwareUrlTransform}
       >
         {content}
       </ReactMarkdown>
