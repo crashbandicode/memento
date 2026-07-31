@@ -3826,7 +3826,12 @@ function AgentActivityCard({
   const eventTime = parsedEventTime && !Number.isNaN(parsedEventTime.getTime())
     ? parsedEventTime.toLocaleString(locale)
     : "";
-  const hasDetails = Boolean(event.result_summary || event.output_path || event.model || eventTime);
+  const showResultSummary = Boolean(
+    event.result_summary && event.status !== "async_launched",
+  );
+  const hasDetails = Boolean(
+    showResultSummary || event.output_path || event.model || eventTime,
+  );
 
   return (
     <div
@@ -3920,7 +3925,7 @@ function AgentActivityCard({
           )}
         </div>
       )}
-      {event.result_summary && (
+      {showResultSummary && (
         <div
           data-agent-result-summary
           style={{

@@ -33,6 +33,9 @@ test.describe("subagent status", () => {
     const started = page.locator('[data-agent-kind="started"]');
     await expect(started).toBeVisible();
     await expect(started).toContainText("Harden ingest pipeline");
+    await expect(started).not.toContainText(
+      "INTERNAL_ASYNC_LAUNCH_METADATA_MUST_NOT_RENDER",
+    );
 
     // ...the snapshot still lists the agent as running...
     const snapshot = page.locator('[data-agent-kind="snapshot"]');
