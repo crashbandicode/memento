@@ -179,6 +179,8 @@ const enUS: Translations = {
     collapse: "Collapse",
     expandAll: "Expand All",
     subagentDispatch: "Subagent dispatch",
+    parentAgent: "Parent agent",
+    parentAgentDispatch: "task dispatch",
     sessionContext: "Session context",
     additionalDirectives: "Additional directives",
     additionalDirectivesHint: "Product and session guidance for this task",

@@ -899,6 +899,177 @@ def build_agent_lifecycle_event(
     }
 
 
+def _is_claude_agent_tool_name(value: object) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+    return compact == "agent"
+
+
+def normalize_claude_agent_launch_event(
+    tool_name: object,
+    tool_input: object,
+    tool_call_id: object,
+) -> dict[str, object] | None:
+    """Normalize a Claude Agent launch using its source tool-use identity."""
+    if not _is_claude_agent_tool_name(tool_name):
+        return None
+    launch_id = _bounded_interaction_text(tool_call_id, 512).strip()
+    payload = _json_mapping(tool_input)
+    description = _bounded_interaction_text(
+        payload.get("description"),
+        1_024,
+    ).strip()
+    if not launch_id or not description:
+        return None
+    event: dict[str, object] = {
+        "version": 2,
+        "source": "claude_agent",
+        "agent_tool_use_id": launch_id,
+        "label": description,
+        "kind": "started",
+        "activity_type": "subagent",
+        "task_kind": "subagent",
+        "task_id": launch_id,
+        "status": "running",
+    }
+    requested_model = _bounded_interaction_text(payload.get("model"), 256).strip()
+    if requested_model:
+        event["model"] = requested_model
+    agent_type = _bounded_interaction_text(
+        payload.get("subagent_type")
+        or payload.get("subagentType")
+        or payload.get("agent_type")
+        or payload.get("agentType"),
+        128,
+    ).strip()
+    if agent_type:
+        event["agent_type"] = agent_type
+    if isinstance(payload.get("run_in_background"), bool):
+        event["is_background"] = payload["run_in_background"]
+    return event
+
+
+def _claude_agent_result_kind(
+    result: dict,
+    result_item: dict,
+) -> tuple[str, str]:
+    raw_status = _bounded_interaction_text(
+        result.get("status")
+        or result.get("state")
+        or result_item.get("status"),
+        80,
+    ).strip().casefold().replace("-", "_").replace(" ", "_")
+    if raw_status in {"interrupted", "cancelled", "canceled", "stopped", "aborted"}:
+        return "interrupted", raw_status
+    if raw_status in {"failed", "error", "errored"}:
+        return "failed", raw_status
+    if raw_status in {"completed", "complete", "finished", "success", "succeeded", "done"}:
+        return "completed", raw_status
+    if raw_status in {"running", "started", "pending", "in_progress", "background"}:
+        return "started", raw_status
+    if (
+        result_item.get("is_error") is True
+        or result_item.get("isError") is True
+        or result.get("is_error") is True
+        or result.get("isError") is True
+        or result.get("success") is False
+        or bool(result.get("error"))
+    ):
+        return "failed", raw_status or "failed"
+    if result.get("isBackground") is True or result.get("is_background") is True:
+        return "started", raw_status or "running"
+    # A non-background tool_result is the source-backed completion of the
+    # exact Agent tool-use ID, not an inference from result text or timing.
+    return "completed", raw_status or "completed"
+
+
+def normalize_claude_agent_result_event(
+    source_object: object,
+    content: object,
+    tool_call_id: object,
+    launch_event: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Normalize an exact Claude Agent result without description matching."""
+    launch_id = _bounded_interaction_text(tool_call_id, 512).strip()
+    if not launch_id:
+        return None
+    result_item = next(
+        (
+            item
+            for item in (content if isinstance(content, list) else [])
+            if isinstance(item, dict)
+            and item.get("type") in {"tool_result", "toolResult"}
+            and _bounded_interaction_text(
+                item.get("tool_use_id")
+                or item.get("tool_call_id")
+                or item.get("toolCallId")
+                or item.get("call_id"),
+                512,
+            ).strip()
+            == launch_id
+        ),
+        {},
+    )
+    if not result_item:
+        return None
+    source = _as_mapping(source_object)
+    result = _as_mapping(
+        source.get("toolUseResult")
+        or source.get("tool_use_result")
+        or result_item.get("toolUseResult")
+        or result_item.get("tool_use_result")
+    )
+    agent_id = _bounded_interaction_text(
+        result.get("agentId")
+        or result.get("agent_id")
+        or result_item.get("agentId")
+        or result_item.get("agent_id"),
+        512,
+    ).strip()
+    has_agent_evidence = bool(
+        launch_event
+        or agent_id
+        or any(
+            key in result
+            for key in (
+                "agentType",
+                "agent_type",
+                "isBackground",
+                "is_background",
+            )
+        )
+    )
+    if not has_agent_evidence:
+        return None
+    kind, status = _claude_agent_result_kind(result, result_item)
+    label = str((launch_event or {}).get("label") or "Subagent")
+    event = {
+        **(launch_event or {}),
+        "version": 2,
+        "source": "claude_agent",
+        "agent_tool_use_id": launch_id,
+        "label": label,
+        "kind": kind,
+        "activity_type": "subagent",
+        "task_kind": "subagent",
+        "task_id": launch_id,
+        "status": status,
+    }
+    if agent_id:
+        event["agent_thread_id"] = agent_id
+    if isinstance(result.get("isBackground"), bool):
+        event["is_background"] = result["isBackground"]
+    elif isinstance(result.get("is_background"), bool):
+        event["is_background"] = result["is_background"]
+    result_details = _extract_tool_result_details(content)
+    result_summary = _bounded_interaction_text(
+        result_details[0] if result_details is not None else "",
+        4_000,
+    ).strip()
+    if result_summary:
+        event["result_summary"] = result_summary
+    return event
+
+
 def normalize_cursor_task_completion_event(
     value: object,
 ) -> dict[str, object] | None:
@@ -1262,29 +1433,70 @@ def parse_conversation_object(
             tool_result = _extract_tool_result_details(raw_content)
             if role == "user" and tool_result is not None:
                 result_content, tool_call_id = tool_result
+                agent_event = normalize_claude_agent_result_event(
+                    obj,
+                    raw_content,
+                    tool_call_id,
+                )
+                if agent_event is not None and timestamp:
+                    event_time_key = (
+                        "completed_at"
+                        if agent_event.get("kind") in {
+                            "completed",
+                            "interrupted",
+                            "failed",
+                        }
+                        else "started_at"
+                    )
+                    agent_event[event_time_key] = timestamp
                 return NormalizedMessage(
                     role="tool",
-                    content=result_content or "(tool returned no textual output)",
-                    tool_name="Tool result",
+                    content=(
+                        f"{agent_event['label']} {agent_event['kind']}"
+                        if agent_event is not None
+                        else result_content or "(tool returned no textual output)"
+                    ),
+                    tool_name=(
+                        "Agent activity"
+                        if agent_event is not None
+                        else "Tool result"
+                    ),
                     timestamp=timestamp,
-                    raw_type="tool_result",
+                    raw_type="agent_event" if agent_event is not None else "tool_result",
                     source_id=source_id,
                     tool_call_id=tool_call_id,
+                    agent_event=agent_event,
                 )
 
             tool_use = _extract_tool_use(raw_content)
             if role == "assistant" and tool_use is not None:
                 tool_name, tool_input, tool_call_id, interaction = tool_use
+                agent_event = normalize_claude_agent_launch_event(
+                    tool_name,
+                    tool_input,
+                    tool_call_id,
+                )
+                if agent_event is not None and timestamp:
+                    agent_event["started_at"] = timestamp
                 return NormalizedMessage(
                     role="tool",
-                    content=f"[{tool_name}]",
-                    tool_name=tool_name,
+                    content=(
+                        f"{agent_event['label']} started"
+                        if agent_event is not None
+                        else f"[{tool_name}]"
+                    ),
+                    tool_name=(
+                        "Agent activity"
+                        if agent_event is not None
+                        else tool_name
+                    ),
                     tool_input=tool_input,
                     timestamp=timestamp,
-                    raw_type="tool_use",
+                    raw_type="agent_event" if agent_event is not None else "tool_use",
                     source_id=source_id,
                     interaction=interaction,
                     tool_call_id=tool_call_id,
+                    agent_event=agent_event,
                 )
 
             # Extract thinking separately from final text (Claude extended thinking)
@@ -3679,16 +3891,32 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
             if tool_use is None:
                 continue
             tool_name, tool_input, tool_call_id, interaction = tool_use
+            agent_event = normalize_claude_agent_launch_event(
+                tool_name,
+                tool_input,
+                tool_call_id,
+            )
+            if agent_event is not None and timestamp:
+                agent_event["started_at"] = timestamp
             messages.append(NormalizedMessage(
                 role="tool",
-                content=f"[{tool_name}]",
-                tool_name=tool_name,
+                content=(
+                    f"{agent_event['label']} started"
+                    if agent_event is not None
+                    else f"[{tool_name}]"
+                ),
+                tool_name=(
+                    "Agent activity"
+                    if agent_event is not None
+                    else tool_name
+                ),
                 tool_input=tool_input,
                 timestamp=timestamp,
-                raw_type="tool_use",
+                raw_type="agent_event" if agent_event is not None else "tool_use",
                 source_id=_claude_part_source_id(source_id, "tool_use", index),
                 interaction=interaction,
                 tool_call_id=tool_call_id,
+                agent_event=agent_event,
             ))
             continue
 
@@ -3696,14 +3924,39 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
         if result is None:
             continue
         result_content, tool_call_id = result
+        agent_event = normalize_claude_agent_result_event(
+            obj,
+            [item],
+            tool_call_id,
+        )
+        if agent_event is not None and timestamp:
+            event_time_key = (
+                "completed_at"
+                if agent_event.get("kind") in {
+                    "completed",
+                    "interrupted",
+                    "failed",
+                }
+                else "started_at"
+            )
+            agent_event[event_time_key] = timestamp
         messages.append(NormalizedMessage(
             role="tool",
-            content=result_content or "(tool returned no textual output)",
-            tool_name="Tool result",
+            content=(
+                f"{agent_event['label']} {agent_event['kind']}"
+                if agent_event is not None
+                else result_content or "(tool returned no textual output)"
+            ),
+            tool_name=(
+                "Agent activity"
+                if agent_event is not None
+                else "Tool result"
+            ),
             timestamp=timestamp,
-            raw_type="tool_result",
+            raw_type="agent_event" if agent_event is not None else "tool_result",
             source_id=_claude_part_source_id(source_id, "tool_result", index),
             tool_call_id=tool_call_id,
+            agent_event=agent_event,
         ))
 
     flush_semantic_items()
@@ -3727,6 +3980,7 @@ def _iter_claude_conversation_messages(
     )
     seen_source_ids: set[str] = set()
     pending_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
+    agent_launches: dict[str, dict[str, object]] = {}
     pending_questions = {
         _coerce_text(interaction.get("id")): interaction
         for interaction in (initial_question_interactions or [])
@@ -3748,6 +4002,59 @@ def _iter_claude_conversation_messages(
         _update_assistant_identity(identity, source_object, "claude_code")
         for message in _parse_claude_record_messages(source_object):
             _attach_assistant_identity(message, identity)
+            event = message.agent_event
+            event_tool_use_id = _coerce_text(
+                (event or {}).get("agent_tool_use_id")
+            ).strip()
+            if (
+                event is not None
+                and event.get("source") == "claude_agent"
+                and event_tool_use_id
+            ):
+                launch = agent_launches.get(event_tool_use_id)
+                if launch is not None:
+                    result_label = _coerce_text(event.get("label")).strip()
+                    event = {
+                        **launch,
+                        **event,
+                        "label": (
+                            _coerce_text(launch.get("label")).strip()
+                            if not result_label or result_label == "Subagent"
+                            else result_label
+                        ),
+                    }
+                    message.agent_event = event
+                    message.content = f"{event['label']} {event['kind']}"
+                if event.get("kind") == "started":
+                    agent_launches[event_tool_use_id] = dict(event)
+            elif message.raw_type == "tool_result" and message.tool_call_id:
+                launch = agent_launches.get(message.tool_call_id)
+                if launch is not None:
+                    source_message = _as_mapping(
+                        _as_mapping(source_object).get("message")
+                    )
+                    event = normalize_claude_agent_result_event(
+                        source_object,
+                        source_message.get("content"),
+                        message.tool_call_id,
+                        launch,
+                    )
+                    if event is not None:
+                        if message.timestamp:
+                            event_time_key = (
+                                "completed_at"
+                                if event.get("kind") in {
+                                    "completed",
+                                    "interrupted",
+                                    "failed",
+                                }
+                                else "started_at"
+                            )
+                            event[event_time_key] = message.timestamp
+                        message.agent_event = event
+                        message.raw_type = "agent_event"
+                        message.tool_name = "Agent activity"
+                        message.content = f"{event['label']} {event['kind']}"
 
             if (
                 (message.role == "user" and message.raw_type == "user")

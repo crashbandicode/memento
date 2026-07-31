@@ -147,6 +147,8 @@ def is_meaningful_human_prompt(
     values = metadata or {}
     if role != "user" or not clean:
         return False
+    if str(values.get("message_origin") or "") == "parent_agent":
+        return False
     if clean.startswith("[Subagent Context]"):
         return False
     if isinstance(values.get("interaction_response"), dict):
@@ -502,7 +504,13 @@ def _write_message(
     if role not in {"user", "assistant", "tool"} and not options.include_session_context:
         return False
 
-    heading = "You" if role == "user" else role.title()
+    heading = (
+        "Parent agent"
+        if role == "user" and metadata.get("message_origin") == "parent_agent"
+        else "You"
+        if role == "user"
+        else role.title()
+    )
     _write(writer, f"### {heading}{timestamp}")
     _write(writer)
     _write(writer, message.content.strip() or "_Empty message._")

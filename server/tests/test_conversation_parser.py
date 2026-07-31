@@ -1806,6 +1806,209 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.tool_name, "Tool result")
         self.assertEqual(msg.content, "alpha-match-omega")
 
+    def test_claude_agent_foreground_lifecycle_uses_exact_tool_use_id(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "launch-row",
+                "timestamp": "2026-07-30T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-agent-one",
+                        "name": "Agent",
+                        "input": {
+                            "description": "Inspect lifecycle identity",
+                            "subagent_type": "general-purpose",
+                            "run_in_background": False,
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "result-row",
+                "timestamp": "2026-07-30T10:01:00Z",
+                "toolUseResult": {"agentId": "a1b2c3"},
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-agent-one",
+                        "content": "Implementation complete.",
+                    }],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual([message.raw_type for message in messages], [
+            "agent_event",
+            "agent_event",
+        ])
+        self.assertEqual(
+            [message.agent_event["kind"] for message in messages],
+            ["started", "completed"],
+        )
+        self.assertTrue(all(
+            message.agent_event["agent_tool_use_id"] == "toolu-agent-one"
+            for message in messages
+        ))
+        self.assertEqual(
+            messages[1].agent_event["agent_thread_id"],
+            "a1b2c3",
+        )
+        self.assertEqual(
+            messages[1].agent_event["label"],
+            "Inspect lifecycle identity",
+        )
+        self.assertEqual(
+            messages[1].agent_event["result_summary"],
+            "Implementation complete.",
+        )
+
+    def test_claude_agent_background_result_stays_running(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "background-launch",
+                "timestamp": "2026-07-30T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-background",
+                        "name": "Agent",
+                        "input": {
+                            "description": "Run background audit",
+                            "run_in_background": True,
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "background-enqueued",
+                "timestamp": "2026-07-30T10:00:01Z",
+                "toolUseResult": {
+                    "agentId": "background-agent",
+                    "isBackground": True,
+                },
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-background",
+                        "content": "Agent started in the background.",
+                    }],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(
+            [message.agent_event["kind"] for message in messages],
+            ["started", "started"],
+        )
+        self.assertEqual(
+            messages[-1].agent_event["label"],
+            "Run background audit",
+        )
+
+    def test_claude_agent_duplicate_descriptions_do_not_cross_correlate(self) -> None:
+        rows = []
+        for suffix in ("one", "two"):
+            rows.append(json.dumps({
+                "type": "assistant",
+                "uuid": f"launch-{suffix}",
+                "timestamp": "2026-07-30T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": f"toolu-{suffix}",
+                        "name": "Agent",
+                        "input": {"description": "Same description"},
+                    }],
+                },
+            }))
+        rows.append(json.dumps({
+            "type": "user",
+            "uuid": "result-two",
+            "timestamp": "2026-07-30T10:01:00Z",
+            "toolUseResult": {"agentId": "agent-two"},
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu-two",
+                    "content": "Done.",
+                }],
+            },
+        }))
+
+        messages = parse_conversation("\n".join(rows), "claude_code")
+
+        self.assertEqual(
+            [
+                (
+                    message.agent_event["agent_tool_use_id"],
+                    message.agent_event["kind"],
+                )
+                for message in messages
+            ],
+            [
+                ("toolu-one", "started"),
+                ("toolu-two", "started"),
+                ("toolu-two", "completed"),
+            ],
+        )
+
+    def test_claude_agent_source_status_preserves_terminal_outcomes(self) -> None:
+        for status, expected in (
+            ("failed", "failed"),
+            ("interrupted", "interrupted"),
+        ):
+            with self.subTest(status=status):
+                raw = "\n".join([
+                    json.dumps({
+                        "type": "assistant",
+                        "uuid": f"launch-{status}",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_use",
+                                "id": f"toolu-{status}",
+                                "name": "Agent",
+                                "input": {"description": f"{status} task"},
+                            }],
+                        },
+                    }),
+                    json.dumps({
+                        "type": "user",
+                        "uuid": f"result-{status}",
+                        "toolUseResult": {
+                            "agentId": f"agent-{status}",
+                            "status": status,
+                        },
+                        "message": {
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": f"toolu-{status}",
+                                "content": "source result",
+                            }],
+                        },
+                    }),
+                ])
+
+                messages = parse_conversation(raw, "claude_code")
+
+                self.assertEqual(messages[-1].agent_event["kind"], expected)
+
     def test_terminal_sequence_stripping_handles_csi_and_osc(self) -> None:
         value = "a\u001b[31mred\u001b[0m b\u001b]0;title\u0007c"
         self.assertEqual(strip_terminal_sequences(value), "ared bc")

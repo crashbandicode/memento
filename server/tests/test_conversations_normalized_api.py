@@ -136,6 +136,38 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         for statement in db.statements:
             self.assertNotIn("documents.content", str(statement.compile()))
 
+    async def test_claude_child_messages_expose_parent_agent_origin(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = (
+            "projects/demo/root-thread/subagents/agent-child.jsonl"
+        )
+        self.doc.metadata_.update({
+            "is_subagent": True,
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "agent-child",
+        })
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=1),
+                _Result(rows=[self.message(1, "user")]),
+            ]
+        )
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["messages"][0]["role"], "user")
+        self.assertEqual(payload["messages"][0]["origin"], "parent_agent")
+
     async def test_messages_return_exact_cursor_native_timestamp(self) -> None:
         self.doc.tool_id = "cursor"
         observed = self.message(6, "assistant")
@@ -564,6 +596,28 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         prompt_sql = str(db.statements[2].compile()).upper()
         self.assertNotIn(" LIMIT ", prompt_sql)
 
+    async def test_claude_child_parent_messages_are_not_prompt_navigation(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = (
+            "projects/demo/root-thread/subagents/agent-child.jsonl"
+        )
+        self.doc.metadata_.update({
+            "is_subagent": True,
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "agent-child",
+        })
+        db = _Db([_Result(scalar_value=self.doc)])
+
+        payload = await get_conversation_prompts(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload, {"prompts": []})
+        self.assertEqual(len(db.statements), 1)
+
     @patch(
         "server.api.conversations.suggest_corrected_query",
         new_callable=AsyncMock,
@@ -672,6 +726,83 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(hierarchy_sql.count("documents.metadata ->>"), 3)
         self.assertTrue(any(value == "root_session_id" for value in hierarchy_params))
         self.assertTrue(any(value == "session_id" for value in hierarchy_params))
+
+    async def test_direct_claude_child_api_uses_launch_description_title(self) -> None:
+        root_thread_id = "root-thread"
+        description = "Verify lifecycle exact matching"
+        self.doc.tool_id = "claude_code"
+        self.doc.title = "Raw parent dispatch"
+        self.doc.relative_path = (
+            f"projects/demo/{root_thread_id}/subagents/agent-child.jsonl"
+        )
+        self.doc.metadata_ = {
+            "session_id": "agent-child",
+            "root_session_id": root_thread_id,
+            "parent_thread_id": root_thread_id,
+            "is_subagent": True,
+            "agent_id": "child",
+            "agent_tool_use_id": "toolu-child",
+            "agent_launch_description": description,
+        }
+        root = SimpleNamespace(
+            id=uuid.uuid4(),
+            machine_id=self.doc.machine_id,
+            tool_id="claude_code",
+            title="Root title",
+            relative_path=f"projects/demo/{root_thread_id}.jsonl",
+            metadata_={"session_id": root_thread_id},
+            source_modified_at=self.now,
+            activity_at=self.now,
+            synced_at=self.now,
+            file_size_bytes=1024,
+        )
+        grandchild = SimpleNamespace(
+            id=uuid.uuid4(),
+            machine_id=self.doc.machine_id,
+            tool_id="claude_code",
+            title="Raw nested dispatch",
+            relative_path=(
+                f"projects/demo/{root_thread_id}/subagents/agent-child/"
+                "subagents/agent-grandchild.jsonl"
+            ),
+            metadata_={
+                "session_id": "agent-grandchild",
+                "root_session_id": root_thread_id,
+                "parent_thread_id": "agent-child",
+                "is_subagent": True,
+                "agent_depth": 2,
+                "agent_id": "grandchild",
+                "agent_tool_use_id": "toolu-grandchild",
+                "agent_launch_description": "Review nested lifecycle",
+            },
+            source_modified_at=self.now,
+            activity_at=self.now,
+            synced_at=self.now,
+            file_size_bytes=512,
+        )
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=2),
+                _Result(scalar_value=None),
+                _Result(rows=[root, self.doc, grandchild]),
+                _Result(rows=[]),
+            ]
+        )
+
+        payload = await get_conversation(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["title"], description)
+        self.assertEqual(payload["user_role_origin"], "parent_agent")
+        self.assertEqual(payload["subagent_count"], 1)
+        self.assertEqual(
+            payload["subagents"][0]["title"],
+            "Review nested lifecycle",
+        )
 
     def test_location_falls_back_to_absolute_project_source_path(self) -> None:
         document = SimpleNamespace(

@@ -12,6 +12,8 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     ConversationRef,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_display_title,
+    conversation_user_role_origin,
     effective_conversation_timestamp,
     fold_codex_subagents,
     fold_conversation_subagents,
@@ -371,6 +373,8 @@ class ConversationHierarchyTests(unittest.TestCase):
                 "agent_launch_description": (
                     "Hoist wave engine into WaveDrainEngine mixin"
                 ),
+                "agent_id": "afceda9d5a896fb52",
+                "agent_tool_use_id": "toolu-launch-wave-engine",
             },
             title="TOOLING — HARD RULES...",
             activity_at=child.activity_at,
@@ -384,6 +388,55 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertEqual(
             summaries["root"][0]["title"],
             "Hoist wave engine into WaveDrainEngine mixin",
+        )
+        self.assertEqual(
+            summaries["root"][0]["agent_tool_use_id"],
+            "toolu-launch-wave-engine",
+        )
+        self.assertEqual(
+            summaries["root"][0]["user_role_origin"],
+            "parent_agent",
+        )
+
+    def test_claude_display_title_override_is_child_only(self) -> None:
+        description = "Inspect lifecycle exact matching"
+        child_path = "projects/demo/root/subagents/agent-child.jsonl"
+
+        self.assertEqual(
+            conversation_display_title(
+                "claude_code",
+                child_path,
+                {
+                    "is_subagent": True,
+                    "agent_launch_description": description,
+                },
+                "Raw first prompt",
+            ),
+            description,
+        )
+        self.assertEqual(
+            conversation_user_role_origin(
+                "claude_code",
+                child_path,
+                {"is_subagent": True},
+            ),
+            "parent_agent",
+        )
+        self.assertEqual(
+            conversation_display_title(
+                "claude_code",
+                "projects/demo/root.jsonl",
+                {"agent_launch_description": description},
+                "Root title",
+            ),
+            "Root title",
+        )
+        self.assertIsNone(
+            conversation_user_role_origin(
+                "claude_code",
+                "projects/demo/root.jsonl",
+                {},
+            )
         )
 
     def test_lifecycle_event_surfaces_child_before_document_ingest(self) -> None:
@@ -424,6 +477,75 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertEqual(summaries[0]["id"], "child-document")
         self.assertTrue(summaries[0]["document_ready"])
         self.assertEqual(summaries[0]["agent_nickname"], "Franklin the 2nd")
+        self.assertEqual(summaries[0]["status"], "completed")
+
+    def test_claude_lifecycle_reconciles_tool_use_to_sidecar_agent_id(self) -> None:
+        summaries = merge_subagent_event_summaries([{
+            "id": "child-document",
+            "session_id": "agent-afceda9d5a896fb52",
+            "agent_id": "afceda9d5a896fb52",
+            "agent_tool_use_id": "toolu-agent-launch",
+            "title": "Inspect exact lifecycle identity",
+        }], [
+            {
+                "agent_tool_use_id": "toolu-agent-launch",
+                "label": "Inspect exact lifecycle identity",
+                "kind": "started",
+                "timestamp": "2026-07-30T10:00:00Z",
+            },
+            {
+                "agent_tool_use_id": "toolu-agent-launch",
+                "agent_thread_id": "afceda9d5a896fb52",
+                "label": "Inspect exact lifecycle identity",
+                "kind": "completed",
+                "timestamp": "2026-07-30T10:01:00Z",
+            },
+        ])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["id"], "child-document")
+        self.assertEqual(summaries[0]["status"], "completed")
+        self.assertEqual(
+            summaries[0]["completed_at"],
+            "2026-07-30T10:01:00Z",
+        )
+
+    def test_claude_duplicate_descriptions_remain_distinct_lifecycle_cards(self) -> None:
+        summaries = merge_subagent_event_summaries([], [
+            {
+                "agent_tool_use_id": "toolu-one",
+                "label": "Same description",
+                "kind": "started",
+            },
+            {
+                "agent_tool_use_id": "toolu-two",
+                "label": "Same description",
+                "kind": "started",
+            },
+        ])
+
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(
+            {summary["agent_tool_use_id"] for summary in summaries},
+            {"toolu-one", "toolu-two"},
+        )
+
+    def test_terminal_lifecycle_status_is_not_reopened_by_replayed_launch(self) -> None:
+        summaries = merge_subagent_event_summaries([], [
+            {
+                "agent_tool_use_id": "toolu-terminal",
+                "label": "Terminal task",
+                "kind": "completed",
+                "timestamp": "2026-07-30T10:01:00Z",
+            },
+            {
+                "agent_tool_use_id": "toolu-terminal",
+                "label": "Terminal task",
+                "kind": "started",
+                "timestamp": "2026-07-30T10:00:00Z",
+            },
+        ])
+
         self.assertEqual(summaries[0]["status"], "completed")
 
     def test_lifecycle_merge_carries_source_model_and_both_times(self) -> None:

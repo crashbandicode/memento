@@ -36,7 +36,9 @@ from ..services.conversation_activity import is_low_activity_summary
 from ..services.conversation_hierarchy import (
     ConversationRef,
     build_logical_activity_map,
+    conversation_display_title,
     conversation_root_thread_id,
+    conversation_user_role_origin,
     current_thread_id,
     fold_conversation_subagents,
     is_conversation_subagent,
@@ -226,7 +228,7 @@ def _line_span_predicate(line_number, spans: tuple[tuple[int, int | None], ...])
 
 async def _selection_plan(
     db: AsyncSession,
-    document_id: uuid.UUID,
+    document: _ExportDocument,
     normalized_count: int,
     options: MarkdownExportOptions,
 ) -> _SelectionPlan:
@@ -237,6 +239,12 @@ async def _selection_plan(
     )
     if not filtered or normalized_count == 0:
         return _SelectionPlan(None, {})
+    if conversation_user_role_origin(
+        document.tool_id,
+        document.relative_path,
+        document.metadata,
+    ) == "parent_agent":
+        return _SelectionPlan((), {})
 
     rows = (
         await db.execute(
@@ -245,7 +253,7 @@ async def _selection_plan(
                 ConversationMessage.timestamp,
             )
             .where(
-                ConversationMessage.document_id == document_id,
+                ConversationMessage.document_id == document.id,
                 ConversationMessage.role == "user",
                 func.length(func.trim(ConversationMessage.content)) > 0,
                 ~ConversationMessage.content.startswith("[Subagent Context]"),
@@ -304,12 +312,23 @@ async def _message_stream(
                 plan.spans,
             ))
         stream = await db.stream_scalars(query)
+        user_role_origin = conversation_user_role_origin(
+            document.tool_id,
+            document.relative_path,
+            document.metadata,
+        )
         async for message in stream:
+            metadata = dict(message.metadata_ or {})
+            if (
+                user_role_origin
+                and (message.role or message.message_type) == "user"
+            ):
+                metadata["message_origin"] = user_role_origin
             yield ExportMessage(
                 line_number=message.line_number,
                 role=message.role or message.message_type or "system",
                 content=message.content or "",
-                metadata=message.metadata_ or {},
+                metadata=metadata,
                 timestamp=message.timestamp,
                 message_type=message.message_type or "",
                 prompt_number=plan.prompt_numbers.get(message.line_number),
@@ -323,8 +342,15 @@ async def _message_stream(
     ).scalar_one_or_none()
     if not raw_content:
         return
+    user_role_origin = conversation_user_role_origin(
+        document.tool_id,
+        document.relative_path,
+        document.metadata,
+    )
     for index, message in enumerate(parse_conversation(raw_content, document.tool_id), start=1):
         metadata: dict[str, Any] = {}
+        if user_role_origin and message.role == "user":
+            metadata["message_origin"] = user_role_origin
         if message.thinking:
             metadata["thinking"] = message.thinking
         if message.tool_name:
@@ -423,7 +449,7 @@ async def _write_document(
 ) -> None:
     if message_count is None:
         message_count = await _message_count(db, document.id)
-    plan = await _selection_plan(db, document.id, message_count, options)
+    plan = await _selection_plan(db, document, message_count, options)
     await write_conversation_markdown(
         writer,
         _markdown_info(document, message_count),
@@ -468,12 +494,20 @@ async def _load_document(
 
 
 def _row_document(row: Mapping[str, Any]) -> _ExportDocument:
+    metadata = row["metadata_"] or {}
     return _ExportDocument(
         id=row["id"],
         tool_id=row["tool_id"],
-        title=row["title"] or row["relative_path"] or "Untitled conversation",
+        title=conversation_display_title(
+            row["tool_id"],
+            row["relative_path"],
+            metadata,
+            row["title"],
+        )
+        or row["relative_path"]
+        or "Untitled conversation",
         relative_path=row["relative_path"],
-        metadata=row["metadata_"] or {},
+        metadata=metadata,
         activity_at=row["activity_at"],
         source_modified_at=row["source_modified_at"],
         synced_at=row["synced_at"],
@@ -727,7 +761,16 @@ async def _select_global_documents(
         options.prompt_selection,
         options.start_at,
         options.end_at,
-        set(documents_by_id),
+        {
+            document.id
+            for document in documents
+            if conversation_user_role_origin(
+                document.tool_id,
+                document.relative_path,
+                document.metadata,
+            )
+            != "parent_agent"
+        },
     )
     if prompt_ids is not None:
         matched_ids.intersection_update(prompt_ids)

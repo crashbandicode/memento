@@ -88,9 +88,11 @@ export default function ConversationPage() {
   const currentAgentNickname = typeof currentMeta?.metadata?.agent_nickname === "string"
     ? currentMeta.metadata.agent_nickname
     : "";
-  const currentAgentLabel = currentAgentPath
-    ? humanizeAgentPath(currentAgentPath)
+  const currentAgentLaunchDescription = typeof currentMeta?.metadata?.agent_launch_description === "string"
+    ? currentMeta.metadata.agent_launch_description.trim()
     : "";
+  const currentAgentLabel = currentAgentLaunchDescription
+    || (currentAgentPath ? humanizeAgentPath(currentAgentPath) : "");
   const hasDiagnostics = currentMeta?.tool_id === "antigravity" && diagnostics && Object.keys(diagnostics).length > 0;
   const activityTimestamp = currentMeta ? new Date(currentMeta.activity_at || currentMeta.synced_at).toLocaleString(locale, {
     year: "numeric",
@@ -127,7 +129,7 @@ export default function ConversationPage() {
               <span>{currentMeta.message_count} {t.conversation.messages}</span>
               {currentAgentLabel && (
                 <span
-                  title={currentAgentPath}
+                  title={currentAgentPath || currentAgentLaunchDescription}
                   style={{
                     display: "inline-flex",
                     alignItems: "center",
@@ -236,6 +238,7 @@ export default function ConversationPage() {
         prompts={prompts}
         syncVersion={syncVersion}
         toolId={currentMeta?.tool_id}
+        userRoleOrigin={currentMeta?.user_role_origin}
         totalMessages={currentMeta?.message_count}
         activeTaskState={currentMeta?.active_task_state}
         artifacts={plans}

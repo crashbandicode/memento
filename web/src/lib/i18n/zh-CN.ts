@@ -185,6 +185,8 @@ const zhCN = {
     collapse: "收起",
     expandAll: "展开全部",
     subagentDispatch: "子任务派发",
+    parentAgent: "父代理",
+    parentAgentDispatch: "任务派发",
     sessionContext: "会话上下文",
     additionalDirectives: "附加指令",
     additionalDirectivesHint: "此任务的产品与会话指导",

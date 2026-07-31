@@ -26,9 +26,13 @@ from ..services.conversation_hierarchy import (
     build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_display_title,
+    conversation_user_role_origin,
+    current_thread_id,
     effective_conversation_timestamp,
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
+    is_conversation_subagent,
     merge_subagent_event_summaries,
 )
 from ..services.conversation_markdown import (
@@ -330,40 +334,82 @@ async def get_conversation(
             hierarchy,
             hierarchy_refs,
         )
-        subagents = build_subagent_summaries(
+        subagents_by_parent = build_subagent_summaries(
             hierarchy,
             hierarchy_refs,
-        ).get(doc.id, [])
+        )
+        summary_parent_id = hierarchy.canonical_document_ids.get(doc.id, doc.id)
+        subagents = subagents_by_parent.get(summary_parent_id, [])
+        current_is_subagent = is_conversation_subagent(
+            doc.tool_id,
+            doc.relative_path,
+            doc.metadata_,
+        )
+        lifecycle_document_ids = (
+            [doc.id]
+            if current_is_subagent
+            else [item.id for item in hierarchy_docs]
+        )
         lifecycle_rows = (
             await db.execute(
                 select(
+                    ConversationMessage.document_id,
                     ConversationMessage.metadata_,
                     ConversationMessage.timestamp,
                 )
                 .where(
-                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.document_id.in_(lifecycle_document_ids),
                     ConversationMessage.metadata_.op("?")("agent_event"),
-                    func.coalesce(
-                        func.jsonb_extract_path_text(
-                            ConversationMessage.metadata_,
-                            "agent_event",
-                            "agent_thread_id",
-                        ),
-                        "",
-                    )
-                    != "",
+                    or_(
+                        func.coalesce(
+                            func.jsonb_extract_path_text(
+                                ConversationMessage.metadata_,
+                                "agent_event",
+                                "agent_thread_id",
+                            ),
+                            "",
+                        )
+                        != "",
+                        func.coalesce(
+                            func.jsonb_extract_path_text(
+                                ConversationMessage.metadata_,
+                                "agent_event",
+                                "agent_tool_use_id",
+                            ),
+                            "",
+                        )
+                        != "",
+                    ),
                 )
-                .order_by(ConversationMessage.line_number)
+                .order_by(
+                    ConversationMessage.timestamp,
+                    ConversationMessage.document_id,
+                    ConversationMessage.line_number,
+                )
             )
         ).all()
+        refs_by_id = {item.document_id: item for item in hierarchy_refs}
         lifecycle_events: list[dict] = []
-        for metadata, timestamp in lifecycle_rows:
+        for source_document_id, metadata, timestamp in lifecycle_rows:
             event = _stored_agent_event(metadata)
             if event is None:
                 continue
+            source_ref = refs_by_id.get(source_document_id)
+            source_metadata = source_ref.metadata if source_ref is not None else {}
+            try:
+                source_depth = int((source_metadata or {}).get("agent_depth") or 0)
+            except (TypeError, ValueError):
+                source_depth = 0
             lifecycle_events.append(
                 {
                     **event,
+                    "parent_thread_id": current_thread_id(source_metadata),
+                    "agent_depth": source_depth + 1,
+                    "user_role_origin": (
+                        "parent_agent"
+                        if doc.tool_id == "claude_code"
+                        else None
+                    ),
                     "timestamp": timestamp.isoformat() if timestamp else None,
                 }
             )
@@ -371,6 +417,13 @@ async def get_conversation(
             subagents,
             lifecycle_events,
         )
+        if current_is_subagent:
+            current_thread = current_thread_id(doc.metadata_)
+            subagents = [
+                child
+                for child in subagents
+                if child.get("parent_thread_id") == current_thread
+            ]
         is_subagent_orphan = doc.id in hierarchy.orphan_document_ids
 
     # Find related brain artifacts (same session_id)
@@ -423,9 +476,19 @@ async def get_conversation(
     return {
         "id": str(doc.id),
         "tool_id": doc.tool_id,
-        "title": doc.title,
+        "title": conversation_display_title(
+            doc.tool_id,
+            doc.relative_path,
+            doc.metadata_,
+            doc.title,
+        ),
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
+        "user_role_origin": conversation_user_role_origin(
+            doc.tool_id,
+            doc.relative_path,
+            doc.metadata_,
+        ),
         "location": _conversation_location(doc),
         "active_task_state": active_task_state,
         "pending_question_count": _pending_question_count(doc.metadata_),
@@ -457,6 +520,11 @@ async def get_conversation_messages(
 ) -> dict:
     """Get paginated, human-readable conversation messages."""
     doc = await _get_conversation_identity(db, _user, doc_id)
+    user_role_origin = conversation_user_role_origin(
+        doc.tool_id,
+        doc.relative_path,
+        doc.metadata_,
+    )
 
     # Prefer normalized rows. They are indexed by document and line number,
     # preserve the viewer fields, and avoid reparsing the raw transcript for
@@ -499,6 +567,11 @@ async def get_conversation_messages(
                     "id": m.id,
                     "line_number": m.line_number,
                     "role": m.role or m.message_type,
+                    "origin": (
+                        user_role_origin
+                        if (m.role or m.message_type) == "user"
+                        else None
+                    ),
                     "content": m.content,
                     "thinking": (
                         (m.metadata_ or {}).get("thinking") if m.metadata_ else None
@@ -547,6 +620,7 @@ async def get_conversation_messages(
                     "id": offset + i,
                     "line_number": offset + i + 1,
                     "role": m.role,
+                    "origin": user_role_origin if m.role == "user" else None,
                     "content": m.content,
                     "thinking": m.thinking or None,
                     "model": m.model,
@@ -579,8 +653,22 @@ async def get_pending_conversation_interactions(
 ) -> dict:
     """Return unresolved questions independently of transcript pagination."""
     doc = await _get_conversation_identity(db, _user, doc_id)
-    source_documents = {doc.id: doc.title}
+    source_documents = {
+        doc.id: conversation_display_title(
+            doc.tool_id,
+            doc.relative_path,
+            doc.metadata_,
+            doc.title,
+        )
+    }
     source_metadata = {doc.id: doc.metadata_}
+    source_origins = {
+        doc.id: conversation_user_role_origin(
+            doc.tool_id,
+            doc.relative_path,
+            doc.metadata_,
+        )
+    }
 
     if doc.tool_id in FOLDABLE_CONVERSATION_TOOLS:
         current_ref = ConversationRef(
@@ -608,8 +696,18 @@ async def get_pending_conversation_interactions(
             )
         ).all()
         for companion_id, companion_title, companion_metadata in companion_rows:
-            source_documents[companion_id] = companion_title
+            source_documents[companion_id] = conversation_display_title(
+                doc.tool_id,
+                None,
+                companion_metadata,
+                companion_title,
+            )
             source_metadata[companion_id] = companion_metadata
+            source_origins[companion_id] = conversation_user_role_origin(
+                doc.tool_id,
+                None,
+                companion_metadata,
+            )
 
     rows = (
         (
@@ -641,6 +739,9 @@ async def get_pending_conversation_interactions(
     inferred_responses: dict[str, tuple[ConversationMessage, dict]] = {}
     for message in rows:
         document_open_ids = open_ids.setdefault(message.document_id, set())
+        message_metadata = dict(message.metadata_ or {})
+        if source_origins.get(message.document_id):
+            message_metadata["message_origin"] = source_origins[message.document_id]
         message_interactions = _message_question_interactions(message.metadata_)
         for interaction in message_interactions:
             interaction_id = str(interaction.get("id") or "").strip()
@@ -674,7 +775,7 @@ async def get_pending_conversation_interactions(
                     document_open_ids.discard(interaction_id)
         if response is None and is_meaningful_human_prompt(
             message.content,
-            message.metadata_,
+            message_metadata,
             message.role,
         ):
             for interaction_id in document_open_ids:
@@ -692,7 +793,7 @@ async def get_pending_conversation_interactions(
             document_open_ids.clear()
         if is_meaningful_human_turn(
             message.content,
-            message.metadata_,
+            message_metadata,
             message.role,
         ):
             if response is not None:
@@ -864,7 +965,12 @@ async def search_conversation_messages(
     editor search. The existing ``messages?line_number=`` endpoint loads the
     bounded rendering window when a hit is selected.
     """
-    await _get_conversation_identity(db, _user, doc_id)
+    doc = await _get_conversation_identity(db, _user, doc_id)
+    user_role_origin = conversation_user_role_origin(
+        doc.tool_id,
+        doc.relative_path,
+        doc.metadata_,
+    )
 
     query_text = normalize_search_query(q)
     if not query_text:
@@ -935,6 +1041,11 @@ async def search_conversation_messages(
                 "id": row["id"],
                 "line_number": row["line_number"],
                 "role": row["role"],
+                "origin": (
+                    user_role_origin
+                    if row["role"] == "user"
+                    else None
+                ),
                 "snippet": make_search_snippet(row["content"], row["snippet_query"]),
                 "timestamp": (
                     row["timestamp"].isoformat() if row["timestamp"] else None
@@ -958,6 +1069,12 @@ async def get_conversation_prompts(
 ) -> dict:
     """Return a lightweight outline of every meaningful human prompt."""
     doc = await _get_conversation_identity(db, _user, doc_id)
+    if conversation_user_role_origin(
+        doc.tool_id,
+        doc.relative_path,
+        doc.metadata_,
+    ) == "parent_agent":
+        return {"prompts": []}
 
     normalized_count = (
         await db.execute(

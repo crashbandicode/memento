@@ -144,7 +144,11 @@ export default function SubagentBadge({
   const visibleSubagents = filteredSubagents.slice(0, DEFAULT_VISIBLE_AGENTS);
 
   const togglePreview = async (subagent: ConversationSubagentSummary) => {
-    const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
+    const key = subagent.agent_tool_use_id
+      || subagent.session_id
+      || subagent.id
+      || subagent.agent_path
+      || subagent.title;
     if (expandedKey === key) {
       setExpandedKey(null);
       return;
@@ -248,7 +252,11 @@ export default function SubagentBadge({
             <div ref={listRef} className={styles.list} data-subagent-list>
               {visibleSubagents.map((subagent) => {
                 const isMatched = Boolean(matchedSubagentId && subagent.id === matchedSubagentId);
-                const key = subagent.session_id || subagent.id || subagent.agent_path || subagent.title;
+                const key = subagent.agent_tool_use_id
+                  || subagent.session_id
+                  || subagent.id
+                  || subagent.agent_path
+                  || subagent.title;
                 const expanded = expandedKey === key;
                 const preview = previews[key];
                 const hasDistinctNickname = Boolean(
@@ -258,6 +266,8 @@ export default function SubagentBadge({
                 const modelLabel = formatAssistantModelLabel(subagent.model);
                 const startedAt = formatSubagentTime(subagent.started_at);
                 const completedAt = formatSubagentTime(subagent.completed_at);
+                const status = subagent.status || "unknown";
+                const statusLabel = formatSubagentStatus(status);
                 return (
                   <div
                     key={key}
@@ -273,9 +283,16 @@ export default function SubagentBadge({
                       <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
                       <span className={styles.agentText}>
                         <span className={styles.agentTitle}>{subagent.title}</span>
-                        <span className={styles.agentMeta}>
-                          <span className={`${styles.statusDot} ${styles[`status_${subagent.status || "unknown"}`]}`} />
-                          {subagent.status && subagent.status !== "unknown" ? subagent.status : "Subagent"}
+                        <span
+                          className={styles.agentMeta}
+                          aria-label={`Subagent status: ${statusLabel}`}
+                          title={`Status: ${statusLabel}`}
+                        >
+                          <span
+                            className={`${styles.statusDot} ${styles[`status_${status}`]}`}
+                            aria-hidden="true"
+                          />
+                          <span className={styles.statusText}>{statusLabel}</span>
                           {typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
                           {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
                           {subagent.document_ready === false ? " · transcript syncing" : ""}
@@ -354,6 +371,18 @@ function formatSubagentTime(value?: string | null): { short: string; full: strin
     }),
     full: parsed.toLocaleString(),
   };
+}
+
+function formatSubagentStatus(
+  status: NonNullable<ConversationSubagentSummary["status"]>,
+): string {
+  return {
+    running: "Running",
+    completed: "Completed",
+    interrupted: "Interrupted",
+    failed: "Failed",
+    unknown: "Unknown",
+  }[status];
 }
 
 function SubagentPreview({
@@ -471,11 +500,18 @@ function previewRowsFromMessage(message: ConversationMessage): PreviewRow[] {
   }
 
   if (content && !placeholder) {
+    const isParentAgent = role === "user" && message.origin === "parent_agent";
     values.push({
       key: `${message.id}-content`,
-      kind: role,
+      kind: isParentAgent ? "parent" : role,
       label: formatPreviewLabel(
-        role === "assistant" ? "Response" : role === "user" ? "Prompt" : toolName || "Tool",
+        role === "assistant"
+          ? "Response"
+          : isParentAgent
+            ? "Parent agent"
+            : role === "user"
+              ? "Prompt"
+              : toolName || "Tool",
       ),
       content,
     });

@@ -219,6 +219,8 @@ export interface DocumentDetail {
 export interface ConversationSubagentSummary {
   id: string | null;
   session_id: string | null;
+  agent_id?: string | null;
+  agent_tool_use_id?: string | null;
   title: string;
   agent_nickname?: string | null;
   agent_path?: string | null;
@@ -229,6 +231,7 @@ export interface ConversationSubagentSummary {
   activity_at?: string | null;
   synced_at?: string | null;
   document_ready?: boolean;
+  user_role_origin?: "parent_agent" | null;
   status?: "running" | "completed" | "interrupted" | "failed" | "unknown";
   last_event_at?: string | null;
   model?: string | null;
@@ -265,6 +268,7 @@ export interface ConversationMeta {
   title: string | null;
   relative_path: string;
   metadata: Record<string, unknown>;
+  user_role_origin?: "parent_agent" | null;
   location?: ConversationLocation | null;
   active_task_state?: ConversationTaskState | null;
   pending_question_count?: number;
@@ -390,6 +394,7 @@ export interface ConversationMessage {
   line_number: number;
   message_type?: string | null;
   role: string | null;
+  origin?: "parent_agent" | null;
   content: string;
   thinking?: string | null;
   model?: string | null;
@@ -412,8 +417,12 @@ export interface ConversationMessage {
 
 export interface ConversationAgentEvent {
   version: number;
+  source?: string;
   agent_path?: string;
   agent_thread_id?: string;
+  agent_tool_use_id?: string;
+  agent_type?: string;
+  is_background?: boolean;
   label?: string;
   kind: "started" | "updated" | "completed" | "interrupted" | "failed" | "snapshot";
   activity_type?: "subagent" | "shell" | "task";
@@ -535,6 +544,7 @@ export interface ConversationSearchHit {
   id: number;
   line_number: number;
   role: "user" | "assistant" | string;
+  origin?: "parent_agent" | null;
   snippet: string;
   timestamp: string | null;
   score: number;

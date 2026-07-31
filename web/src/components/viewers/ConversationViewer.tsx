@@ -44,6 +44,11 @@ import {
   pushSearchHistory,
   readSearchHistory,
 } from "@/lib/search-history";
+import {
+  contextBeforeIncludingTarget,
+  mergeMessagesChronologically,
+  placeTargetWindow,
+} from "@/lib/conversation-message-order";
 
 interface Artifact {
   id: string;
@@ -232,16 +237,12 @@ function isSubagentDispatchMessage(msg: ConversationMessage): boolean {
     || content.includes("\n[Subagent Context]");
 }
 
-function mergeMessagesChronologically(
-  current: ConversationMessage[],
-  incoming: ConversationMessage[],
-): ConversationMessage[] {
-  const byId = new Map(current.map((message) => [String(message.id), message]));
-  incoming.forEach((message) => byId.set(String(message.id), message));
-  return Array.from(byId.values()).sort((left, right) => {
-    const lineDifference = left.line_number - right.line_number;
-    return lineDifference || String(left.id).localeCompare(String(right.id));
-  });
+function isParentAgentMessage(
+  msg: ConversationMessage,
+  userRoleOrigin?: "parent_agent" | null,
+): boolean {
+  return (msg.role || msg.message_type) === "user"
+    && (msg.origin === "parent_agent" || userRoleOrigin === "parent_agent");
 }
 
 type PairedQuestionResponse = {
@@ -266,11 +267,18 @@ function messageVisibilityGroups(
   msg: ConversationMessage,
   toolId: string,
   questionResponses: ReadonlyMap<string, PairedQuestionResponse>,
+  userRoleOrigin?: "parent_agent" | null,
 ): ConversationVisibilityKey[] {
   const role = msg.role || msg.message_type || "unknown";
   if (isScheduledSystemContent(msg.content)) return ["context"];
   if (msg.interaction_response && !messageOwnsQuestionResponse(msg)) return ["user"];
-  if (role === "user") return [isSubagentDispatchMessage(msg) ? "context" : "user"];
+  if (role === "user") {
+    return [
+      isParentAgentMessage(msg, userRoleOrigin) || isSubagentDispatchMessage(msg)
+        ? "context"
+        : "user",
+    ];
+  }
   if (role === "assistant") {
     const groups = new Set<ConversationVisibilityKey>();
     const { narrative, toolCalls } = assistantDisplayParts(msg, toolId);
@@ -333,6 +341,7 @@ export default function ConversationViewer({
   prompts,
   syncVersion,
   toolId,
+  userRoleOrigin,
   totalMessages,
   activeTaskState,
   artifacts,
@@ -341,6 +350,7 @@ export default function ConversationViewer({
   prompts: ConversationPrompt[];
   syncVersion: number;
   toolId?: string;
+  userRoleOrigin?: "parent_agent" | null;
   totalMessages?: number;
   activeTaskState?: ConversationTaskState | null;
   artifacts?: Artifact[];
@@ -838,18 +848,29 @@ export default function ConversationViewer({
           && !nextMessages.some((message) => message.line_number === scrollLine)
           && !(nextDetachedTail?.messages.some((message) => message.line_number === scrollLine))
         ) {
+          // Keep context_before below limit so the server window necessarily
+          // contains the requested row. Using the full prompt-to-target gap
+          // could put the target beyond a 120-row response.
           const aroundScroll = await api.getMessagesAround(
             documentId,
             scrollLine,
-            Math.min(200, Math.max(PROMPT_JUMP_CONTEXT_BEFORE, scrollLine - lineNumber)),
+            contextBeforeIncludingTarget(
+              PROMPT_JUMP_CONTEXT_BEFORE,
+              PROMPT_JUMP_WINDOW_SIZE,
+            ),
             PROMPT_JUMP_WINDOW_SIZE,
           );
-          nextMessages = mergeMessagesChronologically(nextMessages, aroundScroll.messages);
-          contiguousEnd = Math.max(
+          const placedTarget = placeTargetWindow(
+            nextMessages,
             contiguousEnd,
-            aroundScroll.offset + aroundScroll.messages.length,
+            aroundScroll,
           );
-          nextDetachedTail = null;
+          nextMessages = placedTarget.messages;
+          contiguousEnd = placedTarget.contiguousEnd;
+          // The owning prompt turn and target row may be separate ranges. Keep
+          // that gap explicit so scrolling cannot treat missing rows as a
+          // contiguous page or advance offsetRef past unread messages.
+          nextDetachedTail = placedTarget.detached;
         }
         setKnownTotal(response.total);
         startOffsetRef.current = response.offset;
@@ -926,11 +947,17 @@ export default function ConversationViewer({
     }
     const isHumanPrompt = (msg.role || msg.message_type) === "user"
       && !msg.interaction_response
-      && !msg.content.includes("[Subagent Context]")
+      && !isParentAgentMessage(msg, userRoleOrigin)
+      && !isSubagentDispatchMessage(msg)
       && !isScheduledSystemContent(msg.content)
       && !/<system_notification\b/i.test(msg.content)
       && !/the following task has finished/i.test(msg.content);
-    const visibilityGroups = messageVisibilityGroups(msg, toolId || "", questionResponses);
+    const visibilityGroups = messageVisibilityGroups(
+      msg,
+      toolId || "",
+      questionResponses,
+      userRoleOrigin,
+    );
     const messageCategory = visibilityGroups[0] || "context";
     const hasPendingQuestion = Boolean(
       (msg.interaction?.id && !questionResponses.has(msg.interaction.id))
@@ -957,6 +984,7 @@ export default function ConversationViewer({
           <ChatBubble
             msg={msg}
             toolId={toolId}
+            userRoleOrigin={userRoleOrigin}
             locale={locale}
             t={t}
             questionResponses={questionResponses}
@@ -978,6 +1006,7 @@ export default function ConversationViewer({
       <ConversationSearchBar
         documentId={documentId}
         syncVersion={syncVersion}
+        userRoleOrigin={userRoleOrigin}
         onSelectLine={navigateToLine}
         t={t}
       />
@@ -1052,6 +1081,10 @@ export default function ConversationViewer({
         data-conversation-viewer
         data-loaded-messages={visibleMessages.length}
         data-has-earlier={hasEarlier ? "true" : "false"}
+        data-contiguous-start={startOffsetRef.current}
+        data-contiguous-end={offsetRef.current}
+        data-detached-start={detachedTail?.offset}
+        data-detached-end={detachedTail?.endOffset}
         onScroll={handleScroll}
         className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
       >
@@ -1329,11 +1362,13 @@ function ConversationVisibilityControls({
 function ConversationSearchBar({
   documentId,
   syncVersion,
+  userRoleOrigin,
   onSelectLine,
   t,
 }: {
   documentId: string;
   syncVersion: number;
+  userRoleOrigin?: "parent_agent" | null;
   onSelectLine: (lineNumber: number) => void | Promise<void>;
   t: ReturnType<typeof useI18n>["t"];
 }) {
@@ -1637,7 +1672,13 @@ function ConversationSearchBar({
             >
               <span style={{ display: "flex", gap: 7, alignItems: "center", marginBottom: 4, fontSize: 10, color: "var(--aurora-fg4)" }}>
                 <span style={{ color: result.role === "user" ? "var(--aurora-accent)" : "var(--aurora-success)" }}>
-                  {result.role === "user" ? t.searchPage.you : t.searchPage.assistant}
+                  {result.role === "user"
+                    ? (
+                        result.origin === "parent_agent" || userRoleOrigin === "parent_agent"
+                          ? t.conversation.parentAgent
+                          : t.searchPage.you
+                      )
+                    : t.searchPage.assistant}
                 </span>
                 {result.match_type === "fuzzy" && <span>{t.searchPage.fuzzyMatch}</span>}
                 <span style={{ marginLeft: "auto" }}>#{result.line_number}</span>
@@ -3350,13 +3391,20 @@ export function conversationMessageMarkdown(
   toolId: string,
   locale: string,
   questionResponses: ReadonlyMap<string, PairedQuestionResponse> = new Map(),
+  userRoleOrigin?: "parent_agent" | null,
 ): string {
   const role = msg.role || msg.message_type || "unknown";
   const content = cleanTerminalText(msg.content);
   const roleLabel = isScheduledSystemContent(content)
     ? "Scheduled automation"
     : role === "user"
-    ? (isSubagentDispatchMessage(msg) ? "Subagent dispatch" : "You")
+    ? (
+        isParentAgentMessage(msg, userRoleOrigin)
+          ? "Parent agent"
+          : isSubagentDispatchMessage(msg)
+            ? "Subagent dispatch"
+            : "You"
+      )
     : role === "assistant"
       ? "Assistant"
       : role === "tool"
@@ -3867,6 +3915,7 @@ function AgentActivityCard({
 export const ChatBubble = memo(function ChatBubble({
   msg,
   toolId = "",
+  userRoleOrigin,
   locale,
   t,
   questionResponses = new Map(),
@@ -3880,6 +3929,7 @@ export const ChatBubble = memo(function ChatBubble({
 }: {
   msg: ConversationMessage;
   toolId?: string;
+  userRoleOrigin?: "parent_agent" | null;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
   questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
@@ -3906,8 +3956,14 @@ export const ChatBubble = memo(function ChatBubble({
   const [expanded, setExpanded] = useState(false);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const messageMarkdown = useMemo(
-    () => conversationMessageMarkdown(msg, toolId, locale, questionResponses),
-    [locale, msg, questionResponses, toolId],
+    () => conversationMessageMarkdown(
+      msg,
+      toolId,
+      locale,
+      questionResponses,
+      userRoleOrigin,
+    ),
+    [locale, msg, questionResponses, toolId, userRoleOrigin],
   );
   const withCopyControls = (node: ReactNode) => (
     <MessageCopyFrame markdown={messageMarkdown} t={t}>{node}</MessageCopyFrame>
@@ -3955,13 +4011,17 @@ export const ChatBubble = memo(function ChatBubble({
   // dispatch, not a human chat. Render these as a gray "子任务派发" card
   // (centered, muted) so users don't mistake them for their own chat input.
   if (role === "user") {
-    const isSubagentDispatch = content.startsWith("[Subagent Context]")
-      || content.includes("\n[Subagent Context]");
-    if (isSubagentDispatch) {
+    const isParentDispatch = isParentAgentMessage(msg, userRoleOrigin);
+    const isSubagentDispatch = isSubagentDispatchMessage(msg);
+    if (isParentDispatch || isSubagentDispatch) {
       const isLong = content.length > 300;
       const displayContent = isLong && !expanded ? content.slice(0, 300) + "..." : content;
       return withCopyControls(
-        <div style={{ display: "flex", justifyContent: "center", margin: "6px 0" }}>
+        <div
+          data-parent-agent-message={isParentDispatch ? "true" : undefined}
+          data-subagent-dispatch={isSubagentDispatch ? "true" : undefined}
+          style={{ display: "flex", justifyContent: "center", margin: "6px 0" }}
+        >
           <div
             style={{
               maxWidth: "92%",
@@ -3989,7 +4049,16 @@ export const ChatBubble = memo(function ChatBubble({
               alignItems: "center",
               gap: 6,
             }}>
-              <span>{t.conversation.subagentDispatch}</span>
+              <span>
+                {isParentDispatch
+                  ? t.conversation.parentAgent
+                  : t.conversation.subagentDispatch}
+              </span>
+              {isParentDispatch && (
+                <span style={{ opacity: 0.72, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>
+                  · {t.conversation.parentAgentDispatch}
+                </span>
+              )}
               {msg.timestamp && (
                 <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0, color: "var(--aurora-fg4)" }}>
                   · {new Date(msg.timestamp).toLocaleString(locale)}

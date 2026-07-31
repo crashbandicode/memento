@@ -71,6 +71,20 @@ class MeaningfulHumanPromptTests(unittest.TestCase):
             )
         )
 
+    def test_parent_agent_dispatch_is_not_a_human_prompt(self) -> None:
+        self.assertFalse(
+            is_meaningful_human_prompt(
+                "Inspect the lifecycle parser.",
+                {"message_origin": "parent_agent"},
+            )
+        )
+        self.assertTrue(
+            is_meaningful_human_prompt(
+                "Inspect the lifecycle parser.",
+                {},
+            )
+        )
+
 
 class PromptSelectionTests(unittest.TestCase):
     def test_parses_merges_and_supports_open_end(self) -> None:
@@ -275,6 +289,24 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertNotIn("Keep `C:\\work\\repo` unchanged.", hidden_text)
         self.assertIn("Ship the requested fix", hidden_text)
         self.assertEqual(hidden_stats.prompts_seen, 1)
+
+    def test_parent_agent_messages_render_without_human_prompt_attribution(self) -> None:
+        items = [
+            message(
+                1,
+                "user",
+                "Inspect the lifecycle parser.",
+                metadata={"message_origin": "parent_agent"},
+            ),
+            message(2, "assistant", "Inspection complete."),
+        ]
+
+        text, stats = self.render(items)
+
+        self.assertIn("### Parent agent", text)
+        self.assertNotIn("## Prompt 1 — You", text)
+        self.assertNotIn("### You", text)
+        self.assertEqual(stats.prompts_seen, 0)
 
     def test_display_filter_parity_keeps_selected_categories(self) -> None:
         items = [

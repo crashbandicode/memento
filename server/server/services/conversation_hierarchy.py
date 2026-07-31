@@ -125,6 +125,58 @@ def is_conversation_subagent(
     )
 
 
+def conversation_display_title(
+    tool_id: str | None,
+    relative_path: str | None,
+    metadata: Mapping[str, Any] | None,
+    source_title: str | None,
+) -> str | None:
+    """Return a presentation title without changing the source document title."""
+    values = metadata or {}
+    if (
+        tool_id == "claude_code"
+        and (
+            is_conversation_subagent(tool_id, relative_path, values)
+            or (
+                bool(values.get("is_subagent"))
+                and bool(
+                    values.get("parent_thread_id")
+                    or values.get("root_session_id")
+                )
+            )
+        )
+    ):
+        launch_description = str(
+            values.get("agent_launch_description") or ""
+        ).strip()
+        if launch_description:
+            return launch_description
+    return source_title
+
+
+def conversation_user_role_origin(
+    tool_id: str | None,
+    relative_path: str | None,
+    metadata: Mapping[str, Any] | None,
+) -> str | None:
+    """Identify native Claude child user turns as parent-agent messages."""
+    if (
+        tool_id == "claude_code"
+        and (
+            is_conversation_subagent(tool_id, relative_path, metadata)
+            or (
+                bool((metadata or {}).get("is_subagent"))
+                and bool(
+                    (metadata or {}).get("parent_thread_id")
+                    or (metadata or {}).get("root_session_id")
+                )
+            )
+        )
+    ):
+        return "parent_agent"
+    return None
+
+
 def conversation_root_thread_id(
     tool_id: str | None,
     relative_path: str | None,
@@ -328,11 +380,16 @@ def build_subagent_summaries(
                 continue
             metadata = child.metadata or {}
             thread_id = current_thread_id(metadata)
+            agent_id = str(metadata.get("agent_id") or "").strip() or None
+            agent_tool_use_id = (
+                str(metadata.get("agent_tool_use_id") or "").strip() or None
+            )
             nickname = metadata.get("agent_nickname")
             launch_description = (
                 str(metadata.get("agent_launch_description") or "").strip()
-                or None
-            )
+                if child.tool_id == "claude_code"
+                else ""
+            ) or None
             agent_path = metadata.get("agent_path")
             agent_path_label = (
                 str(agent_path).strip("/").rsplit("/", 1)[-1]
@@ -353,6 +410,8 @@ def build_subagent_summaries(
             children.append({
                 "id": str(child.document_id),
                 "session_id": thread_id,
+                "agent_id": agent_id,
+                "agent_tool_use_id": agent_tool_use_id,
                 "title": (
                     launch_description
                     or agent_path_label
@@ -371,6 +430,11 @@ def build_subagent_summaries(
                 "activity_at": timestamp.isoformat() if timestamp else None,
                 "synced_at": (
                     child.synced_at.isoformat() if child.synced_at else None
+                ),
+                "user_role_origin": conversation_user_role_origin(
+                    child.tool_id,
+                    child.relative_path,
+                    metadata,
                 ),
                 "model": model,
                 "started_at": None,
@@ -396,15 +460,27 @@ def merge_subagent_event_summaries(
     """
 
     merged = [dict(summary) for summary in summaries]
-    by_thread = {
-        str(summary.get("session_id")): summary
-        for summary in merged
-        if summary.get("session_id")
-    }
+    by_thread: dict[str, dict[str, Any]] = {}
+    by_tool_use: dict[str, dict[str, Any]] = {}
+
+    def register(summary: dict[str, Any]) -> None:
+        for value in (summary.get("session_id"), summary.get("agent_id")):
+            identity = str(value or "").strip()
+            if identity:
+                by_thread[identity] = summary
+        tool_use_id = str(summary.get("agent_tool_use_id") or "").strip()
+        if tool_use_id:
+            by_tool_use[tool_use_id] = summary
+
+    for summary in merged:
+        register(summary)
+
+    terminal_statuses = {"completed", "interrupted", "failed"}
     for item in events:
         thread_id = str(item.get("agent_thread_id") or "").strip()
+        tool_use_id = str(item.get("agent_tool_use_id") or "").strip()
         agent_path = str(item.get("agent_path") or "").strip()
-        if not thread_id or not agent_path:
+        if not thread_id and not tool_use_id:
             continue
         kind = str(item.get("kind") or "updated").strip().casefold()
         status = {
@@ -424,58 +500,102 @@ def merge_subagent_event_summaries(
             if kind in {"completed", "interrupted", "failed"}
             else None
         )
-        existing = by_thread.get(thread_id)
+        existing = (
+            by_tool_use.get(tool_use_id)
+            if tool_use_id
+            else None
+        ) or (
+            by_thread.get(thread_id)
+            if thread_id
+            else None
+        )
         if existing is None:
             label = str(item.get("label") or "").strip()
             if not label:
-                label = " ".join(
-                    agent_path.rstrip("/").rsplit("/", 1)[-1]
-                    .replace("_", " ")
-                    .replace("-", " ")
-                    .split()
+                label = (
+                    " ".join(
+                        agent_path.rstrip("/").rsplit("/", 1)[-1]
+                        .replace("_", " ")
+                        .replace("-", " ")
+                        .split()
+                    )
+                    if agent_path
+                    else ""
                 ) or "Subagent"
             existing = {
                 "id": None,
-                "session_id": thread_id,
+                "session_id": thread_id or None,
+                "agent_id": thread_id or None,
+                "agent_tool_use_id": tool_use_id or None,
                 "title": label,
                 "agent_nickname": None,
-                "agent_path": agent_path,
-                "agent_depth": None,
-                "parent_thread_id": None,
+                "agent_path": agent_path or None,
+                "agent_depth": item.get("agent_depth"),
+                "parent_thread_id": item.get("parent_thread_id"),
                 "relative_path": None,
                 "timestamp": item.get("timestamp"),
                 "activity_at": item.get("timestamp"),
                 "synced_at": None,
                 "document_ready": False,
+                "user_role_origin": item.get("user_role_origin"),
                 "model": event_model,
                 "started_at": started_at,
                 "completed_at": completed_at,
             }
             merged.append(existing)
-            by_thread[thread_id] = existing
+            register(existing)
         else:
             existing["document_ready"] = bool(existing.get("id"))
             # Path-linked children often arrive with a first-prompt title and no
             # agent_path. Overlay the shared lifecycle identity when missing so
             # Cursor/Claude cards match Codex presentation quality.
-            if agent_path and not existing.get("agent_path"):
+            filled_agent_path = bool(agent_path and not existing.get("agent_path"))
+            if filled_agent_path:
                 existing["agent_path"] = agent_path
-                label = str(item.get("label") or "").strip()
-                if label:
-                    existing["title"] = label
+            label = str(item.get("label") or "").strip()
+            if (
+                label
+                and label != "Subagent"
+                and (
+                    tool_use_id
+                    or filled_agent_path
+                )
+            ):
+                existing["title"] = label
+            if thread_id and not existing.get("agent_id"):
+                existing["agent_id"] = thread_id
+            if thread_id and not existing.get("session_id"):
+                existing["session_id"] = thread_id
+            if tool_use_id and not existing.get("agent_tool_use_id"):
+                existing["agent_tool_use_id"] = tool_use_id
+            if item.get("parent_thread_id") and not existing.get("parent_thread_id"):
+                existing["parent_thread_id"] = item.get("parent_thread_id")
+            if item.get("agent_depth") is not None and existing.get("agent_depth") is None:
+                existing["agent_depth"] = item.get("agent_depth")
+            register(existing)
         if event_model and not existing.get("model"):
             existing["model"] = event_model
         if started_at and not existing.get("started_at"):
             existing["started_at"] = started_at
         if completed_at:
             existing["completed_at"] = completed_at
-        existing["status"] = status
-        existing["last_event_at"] = event_timestamp
+        previous_status = str(existing.get("status") or "unknown")
+        # A terminal source event is sticky for a unique launch tool-use ID.
+        # Replayed/out-of-order launch rows must never turn a finished child green.
+        if not (
+            previous_status in terminal_statuses
+            and status == "running"
+        ):
+            existing["status"] = status
+            existing["last_event_at"] = event_timestamp
 
     for summary in merged:
         summary.setdefault("document_ready", bool(summary.get("id")))
         summary.setdefault("status", "unknown")
         summary.setdefault("last_event_at", None)
+        summary.setdefault("agent_id", None)
+        summary.setdefault("agent_tool_use_id", None)
+        summary.setdefault("user_role_origin", None)
         summary.setdefault("model", None)
         summary.setdefault("started_at", None)
         summary.setdefault("completed_at", None)
