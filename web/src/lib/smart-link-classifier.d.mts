@@ -17,12 +17,21 @@ export type SmartLinkInfo =
       ref: string;
       domain: string;
     }
-  | { kind: "web"; href: string; label: string; domain: string };
+  | { kind: "web"; href: string; label: string; domain: string }
+  | {
+      kind: "canvas";
+      href: string;
+      label: string;
+      name: string;
+      path: string;
+      domain?: string;
+    };
 
 export type SmartCodeInfo =
   | { kind: "plain"; value: string }
   | { kind: "file"; value: string; display: string }
-  | { kind: "sha"; value: string; display: string };
+  | { kind: "sha"; value: string; display: string }
+  | { kind: "canvas"; value: string; display: string; path: string };
 
 export function looksLikeFilePath(value: string): boolean;
 export function displayFileName(value: string): string;

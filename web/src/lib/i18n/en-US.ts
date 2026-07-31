@@ -177,6 +177,18 @@ const enUS: Translations = {
     offlineVscdbFallback: "Recovered from local Antigravity session state",
     offlinePbFallback: "Recovered from local protobuf cache",
     collapse: "Collapse",
+    canvas: {
+      chip: "Canvas",
+      eyebrow: "Cursor Canvas",
+      close: "Close canvas viewer",
+      copySource: "Copy source",
+      openExternal: "Open in new tab",
+      loading: "Loading canvas…",
+      loadError: "The canvas content could not be loaded.",
+      unavailableTitle: "This canvas can't be previewed",
+      unavailableBody:
+        "Memento stores the conversation transcript, not the compiled Cursor Canvas. Rendering a .canvas.tsx file needs the Cursor editor and its canvas SDK, so it can't be shown interactively here. The canvas location recorded in the conversation is below.",
+    },
     expandAll: "Expand All",
     subagentDispatch: "Subagent dispatch",
     parentAgent: "Parent agent",

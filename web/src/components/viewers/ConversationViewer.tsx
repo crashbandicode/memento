@@ -4182,7 +4182,7 @@ export const ChatBubble = memo(function ChatBubble({
               }}
             >
               <div className="prose prose-sm max-w-none">
-                <MarkdownViewer content={displayContent} />
+                <MarkdownViewer content={displayContent} canvases={msg.canvases} />
               </div>
               {isLong && (
                 <MessageExpandButton
@@ -4320,7 +4320,7 @@ export const ChatBubble = memo(function ChatBubble({
                 >
                   {showAssistant && displayContent && (
                     <div className="prose prose-sm max-w-none">
-                      <MarkdownViewer content={displayContent} />
+                      <MarkdownViewer content={displayContent} canvases={msg.canvases} />
                     </div>
                   )}
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: showAssistant && displayContent ? 8 : 0 }}>

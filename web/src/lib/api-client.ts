@@ -157,6 +157,9 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
 
 // --- Types ---
 
+import type { CanvasArtifact } from "./canvas-artifact.mjs";
+export type { CanvasArtifact };
+
 export interface ToolSummary {
   id: string;
   display_name: string;
@@ -410,6 +413,7 @@ export interface ConversationMessage {
   interaction_response?: QuestionInteractionResponse | null;
   task_state?: ConversationTaskState | null;
   agent_event?: ConversationAgentEvent | null;
+  canvases?: CanvasArtifact[] | null;
   raw_type?: string;
   metadata?: Record<string, unknown>;
   timestamp: string | null;

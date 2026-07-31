@@ -1,3 +1,9 @@
+import {
+  canvasDisplayName,
+  isSafeCanvasPath,
+  looksLikeCanvasArtifact,
+} from "./canvas-artifact.mjs";
+
 const FILE_EXTENSION = /\.(?:c|cc|cpp|cs|css|csv|dockerfile|go|h|hpp|html?|ini|java|js|jsx|json|jsonl|kt|kts|lock|log|lua|md|mdx|mjs|mts|php|plist|properties|proto|ps1|py|rb|rs|scss|sh|sql|svg|swift|toml|ts|tsx|txt|vue|xml|ya?ml)(?:[?#].*)?$/i;
 const SPECIAL_FILE = /(?:^|[/\\])(?:AGENTS\.md|Dockerfile|Gemfile|HANDOFF\.md|LICENSE|Makefile|Procfile|README|Tiltfile)(?:[?#].*)?$/i;
 const SHA = /^[0-9a-f]{7,40}$/i;
@@ -84,6 +90,20 @@ export function classifySmartLink(href, label = "") {
 
   if (!HTTP.test(normalizedHref)) {
     const path = normalizedCandidate(normalizedHref || normalizedLabel);
+    const canvasTarget = looksLikeCanvasArtifact(path) ? path : normalizedLabel;
+    if (
+      (looksLikeCanvasArtifact(path) || looksLikeCanvasArtifact(normalizedLabel))
+      && isSafeCanvasPath(canvasTarget)
+    ) {
+      const labelIsCanvas = !normalizedLabel || looksLikeCanvasArtifact(normalizedLabel);
+      return {
+        kind: "canvas",
+        href: normalizedHref,
+        label: labelIsCanvas ? canvasDisplayName(canvasTarget) : normalizedLabel,
+        name: canvasDisplayName(canvasTarget),
+        path: canvasTarget || normalizedLabel,
+      };
+    }
     if (looksLikeFilePath(path) || looksLikeFilePath(normalizedLabel)) {
       const labelIsPath = !normalizedLabel || looksLikeFilePath(normalizedLabel);
       return {
@@ -134,6 +154,18 @@ export function classifySmartLink(href, label = "") {
   }
 
   const decodedPath = safeDecode(url.pathname);
+  if (looksLikeCanvasArtifact(decodedPath) && isSafeCanvasPath(decodedPath)) {
+    return {
+      kind: "canvas",
+      href: normalizedHref,
+      label: rawLinkLabel(normalizedLabel, normalizedHref)
+        ? canvasDisplayName(decodedPath)
+        : normalizedLabel,
+      name: canvasDisplayName(decodedPath),
+      path: `${url.hostname}${decodedPath}`,
+      domain: url.hostname,
+    };
+  }
   if (looksLikeFilePath(decodedPath)) {
     return {
       kind: "file",
@@ -159,6 +191,14 @@ export function classifyInlineCode(value) {
   if (!normalized || /[\r\n]/.test(normalized)) return { kind: "plain", value };
   if (SHA.test(normalized)) {
     return { kind: "sha", value: normalized, display: normalized.slice(0, 10) };
+  }
+  if (looksLikeCanvasArtifact(normalized) && isSafeCanvasPath(normalized)) {
+    return {
+      kind: "canvas",
+      value: normalized,
+      display: canvasDisplayName(normalized),
+      path: normalized,
+    };
   }
   if (looksLikeFilePath(normalized)) {
     return { kind: "file", value: normalized, display: displayFileName(normalized) };

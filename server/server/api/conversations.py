@@ -35,6 +35,7 @@ from ..services.conversation_hierarchy import (
     is_conversation_subagent,
     merge_subagent_event_summaries,
 )
+from ..services.canvas_artifacts import detect_message_canvases
 from ..services.conversation_markdown import (
     is_meaningful_human_prompt,
     is_meaningful_human_turn,
@@ -62,6 +63,12 @@ from ..services.message_search import (
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+
+def _canvas_field(content: str | None) -> dict:
+    """Attach validated Cursor Canvas descriptors only when a message has any."""
+    canvases = detect_message_canvases(content)
+    return {"canvases": canvases} if canvases else {}
 
 _MACHINE_PLATFORM_SUFFIX_RE = re.compile(
     r"\s+\((?:darwin|linux|windows)\)\s*$",
@@ -596,6 +603,7 @@ async def get_conversation_messages(
                     "agent_event": _stored_agent_event(m.metadata_),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
+                    **_canvas_field(m.content),
                 }
                 for m in messages
             ],
@@ -640,6 +648,7 @@ async def get_conversation_messages(
                     "agent_event": m.agent_event,
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
+                    **_canvas_field(m.content),
                 }
                 for i, m in enumerate(page)
             ],
