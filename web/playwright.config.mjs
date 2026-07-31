@@ -1,6 +1,12 @@
 // @ts-check
 import { defineConfig, devices } from "@playwright/test";
 
+const port = Number.parseInt(process.env.MEMENTO_E2E_PORT ?? "3100", 10);
+if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+  throw new Error(`Invalid MEMENTO_E2E_PORT: ${process.env.MEMENTO_E2E_PORT}`);
+}
+const baseURL = `http://127.0.0.1:${port}`;
+
 /**
  * Playwright configuration for the Memento web regression suite (Workstream D).
  *
@@ -9,15 +15,15 @@ import { defineConfig, devices } from "@playwright/test";
  * A local `next dev` server renders the REAL app so the tests exercise the real
  * ConversationViewer / SubagentBadge / prompt navigator rendering paths.
  *
- * PREREQUISITES (kept out of package.json intentionally — this is an additive,
- * test-only harness that must not perturb the app's dependency set):
+ * PREREQUISITES:
  *   1. Node.js >= 20 (Next 16 and Playwright both require it; the repo's system
- *      node is 18, so use nvm/fnm or the Windows Node 24 toolchain).
- *   2. npm i -D @playwright/test
+ *      node is 18, so use the user-local Node 24 install under ~/.local).
+ *   2. npm ci
  *   3. npx playwright install chromium      (NO `install-deps`, NO sudo)
  *
  * RUN:
- *   npx playwright test -c playwright.config.mjs            # all specs
+ *   ./run-playwright.ps1                                     # durable WSL setup
+ *   npx playwright test -c playwright.config.mjs            # Node >= 20 on PATH
  *   npx playwright test -c playwright.config.mjs --list     # enumerate only
  *
  * The suite runs single-worker on purpose to keep machine load low (no large
@@ -33,7 +39,7 @@ export default defineConfig({
   timeout: 30_000,
   expect: { timeout: 7_500 },
   use: {
-    baseURL: "http://localhost:3100",
+    baseURL,
     viewport: { width: 1440, height: 900 },
     trace: "retain-on-failure",
   },
@@ -44,11 +50,11 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npm run dev -- -p 3100",
-    url: "http://localhost:3100/auth/login",
-    reuseExistingServer: true,
+    command: `npm run dev -- -H 127.0.0.1 -p ${port}`,
+    url: `${baseURL}/auth/login`,
+    reuseExistingServer: false,
     timeout: 120_000,
     // Same-origin API base → intercepted requests need no CORS negotiation.
-    env: { NEXT_PUBLIC_MEMENTO_API_BASE: "http://localhost:3100" },
+    env: { NEXT_PUBLIC_MEMENTO_API_BASE: baseURL },
   },
 });

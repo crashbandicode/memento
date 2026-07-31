@@ -9,6 +9,16 @@ This document is the canonical bug-fix / regression handoff for conversation att
 
 Related architecture context: [project-architecture.md](./project-architecture.md), [collector-architecture.md](./collector-architecture.md).
 
+## Browser E2E rerun
+
+Node 24 is installed for `patrick` at `~/.local/node-current`, `@playwright/test` is a web dev dependency, and Chromium is stored in the user-owned `~/.cache/ms-playwright` cache. The WSL host also has Chromium's `libnspr4`/`libnss3` runtime packages. From the repository root, run:
+
+```powershell
+/usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File ./web/run-playwright.ps1
+```
+
+This durable user-owned setup was validated with the full hermetic Chromium suite: **11/11 passed**.
+
 ---
 
 ## Bugs fixed
@@ -164,9 +174,9 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 | Parent-agent origin / sticky lifecycle (`83951fb`) | hierarchy + parser + normalized API tests | unit / API | covered |
 | AskUserQuestion vs PermissionRequest wrapper (`7cb05b0`) | collector + parser + thread_metadata + normalized API tests | unit / API | covered |
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
-| Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run needs Node ≥20) |
+| Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run verified on Node 24) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
-| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (10/10 hermetic Chromium tests on Node 24) |
+| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (11/11 hermetic Chromium tests on Node 24) |
 
 ---
 
@@ -177,7 +187,7 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
 3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
 4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (10/10) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
+5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (11/11) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
 6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
 7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 

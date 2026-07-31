@@ -2797,7 +2797,10 @@ function QuestionInteractionCard({
 }: {
   interaction: QuestionInteraction;
   pairedResponse?: PairedQuestionResponse;
-  identity?: Pick<ConversationMessage, "model" | "reasoning_effort" | "service_tier" | "agent_mode">;
+  identity?: Pick<
+    ConversationMessage,
+    "line_number" | "model" | "reasoning_effort" | "service_tier" | "agent_mode"
+  >;
   t: ReturnType<typeof useI18n>["t"];
 }) {
   const response = pairedResponse?.response;
@@ -2827,13 +2830,15 @@ function QuestionInteractionCard({
       data-question-interaction={interaction.id}
       className="mx-0.5 min-w-0 sm:mx-1"
     >
-      {pairedResponse && (
+      {pairedResponse
+        && pairedResponse.message.line_number !== identity?.line_number
+        && (
         <span
           id={`conversation-line-${pairedResponse.message.line_number}`}
           aria-hidden="true"
           style={{ display: "block", position: "relative", top: -8, scrollMarginTop: 16 }}
         />
-      )}
+        )}
       <div
         style={{
           width: "100%",

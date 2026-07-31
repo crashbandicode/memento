@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import {
   metadataOnlyPrompts,
   permissionWrappedQuestion,
+  sameRowQuestionResponse,
 } from "./fixtures/conversation-scenarios.mjs";
 import { openConversation, transcript } from "./support/conversation-page.mjs";
 
@@ -42,6 +43,15 @@ test.describe("prompt visibility & question wrapper unwrap", () => {
     await expect(
       transcript(page).getByText("Which database should power the new service?"),
     ).toHaveCount(1);
+  });
+
+  test("question and response on one row share one navigation anchor", async ({ page }) => {
+    await openConversation(page, sameRowQuestionResponse);
+
+    await expect(
+      transcript(page).locator('[data-question-interaction="int-cancelled-db"]'),
+    ).toHaveCount(1);
+    await expect(page.locator("#conversation-line-2")).toHaveCount(1);
   });
 
   test("live prompt outline appears on metadata-only ingest with no SSE stream [regression #2]", async ({ page }) => {

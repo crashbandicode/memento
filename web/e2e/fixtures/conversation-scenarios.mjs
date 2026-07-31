@@ -131,6 +131,73 @@ export const permissionWrappedQuestion = {
 };
 
 /**
+ * A normalized historical tool row can own both its question and its response.
+ * The viewer must not add a second DOM navigation anchor for the same line.
+ */
+export const sameRowQuestionResponse = {
+  docId: "conv-same-row-question-response",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-same-row-question-response",
+    tool_id: "cursor",
+    title: "Cancelled question",
+    relative_path: "cursor/sessions/cancelled-question.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    pending_question_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Ask me which database to use.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "tool",
+      content: "Status: cancelled\n\n{}",
+      interaction: /** @type {QuestionInteraction} */ ({
+        kind: "question",
+        id: "int-cancelled-db",
+        source: "cursor",
+        tool_name: "ask_question",
+        questions: [
+          {
+            id: "db",
+            header: "DATABASE",
+            prompt: "Which database should power the service?",
+            type: "single_select",
+            allow_custom: false,
+            options: [
+              { id: "postgres", label: "PostgreSQL" },
+              { id: "mysql", label: "MySQL" },
+            ],
+          },
+        ],
+      }),
+      interaction_response: {
+        kind: "question_response",
+        interaction_id: "int-cancelled-db",
+        status: "cancelled",
+        answers: [],
+        raw_text: "{}",
+      },
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Ask me which database to use.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
+/**
  * Regression #2 — missing live prompt on metadata-only ingest (no SSE).
  *
  * The prompt outline is delivered purely by GET .../prompts. The SSE stream is
