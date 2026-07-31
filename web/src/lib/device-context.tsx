@@ -6,6 +6,9 @@ import { getStoredAuthToken } from "./auth-storage";
 
 type Device = DeviceSummary;
 
+const DEVICE_SCOPE_STORAGE_KEY = "dr_device_scope_v2";
+const LEGACY_DEVICE_SCOPE_STORAGE_KEY = "dr_device_id";
+
 interface DeviceState {
   devices: Device[];
   selectedDeviceId: string | null; // null = all devices
@@ -25,11 +28,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   // Lazy init from localStorage — avoids setState-in-effect rule.
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(() => {
     if (typeof window === "undefined") return null;
-    const saved = localStorage.getItem("dr_device_id");
+    const saved = localStorage.getItem(DEVICE_SCOPE_STORAGE_KEY);
     return saved && saved !== "all" ? saved : null;
   });
 
   useEffect(() => {
+    // v1 device scope could silently disagree with the all-device dashboard.
+    // Ignore it once so stale browser-specific selections (especially on
+    // mobile) cannot hide conversations after this consistency fix.
+    localStorage.removeItem(LEGACY_DEVICE_SCOPE_STORAGE_KEY);
+
     // Only fetch if logged in
     const token = getStoredAuthToken();
     if (token) {
@@ -38,7 +46,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           setDevices(nextDevices);
           setSelectedDeviceId((current) => {
             if (current && !nextDevices.some((device) => device.device_id === current)) {
-              localStorage.setItem("dr_device_id", "all");
+              localStorage.setItem(DEVICE_SCOPE_STORAGE_KEY, "all");
               return null;
             }
             return current;
@@ -50,7 +58,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
 
   const handleSelect = (id: string | null) => {
     setSelectedDeviceId(id);
-    localStorage.setItem("dr_device_id", id || "all");
+    localStorage.setItem(DEVICE_SCOPE_STORAGE_KEY, id || "all");
   };
 
   const deviceParam = selectedDeviceId ? `&device_id=${selectedDeviceId}` : "";

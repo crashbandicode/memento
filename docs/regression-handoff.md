@@ -1,9 +1,9 @@
 # Regression handoff — conversation UX & live interactions
 
 **Date:** 2026-07-31  
-**Covered versions:** v0.1.44 → v0.1.51  
-**HEAD:** see release tag `v0.1.51`  
-**Status:** v0.1.51 includes the shared smart-link renderer and the post-v0.1.50 Claude lifecycle fix.
+**Covered versions:** v0.1.44 → v0.1.52
+**HEAD:** see release tag `v0.1.52`
+**Status:** v0.1.52 fixes stale mobile device scope and keeps dashboard/tool counts consistent; v0.1.51 includes the shared smart-link renderer and Claude lifecycle fix.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -138,6 +138,14 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 - **Key files:** `web/src/components/viewers/SmartLink.tsx`, `SmartLink.module.css`, `MarkdownViewer.tsx`, `ConversationViewer.tsx`, `web/src/lib/smart-link-classifier.mjs`
 - **Tests:** `web/tests/smart-link-classifier.test.mjs`; fixture invariants in `web/e2e/fixtures/mock-router.test.mjs`; real Chromium assertions for all three tool ids in `web/e2e/smart-links.spec.mjs`.
 
+### 15. v0.1.52 — consistent mobile dashboard/tool device scope
+
+- **Symptom:** On a phone, the all-device dashboard showed multiple Claude Code conversations, but tapping its Claude card opened a tool page reporting exactly one file. Desktop looked correct because its browser had a different saved device selection.
+- **Root cause:** `DeviceProvider` restored the browser-local legacy `dr_device_id`; tool and project requests applied it as `device_id`, while the dashboard request ignored it. Production data made the mismatch exact: the saved Butterbridge scope had one Claude config file and no Claude conversations, while Yoga held the conversation set.
+- **Fix:** Reset the ambiguous legacy scope once via the versioned `dr_device_scope_v2` key, defaulting upgraded browsers to All Devices. Dashboard requests now apply an intentional current device scope just like tool requests, so counts and navigation cannot silently disagree. This shared context/query path covers every tool, not only Claude Code.
+- **Key files:** `web/src/lib/device-context.tsx`, `web/src/app/app/page.tsx`
+- **Tests:** `web/e2e/mobile-tool-browse.spec.mjs` uses a 472×1024 viewport and fixtures that reproduce all-device `3` versus Butterbridge `1`; it proves legacy mobile state opens all three Claude conversations and proves a new intentional device scope keeps dashboard/tool counts at one. Router fixture behavior is also covered in `web/e2e/fixtures/mock-router.test.mjs`.
+
 ---
 
 ## Test coverage matrix
@@ -166,7 +174,8 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
 | Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run needs Node ≥20) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
-| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (10/10 hermetic Chromium tests on Node 24) |
+| Mobile dashboard/tool device-scope consistency (v0.1.52) | `mock-router.test.mjs`, `mobile-tool-browse.spec.mjs` | unit / mobile Playwright | covered (legacy reset + intentional scope) |
+| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (12/12 hermetic Chromium tests across Node 22/24) |
 
 ---
 
@@ -177,7 +186,7 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
 3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
 4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (10/10) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
+5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (21/21), and the original 10-test Chromium suite plus the two mobile scope regressions pass across Node 22/24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
 6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
 7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 

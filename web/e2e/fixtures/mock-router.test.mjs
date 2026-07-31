@@ -28,6 +28,10 @@ import {
   scenarios,
   smartLinkScenarios,
 } from "./conversation-scenarios.mjs";
+import {
+  BUTTERBRIDGE_DEVICE_ID,
+  mobileToolBrowse,
+} from "./tool-browse-scenario.mjs";
 
 const base = "http://localhost:3100";
 
@@ -117,6 +121,33 @@ test("shell collection routes tolerate trailing slashes", () => {
     scenario: metadataOnlyPrompts,
   });
   assert.deepEqual(hierarchy.json, []);
+});
+
+test("tool browse fixtures distinguish all-device and persisted device scope", () => {
+  const globalDashboard = resolveConversationRoute({
+    url: `${base}/api/dashboard?tz_offset=240`,
+    scenario: mobileToolBrowse,
+  });
+  assert.equal(globalDashboard.json.tools[0].total_files, 3);
+
+  const scopedDashboard = resolveConversationRoute({
+    url: `${base}/api/dashboard?tz_offset=240&device_id=${BUTTERBRIDGE_DEVICE_ID}`,
+    scenario: mobileToolBrowse,
+  });
+  assert.equal(scopedDashboard.json.tools[0].total_files, 1);
+
+  const globalFiles = resolveConversationRoute({
+    url: `${base}/api/tools/claude_code/files?offset=0&limit=50`,
+    scenario: mobileToolBrowse,
+  });
+  assert.equal(globalFiles.json.length, 3);
+
+  const scopedFiles = resolveConversationRoute({
+    url: `${base}/api/tools/claude_code/files?offset=0&limit=50&device_id=${BUTTERBRIDGE_DEVICE_ID}`,
+    scenario: mobileToolBrowse,
+  });
+  assert.equal(scopedFiles.json.length, 1);
+  assert.equal(scopedFiles.json[0].category, "config");
 });
 
 test("pathnameOf tolerates relative and absolute URLs", () => {
