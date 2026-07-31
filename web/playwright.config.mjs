@@ -5,7 +5,7 @@ const port = Number.parseInt(process.env.MEMENTO_E2E_PORT ?? "3100", 10);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error(`Invalid MEMENTO_E2E_PORT: ${process.env.MEMENTO_E2E_PORT}`);
 }
-const baseURL = `http://127.0.0.1:${port}`;
+const baseURL = `http://localhost:${port}`;
 
 /**
  * Playwright configuration for the Memento web regression suite (Workstream D).
