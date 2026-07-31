@@ -319,10 +319,73 @@ export const parentAgentLabeling = {
   latestAgentLine: 2,
 };
 
+const SMART_LINK_MARKDOWN = [
+  "This intentionally long fixture keeps the rich links behind the conversation expand control. ".repeat(7),
+  "",
+  "- Edited [`docs/HANDOFF.md +40 -0`](docs/HANDOFF.md)",
+  "- Production config: `config/prod.toml`",
+  "- [Rescue baseline → current FastAPI](https://gitlab.com/crashbandicode/memento/-/compare/f54a57bd...13ab85e7)",
+  "- [Release commit](https://github.com/crashbandicode/memento/commit/9c216b8aa55aa55aa55aa55aa55aa55aa55aa55a)",
+  "- Deployed revision: `9c216b8`",
+  "- [Memento deployment](https://memento.babypotatofarm.com/status)",
+].join("\n");
+
+function smartLinkScenario(toolId, suffix) {
+  return {
+    docId: `conv-smart-links-${suffix}`,
+    meta: {
+      id: `conv-smart-links-${suffix}`,
+      tool_id: toolId,
+      title: `Smart links from ${toolId}`,
+      relative_path: `${suffix}/sessions/smart-links.jsonl`,
+      metadata: {},
+      message_count: 2,
+      subagent_count: 0,
+      synced_at: T2,
+      activity_at: T2,
+    },
+    messages: [
+      {
+        id: 1,
+        line_number: 1,
+        role: "user",
+        content: "Show the affected files, compare, commit, and deployment link.",
+        timestamp: T0,
+      },
+      {
+        id: 2,
+        line_number: 2,
+        role: "assistant",
+        model: `${toolId}-fixture-model`,
+        content: SMART_LINK_MARKDOWN,
+        timestamp: T1,
+      },
+    ],
+    prompts: [
+      {
+        id: 1,
+        line_number: 1,
+        content: "Show the affected files, compare, commit, and deployment link.",
+        timestamp: T0,
+      },
+    ],
+    pending: EMPTY_PENDING,
+    latestAgentLine: 2,
+  };
+}
+
+export const claudeSmartLinks = smartLinkScenario("claude_code", "claude");
+export const cursorSmartLinks = smartLinkScenario("cursor", "cursor");
+export const codexSmartLinks = smartLinkScenario("codex", "codex");
+export const smartLinkScenarios = [claudeSmartLinks, cursorSmartLinks, codexSmartLinks];
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
   [parentAgentLabeling.docId]: parentAgentLabeling,
+  [claudeSmartLinks.docId]: claudeSmartLinks,
+  [cursorSmartLinks.docId]: cursorSmartLinks,
+  [codexSmartLinks.docId]: codexSmartLinks,
 };

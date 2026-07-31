@@ -1,9 +1,9 @@
 # Regression handoff — conversation UX & live interactions
 
 **Date:** 2026-07-31  
-**Covered versions:** v0.1.44 → v0.1.50  
-**HEAD:** `f8f4f16` (`release: v0.1.50`)  
-**Status:** v0.1.50 has shipped and been deployed.
+**Covered versions:** v0.1.44 → v0.1.51  
+**HEAD:** see release tag `v0.1.51`  
+**Status:** v0.1.51 includes the shared smart-link renderer and the post-v0.1.50 Claude lifecycle fix.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -130,6 +130,14 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 - **Tests:** `server/tests/test_claude_async_agent_lifecycle.py` (async launch stays running with no completion timestamp; hierarchy projects `running`; foreground completion stays terminal)
 - **Coverage gap:** Existing normalized rows for already-ingested launches remain incorrectly terminal until reparse/backfill. Sidecar reconciliation that requires `agentId` still misses title enrichment when sidecars omit the field (use filename ID). Confirm eventual background-completion notifications still project so corrected agents do not stay `running` forever. UI/Playwright coverage of the running badge is tracked under Workstream D.
 
+### 14. v0.1.51 — conversation smart links across Claude, Cursor, and Codex
+
+- **Symptom:** Conversation links looked like raw Markdown: file paths and SHAs were plain monospace, repository compares had no provider/ref structure, generic URLs lacked a domain cue, and long-message expansion was a weak text-only action.
+- **Fix:** Normalize links in the shared `MarkdownViewer` render layer. File links and inline paths now use document chips (including `+N -M` stats); GitHub/GitLab compare and commit URLs show provider icons plus ref pills; generic web links show a domain cue; inline SHAs use compact pills; the expand control is an accessible icon button.
+- **Why all three tools are covered:** Claude, Cursor, and Codex conversation prose all reaches the same `MarkdownViewer` component. No collector-specific markup is required.
+- **Key files:** `web/src/components/viewers/SmartLink.tsx`, `SmartLink.module.css`, `MarkdownViewer.tsx`, `ConversationViewer.tsx`, `web/src/lib/smart-link-classifier.mjs`
+- **Tests:** `web/tests/smart-link-classifier.test.mjs`; fixture invariants in `web/e2e/fixtures/mock-router.test.mjs`; real Chromium assertions for all three tool ids in `web/e2e/smart-links.spec.mjs`.
+
 ---
 
 ## Test coverage matrix
@@ -157,7 +165,8 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 | AskUserQuestion vs PermissionRequest wrapper (`7cb05b0`) | collector + parser + thread_metadata + normalized API tests | unit / API | covered |
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
 | Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run needs Node ≥20) |
-| End-to-end live conversation UX | `web/e2e/prompt-visibility.spec.mjs`, `parent-agent-labeling.spec.mjs`, `subagent-status.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (hermetic fixtures; Chromium run blocked on Node 18 host) |
+| Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
+| End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (10/10 hermetic Chromium tests on Node 24) |
 
 ---
 
@@ -168,7 +177,7 @@ Related architecture context: [project-architecture.md](./project-architecture.m
 2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
 3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
 4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite added under `web/e2e/` (fixture-driven, SSE aborted). Fixture invariants pass via `node --test` (13/13). Full Chromium execution still needs Node ≥20 + `@playwright/test` install (`npx playwright test -c playwright.config.mjs`). Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
+5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. Browser-free smart-link/router coverage passes (20/20), and the full Chromium suite passes (10/10) on Node 24. Remaining UI gaps: path-linked companion refresh, Cursor task-completion card, directive title-cleaning.
 6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
 7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 

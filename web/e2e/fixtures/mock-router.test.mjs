@@ -17,12 +17,16 @@ import test from "node:test";
 
 import { resolveConversationRoute, pathnameOf } from "./mock-router.mjs";
 import {
+  codexSmartLinks,
   FIXTURE_USER,
+  claudeSmartLinks,
+  cursorSmartLinks,
   metadataOnlyPrompts,
   parentAgentLabeling,
   permissionWrappedQuestion,
   runningSubagent,
   scenarios,
+  smartLinkScenarios,
 } from "./conversation-scenarios.mjs";
 
 const base = "http://localhost:3100";
@@ -102,6 +106,19 @@ test("unknown endpoints fall back to empty JSON, never the network", () => {
   assert.deepEqual(list.json, []);
 });
 
+test("shell collection routes tolerate trailing slashes", () => {
+  const devices = resolveConversationRoute({
+    url: `${base}/api/devices/`,
+    scenario: metadataOnlyPrompts,
+  });
+  assert.deepEqual(devices.json, []);
+  const hierarchy = resolveConversationRoute({
+    url: `${base}/api/hierarchy/devices`,
+    scenario: metadataOnlyPrompts,
+  });
+  assert.deepEqual(hierarchy.json, []);
+});
+
 test("pathnameOf tolerates relative and absolute URLs", () => {
   assert.equal(pathnameOf("/api/conversations/x/messages?a=1"), "/api/conversations/x/messages");
   assert.equal(pathnameOf("https://memento.test:8001/api/auth/me"), "/api/auth/me");
@@ -154,6 +171,24 @@ test("regression #5: parent-agent origin + launch description title", () => {
   const dispatch = parentAgentLabeling.messages[0];
   assert.equal(dispatch.role, "user");
   assert.equal(dispatch.origin, "parent_agent");
+});
+
+test("smart-link fixtures cover the shared Claude, Cursor, and Codex render layer", () => {
+  assert.deepEqual(
+    smartLinkScenarios.map((scenario) => scenario.meta.tool_id),
+    ["claude_code", "cursor", "codex"],
+  );
+  assert.equal(smartLinkScenarios[0], claudeSmartLinks);
+  assert.equal(smartLinkScenarios[1], cursorSmartLinks);
+  assert.equal(smartLinkScenarios[2], codexSmartLinks);
+  for (const scenario of smartLinkScenarios) {
+    const markdown = scenario.messages[1].content;
+    assert.ok(markdown.length > 500, `${scenario.meta.tool_id} exercises Expand All`);
+    assert.match(markdown, /docs\/HANDOFF\.md \+40 -0/);
+    assert.match(markdown, /gitlab\.com\/.+\/-\/compare\/f54a57bd\.\.\.13ab85e7/);
+    assert.match(markdown, /github\.com\/.+\/commit\/9c216b8/);
+    assert.match(markdown, /memento\.babypotatofarm\.com\/status/);
+  }
 });
 
 test("every registered scenario has the endpoints a spec will request", () => {

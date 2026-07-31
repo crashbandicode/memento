@@ -72,7 +72,7 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
       json: { mode: "closed", has_any_user: true, github_enabled: false },
     };
   }
-  if (pathname.endsWith("/api/devices")) {
+  if (/\/api\/(?:hierarchy\/)?devices\/?$/.test(pathname)) {
     return { action: "fulfill", status: 200, json: [] };
   }
 
@@ -125,7 +125,7 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
 
   // --- Safe default: never hit a real backend --------------------------------
   // GET collections default to an empty array; everything else to empty object.
-  if (upperMethod === "GET" && /\/(files|projects|tools|daily)$/.test(pathname)) {
+  if (upperMethod === "GET" && /\/(files|projects|tools|daily)\/?$/.test(pathname)) {
     return { action: "fulfill", status: 200, json: [] };
   }
   return { action: "fulfill", status: 200, json: {} };

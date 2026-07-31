@@ -3279,6 +3279,46 @@ function ConversationContextCard({
   );
 }
 
+function MessageExpandButton({
+  expanded,
+  onClick,
+  t,
+}: {
+  expanded: boolean;
+  onClick: () => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const label = expanded ? t.conversation.collapse : t.conversation.expandAll;
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      aria-label={label}
+      data-testid="message-expand-toggle"
+      onClick={onClick}
+      style={{
+        display: "inline-flex",
+        minHeight: 25,
+        alignItems: "center",
+        gap: 5,
+        marginTop: 7,
+        padding: "3px 8px",
+        border: "1px solid color-mix(in srgb, #1677c8 20%, var(--aurora-border))",
+        borderRadius: 7,
+        background: "color-mix(in srgb, #1677c8 5%, var(--aurora-surface-solid))",
+        color: "#1677c8",
+        fontSize: 10.5,
+        fontWeight: 620,
+        lineHeight: 1.2,
+        cursor: "pointer",
+      }}
+    >
+      <Icon name={expanded ? "chevron_up" : "chevron_down"} size={11} strokeWidth={2} aria-hidden="true" />
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function MessageAttachments({
   attachments,
   t,
@@ -4067,21 +4107,11 @@ export const ChatBubble = memo(function ChatBubble({
             </div>
             {displayContent}
             {isLong && (
-              <button
+              <MessageExpandButton
+                expanded={expanded}
                 onClick={() => setExpanded(!expanded)}
-                style={{
-                  display: "block",
-                  marginTop: 6,
-                  fontSize: 11,
-                  color: "var(--aurora-accent)",
-                  background: "transparent",
-                  border: 0,
-                  cursor: "pointer",
-                  padding: 0,
-                }}
-              >
-                {expanded ? t.conversation.collapse : t.conversation.expandAll}
-              </button>
+                t={t}
+              />
             )}
           </div>
         </div>
@@ -4145,20 +4175,11 @@ export const ChatBubble = memo(function ChatBubble({
                 <MarkdownViewer content={displayContent} />
               </div>
               {isLong && (
-                <button
+                <MessageExpandButton
+                  expanded={expanded}
                   onClick={() => setExpanded(!expanded)}
-                  style={{
-                    display: "block",
-                    marginTop: 6,
-                    fontSize: 11,
-                    color: "var(--aurora-accent)",
-                    background: "transparent",
-                    border: 0,
-                    cursor: "pointer",
-                  }}
-                >
-                  {expanded ? t.conversation.collapse : t.conversation.expandAll}
-                </button>
+                  t={t}
+                />
               )}
             </div>
           </MessageCopyFrame>
@@ -4294,12 +4315,11 @@ export const ChatBubble = memo(function ChatBubble({
                   )}
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: showAssistant && displayContent ? 8 : 0 }}>
                     {showAssistant && isLong && (
-                      <button
+                      <MessageExpandButton
+                        expanded={expanded}
                         onClick={() => setExpanded(!expanded)}
-                        style={{ fontSize: 11, color: "var(--aurora-accent)", background: "transparent", border: 0, cursor: "pointer", textDecoration: "underline" }}
-                      >
-                        {expanded ? t.conversation.collapse : t.conversation.expandAll}
-                      </button>
+                        t={t}
+                      />
                     )}
                     {hasSeparateThinking && (
                       <button

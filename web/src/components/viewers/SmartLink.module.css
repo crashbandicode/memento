@@ -1,0 +1,150 @@
+.link {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 24px;
+  align-items: center;
+  gap: 5px;
+  margin: 1px 2px;
+  padding: 2px 7px 2px 5px;
+  border: 1px solid color-mix(in srgb, var(--aurora-fg4) 18%, var(--aurora-border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--aurora-chip) 62%, var(--aurora-surface-solid));
+  box-shadow: 0 1px 0 color-mix(in srgb, white 45%, transparent) inset;
+  color: #1677c8;
+  font-size: 0.88em;
+  font-weight: 570;
+  line-height: 1.35;
+  text-decoration: none !important;
+  vertical-align: middle;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.link:hover {
+  border-color: color-mix(in srgb, #1677c8 32%, var(--aurora-border));
+  background: color-mix(in srgb, #1677c8 7%, var(--aurora-surface-solid));
+  color: #075f9f;
+  text-decoration: none !important;
+}
+
+.link:focus-visible {
+  outline: 2px solid color-mix(in srgb, #1677c8 72%, white);
+  outline-offset: 2px;
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+}
+
+.icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  color: #2784bd;
+}
+
+.provider {
+  flex-wrap: wrap;
+  padding-right: 6px;
+}
+
+.providerGithub .icon {
+  color: var(--aurora-fg2);
+}
+
+.providerGitlab .icon {
+  color: #e24329;
+}
+
+.ref {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--aurora-fg4) 18%, var(--aurora-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--aurora-fg3) 9%, var(--aurora-surface-solid));
+  color: var(--aurora-fg2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.87em;
+  font-weight: 620;
+  letter-spacing: -0.015em;
+  line-height: 1.45;
+}
+
+.arrow {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--aurora-fg4);
+}
+
+.domain {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  padding-left: 6px;
+  border-left: 1px solid var(--aurora-border-strong);
+  color: var(--aurora-fg3);
+  font-size: 0.82em;
+  font-weight: 520;
+}
+
+.fileStats {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding-left: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78em;
+  font-weight: 650;
+}
+
+.added {
+  color: #16803a;
+}
+
+.removed {
+  color: #c2413b;
+}
+
+.inlineChip {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 21px;
+  align-items: center;
+  gap: 4px;
+  margin: 0 1px;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--aurora-fg4) 16%, var(--aurora-border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--aurora-chip) 72%, var(--aurora-surface-solid));
+  color: var(--aurora-fg2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.84em;
+  font-weight: 570;
+  line-height: 1.35;
+  vertical-align: baseline;
+}
+
+.inlineFile {
+  color: #176da8;
+}
+
+.inlineSha {
+  border-radius: 999px;
+  color: var(--aurora-fg2);
+}
+
+:global(html[data-theme="dark"]) .link {
+  color: #6db7ed;
+  box-shadow: none;
+}
+
+:global(html[data-theme="dark"]) .link:hover {
+  color: #9bcff2;
+}

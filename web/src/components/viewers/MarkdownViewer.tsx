@@ -6,6 +6,7 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import MermaidDiagram from "./MermaidDiagram";
+import { SmartCode, SmartLink } from "./SmartLink";
 import "highlight.js/styles/github-dark.min.css";
 
 function nodeText(node: ReactNode): string {
@@ -25,6 +26,8 @@ function mermaidSource(children: ReactNode): string | null {
 }
 
 const markdownComponents: Components = {
+  a: SmartLink,
+  code: SmartCode,
   pre: ({ children, ...props }) => {
     const source = mermaidSource(children);
     return source === null
@@ -134,8 +137,6 @@ export default function MarkdownViewer({ content }: { content: string }) {
         "prose-th:border prose-th:border-gray-200 prose-th:px-3 prose-th:py-1.5",
         // Word break for long URLs and paths
         "break-words overflow-wrap-anywhere",
-        // Links
-        "prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline prose-a:break-all",
         // Lists
         "prose-li:my-0.5",
         // Blockquote
