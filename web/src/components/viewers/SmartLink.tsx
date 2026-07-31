@@ -163,8 +163,20 @@ export function SmartCode({
   const value = nodeText(children).replace(/\n$/, "");
   const info = classifyInlineCode(value);
 
-  if (className || info.kind === "plain") {
+  if (className) {
     return <code {...props} className={className}>{children}</code>;
+  }
+
+  if (info.kind === "plain") {
+    return (
+      <code
+        {...props}
+        className={styles.inlineCode}
+        data-testid="inline-code"
+      >
+        {children}
+      </code>
+    );
   }
 
   if (info.kind === "sha") {

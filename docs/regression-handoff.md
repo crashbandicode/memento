@@ -1,9 +1,9 @@
 # Regression handoff — conversation UX & live interactions
 
-**Date:** 2026-07-31  
-**Covered versions:** v0.1.44 → v0.1.51  
-**HEAD:** see release tag `v0.1.51`  
-**Status:** v0.1.51 includes the shared smart-link renderer and the post-v0.1.50 Claude lifecycle fix.
+**Date:** 2026-07-31
+**Covered versions:** v0.1.44 → v0.1.53
+**HEAD:** see release tag `v0.1.53`
+**Status:** v0.1.53 includes shared smart links, Slack-like inline code, and the post-v0.1.50 Claude lifecycle fix.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -148,6 +148,13 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 - **Key files:** `web/src/components/viewers/SmartLink.tsx`, `SmartLink.module.css`, `MarkdownViewer.tsx`, `ConversationViewer.tsx`, `web/src/lib/smart-link-classifier.mjs`
 - **Tests:** `web/tests/smart-link-classifier.test.mjs`; fixture invariants in `web/e2e/fixtures/mock-router.test.mjs`; real Chromium assertions for all three tool ids in `web/e2e/smart-links.spec.mjs`.
 
+### 15. v0.1.53 — Slack-like inline code across conversation tools
+
+- **Symptom:** Plain Markdown inline code was only monospace because the typography utility styles were not reliably emitted; it had no background, padding, radius, or accent color.
+- **Fix:** Give plain `<code>` nodes an explicit shared CSS-module class with a token-based neutral chip, restrained tan text, compact spacing, and dark-mode colors. Fenced code is explicitly excluded/reset and remains a block.
+- **Why all three tools are covered:** Claude, Cursor, and Codex message prose uses the shared `MarkdownViewer` / `SmartCode` renderer.
+- **Tests:** `web/e2e/smart-links.spec.mjs` checks computed light/dark inline-chip styling for all three tools and separately verifies fenced code keeps its syntax-highlighted block layout.
+
 ---
 
 ## Test coverage matrix
@@ -176,6 +183,7 @@ This durable user-owned setup was validated with the full hermetic Chromium suit
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
 | Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run verified on Node 24) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
+| Inline code chips across Claude, Cursor, and Codex (v0.1.53) | `smart-links.spec.mjs` | Playwright | covered (computed style + fenced-block regression) |
 | End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered (11/11 hermetic Chromium tests on Node 24) |
 
 ---

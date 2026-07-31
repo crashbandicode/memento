@@ -393,10 +393,15 @@ const SMART_LINK_MARKDOWN = [
   "",
   "- Edited [`docs/HANDOFF.md +40 -0`](docs/HANDOFF.md)",
   "- Production config: `config/prod.toml`",
+  "- Refresh entry point: `run_refresh_active_via_bjobs`",
   "- [Rescue baseline → current FastAPI](https://gitlab.com/crashbandicode/memento/-/compare/f54a57bd...13ab85e7)",
   "- [Release commit](https://github.com/crashbandicode/memento/commit/9c216b8aa55aa55aa55aa55aa55aa55aa55aa55a)",
   "- Deployed revision: `9c216b8`",
   "- [Memento deployment](https://memento.babypotatofarm.com/status)",
+  "",
+  "```python",
+  "run_refresh_active_via_bjobs()",
+  "```",
 ].join("\n");
 
 function smartLinkScenario(toolId, suffix) {

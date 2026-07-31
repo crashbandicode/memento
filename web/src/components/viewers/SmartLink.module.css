@@ -112,6 +112,24 @@
   color: #c2413b;
 }
 
+.inlineCode {
+  margin: 0 0.08em;
+  padding: 0.08em 0.38em 0.12em;
+  border: 1px solid color-mix(in srgb, var(--aurora-fg3) 18%, var(--aurora-border));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--aurora-fg1) 7%, var(--aurora-surface-solid));
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  box-shadow: 0 1px 0 color-mix(in srgb, white 46%, transparent) inset;
+  color: #9a4512;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.86em;
+  font-weight: 560;
+  line-height: inherit;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
 .inlineChip {
   display: inline-flex;
   max-width: 100%;
@@ -145,6 +163,29 @@
   box-shadow: none;
 }
 
+:global(html[data-theme="dark"]) .inlineCode {
+  border-color: color-mix(in srgb, var(--aurora-fg3) 28%, var(--aurora-border));
+  background: color-mix(in srgb, var(--aurora-fg1) 11%, var(--aurora-surface-solid));
+  box-shadow: none;
+  color: #f0b77a;
+}
+
 :global(html[data-theme="dark"]) .link:hover {
   color: #9bcff2;
+}
+
+:global(.prose) pre .inlineCode {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-decoration-break: slice;
+  -webkit-box-decoration-break: slice;
+  box-shadow: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  overflow-wrap: normal;
+  word-break: inherit;
 }

@@ -40,11 +40,60 @@ test.describe("smart conversation links", () => {
 
       await expect(page.getByTestId("smart-code-sha")).toHaveText("9c216b8");
 
+      const inlineCode = page.getByTestId("inline-code");
+      await expect(inlineCode).toHaveText("run_refresh_active_via_bjobs");
+      const inlineStyles = await inlineCode.evaluate((element) => {
+        const styles = window.getComputedStyle(element);
+        return {
+          backgroundColor: styles.backgroundColor,
+          bodyColor: window.getComputedStyle(element.parentElement).color,
+          borderRadius: styles.borderTopLeftRadius,
+          color: styles.color,
+          fontFamily: styles.fontFamily,
+          paddingLeft: Number.parseFloat(styles.paddingLeft),
+        };
+      });
+      expect(inlineStyles.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+      expect(inlineStyles.color).not.toBe(inlineStyles.bodyColor);
+      expect(inlineStyles.borderRadius).toBe("4px");
+      expect(inlineStyles.fontFamily).toContain("ui-monospace");
+      expect(inlineStyles.paddingLeft).toBeGreaterThan(0);
+
+      const fencedCode = page.locator("pre code");
+      await expect(fencedCode).toHaveText("run_refresh_active_via_bjobs()");
+      await expect(fencedCode).toHaveClass(/(?:^|\s)language-python(?:\s|$)/);
+      await expect(fencedCode).not.toHaveAttribute("data-testid", "inline-code");
+      const fencedStyles = await fencedCode.evaluate((element) => {
+        const styles = window.getComputedStyle(element);
+        return {
+          backgroundColor: styles.backgroundColor,
+          display: styles.display,
+          paddingLeft: Number.parseFloat(styles.paddingLeft),
+        };
+      });
+      expect(fencedStyles.backgroundColor).not.toBe(inlineStyles.backgroundColor);
+      expect(fencedStyles.display).toBe("block");
+      expect(fencedStyles.paddingLeft).toBeGreaterThan(inlineStyles.paddingLeft);
+
       const webLink = page.getByTestId("smart-link-web");
       await expect(webLink).toBeVisible();
       await expect(webLink).toContainText("Memento deployment");
       await expect(webLink).toContainText("memento.babypotatofarm.com");
       await expect(webLink).toHaveAttribute("target", "_blank");
+
+      await page.evaluate(() => {
+        document.documentElement.dataset.theme = "dark";
+      });
+      const darkInlineStyles = await inlineCode.evaluate((element) => {
+        const styles = window.getComputedStyle(element);
+        return {
+          backgroundColor: styles.backgroundColor,
+          bodyColor: window.getComputedStyle(element.parentElement).color,
+          color: styles.color,
+        };
+      });
+      expect(darkInlineStyles.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+      expect(darkInlineStyles.color).not.toBe(darkInlineStyles.bodyColor);
     });
   }
 });
