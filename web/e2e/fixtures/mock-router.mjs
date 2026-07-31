@@ -39,8 +39,6 @@ export function pathnameOf(url) {
 export function resolveConversationRoute({ url, method = "GET", scenario }) {
   const pathname = pathnameOf(url);
   const upperMethod = method.toUpperCase();
-  const parsedUrl = new URL(url, "http://mock.local");
-  const deviceId = parsedUrl.searchParams.get("device_id");
 
   // The SSE stream is intentionally inert — reproduces a metadata-only ingest
   // with no live event replay. Aborting fires the hook's benign reconnect path.
@@ -74,54 +72,8 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
       json: { mode: "closed", has_any_user: true, github_enabled: false },
     };
   }
-  if (/\/api\/hierarchy\/devices\/?$/.test(pathname)) {
-    return {
-      action: "fulfill",
-      status: 200,
-      json: scenario.hierarchyDevices ?? [],
-    };
-  }
-  if (/\/api\/devices\/?$/.test(pathname)) {
-    return {
-      action: "fulfill",
-      status: 200,
-      json: scenario.devices ?? [],
-    };
-  }
-
-  // --- Dashboard / tool browsing --------------------------------------------
-  if (pathname.endsWith("/api/dashboard") && scenario.dashboard) {
-    return {
-      action: "fulfill",
-      status: 200,
-      json: (deviceId && scenario.dashboardByDevice?.[deviceId])
-        || scenario.dashboard,
-    };
-  }
-  const toolFilesMatch = pathname.match(/\/api\/tools\/([^/]+)\/files$/);
-  if (toolFilesMatch && scenario.toolFiles) {
-    const toolId = decodeURIComponent(toolFilesMatch[1]);
-    return {
-      action: "fulfill",
-      status: 200,
-      json: (deviceId && scenario.toolFilesByDevice?.[deviceId]?.[toolId])
-        || scenario.toolFiles[toolId]
-        || [],
-    };
-  }
-  const toolDetailMatch = pathname.match(/\/api\/tools\/([^/]+)$/);
-  if (toolDetailMatch && scenario.toolDetails) {
-    const toolId = decodeURIComponent(toolDetailMatch[1]);
-    return {
-      action: "fulfill",
-      status: 200,
-      json: (deviceId && scenario.toolDetailsByDevice?.[deviceId]?.[toolId])
-        || scenario.toolDetails[toolId]
-        || {},
-    };
-  }
-  if (pathname.endsWith("/api/projects") && scenario.projects) {
-    return { action: "fulfill", status: 200, json: scenario.projects };
+  if (/\/api\/(?:hierarchy\/)?devices\/?$/.test(pathname)) {
+    return { action: "fulfill", status: 200, json: [] };
   }
 
   // --- Conversation endpoints (order: most specific first) --------------------

@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
-import { useDevice } from "@/lib/device-context";
 import { useSSE } from "@/lib/use-sse";
 import { useNow } from "@/lib/use-now";
 import { timeAgo } from "@/lib/constants";
@@ -67,7 +66,6 @@ export default function Dashboard() {
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const maxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { t } = useI18n();
-  const { selectedDeviceId } = useDevice();
   const now = useNow();
 
   const fetchData = useCallback(() => {
@@ -79,9 +77,7 @@ export default function Dashboard() {
     const controller = new AbortController();
     abortRef.current = controller;
     const tz = new Date().getTimezoneOffset();
-    const query = new URLSearchParams({ tz_offset: String(tz) });
-    if (selectedDeviceId) query.set("device_id", selectedDeviceId);
-    authFetch(`${getApiBase()}/api/dashboard?${query}`, {
+    authFetch(`${getApiBase()}/api/dashboard?tz_offset=${tz}`, {
       signal: controller.signal,
     })
       .then((r) => r.json())
@@ -101,7 +97,7 @@ export default function Dashboard() {
           debounceTimerRef.current = setTimeout(fetchData, 250);
         }
       });
-  }, [selectedDeviceId]);
+  }, []);
 
   const clearScheduledRefresh = useCallback(() => {
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
