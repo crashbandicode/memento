@@ -31,6 +31,7 @@ import {
   runningSubagent,
   scenarios,
   smartLinkScenarios,
+  urlNavigationLargeThread,
 } from "./conversation-scenarios.mjs";
 
 const base = "http://localhost:3100";
@@ -126,6 +127,36 @@ test("shell collection routes tolerate trailing slashes", () => {
 test("pathnameOf tolerates relative and absolute URLs", () => {
   assert.equal(pathnameOf("/api/conversations/x/messages?a=1"), "/api/conversations/x/messages");
   assert.equal(pathnameOf("https://memento.test:8001/api/auth/me"), "/api/auth/me");
+});
+
+test("large URL-navigation fixture serves bounded around-windows", () => {
+  const result = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/messages?line_number=217&context_before=12&limit=120`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.equal(result.json.total, 260);
+  assert.equal(result.json.offset, 204);
+  assert.equal(result.json.messages[12].line_number, 217);
+  assert.equal(result.json.messages.length, 56);
+});
+
+test("large fixture search pages repeated Unicode matches chronologically", () => {
+  const query = encodeURIComponent(urlNavigationLargeThread.searchQuery);
+  const first = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/search?q=${query}&limit=5`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.deepEqual(
+    first.json.results.map((result) => result.line_number),
+    [13, 26, 39, 52, 65],
+  );
+  assert.equal(first.json.has_more, true);
+
+  const second = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/search?q=${query}&limit=5&after_line=65`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.equal(second.json.results[0].line_number, 78);
 });
 
 // --- Fixture invariants: each scenario still guards its regression -----------

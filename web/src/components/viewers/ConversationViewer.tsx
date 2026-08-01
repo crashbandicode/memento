@@ -50,6 +50,17 @@ import {
   mergeMessagesChronologically,
   placeTargetWindow,
 } from "@/lib/conversation-message-order";
+import {
+  EMPTY_CONVERSATION_URL_STATE,
+  clearConversationSearchState,
+  decideConversationHistoryMode,
+  normalizeConversationPosition,
+  parseConversationUrlState,
+  sanitizeConversationQuery,
+  serializeConversationUrlState,
+  type ConversationHistoryReason,
+  type ConversationUrlState,
+} from "@/lib/conversation-url-state";
 
 interface Artifact {
   id: string;
@@ -219,6 +230,9 @@ const PROMPT_JUMP_WINDOW_SIZE = 120;
 const PROMPT_JUMP_MAX_WINDOW_SIZE = 400;
 const LIVE_SCROLL_FOLLOW_THRESHOLD = 72;
 const PAGE_LOAD_SCROLL_THRESHOLD = 300;
+const URL_ANCHOR_CLEARANCE = 16;
+const URL_ANCHOR_DEBOUNCE_MS = 220;
+const URL_RESTORE_SETTLE_MS = 900;
 
 type ConversationVisibilityKey = keyof ConversationVisibility;
 
@@ -319,6 +333,15 @@ type DetachedTail = {
 type PendingNavigation = {
   lineNumber: number;
   behavior: ScrollBehavior;
+  position: number | null;
+};
+
+type NavigateToLineOptions = {
+  loadPromptTurn?: boolean;
+  scrollToLineNumber?: number;
+  position?: number | null;
+  reason?: ConversationHistoryReason;
+  nextUrlState?: ConversationUrlState;
 };
 
 type ScrollAnchor = {
@@ -368,6 +391,9 @@ export default function ConversationViewer({
   const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
   const [pendingInteractions, setPendingInteractions] = useState<PendingConversationInteraction[]>([]);
   const [inferredInteractionResponses, setInferredInteractionResponses] = useState<InferredConversationInteractionResponse[]>([]);
+  const [urlState, setUrlState] = useState<ConversationUrlState>(
+    EMPTY_CONVERSATION_URL_STATE,
+  );
   const [visibility, setVisibility] = useState<ConversationVisibility>(() =>
     readConversationVisibility(documentId),
   );
@@ -382,7 +408,39 @@ export default function ConversationViewer({
   const detachedTailRef = useRef<DetachedTail | null>(null);
   const pendingScrollAnchorRef = useRef<ScrollAnchor | null>(null);
   const lastScrollTopRef = useRef(0);
+  const urlStateRef = useRef<ConversationUrlState>(EMPTY_CONVERSATION_URL_STATE);
+  const urlAnchorTimerRef = useRef<number | null>(null);
+  const suppressAnchorWritesUntilRef = useRef(0);
+  const passiveAnchorTrackingRef = useRef(false);
+  const passiveAnchorIntentVersionRef = useRef(0);
+  const navigationIntentVersionRef = useRef(0);
   const { t, locale } = useI18n();
+  const writeUrlState = useCallback((
+    nextState: ConversationUrlState,
+    reason: ConversationHistoryReason,
+  ) => {
+    if (typeof window === "undefined") return;
+    const currentState = parseConversationUrlState(window.location.search);
+    const mode = decideConversationHistoryMode(reason, currentState, nextState);
+    urlStateRef.current = nextState;
+    setUrlState(nextState);
+    if (mode === "none") return;
+
+    const url = new URL(window.location.href);
+    url.search = serializeConversationUrlState(url.searchParams, nextState).toString();
+    const browserState = window.history.state && typeof window.history.state === "object"
+      ? window.history.state
+      : {};
+    const nextBrowserState = {
+      ...browserState,
+      __memento_conversation_navigation: true,
+    };
+    if (mode === "push") {
+      window.history.pushState(nextBrowserState, "", url);
+    } else {
+      window.history.replaceState(nextBrowserState, "", url);
+    }
+  }, []);
   const updateDetachedTail = useCallback((next: DetachedTail | null) => {
     detachedTailRef.current = next;
     setDetachedTail(next);
@@ -663,15 +721,38 @@ export default function ConversationViewer({
       return;
     }
     const container = containerRef.current;
-    if (pendingNavigation.behavior === "instant" && container) {
-      const targetTop = target.getBoundingClientRect().top;
-      const containerTop = container.getBoundingClientRect().top;
+    suppressAnchorWritesUntilRef.current = Date.now() + URL_RESTORE_SETTLE_MS;
+    const scrollTarget = (behavior: ScrollBehavior) => {
+      if (!container) {
+        target.scrollIntoView({ behavior, block: "start" });
+        return;
+      }
+      const targetBounds = target.getBoundingClientRect();
+      const containerBounds = container.getBoundingClientRect();
+      const position = normalizeConversationPosition(pendingNavigation.position) ?? 0;
+      const positionOffset = targetBounds.height * position / 1_000;
       container.scrollTo({
-        top: container.scrollTop + targetTop - containerTop - 16,
-        behavior: "instant",
+        top: Math.max(
+          0,
+          container.scrollTop
+            + targetBounds.top
+            - containerBounds.top
+            - URL_ANCHOR_CLEARANCE
+            + positionOffset,
+        ),
+        behavior,
       });
-    } else {
-      target.scrollIntoView({ behavior: pendingNavigation.behavior, block: "start" });
+    };
+    scrollTarget(pendingNavigation.behavior);
+
+    // Markdown, images, fonts, and a detached around-window can all change the
+    // target's height immediately after it mounts. Re-apply instant restores
+    // during the short layout-settle window so direct links land predictably.
+    const settleTimers: number[] = [];
+    if (pendingNavigation.behavior === "instant") {
+      for (const delay of [0, 120, 360]) {
+        settleTimers.push(window.setTimeout(() => scrollTarget("instant"), delay));
+      }
     }
     const timeout = window.setTimeout(() => {
       // Reaffirm the prompt that contains the navigation target. Instant
@@ -683,13 +764,100 @@ export default function ConversationViewer({
       );
       setPendingNavigation(null);
       setNavigatingPromptLine(null);
-    }, pendingNavigation.behavior === "smooth" ? 650 : 100);
-    return () => window.clearTimeout(timeout);
+    }, pendingNavigation.behavior === "smooth" ? 650 : 500);
+    return () => {
+      window.clearTimeout(timeout);
+      settleTimers.forEach((timer) => window.clearTimeout(timer));
+    };
   }, [messages, detachedTail, pendingNavigation]);
+
+  const schedulePassiveAnchorUpdate = useCallback(() => {
+    if (
+      !passiveAnchorTrackingRef.current
+      || passiveAnchorIntentVersionRef.current <= navigationIntentVersionRef.current
+    ) return;
+    if (urlAnchorTimerRef.current !== null) {
+      window.clearTimeout(urlAnchorTimerRef.current);
+    }
+    urlAnchorTimerRef.current = window.setTimeout(() => {
+      urlAnchorTimerRef.current = null;
+      if (
+        !passiveAnchorTrackingRef.current
+        || passiveAnchorIntentVersionRef.current <= navigationIntentVersionRef.current
+        || Date.now() < suppressAnchorWritesUntilRef.current
+        || pendingNavigation !== null
+        || navigatingPromptLine !== null
+        || latestAgentLoading
+      ) return;
+      const container = containerRef.current;
+      if (!container) return;
+
+      const containerBounds = container.getBoundingClientRect();
+      const anchorPoint = containerBounds.top + URL_ANCHOR_CLEARANCE;
+      const candidates = Array.from(
+        container.querySelectorAll<HTMLElement>("[data-message-line]"),
+      ).filter((element) =>
+        !element.hidden
+        && element.dataset.messageVisible !== "false"
+        && element.getBoundingClientRect().bottom > containerBounds.top
+        && element.getBoundingClientRect().top < containerBounds.bottom,
+      );
+      if (candidates.length === 0) return;
+      const target = candidates.find((element) => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.top <= anchorPoint && bounds.bottom > anchorPoint;
+      }) || candidates[0];
+      const targetBounds = target.getBoundingClientRect();
+      const line = Number(target.dataset.messageLine);
+      if (!Number.isInteger(line) || line <= 0) return;
+      const position = normalizeConversationPosition(
+        targetBounds.height > 0
+          ? ((anchorPoint - targetBounds.top) / targetBounds.height) * 1_000
+          : 0,
+      ) ?? 0;
+      const current = parseConversationUrlState(window.location.search);
+      if (
+        current.line === line
+        && Math.abs((current.position ?? 0) - position) < 8
+      ) return;
+      writeUrlState(
+        { ...current, line, position },
+        "passive-scroll",
+      );
+    }, URL_ANCHOR_DEBOUNCE_MS);
+  }, [
+    latestAgentLoading,
+    navigatingPromptLine,
+    pendingNavigation,
+    writeUrlState,
+  ]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      () => schedulePassiveAnchorUpdate(),
+      {
+        root: container,
+        threshold: [0, 0.25, 0.5, 0.75, 1],
+      },
+    );
+    container
+      .querySelectorAll<HTMLElement>("[data-message-line]")
+      .forEach((element) => observer.observe(element));
+    return () => observer.disconnect();
+  }, [schedulePassiveAnchorUpdate, visibleMessages]);
+
+  useEffect(() => () => {
+    if (urlAnchorTimerRef.current !== null) {
+      window.clearTimeout(urlAnchorTimerRef.current);
+    }
+  }, []);
 
   const handleScroll = () => {
     const el = containerRef.current;
     if (!el) return;
+    schedulePassiveAnchorUpdate();
     const previousScrollTop = lastScrollTopRef.current;
     const scrollingUp = el.scrollTop < previousScrollTop;
     const scrollingDown = el.scrollTop > previousScrollTop;
@@ -739,12 +907,30 @@ export default function ConversationViewer({
     }
   };
 
+  const enablePassiveAnchorTracking = () => {
+    if (Date.now() < suppressAnchorWritesUntilRef.current) return;
+    passiveAnchorTrackingRef.current = true;
+    passiveAnchorIntentVersionRef.current += 1;
+  };
+
   const navigateToLine = useCallback(async (
     lineNumber: number,
-    loadPromptTurn = false,
-    scrollToLineNumber?: number,
+    options: NavigateToLineOptions = {},
   ) => {
+    const {
+      loadPromptTurn = false,
+      scrollToLineNumber,
+      position = null,
+      reason = "prompt-jump",
+      nextUrlState,
+    } = options;
     const scrollLine = scrollToLineNumber ?? lineNumber;
+    passiveAnchorTrackingRef.current = false;
+    navigationIntentVersionRef.current = passiveAnchorIntentVersionRef.current;
+    if (urlAnchorTimerRef.current !== null) {
+      window.clearTimeout(urlAnchorTimerRef.current);
+      urlAnchorTimerRef.current = null;
+    }
     const anchorId = `conversation-line-${scrollLine}`;
     let loadedTargetWindow = false;
     const containingPromptLine = promptLineAtOrBefore(promptLinesRef.current, scrollLine);
@@ -901,15 +1087,34 @@ export default function ConversationViewer({
         target.getBoundingClientRect().top - container.getBoundingClientRect().top,
       ) > container.clientHeight * 2,
     );
+    const currentUrlState = parseConversationUrlState(window.location.search);
+    const explicitNavigationState = nextUrlState || {
+      ...currentUrlState,
+      line: scrollLine,
+      position: normalizeConversationPosition(position),
+      match: reason.startsWith("search-") ? currentUrlState.match : null,
+      hit: reason.startsWith("search-") ? currentUrlState.hit : null,
+    };
+    writeUrlState(explicitNavigationState, reason);
+    suppressAnchorWritesUntilRef.current = Date.now() + URL_RESTORE_SETTLE_MS;
     setPendingNavigation({
       lineNumber: scrollLine,
-      behavior: loadedTargetWindow || targetIsDistant ? "instant" : "smooth",
+      behavior: (
+        reason === "initial"
+        || reason === "popstate"
+        || loadedTargetWindow
+        || targetIsDistant
+      ) ? "instant" : "smooth",
+      position: normalizeConversationPosition(position),
     });
-  }, [documentId, updateDetachedTail]);
+  }, [documentId, updateDetachedTail, writeUrlState]);
 
   const navigateToPrompt = async (prompt: ConversationPrompt) => {
     setActivePromptLine(prompt.line_number);
-    await navigateToLine(prompt.line_number, true);
+    await navigateToLine(prompt.line_number, {
+      loadPromptTurn: true,
+      reason: "prompt-jump",
+    });
   };
 
   const navigateToLatestAgent = async (): Promise<boolean> => {
@@ -925,9 +1130,13 @@ export default function ConversationViewer({
       // Load the owning human turn, then scroll to the latest agent row in one
       // navigation so a detached head+tail view cannot pin the counter at 1.
       if (containingPromptLine !== null) {
-        await navigateToLine(containingPromptLine, true, target.line_number);
+        await navigateToLine(containingPromptLine, {
+          loadPromptTurn: true,
+          scrollToLineNumber: target.line_number,
+          reason: "latest-agent",
+        });
       } else {
-        await navigateToLine(target.line_number);
+        await navigateToLine(target.line_number, { reason: "latest-agent" });
       }
       return true;
     } catch (error) {
@@ -937,6 +1146,73 @@ export default function ConversationViewer({
       setLatestAgentLoading(false);
     }
   };
+
+  const restoreUrlState = useCallback((
+    nextState: ConversationUrlState,
+    reason: "initial" | "popstate",
+  ) => {
+    suppressAnchorWritesUntilRef.current = Date.now() + URL_RESTORE_SETTLE_MS;
+    writeUrlState(nextState, reason);
+    if (nextState.line !== null) {
+      void navigateToLine(nextState.line, {
+        position: nextState.position,
+        reason,
+        nextUrlState: nextState,
+      });
+    }
+  }, [navigateToLine, writeUrlState]);
+
+  useEffect(() => {
+    restoreUrlState(
+      parseConversationUrlState(window.location.search),
+      "initial",
+    );
+  }, [documentId, restoreUrlState]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      restoreUrlState(
+        parseConversationUrlState(window.location.search),
+        "popstate",
+      );
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [restoreUrlState]);
+
+  const commitConversationSearch = useCallback((value: string) => {
+    const current = parseConversationUrlState(window.location.search);
+    const query = sanitizeConversationQuery(value);
+    const next = query
+      ? {
+          ...current,
+          query,
+          scope: "messages" as const,
+          match: null,
+          hit: null,
+        }
+      : clearConversationSearchState(current);
+    writeUrlState(next, query ? "search-submit" : "search-clear");
+  }, [writeUrlState]);
+
+  const selectConversationSearchMatch = useCallback(async (
+    result: ConversationSearchHit,
+    ordinal: number,
+    reason: "search-select" | "search-next" | "search-previous",
+  ) => {
+    const current = parseConversationUrlState(window.location.search);
+    const next: ConversationUrlState = {
+      ...current,
+      line: result.line_number,
+      position: null,
+      match: ordinal,
+      hit: result.line_number,
+    };
+    await navigateToLine(result.line_number, {
+      reason,
+      nextUrlState: next,
+    });
+  }, [navigateToLine]);
 
   const renderMessage = (msg: ConversationMessage) => {
     if (isMirroredActiveTaskMessage(msg, activeTaskState)) {
@@ -976,6 +1252,7 @@ export default function ConversationViewer({
         key={String(msg.id)}
         id={`conversation-line-${msg.line_number}`}
         data-message-id={String(msg.id)}
+        data-message-line={msg.line_number}
         data-prompt-line={isHumanPrompt ? msg.line_number : undefined}
         data-message-category={messageCategory}
         data-message-groups={visibilityGroups.join(" ")}
@@ -1011,7 +1288,9 @@ export default function ConversationViewer({
         documentId={documentId}
         syncVersion={syncVersion}
         userRoleOrigin={userRoleOrigin}
-        onSelectLine={navigateToLine}
+        urlState={urlState}
+        onCommitQuery={commitConversationSearch}
+        onSelectMatch={selectConversationSearchMatch}
         t={t}
       />
       <ConversationVisibilityControls
@@ -1055,7 +1334,9 @@ export default function ConversationViewer({
                     {item.document_id === documentId && hasNavigableLine ? (
                       <button
                         type="button"
-                        onClick={() => void navigateToLine(item.line_number)}
+                        onClick={() => void navigateToLine(item.line_number, {
+                          reason: "pending-interaction",
+                        })}
                         style={{
                           border: 0,
                           padding: 0,
@@ -1113,6 +1394,17 @@ export default function ConversationViewer({
         data-detached-start={detachedTail?.offset}
         data-detached-end={detachedTail?.endOffset}
         onScroll={handleScroll}
+        onWheel={enablePassiveAnchorTracking}
+        onTouchStart={enablePassiveAnchorTracking}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) enablePassiveAnchorTracking();
+        }}
+        onKeyDown={(event) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+            enablePassiveAnchorTracking();
+          }
+        }}
+        tabIndex={0}
         className="h-[calc(100vh-8rem)] sm:h-[calc(100vh-10rem)] md:h-[calc(100vh-12rem)] overflow-y-auto"
       >
         <div style={{ fontSize: 11, color: "var(--aurora-fg4)", marginBottom: 16, textAlign: "center" }}>
@@ -1378,51 +1670,36 @@ function ConversationSearchBar({
   documentId,
   syncVersion,
   userRoleOrigin,
-  onSelectLine,
+  urlState,
+  onCommitQuery,
+  onSelectMatch,
   t,
 }: {
   documentId: string;
   syncVersion: number;
   userRoleOrigin?: "parent_agent" | null;
-  onSelectLine: (lineNumber: number) => void | Promise<void>;
+  urlState: ConversationUrlState;
+  onCommitQuery: (query: string) => void;
+  onSelectMatch: (
+    result: ConversationSearchHit,
+    ordinal: number,
+    reason: "search-select" | "search-next" | "search-previous",
+  ) => void | Promise<void>;
   t: ReturnType<typeof useI18n>["t"];
 }) {
-  const [query, setQuery] = useState("");
+  const [draftQuery, setDraftQuery] = useState(urlState.query);
   const [results, setResults] = useState<ConversationSearchHit[]>([]);
   const [nextAfterLine, setNextAfterLine] = useState<number | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(Boolean(urlState.query));
   const [history, setHistory] = useState<string[]>(() => readSearchHistory(CONVERSATION_SEARCH_HISTORY_KEY));
   const inputRef = useRef<HTMLInputElement>(null);
-  const deepLinkHandledRef = useRef("");
-  const searchSnapshotRef = useRef({
-    query: "",
-    results: [] as ConversationSearchHit[],
-    nextAfterLine: null as number | null,
-    hasMore: false,
-  });
 
   useEffect(() => {
-    searchSnapshotRef.current = { query, results, nextAfterLine, hasMore };
-  }, [query, results, nextAfterLine, hasMore]);
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const initialQuery = params.get("q") || "";
-    const initialLine = Number(params.get("line"));
-    setQuery(initialQuery);
-    if (initialQuery) setOpen(true);
-    const deepLinkKey = `${documentId}:${initialLine}`;
-    if (
-      Number.isInteger(initialLine)
-      && initialLine > 0
-      && deepLinkHandledRef.current !== deepLinkKey
-    ) {
-      deepLinkHandledRef.current = deepLinkKey;
-      void onSelectLine(initialLine);
-    }
-  }, [documentId, onSelectLine]);
+    setDraftQuery(urlState.query);
+    if (urlState.query) setOpen(true);
+  }, [urlState.query]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1442,7 +1719,7 @@ function ConversationSearchBar({
   }, []);
 
   useEffect(() => {
-    const cleanQuery = query.trim();
+    const cleanQuery = urlState.query;
     if (!cleanQuery) {
       setResults([]);
       setHasMore(false);
@@ -1451,101 +1728,134 @@ function ConversationSearchBar({
       return;
     }
     const controller = new AbortController();
-    const timer = window.setTimeout(() => {
+    const restoreResults = async () => {
       setLoading(true);
-      api.searchConversation(documentId, cleanQuery, null, 50, controller.signal)
-        .then((response) => {
-          setResults(response.results);
-          setNextAfterLine(response.next_after_line);
-          setHasMore(response.has_more);
+      try {
+        const restored: ConversationSearchHit[] = [];
+        let afterLine: number | null = null;
+        let more = true;
+        let pages = 0;
+        while (more && pages < 200) {
+          const response = await api.searchConversation(
+            documentId,
+            cleanQuery,
+            afterLine,
+            50,
+            controller.signal,
+          );
+          const knownLines = new Set(restored.map((result) => result.line_number));
+          restored.push(
+            ...response.results.filter((result) => !knownLines.has(result.line_number)),
+          );
+          afterLine = response.next_after_line;
+          more = response.has_more && afterLine !== null;
+          pages += 1;
+          const restoredIdentity = urlState.hit !== null
+            && restored.some((result) => result.line_number === urlState.hit);
+          const restoredOrdinal = urlState.match !== null
+            && restored.length >= urlState.match;
+          if (
+            urlState.match === null
+            || restoredIdentity
+            || restoredOrdinal
+            || !more
+          ) break;
+        }
+        if (!controller.signal.aborted) {
+          setResults(restored);
+          setNextAfterLine(afterLine);
+          setHasMore(more);
           setOpen(true);
           setHistory(pushSearchHistory(CONVERSATION_SEARCH_HISTORY_KEY, cleanQuery));
-        })
-        .catch((error: unknown) => {
-          if ((error as { name?: string })?.name !== "AbortError") {
-            console.error("Failed to search conversation:", error);
-          }
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setLoading(false);
-        });
-    }, 280);
-    return () => {
-      window.clearTimeout(timer);
-      controller.abort();
-    };
-  }, [documentId, query]);
-
-  // Refresh the result window after a collector append without collapsing a
-  // paged/scrolled search back to its first 50 rows. Search is chronological,
-  // so refreshing at most the first 100 rows and retaining the already-loaded
-  // suffix keeps the cursor stable while incorporating edits near the front.
-  useEffect(() => {
-    if (syncVersion === 0) return;
-    const snapshot = searchSnapshotRef.current;
-    const cleanQuery = snapshot.query.trim();
-    if (!cleanQuery || snapshot.results.length === 0) return;
-
-    const controller = new AbortController();
-    const refreshLimit = Math.min(100, Math.max(50, snapshot.results.length));
-    setLoading(true);
-    api.searchConversation(documentId, cleanQuery, null, refreshLimit, controller.signal)
-      .then((response) => {
-        if (searchSnapshotRef.current.query.trim() !== cleanQuery) return;
-        setResults((previous) => {
-          const refreshedIds = new Set(response.results.map((result) => result.id));
-          const preservedSuffix = previous
-            .slice(refreshLimit)
-            .filter((result) => !refreshedIds.has(result.id));
-          return [...response.results, ...preservedSuffix];
-        });
-        if (snapshot.results.length <= refreshLimit) {
-          setNextAfterLine(response.next_after_line);
-          setHasMore(response.has_more);
         }
-      })
-      .catch((error: unknown) => {
+      } catch (error) {
         if ((error as { name?: string })?.name !== "AbortError") {
-          console.error("Failed to refresh conversation search:", error);
+          console.error("Failed to search conversation:", error);
         }
-      })
-      .finally(() => {
+      } finally {
         if (!controller.signal.aborted) setLoading(false);
-      });
+      }
+    };
+    void restoreResults();
     return () => controller.abort();
-  }, [documentId, syncVersion]);
+  }, [
+    documentId,
+    syncVersion,
+    urlState.hit,
+    urlState.match,
+    urlState.query,
+  ]);
 
-  const loadMoreResults = async () => {
-    if (loading || nextAfterLine === null) return;
+  const loadMoreResults = async (): Promise<ConversationSearchHit[]> => {
+    if (loading || nextAfterLine === null || !urlState.query) return results;
     setLoading(true);
     try {
       const response = await api.searchConversation(
         documentId,
-        query.trim(),
+        urlState.query,
         nextAfterLine,
         50,
       );
-      const existing = new Set(results.map((result) => result.id));
-      setResults((previous) => [
-        ...previous,
-        ...response.results.filter((result) => !existing.has(result.id)),
-      ]);
+      const existing = new Set(results.map((result) => result.line_number));
+      const nextResults = [
+        ...results,
+        ...response.results.filter((result) => !existing.has(result.line_number)),
+      ];
+      setResults(nextResults);
       setNextAfterLine(response.next_after_line);
       setHasMore(response.has_more);
+      return nextResults;
     } catch (error) {
       console.error("Failed to load more conversation search results:", error);
+      return results;
     } finally {
       setLoading(false);
     }
   };
 
-  const selectResult = async (result: ConversationSearchHit) => {
-    await onSelectLine(result.line_number);
-    const url = new URL(window.location.href);
-    url.searchParams.set("line", String(result.line_number));
-    url.searchParams.set("q", query.trim());
-    window.history.replaceState(window.history.state, "", url);
+  const selectedResultIndex = urlState.hit === null
+    ? -1
+    : results.findIndex((result) => result.line_number === urlState.hit);
+
+  const selectResult = async (
+    result: ConversationSearchHit,
+    index: number,
+    reason: "search-select" | "search-next" | "search-previous" = "search-select",
+  ) => {
+    await onSelectMatch(result, index + 1, reason);
     setOpen(false);
+  };
+
+  const stepResult = async (delta: -1 | 1) => {
+    let available = results;
+    let currentIndex = selectedResultIndex;
+    if (currentIndex < 0 && urlState.match !== null) {
+      currentIndex = Math.min(urlState.match - 1, available.length - 1);
+    }
+    let targetIndex = currentIndex < 0
+      ? (delta > 0 ? 0 : available.length - 1)
+      : currentIndex + delta;
+    if (targetIndex >= available.length && hasMore) {
+      available = await loadMoreResults();
+      targetIndex = currentIndex + delta;
+    }
+    const target = available[targetIndex];
+    if (!target) return;
+    await selectResult(
+      target,
+      targetIndex,
+      delta > 0 ? "search-next" : "search-previous",
+    );
+  };
+
+  const submitSearch = () => {
+    const clean = sanitizeConversationQuery(draftQuery);
+    setDraftQuery(clean);
+    setOpen(true);
+    if (clean) {
+      setHistory(pushSearchHistory(CONVERSATION_SEARCH_HISTORY_KEY, clean));
+    }
+    onCommitQuery(clean);
   };
 
   return (
@@ -1565,30 +1875,84 @@ function ConversationSearchBar({
           ref={inputRef}
           data-conversation-search-input
           type="search"
-          value={query}
+          value={draftQuery}
           onFocus={() => setOpen(true)}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => {
+            setDraftQuery(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            submitSearch();
+          }}
           placeholder={t.conversation.searchMessages}
           aria-label={t.conversation.searchMessages}
           style={{ flex: 1, minWidth: 0, border: 0, outline: 0, background: "transparent", color: "var(--aurora-fg1)", fontSize: 13 }}
         />
         {loading && <span aria-label={t.loading} style={{ color: "var(--aurora-fg4)", fontSize: 11 }}>…</span>}
-        {query && (
+        {urlState.query && results.length > 0 && (
+          <span
+            data-conversation-search-position
+            style={{ color: "var(--aurora-fg4)", fontSize: 10, whiteSpace: "nowrap" }}
+          >
+            {selectedResultIndex >= 0 ? selectedResultIndex + 1 : "–"}/{hasMore ? `${results.length}+` : results.length}
+          </span>
+        )}
+        {urlState.query && (
+          <>
+            <button
+              type="button"
+              data-conversation-search-previous
+              disabled={loading || selectedResultIndex === 0 || results.length === 0}
+              onClick={() => void stepResult(-1)}
+              aria-label="Previous search match"
+              style={{ border: 0, background: "transparent", color: "var(--aurora-fg3)", cursor: "pointer", padding: 3 }}
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              data-conversation-search-next
+              disabled={loading || results.length === 0 || (selectedResultIndex === results.length - 1 && !hasMore)}
+              onClick={() => void stepResult(1)}
+              aria-label="Next search match"
+              style={{ border: 0, background: "transparent", color: "var(--aurora-fg3)", cursor: "pointer", padding: 3 }}
+            >
+              ↓
+            </button>
+          </>
+        )}
+        {draftQuery && (
           <button
             type="button"
-            onClick={() => { setQuery(""); setOpen(false); inputRef.current?.focus(); }}
+            onClick={() => {
+              setDraftQuery("");
+              setOpen(false);
+              onCommitQuery("");
+              inputRef.current?.focus();
+            }}
             aria-label={t.conversation.clearSearch}
             style={{ border: 0, background: "transparent", color: "var(--aurora-fg4)", cursor: "pointer", padding: 2 }}
           >
             ×
           </button>
         )}
+        <button
+          type="button"
+          data-conversation-search-submit
+          onClick={submitSearch}
+          aria-label="Search conversation"
+          style={{ border: 0, borderRadius: 7, background: "var(--aurora-accent-soft)", color: "var(--aurora-accent)", cursor: "pointer", padding: "3px 7px", fontSize: 10, fontWeight: 650 }}
+        >
+          Go
+        </button>
         <kbd style={{ color: "var(--aurora-fg4)", fontSize: 10, border: "1px solid var(--aurora-border)", borderRadius: 5, padding: "1px 5px" }}>
           {typeof navigator !== "undefined" && /Mac/.test(navigator.platform) ? "⌘F" : "Ctrl F"}
         </kbd>
       </label>
 
-      {open && !query.trim() && history.length > 0 && (
+      {open && !draftQuery.trim() && history.length > 0 && (
         <div
           data-conversation-search-history
           role="listbox"
@@ -1617,7 +1981,11 @@ function ConversationSearchBar({
               role="option"
               aria-selected="false"
               data-conversation-search-history-item={item}
-              onClick={() => { setQuery(item); setOpen(true); }}
+              onClick={() => {
+                setDraftQuery(item);
+                setOpen(true);
+                onCommitQuery(item);
+              }}
               style={{
                 display: "block",
                 width: "100%",
@@ -1637,7 +2005,7 @@ function ConversationSearchBar({
         </div>
       )}
 
-      {open && query.trim() && (
+      {open && urlState.query && draftQuery === urlState.query && (
         <div
           data-conversation-search-results
           role="listbox"
@@ -1665,14 +2033,15 @@ function ConversationSearchBar({
               {t.conversation.noMatchingMessages}
             </div>
           )}
-          {results.map((result) => (
+          {results.map((result, index) => (
             <button
               key={result.id}
               type="button"
               role="option"
-              aria-selected="false"
+              aria-selected={index === selectedResultIndex}
               data-conversation-search-hit={result.line_number}
-              onClick={() => void selectResult(result)}
+              data-conversation-search-ordinal={index + 1}
+              onClick={() => void selectResult(result, index)}
               style={{
                 display: "block",
                 width: "100%",

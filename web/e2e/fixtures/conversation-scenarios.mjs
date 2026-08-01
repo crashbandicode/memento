@@ -925,6 +925,72 @@ export const claudeCanvas = {
 
 export const canvasScenarios = [cursorCanvas, codexCanvas, claudeCanvas];
 
+/**
+ * URL-navigation regression fixture: 260 rows force around-window loading,
+ * repeated Unicode search hits exercise stable ordinals, and line 180 is tall
+ * enough to verify normalized intra-message restoration across viewports.
+ */
+const URL_NAVIGATION_QUERY = "navigation needle 🧭";
+const URL_NAVIGATION_PROMPT_LINES = new Set(
+  Array.from({ length: 11 }, (_, index) => 1 + index * 25),
+);
+const URL_NAVIGATION_MESSAGES = Array.from({ length: 260 }, (_, index) => {
+  const line = index + 1;
+  const isPrompt = URL_NAVIGATION_PROMPT_LINES.has(line);
+  const timestamp = new Date(Date.parse(T0) + line * 1_000).toISOString();
+  let content = `Deterministic conversation row ${line}.`;
+  if (line % 13 === 0) {
+    content += ` Repeated ${URL_NAVIGATION_QUERY} match at stable line ${line}.`;
+  }
+  let toolCalls;
+  if (line === 180) {
+    content = `Long structured message: ${URL_NAVIGATION_QUERY}.`;
+    toolCalls = Array.from({ length: 24 }, (_, toolIndex) => ({
+      name: "ReadFile",
+      input: JSON.stringify({ path: `/fixture/segment-${toolIndex + 1}.md` }),
+      result: `Deterministic tool result ${toolIndex + 1} for URL position restoration.`,
+    }));
+  }
+  return /** @type {ConversationMessage} */ ({
+    id: 10_000 + line,
+    line_number: line,
+    role: isPrompt ? "user" : line % 2 === 0 ? "assistant" : "tool",
+    model: line % 2 === 0 ? "cursor-fixture-model" : undefined,
+    content,
+    tool_calls: toolCalls,
+    timestamp,
+  });
+});
+
+export const urlNavigationLargeThread = {
+  docId: "conv-url-navigation-large",
+  searchQuery: URL_NAVIGATION_QUERY,
+  longMessageLine: 180,
+  deepLinkLine: 217,
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-url-navigation-large",
+    tool_id: "cursor",
+    title: "Large URL navigation regression",
+    relative_path: "cursor/sessions/url-navigation-large.jsonl",
+    metadata: {},
+    message_count: URL_NAVIGATION_MESSAGES.length,
+    subagent_count: 0,
+    synced_at: T3,
+    activity_at: T3,
+  }),
+  messages: URL_NAVIGATION_MESSAGES,
+  prompts: URL_NAVIGATION_MESSAGES
+    .filter((message) => URL_NAVIGATION_PROMPT_LINES.has(message.line_number))
+    .map((message) => ({
+      id: message.id,
+      line_number: message.line_number,
+      content: message.content,
+      timestamp: message.timestamp,
+    })),
+  pending: EMPTY_PENDING,
+  latestAgentLine: 260,
+};
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -940,4 +1006,5 @@ export const scenarios = {
   [cursorCanvas.docId]: cursorCanvas,
   [codexCanvas.docId]: codexCanvas,
   [claudeCanvas.docId]: claudeCanvas,
+  [urlNavigationLargeThread.docId]: urlNavigationLargeThread,
 };

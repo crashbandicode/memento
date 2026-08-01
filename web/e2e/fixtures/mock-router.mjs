@@ -38,6 +38,7 @@ export function pathnameOf(url) {
  */
 export function resolveConversationRoute({ url, method = "GET", scenario }) {
   const pathname = pathnameOf(url);
+  const parsedUrl = new URL(url, "http://mock.local");
   const upperMethod = method.toUpperCase();
 
   // The SSE stream is intentionally inert — reproduces a metadata-only ingest
@@ -100,21 +101,70 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
   }
   if (/\/api\/conversations\/[^/]+\/messages$/.test(pathname)) {
     const messages = scenario.messages ?? [];
+    const requestedLimit = Number(parsedUrl.searchParams.get("limit") || 50);
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.max(1, Math.min(400, requestedLimit))
+      : 50;
+    const lineNumber = Number(parsedUrl.searchParams.get("line_number"));
+    let offset = Number(parsedUrl.searchParams.get("offset") || 0);
+    if (!Number.isInteger(offset) || offset < 0) offset = 0;
+    if (parsedUrl.searchParams.get("tail") === "true") {
+      offset = Math.max(0, messages.length - limit);
+    } else if (Number.isInteger(lineNumber) && lineNumber > 0) {
+      const targetIndex = messages.findIndex(
+        (message) => message.line_number === lineNumber,
+      );
+      const requestedContext = Number(
+        parsedUrl.searchParams.get("context_before") || 0,
+      );
+      const contextBefore = Number.isInteger(requestedContext)
+        ? Math.max(0, Math.min(limit - 1, requestedContext))
+        : 0;
+      offset = targetIndex >= 0
+        ? Math.max(0, targetIndex - contextBefore)
+        : Math.min(offset, messages.length);
+    }
+    const window = offset === 0 && limit >= messages.length
+      ? messages
+      : messages.slice(offset, offset + limit);
     return {
       action: "fulfill",
       status: 200,
-      json: { total: messages.length, offset: 0, limit: 50, messages },
+      json: { total: messages.length, offset, limit, messages: window },
     };
   }
   if (/\/api\/conversations\/[^/]+\/search$/.test(pathname)) {
+    const query = (parsedUrl.searchParams.get("q") || "").trim();
+    const requestedLimit = Number(parsedUrl.searchParams.get("limit") || 50);
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.max(1, Math.min(100, requestedLimit))
+      : 50;
+    const afterLine = Number(parsedUrl.searchParams.get("after_line"));
+    const normalizedQuery = query.toLocaleLowerCase();
+    const matches = (scenario.messages ?? [])
+      .filter((message) =>
+        (!Number.isInteger(afterLine) || message.line_number > afterLine)
+        && String(message.content || "").toLocaleLowerCase().includes(normalizedQuery),
+      );
+    const page = matches.slice(0, limit);
+    const hasMore = matches.length > page.length;
     return {
       action: "fulfill",
       status: 200,
       json: {
-        query: "",
-        results: [],
-        next_after_line: null,
-        has_more: false,
+        query,
+        results: page.map((message) => ({
+          id: message.id,
+          line_number: message.line_number,
+          role: message.role,
+          origin: message.origin ?? null,
+          snippet: String(message.content || "").slice(0, 240),
+          timestamp: message.timestamp ?? null,
+          score: 1,
+          match_type: "exact",
+        })),
+        next_after_line: hasMore ? page.at(-1)?.line_number ?? null : null,
+        has_more: hasMore,
         corrected_query: null,
       },
     };

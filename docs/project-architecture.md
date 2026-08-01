@@ -353,6 +353,23 @@ MCP Memory Server
 | **个人资料** `/profile` | 账号信息 + collector token (遮蔽/显示/复制) + 一键重新生成 + 登出 |
 | **管理** `/admin` (admin/owner) | 用户审批,用户行下挂可复制的 collector token;权限管理;同步状态;设备的更新/重采/彻底删除 |
 
+### 对话 URL 导航状态
+
+`/conversations/[id]` 使用 `web/src/lib/conversation-url-state.ts` 作为唯一的
+解析/序列化策略。Schema 为 `line`（稳定服务端行号）、可选 `pos`（消息内部
+0–1000 比例）、`q`（最多 256 个 Unicode code point 的已提交搜索）、
+`scope=messages`、`match`（1-based 结果序号）和 `hit`（匹配消息稳定行号）。
+序列化会保留不属于该 schema 的 query 参数；旧的 `?line=N` 深链接继续有效，
+非法值被忽略。
+
+显式搜索、匹配前后跳转、Prompt navigator、待处理问题和 latest-agent 跳转使用
+`history.pushState`。滚轮、触摸和键盘产生的被动阅读位置由
+`IntersectionObserver` + 220ms debounce 采样，并仅用 `replaceState` 更新，
+避免污染 Back 历史。恢复流程先通过 messages around-window API 加载目标分页
+窗口/分离尾部，再在短暂 layout-settle 窗口按 `line + pos` 定位；程序化滚动被
+generation guard 隔离，不会反向覆盖刚恢复的 URL。顶部固定控件通过 transcript
+内 16px clearance 避让。
+
 ### 主题系统
 
 右上角皮肤切换器支持 **3 套皮肤 × 明暗** = 6 种组合,localStorage 持久化:
