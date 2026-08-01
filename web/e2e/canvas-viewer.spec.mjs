@@ -45,7 +45,7 @@ test.describe("canvas viewer", () => {
     });
   }
 
-  test("Cursor canvas expands into an accessible source viewer", async ({ page }) => {
+  test("Cursor canvas renders captured output in an isolated iframe", async ({ page }) => {
     const errors = trackErrors(page);
     await openConversation(page, cursorCanvas);
 
@@ -58,14 +58,31 @@ test.describe("canvas viewer", () => {
     await expect(dialog).toHaveAttribute("role", "dialog");
     await expect(dialog).toHaveAttribute("aria-modal", "true");
     await expect(dialog).toHaveAttribute("aria-labelledby", /.+/);
-    await expect(dialog).toHaveAttribute("data-canvas-mode", "source");
+    await expect(dialog).toHaveAttribute("data-canvas-mode", "interactive");
     await expect(dialog).toHaveAttribute("data-canvas-layout", "modal");
 
+    const frame = page.getByTestId("canvas-frame");
+    await expect(frame).toBeVisible();
+    const sandbox = (await frame.getAttribute("sandbox")) ?? "";
+    expect(sandbox).toContain("allow-scripts");
+    expect(sandbox).not.toContain("allow-same-origin");
+    expect(sandbox).not.toContain("allow-popups");
+    const srcdoc = (await frame.getAttribute("srcdoc")) ?? "";
+    expect(srcdoc).toContain("default-src 'none'");
+    expect(srcdoc).toContain("connect-src 'none'");
+    expect(srcdoc).toContain("frame-src 'none'");
+    await expect(
+      page
+        .frameLocator('[data-testid="canvas-frame"]')
+        .locator("#captured-canvas-marker"),
+    ).toContainText("Captured Cursor canvas rendered");
+
+    await page.getByTestId("canvas-source-toggle").click();
     await expect(page.getByTestId("canvas-source")).toContainText(
       "export default function BillingReview",
     );
-    // Nothing is ever executed for source mode — no iframe is created.
-    await expect(page.getByTestId("canvas-frame")).toHaveCount(0);
+    await page.getByTestId("canvas-source-toggle").click();
+    await expect(frame).toBeVisible();
 
     const focusInside = await page.evaluate(() => {
       const dlg = document.querySelector('[data-testid="canvas-viewer"]');
@@ -73,7 +90,7 @@ test.describe("canvas viewer", () => {
     });
     expect(focusInside).toBe(true);
 
-    await page.screenshot({ path: path.join(ART_DIR, "cursor-source-desktop.png"), fullPage: true });
+    await page.screenshot({ path: path.join(ART_DIR, "cursor-captured-desktop.png"), fullPage: true });
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -153,7 +170,8 @@ test.describe("canvas viewer", () => {
     const box = await dialog.boundingBox();
     expect(box?.width ?? 0).toBeGreaterThan(360);
 
-    await page.screenshot({ path: path.join(ART_DIR, "cursor-source-mobile.png"), fullPage: true });
+    await expect(page.getByTestId("canvas-frame")).toBeVisible();
+    await page.screenshot({ path: path.join(ART_DIR, "cursor-captured-mobile.png"), fullPage: true });
 
     await page.getByTestId("canvas-viewer-close").click();
     await expect(dialog).toHaveCount(0);

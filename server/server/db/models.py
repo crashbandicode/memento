@@ -6,8 +6,8 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String,
-    Text, UniqueConstraint, func,
+    BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer,
+    LargeBinary, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -208,6 +208,138 @@ class ConversationMessage(Base):
         Index("uq_conv_msg_doc_line", "document_id", "line_number", unique=True),
         Index("idx_conv_msg_timestamp", "timestamp"),
         Index("idx_conv_msg_doc_ts", "document_id", "timestamp"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Captured Cursor Canvas artifacts
+# ---------------------------------------------------------------------------
+class CanvasArtifactBlob(Base):
+    """Immutable, hash-addressed artifact bytes shared by authorized links."""
+
+    __tablename__ = "canvas_artifact_blobs"
+
+    content_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class CanvasArtifact(Base):
+    """One validated Canvas source and its optional renderable representation."""
+
+    __tablename__ = "canvas_artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    origin_machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    source_hash: Mapped[str] = mapped_column(
+        ForeignKey("canvas_artifact_blobs.content_hash"), nullable=False
+    )
+    compiled_hash: Mapped[str | None] = mapped_column(
+        ForeignKey("canvas_artifact_blobs.content_hash")
+    )
+    runtime_hash: Mapped[str | None] = mapped_column(
+        ForeignKey("canvas_artifact_blobs.content_hash")
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    render_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    compiler_version: Mapped[str | None] = mapped_column(String(128))
+    runtime_sdk_version: Mapped[str | None] = mapped_column(String(128))
+    origin: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "source_hash", name="uq_canvas_artifact_user_source"),
+        Index("idx_canvas_artifact_machine", "origin_machine_id"),
+    )
+
+
+class CanvasArtifactReference(Base):
+    """A device-owned conversation reference and its explicit backfill outcome."""
+
+    __tablename__ = "canvas_artifact_references"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("conversation_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    recorded_path: Mapped[str] = mapped_column(Text, nullable=False)
+    path_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("canvas_artifacts.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="discovered"
+    )
+    reason: Mapped[str | None] = mapped_column(String(128))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "path_hash",
+            name="uq_canvas_reference_message_path",
+        ),
+        Index("idx_canvas_reference_machine_status", "machine_id", "status"),
+        Index("idx_canvas_reference_document", "document_id"),
+        Index("idx_canvas_reference_artifact", "artifact_id"),
+    )
+
+
+class CanvasArtifactInventoryState(Base):
+    """Per-device high-water mark for bounded historical reference discovery."""
+
+    __tablename__ = "canvas_artifact_inventory_states"
+
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), primary_key=True
+    )
+    last_message_id: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 

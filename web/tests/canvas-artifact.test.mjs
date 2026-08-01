@@ -45,7 +45,17 @@ test("embed URL allowlist blocks dangerous schemes", () => {
   assert.equal(isSafeCanvasEmbedUrl(`https://example.com/${"x".repeat(600)}`), false);
 });
 
-test("resolveCanvasView prefers html, then url, then source, then unsupported", () => {
+test("resolveCanvasView prefers captured output, then legacy views", () => {
+  assert.deepEqual(
+    resolveCanvasView({
+      render_url: "/api/canvas-artifacts/11111111-1111-4111-8111-111111111111/render",
+      html: "<b>legacy</b>",
+    }),
+    {
+      mode: "interactive",
+      renderUrl: "/api/canvas-artifacts/11111111-1111-4111-8111-111111111111/render",
+    },
+  );
   assert.deepEqual(resolveCanvasView({ html: "<b>hi</b>" }), {
     mode: "embed",
     variant: "srcdoc",
@@ -68,6 +78,9 @@ test("resolveCanvasView prefers html, then url, then source, then unsupported", 
 
 test("resolveCanvasView rejects unsafe embed URLs (falls back)", () => {
   assert.deepEqual(resolveCanvasView({ url: "javascript:alert(1)" }), { mode: "unsupported" });
+  assert.deepEqual(resolveCanvasView({ render_url: "https://evil.test/render" }), {
+    mode: "unsupported",
+  });
 });
 
 test("resolveCanvasView enforces size caps", () => {

@@ -756,7 +756,7 @@ export const smartLinkScenarios = [claudeSmartLinks, cursorSmartLinks, codexSmar
  * Canvas artifacts across the three tools. Each scenario exercises a different
  * viewer mode so the shared detection + secure-viewer layer is covered end to
  * end:
- *   - Cursor  → read-only SOURCE preview (transcript embedded the TSX).
+ *   - Cursor  → captured INTERACTIVE preview with authenticated source.
  *   - Codex   → sandboxed EMBED of a self-contained HTML export.
  *   - Claude  → link-only, no server descriptor → UNSUPPORTED fallback.
  * These are simulated snapshots, not live data.
@@ -776,6 +776,14 @@ const CURSOR_CANVAS_SOURCE = [
   "  );",
   "}",
 ].join("\n");
+const CURSOR_CANVAS_ARTIFACT_ID = "11111111-1111-4111-8111-111111111111";
+const CURSOR_CANVAS_SHELL = [
+  "<!doctype html><html><head>",
+  '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; connect-src \'none\'; frame-src \'none\'; script-src \'unsafe-inline\'">',
+  "</head><body>",
+  '<main id="captured-canvas-marker">Captured Cursor canvas rendered</main>',
+  "</body></html>",
+].join("");
 
 export const cursorCanvas = {
   docId: "conv-canvas-cursor",
@@ -809,9 +817,11 @@ export const cursorCanvas = {
           name: "billing-review",
           path: CURSOR_CANVAS_PATH,
           href: CURSOR_CANVAS_PATH,
-          source_kind: "source",
-          source: CURSOR_CANVAS_SOURCE,
-          source_language: "tsx",
+          source_kind: "interactive",
+          artifact_id: CURSOR_CANVAS_ARTIFACT_ID,
+          render_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/render`,
+          source_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/source`,
+          capture_status: "renderable",
         },
       ],
       timestamp: T1,
@@ -822,6 +832,12 @@ export const cursorCanvas = {
   ],
   pending: EMPTY_PENDING,
   latestAgentLine: 2,
+  canvasArtifacts: {
+    [CURSOR_CANVAS_ARTIFACT_ID]: {
+      render: CURSOR_CANVAS_SHELL,
+      source: CURSOR_CANVAS_SOURCE,
+    },
+  },
 };
 
 const CODEX_CANVAS_PATH =

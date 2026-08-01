@@ -6,7 +6,7 @@ export interface CanvasArtifact {
   /** Original href/target as it appeared in the transcript. */
   href: string;
   /** How the server classified the available representation. */
-  source_kind?: "embed" | "source" | "unsupported";
+  source_kind?: "embed" | "source" | "unsupported" | "interactive" | "captured_source";
   /** Read-only TSX/source text embedded in the transcript, if any. */
   source?: string | null;
   /** Language hint for the source preview (defaults to `tsx`). */
@@ -17,9 +17,18 @@ export interface CanvasArtifact {
   url?: string | null;
   /** Host for a remote artifact URL. */
   host?: string | null;
+  /** Authenticated stored artifact identity. */
+  artifact_id?: string | null;
+  /** Relative authenticated endpoint returning the isolated render shell. */
+  render_url?: string | null;
+  /** Relative authenticated endpoint returning inert TSX source. */
+  source_url?: string | null;
+  /** Explicit collector backfill state. */
+  capture_status?: string | null;
 }
 
 export type CanvasView =
+  | { mode: "interactive"; renderUrl: string }
   | { mode: "embed"; variant: "srcdoc"; html: string }
   | { mode: "embed"; variant: "src"; url: string }
   | { mode: "source"; source: string; language: string }

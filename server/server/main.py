@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import admin, auth, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
+from .api import admin, auth, canvas_artifacts, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -714,6 +714,7 @@ app.add_middleware(
 # Register routers
 app.include_router(dashboard.router)
 app.include_router(ingest.router)
+app.include_router(canvas_artifacts.router)
 app.include_router(tools.router)
 app.include_router(documents.router)
 app.include_router(conversations.router)

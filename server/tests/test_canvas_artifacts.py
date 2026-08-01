@@ -32,6 +32,13 @@ def test_detects_markdown_link_without_source_is_unsupported():
     assert conversation_has_canvas(content) is True
 
 
+def test_canvas_filename_label_does_not_create_duplicate_relative_reference():
+    content = f"Built [{CANVAS_PATH.rsplit('/', 1)[-1]}]({CANVAS_PATH})."
+    canvases = detect_message_canvases(content)
+    assert len(canvases) == 1
+    assert canvases[0]["path"] == CANVAS_PATH
+
+
 def test_detects_bare_inline_canvas_path():
     content = f"See `{CANVAS_PATH}` for the report."
     canvases = detect_message_canvases(content)

@@ -50,6 +50,25 @@ export async function installConversationMocks(page, scenario) {
       return;
     }
 
+    const artifactMatch = new URL(request.url()).pathname.match(
+      /^\/api\/canvas-artifacts\/([0-9a-f-]{36})\/(render|source)$/,
+    );
+    if (method === "GET" && artifactMatch) {
+      const [, artifactId, kind] = artifactMatch;
+      const artifact = scenario.canvasArtifacts?.[artifactId];
+      if (!artifact || typeof artifact[kind] !== "string") {
+        await route.fulfill({ status: 404, body: "Not found" });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: kind === "render" ? "text/html" : "text/typescript",
+        headers: CORS_HEADERS,
+        body: artifact[kind],
+      });
+      return;
+    }
+
     const result = resolveConversationRoute({
       url: request.url(),
       method,

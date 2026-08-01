@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, load_only
 
 from ..db.models import (
+    CanvasArtifact,
+    CanvasArtifactReference,
     ConversationMessage,
     ConversationTaskState,
     Document,
@@ -36,6 +38,7 @@ from ..services.conversation_hierarchy import (
     merge_subagent_event_summaries,
 )
 from ..services.canvas_artifacts import detect_message_canvases
+from ..services.canvas_artifact_store import normalized_path_hash
 from ..services.conversation_markdown import (
     is_meaningful_human_prompt,
     is_meaningful_human_turn,
@@ -65,10 +68,59 @@ from ..services.user_filter import user_machine_ids
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
-def _canvas_field(content: str | None) -> dict:
+def _canvas_field(content: str | None, links: dict[str, dict] | None = None) -> dict:
     """Attach validated Cursor Canvas descriptors only when a message has any."""
     canvases = detect_message_canvases(content)
+    if links:
+        for canvas in canvases:
+            link = links.get(normalized_path_hash(str(canvas.get("path") or "")))
+            if not link:
+                continue
+            canvas["capture_status"] = link["status"]
+            if link.get("artifact_id"):
+                artifact_id = link["artifact_id"]
+                canvas["artifact_id"] = artifact_id
+                canvas["source_url"] = f"/api/canvas-artifacts/{artifact_id}/source"
+                if link.get("render_mode") == "interactive":
+                    canvas["render_url"] = (
+                        f"/api/canvas-artifacts/{artifact_id}/render"
+                    )
+                    canvas["source_kind"] = "interactive"
+                else:
+                    canvas["source_kind"] = "captured_source"
     return {"canvases": canvases} if canvases else {}
+
+
+async def _canvas_links_for_messages(
+    db: AsyncSession,
+    message_ids: list[int],
+) -> dict[int, dict[str, dict]]:
+    if not message_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                CanvasArtifactReference.message_id,
+                CanvasArtifactReference.path_hash,
+                CanvasArtifactReference.artifact_id,
+                CanvasArtifactReference.status,
+                CanvasArtifact.render_mode,
+            )
+            .outerjoin(
+                CanvasArtifact,
+                CanvasArtifact.id == CanvasArtifactReference.artifact_id,
+            )
+            .where(CanvasArtifactReference.message_id.in_(message_ids))
+        )
+    ).all()
+    links: dict[int, dict[str, dict]] = {}
+    for message_id, path_hash, artifact_id, status, render_mode in rows:
+        links.setdefault(message_id, {})[path_hash] = {
+            "artifact_id": str(artifact_id) if artifact_id else None,
+            "status": status,
+            "render_mode": render_mode,
+        }
+    return links
 
 _MACHINE_PLATFORM_SUFFIX_RE = re.compile(
     r"\s+\((?:darwin|linux|windows)\)\s*$",
@@ -567,6 +619,14 @@ async def get_conversation_messages(
 
         msgs_result = await db.execute(message_query)
         messages = msgs_result.scalars().all()
+        canvas_links = await _canvas_links_for_messages(
+            db,
+            [
+                message.id
+                for message in messages
+                if ".canvas.tsx" in (message.content or "").casefold()
+            ],
+        )
         return {
             "total": total,
             "offset": offset,
@@ -603,7 +663,7 @@ async def get_conversation_messages(
                     "agent_event": _stored_agent_event(m.metadata_),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
-                    **_canvas_field(m.content),
+                    **_canvas_field(m.content, canvas_links.get(m.id)),
                 }
                 for m in messages
             ],

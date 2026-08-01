@@ -130,10 +130,12 @@ def is_safe_canvas_embed_url(value: str | None) -> bool:
 def _iter_references(content: str):
     """Yield ``(position, label, href)`` for each canvas reference, deduped."""
     seen: set[str] = set()
+    markdown_ranges: list[tuple[int, int]] = []
 
     for match in _MARKDOWN_LINK.finditer(content):
         label, href = match.group(1), match.group(2)
         if looks_like_canvas_artifact(href) or looks_like_canvas_artifact(label):
+            markdown_ranges.append(match.span())
             target = href if looks_like_canvas_artifact(href) else label
             key = _path_part(target).lower()
             if key and key not in seen:
@@ -141,6 +143,8 @@ def _iter_references(content: str):
                 yield match.start(), label, href
 
     for match in _BARE_CANVAS.finditer(content):
+        if any(start <= match.start() < end for start, end in markdown_ranges):
+            continue
         href = match.group(0)
         key = _path_part(href).lower()
         if key and key not in seen:
