@@ -99,11 +99,12 @@ export async function installConversationMocks(page, scenario) {
  * Seed auth, install mocks, open the conversation page and wait for the viewer.
  * @param {import('@playwright/test').Page} page
  * @param {any} scenario
+ * @param {string} [query]
  */
-export async function openConversation(page, scenario) {
+export async function openConversation(page, scenario, query = "") {
   await seedAuth(page);
   await installConversationMocks(page, scenario);
-  await page.goto(`/conversations/${scenario.docId}`);
+  await page.goto(`/conversations/${scenario.docId}${query}`);
   await page.waitForSelector("[data-conversation-viewer]", { timeout: 15000 });
   // The initial message page has finished loading once the viewer reports it.
   await page.waitForFunction(() => {
