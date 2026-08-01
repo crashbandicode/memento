@@ -11,6 +11,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "@/components/aurora/Icon";
+import { authFetch, getApiBase } from "@/lib/api-client";
 import { useI18n } from "@/lib/i18n";
 import {
   buildCanvasSrcDoc,
@@ -71,9 +72,37 @@ export function CanvasViewer({
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const isMobile = useIsMobile();
+  const [renderResult, setRenderResult] = useState<{
+    url: string;
+    shell: string | null;
+    error: boolean;
+  } | null>(null);
+  const [storedSource, setStoredSource] = useState<string | null>(null);
+  const [showSource, setShowSource] = useState(false);
 
   const view = useMemo(() => resolveCanvasView(artifact), [artifact]);
   const requestClose = useCallback(() => onClose(), [onClose]);
+
+  useEffect(() => {
+    if (!open || view.mode !== "interactive") return undefined;
+    const controller = new AbortController();
+    void authFetch(`${getApiBase()}${view.renderUrl}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Canvas HTTP ${response.status}`);
+        const shell = await response.text();
+        if (!shell || shell.length > 5_000_000) throw new Error("Invalid Canvas shell");
+        setRenderResult({ url: view.renderUrl, shell, error: false });
+      })
+      .catch((error: unknown) => {
+        if ((error as { name?: string })?.name !== "AbortError") {
+          setRenderResult({ url: view.renderUrl, shell: null, error: true });
+        }
+      });
+    return () => controller.abort();
+  }, [open, view]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -119,12 +148,38 @@ export function CanvasViewer({
     }
   };
 
+  const loadStoredSource = async (): Promise<string | null> => {
+    if (storedSource) return storedSource;
+    if (!artifact.source_url) return null;
+    const response = await authFetch(`${getApiBase()}${artifact.source_url}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`Canvas source HTTP ${response.status}`);
+    const source = await response.text();
+    if (source.length > 200_000) throw new Error("Canvas source is too large");
+    setStoredSource(source);
+    return source;
+  };
+
   const copySource = async () => {
-    if (view.mode !== "source") return;
     try {
-      await navigator.clipboard?.writeText(view.source);
+      const source = view.mode === "source" ? view.source : await loadStoredSource();
+      if (source) await navigator.clipboard?.writeText(source);
     } catch {
       /* clipboard denied — the source stays visible for manual selection */
+    }
+  };
+
+  const toggleSource = async () => {
+    if (showSource) {
+      setShowSource(false);
+      return;
+    }
+    try {
+      if (view.mode !== "source") await loadStoredSource();
+      setShowSource(true);
+    } catch {
+      setShowSource(false);
     }
   };
 
@@ -132,6 +187,13 @@ export function CanvasViewer({
 
   const canOpenExternally =
     typeof artifact.url === "string" && isSafeCanvasEmbedUrl(artifact.url);
+  const canShowStoredSource = Boolean(artifact.source_url);
+  const cursorUrl = artifact.artifact_id && /^[A-Za-z]:[\\/]/.test(artifact.path || "")
+    ? `cursor://file/${encodeURI((artifact.path || "").replaceAll("\\", "/"))}`
+    : null;
+  const currentRender = view.mode === "interactive" && renderResult?.url === view.renderUrl
+    ? renderResult
+    : null;
 
   return createPortal(
     <div
@@ -162,6 +224,9 @@ export function CanvasViewer({
               {artifact.name || "canvas"}
             </h2>
           </div>
+          <span className={styles.modeBadge}>
+            {view.mode === "interactive" ? copy.interactive : copy.static}
+          </span>
           <span className={styles.spacer} />
           {view.mode === "source" && (
             <button
@@ -173,6 +238,28 @@ export function CanvasViewer({
               <Icon name="copy" size={14} />
               <span>{copy.copySource}</span>
             </button>
+          )}
+          {canShowStoredSource && view.mode !== "source" && (
+            <button
+              type="button"
+              className={styles.toolbarBtn}
+              data-testid="canvas-source-toggle"
+              onClick={toggleSource}
+            >
+              <Icon name="file_text" size={14} />
+              <span>{showSource ? copy.viewVisual : copy.viewSource}</span>
+            </button>
+          )}
+          {cursorUrl && (
+            <a
+              className={styles.toolbarBtn}
+              data-testid="canvas-open-cursor"
+              href={cursorUrl}
+              rel="noreferrer"
+            >
+              <Icon name="external_link" size={14} />
+              <span>{copy.openInCursor}</span>
+            </a>
           )}
           {canOpenExternally && (
             <a
@@ -198,7 +285,30 @@ export function CanvasViewer({
         </header>
 
         <div className={styles.body}>
-          <CanvasViewerBody view={view} artifact={artifact} copy={copy} />
+          {showSource && (storedSource || view.mode === "source") ? (
+            <div className={styles.sourceWrap}>
+              <button
+                type="button"
+                className={styles.copyFloating}
+                data-testid="canvas-copy"
+                onClick={copySource}
+              >
+                <Icon name="copy" size={14} />
+                {copy.copySource}
+              </button>
+              <pre className={styles.source} data-testid="canvas-source" tabIndex={0}>
+                {storedSource || (view.mode === "source" ? view.source : "")}
+              </pre>
+            </div>
+          ) : (
+            <CanvasViewerBody
+              view={view}
+              artifact={artifact}
+              copy={copy}
+              renderShell={currentRender?.shell ?? null}
+              renderError={currentRender?.error ?? false}
+            />
+          )}
         </div>
       </div>
     </div>,
@@ -210,11 +320,47 @@ function CanvasViewerBody({
   view,
   artifact,
   copy,
+  renderShell,
+  renderError,
 }: {
   view: ReturnType<typeof resolveCanvasView>;
   artifact: CanvasArtifact;
   copy: ReturnType<typeof useI18n>["t"]["conversation"]["canvas"];
+  renderShell: string | null;
+  renderError: boolean;
 }) {
+  if (view.mode === "interactive") {
+    if (renderError) {
+      return (
+        <div className={styles.fallback} data-testid="canvas-load-error">
+          <p className={styles.fallbackTitle}>{copy.loadError}</p>
+        </div>
+      );
+    }
+    if (!renderShell) {
+      return (
+        <div className={styles.fallback} data-testid="canvas-loading" role="status">
+          <p className={styles.fallbackText}>{copy.loading}</p>
+        </div>
+      );
+    }
+    return (
+      <iframe
+        className={styles.frame}
+        data-testid="canvas-frame"
+        data-canvas-embed="captured"
+        title={`${copy.eyebrow}: ${artifact.name}`}
+        sandbox={CANVAS_IFRAME_SANDBOX}
+        referrerPolicy="no-referrer"
+        allow={
+          "camera 'none'; clipboard-read 'none'; clipboard-write 'none'; "
+          + "display-capture 'none'; geolocation 'none'; microphone 'none'; "
+          + "payment 'none'; usb 'none'"
+        }
+        srcDoc={renderShell}
+      />
+    );
+  }
   if (view.mode === "embed") {
     const commonProps = {
       className: styles.frame,

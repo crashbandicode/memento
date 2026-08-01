@@ -756,7 +756,7 @@ export const smartLinkScenarios = [claudeSmartLinks, cursorSmartLinks, codexSmar
  * Canvas artifacts across the three tools. Each scenario exercises a different
  * viewer mode so the shared detection + secure-viewer layer is covered end to
  * end:
- *   - Cursor  → read-only SOURCE preview (transcript embedded the TSX).
+ *   - Cursor  → captured INTERACTIVE preview with authenticated source.
  *   - Codex   → sandboxed EMBED of a self-contained HTML export.
  *   - Claude  → link-only, no server descriptor → UNSUPPORTED fallback.
  * These are simulated snapshots, not live data.
@@ -776,6 +776,14 @@ const CURSOR_CANVAS_SOURCE = [
   "  );",
   "}",
 ].join("\n");
+const CURSOR_CANVAS_ARTIFACT_ID = "11111111-1111-4111-8111-111111111111";
+const CURSOR_CANVAS_SHELL = [
+  "<!doctype html><html><head>",
+  '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; connect-src \'none\'; frame-src \'none\'; script-src \'unsafe-inline\'">',
+  "</head><body>",
+  '<main id="captured-canvas-marker">Captured Cursor canvas rendered</main>',
+  "</body></html>",
+].join("");
 
 export const cursorCanvas = {
   docId: "conv-canvas-cursor",
@@ -809,9 +817,11 @@ export const cursorCanvas = {
           name: "billing-review",
           path: CURSOR_CANVAS_PATH,
           href: CURSOR_CANVAS_PATH,
-          source_kind: "source",
-          source: CURSOR_CANVAS_SOURCE,
-          source_language: "tsx",
+          source_kind: "interactive",
+          artifact_id: CURSOR_CANVAS_ARTIFACT_ID,
+          render_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/render`,
+          source_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/source`,
+          capture_status: "renderable",
         },
       ],
       timestamp: T1,
@@ -822,6 +832,12 @@ export const cursorCanvas = {
   ],
   pending: EMPTY_PENDING,
   latestAgentLine: 2,
+  canvasArtifacts: {
+    [CURSOR_CANVAS_ARTIFACT_ID]: {
+      render: CURSOR_CANVAS_SHELL,
+      source: CURSOR_CANVAS_SOURCE,
+    },
+  },
 };
 
 const CODEX_CANVAS_PATH =
@@ -925,6 +941,109 @@ export const claudeCanvas = {
 
 export const canvasScenarios = [cursorCanvas, codexCanvas, claudeCanvas];
 
+/**
+ * URL-navigation regression fixture: 260 rows force around-window loading,
+ * repeated Unicode search hits exercise stable ordinals, and line 180 is tall
+ * enough to verify normalized intra-message restoration across viewports.
+ */
+const URL_NAVIGATION_QUERY = "navigation needle 🧭";
+const URL_NAVIGATION_PROMPT_LINES = new Set(
+  Array.from({ length: 11 }, (_, index) => 1 + index * 25),
+);
+const URL_NAVIGATION_MESSAGES = Array.from({ length: 260 }, (_, index) => {
+  const line = index + 1;
+  const isPrompt = URL_NAVIGATION_PROMPT_LINES.has(line);
+  const timestamp = new Date(Date.parse(T0) + line * 1_000).toISOString();
+  let content = `Deterministic conversation row ${line}.`;
+  if (line % 13 === 0) {
+    content += ` Repeated ${URL_NAVIGATION_QUERY} match at stable line ${line}.`;
+  }
+  let toolCalls;
+  if (line === 180) {
+    content = `Long structured message: ${URL_NAVIGATION_QUERY}.`;
+    toolCalls = Array.from({ length: 24 }, (_, toolIndex) => ({
+      name: "ReadFile",
+      input: JSON.stringify({ path: `/fixture/segment-${toolIndex + 1}.md` }),
+      result: `Deterministic tool result ${toolIndex + 1} for URL position restoration.`,
+    }));
+  }
+  return /** @type {ConversationMessage} */ ({
+    id: 10_000 + line,
+    line_number: line,
+    role: isPrompt ? "user" : line % 2 === 0 ? "assistant" : "tool",
+    model: line % 2 === 0 ? "cursor-fixture-model" : undefined,
+    content,
+    tool_calls: toolCalls,
+    timestamp,
+  });
+});
+
+export const urlNavigationLargeThread = {
+  docId: "conv-url-navigation-large",
+  searchQuery: URL_NAVIGATION_QUERY,
+  longMessageLine: 180,
+  deepLinkLine: 217,
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-url-navigation-large",
+    tool_id: "cursor",
+    title: "Large URL navigation regression",
+    relative_path: "cursor/sessions/url-navigation-large.jsonl",
+    metadata: {},
+    message_count: URL_NAVIGATION_MESSAGES.length,
+    subagent_count: 0,
+    synced_at: T3,
+    activity_at: T3,
+  }),
+  messages: URL_NAVIGATION_MESSAGES,
+  prompts: URL_NAVIGATION_MESSAGES
+    .filter((message) => URL_NAVIGATION_PROMPT_LINES.has(message.line_number))
+    .map((message) => ({
+      id: message.id,
+      line_number: message.line_number,
+      content: message.content,
+      timestamp: message.timestamp,
+    })),
+  pending: EMPTY_PENDING,
+  latestAgentLine: 260,
+};
+
+export const urlNavigationCanvasThread = {
+  ...urlNavigationLargeThread,
+  docId: "conv-url-navigation-canvas",
+  meta: {
+    ...urlNavigationLargeThread.meta,
+    id: "conv-url-navigation-canvas",
+    title: "Canvas URL navigation regression",
+    relative_path: "cursor/sessions/url-navigation-canvas.jsonl",
+  },
+  messages: urlNavigationLargeThread.messages.map((message) =>
+    message.line_number === urlNavigationLargeThread.longMessageLine
+      ? {
+        ...message,
+        content: `${message.content} [billing-review](${CURSOR_CANVAS_PATH})`,
+        canvases: [
+          {
+            name: "billing-review",
+            path: CURSOR_CANVAS_PATH,
+            href: CURSOR_CANVAS_PATH,
+            source_kind: "interactive",
+            artifact_id: CURSOR_CANVAS_ARTIFACT_ID,
+            render_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/render`,
+            source_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/source`,
+            capture_status: "renderable",
+          },
+        ],
+      }
+      : message
+  ),
+  canvasArtifacts: {
+    [CURSOR_CANVAS_ARTIFACT_ID]: {
+      render: CURSOR_CANVAS_SHELL,
+      source: CURSOR_CANVAS_SOURCE,
+    },
+  },
+};
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -940,4 +1059,6 @@ export const scenarios = {
   [cursorCanvas.docId]: cursorCanvas,
   [codexCanvas.docId]: codexCanvas,
   [claudeCanvas.docId]: claudeCanvas,
+  [urlNavigationLargeThread.docId]: urlNavigationLargeThread,
+  [urlNavigationCanvasThread.docId]: urlNavigationCanvasThread,
 };

@@ -31,6 +31,7 @@ import {
   runningSubagent,
   scenarios,
   smartLinkScenarios,
+  urlNavigationLargeThread,
 } from "./conversation-scenarios.mjs";
 
 const base = "http://localhost:3100";
@@ -128,6 +129,36 @@ test("pathnameOf tolerates relative and absolute URLs", () => {
   assert.equal(pathnameOf("https://memento.test:8001/api/auth/me"), "/api/auth/me");
 });
 
+test("large URL-navigation fixture serves bounded around-windows", () => {
+  const result = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/messages?line_number=217&context_before=12&limit=120`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.equal(result.json.total, 260);
+  assert.equal(result.json.offset, 204);
+  assert.equal(result.json.messages[12].line_number, 217);
+  assert.equal(result.json.messages.length, 56);
+});
+
+test("large fixture search pages repeated Unicode matches chronologically", () => {
+  const query = encodeURIComponent(urlNavigationLargeThread.searchQuery);
+  const first = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/search?q=${query}&limit=5`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.deepEqual(
+    first.json.results.map((result) => result.line_number),
+    [13, 26, 39, 52, 65],
+  );
+  assert.equal(first.json.has_more, true);
+
+  const second = resolveConversationRoute({
+    url: `${base}/api/conversations/${urlNavigationLargeThread.docId}/search?q=${query}&limit=5&after_line=65`,
+    scenario: urlNavigationLargeThread,
+  });
+  assert.equal(second.json.results[0].line_number, 78);
+});
+
 // --- Fixture invariants: each scenario still guards its regression -----------
 
 test("regression #1/#3: permission wrapper is unwrapped to the real question", () => {
@@ -195,17 +226,19 @@ test("smart-link fixtures cover the shared Claude, Cursor, and Codex render laye
   }
 });
 
-test("canvas fixtures cover source, embed, and unsupported across three tools", () => {
+test("canvas fixtures cover captured, embed, and unsupported across three tools", () => {
   assert.deepEqual(
     canvasScenarios.map((scenario) => scenario.meta.tool_id),
     ["cursor", "codex", "claude_code"],
   );
 
-  // Cursor: transcript embeds the TSX source → read-only source preview.
+  // Cursor: collector uploaded an authenticated interactive artifact + source.
   const cursorArtifact = cursorCanvas.messages[1].canvases[0];
-  assert.equal(cursorArtifact.source_kind, "source");
+  assert.equal(cursorArtifact.source_kind, "interactive");
   assert.match(cursorArtifact.path, /\.canvas\.tsx$/);
-  assert.match(cursorArtifact.source, /export default function BillingReview/);
+  assert.match(cursorArtifact.render_url, /\/canvas-artifacts\/.+\/render$/);
+  assert.match(cursorArtifact.source_url, /\/canvas-artifacts\/.+\/source$/);
+  assert.ok(cursorCanvas.canvasArtifacts[cursorArtifact.artifact_id]);
 
   // Codex: a self-contained HTML export → sandboxed embed.
   const codexArtifact = codexCanvas.messages[1].canvases[0];

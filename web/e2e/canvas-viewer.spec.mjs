@@ -7,6 +7,7 @@ import {
   claudeCanvas,
   codexCanvas,
   cursorCanvas,
+  urlNavigationCanvasThread,
 } from "./fixtures/conversation-scenarios.mjs";
 import { openConversation } from "./support/conversation-page.mjs";
 
@@ -45,7 +46,7 @@ test.describe("canvas viewer", () => {
     });
   }
 
-  test("Cursor canvas expands into an accessible source viewer", async ({ page }) => {
+  test("Cursor canvas renders captured output in an isolated iframe", async ({ page }) => {
     const errors = trackErrors(page);
     await openConversation(page, cursorCanvas);
 
@@ -58,14 +59,31 @@ test.describe("canvas viewer", () => {
     await expect(dialog).toHaveAttribute("role", "dialog");
     await expect(dialog).toHaveAttribute("aria-modal", "true");
     await expect(dialog).toHaveAttribute("aria-labelledby", /.+/);
-    await expect(dialog).toHaveAttribute("data-canvas-mode", "source");
+    await expect(dialog).toHaveAttribute("data-canvas-mode", "interactive");
     await expect(dialog).toHaveAttribute("data-canvas-layout", "modal");
 
+    const frame = page.getByTestId("canvas-frame");
+    await expect(frame).toBeVisible();
+    const sandbox = (await frame.getAttribute("sandbox")) ?? "";
+    expect(sandbox).toContain("allow-scripts");
+    expect(sandbox).not.toContain("allow-same-origin");
+    expect(sandbox).not.toContain("allow-popups");
+    const srcdoc = (await frame.getAttribute("srcdoc")) ?? "";
+    expect(srcdoc).toContain("default-src 'none'");
+    expect(srcdoc).toContain("connect-src 'none'");
+    expect(srcdoc).toContain("frame-src 'none'");
+    await expect(
+      page
+        .frameLocator('[data-testid="canvas-frame"]')
+        .locator("#captured-canvas-marker"),
+    ).toContainText("Captured Cursor canvas rendered");
+
+    await page.getByTestId("canvas-source-toggle").click();
     await expect(page.getByTestId("canvas-source")).toContainText(
       "export default function BillingReview",
     );
-    // Nothing is ever executed for source mode — no iframe is created.
-    await expect(page.getByTestId("canvas-frame")).toHaveCount(0);
+    await page.getByTestId("canvas-source-toggle").click();
+    await expect(frame).toBeVisible();
 
     const focusInside = await page.evaluate(() => {
       const dlg = document.querySelector('[data-testid="canvas-viewer"]');
@@ -73,7 +91,7 @@ test.describe("canvas viewer", () => {
     });
     expect(focusInside).toBe(true);
 
-    await page.screenshot({ path: path.join(ART_DIR, "cursor-source-desktop.png"), fullPage: true });
+    await page.screenshot({ path: path.join(ART_DIR, "cursor-captured-desktop.png"), fullPage: true });
 
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -153,10 +171,61 @@ test.describe("canvas viewer", () => {
     const box = await dialog.boundingBox();
     expect(box?.width ?? 0).toBeGreaterThan(360);
 
-    await page.screenshot({ path: path.join(ART_DIR, "cursor-source-mobile.png"), fullPage: true });
+    await expect(page.getByTestId("canvas-frame")).toBeVisible();
+    await page.screenshot({ path: path.join(ART_DIR, "cursor-captured-mobile.png"), fullPage: true });
 
     await page.getByTestId("canvas-viewer-close").click();
     await expect(dialog).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("Canvas close preserves URL search state across mobile refresh and history", async ({ page }) => {
+    const errors = trackErrors(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, urlNavigationCanvasThread);
+
+    const input = page.locator("[data-conversation-search-input]");
+    await input.fill(urlNavigationCanvasThread.searchQuery);
+    await input.press("Enter");
+    const hit = page.locator(
+      `[data-conversation-search-hit="${urlNavigationCanvasThread.longMessageLine}"]`,
+    );
+    await expect(hit).toBeVisible();
+    await hit.click();
+
+    const target = page.locator(
+      `#conversation-line-${urlNavigationCanvasThread.longMessageLine}`,
+    );
+    await expect(target).toBeVisible();
+    await expect.poll(
+      () => new URL(page.url()).searchParams.get("line"),
+    ).toBe(String(urlNavigationCanvasThread.longMessageLine));
+    const anchoredUrl = page.url();
+    const params = new URL(anchoredUrl).searchParams;
+    expect(params.get("q")).toBe(urlNavigationCanvasThread.searchQuery);
+    expect(params.get("scope")).toBe("messages");
+    expect(params.get("match")).not.toBeNull();
+
+    await target.getByTestId("smart-link-canvas").click();
+    await expect(page.getByTestId("canvas-viewer")).toBeVisible();
+    await page.getByTestId("canvas-viewer-close").click();
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+    expect(page.url()).toBe(anchoredUrl);
+
+    await page.reload();
+    await expect(target).toBeVisible({ timeout: 15_000 });
+    await expect(input).toHaveValue(urlNavigationCanvasThread.searchQuery);
+    expect(page.url()).toBe(anchoredUrl);
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+
+    await page.goBack();
+    await expect.poll(() => page.url()).not.toBe(anchoredUrl);
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+
+    await page.goForward();
+    await expect(target).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => page.url()).toBe(anchoredUrl);
+    await expect(input).toHaveValue(urlNavigationCanvasThread.searchQuery);
     expect(errors).toEqual([]);
   });
 });

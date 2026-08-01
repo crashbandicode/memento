@@ -50,6 +50,25 @@ export async function installConversationMocks(page, scenario) {
       return;
     }
 
+    const artifactMatch = new URL(request.url()).pathname.match(
+      /^\/api\/canvas-artifacts\/([0-9a-f-]{36})\/(render|source)$/,
+    );
+    if (method === "GET" && artifactMatch) {
+      const [, artifactId, kind] = artifactMatch;
+      const artifact = scenario.canvasArtifacts?.[artifactId];
+      if (!artifact || typeof artifact[kind] !== "string") {
+        await route.fulfill({ status: 404, body: "Not found" });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: kind === "render" ? "text/html" : "text/typescript",
+        headers: CORS_HEADERS,
+        body: artifact[kind],
+      });
+      return;
+    }
+
     const result = resolveConversationRoute({
       url: request.url(),
       method,
@@ -80,11 +99,12 @@ export async function installConversationMocks(page, scenario) {
  * Seed auth, install mocks, open the conversation page and wait for the viewer.
  * @param {import('@playwright/test').Page} page
  * @param {any} scenario
+ * @param {string} [query]
  */
-export async function openConversation(page, scenario) {
+export async function openConversation(page, scenario, query = "") {
   await seedAuth(page);
   await installConversationMocks(page, scenario);
-  await page.goto(`/conversations/${scenario.docId}`);
+  await page.goto(`/conversations/${scenario.docId}${query}`);
   await page.waitForSelector("[data-conversation-viewer]", { timeout: 15000 });
   // The initial message page has finished loading once the viewer reports it.
   await page.waitForFunction(() => {

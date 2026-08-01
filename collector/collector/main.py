@@ -14,6 +14,7 @@ from collections.abc import Callable
 
 from .claude_pending_hook import install_claude_pending_hooks
 from .claude_pending_questions import extract_claude_pending_interaction_updates
+from .canvas_sync import sync_pending_canvases
 from .config import CollectorConfig, SYSTEM, _default_data_dir
 from .cursor_state_export import (
     CursorStateExporter,
@@ -37,6 +38,7 @@ PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
 CURSOR_STATE_POLL_INTERVAL = 5  # Keep live state current without hot-looping SQLite
 CLAUDE_PENDING_POLL_INTERVAL = 5  # Surface live questions before JSONL flush
+_canvas_sync_lock = threading.Lock()
 
 
 def _load_saved_config() -> CollectorConfig:
@@ -115,6 +117,29 @@ def _run_initial_scan(watcher: FileWatcher, logger: logging.Logger) -> None:
         logger.info("Initial scan complete: %d files queued", count)
     except Exception:
         logger.exception("Initial scan failed")
+
+
+def _poll_canvas_artifacts(config: CollectorConfig, logger: logging.Logger) -> None:
+    """Run one bounded artifact batch without overlapping a prior batch."""
+    if not _canvas_sync_lock.acquire(blocking=False):
+        return
+    try:
+        counts = sync_pending_canvases(config, logger)
+        if counts["requested"]:
+            logger.info(
+                "Canvas backfill batch: requested=%d renderable=%d static=%d "
+                "missing=%d rejected=%d failed=%d",
+                counts["requested"],
+                counts["renderable"],
+                counts["static_only"],
+                counts["missing"],
+                counts["rejected"],
+                counts["failed"],
+            )
+    except Exception:
+        logger.exception("Canvas backfill poll failed")
+    finally:
+        _canvas_sync_lock.release()
 
 
 def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatcher,
@@ -687,6 +712,11 @@ def main() -> None:
                     logger,
                     on_resync=lambda: _invalidate_cursor_state(cursor_exporter),
                 )
+                threading.Thread(
+                    target=_poll_canvas_artifacts,
+                    args=(config, logger),
+                    daemon=True,
+                ).start()
 
             # Auto-update check every hour
             if config.auto_update_enabled and now - last_update_check > AUTO_UPDATE_INTERVAL:

@@ -4,6 +4,8 @@
 # Tauri's `<triple>` naming convention and drops the binary in
 # ../src-tauri/binaries/.
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
@@ -29,6 +31,13 @@ hidden = (
 # the moment `collector.parsers.toml_parser` is imported.
 extra_datas = []
 extra_binaries = []
+compiler_script = (
+    Path(__file__).resolve().parents[2]
+    / "collector"
+    / "collector"
+    / "canvas_compile.cjs"
+)
+extra_datas.append((str(compiler_script), "collector"))
 for pkg in ("tomli", "pydantic", "pydantic_core", "watchdog", "cryptography",
             "httpx", "httpcore"):
     try:

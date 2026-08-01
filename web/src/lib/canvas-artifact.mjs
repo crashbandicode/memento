@@ -136,6 +136,12 @@ export function canvasArtifactFromLink(href, label) {
  */
 export function resolveCanvasView(artifact) {
   const a = artifact || {};
+  if (
+    typeof a.render_url === "string"
+    && /^\/api\/canvas-artifacts\/[0-9a-f-]{36}\/render$/.test(a.render_url)
+  ) {
+    return { mode: "interactive", renderUrl: a.render_url };
+  }
   const html = typeof a.html === "string" ? a.html : "";
   if (html && html.length <= MAX_CANVAS_HTML_LENGTH) {
     return { mode: "embed", variant: "srcdoc", html };
