@@ -274,6 +274,16 @@ Claude Agent、Cursor Task 和 Codex sub-agent activity 会投影到共享的
 共享 tool-use ID 和 kind，因此合并成一张卡；合并保留最早 `started_at`，并吸收
 后续记录提供的 `agent_thread_id` / status。
 
+公开生命周期状态为 `running`、`completed`、`failed`、`cancelled`、
+`interrupted`、`unknown` 和 `disconnected`。父线程中的 async tool result
+只证明任务已启动；Claude 子 transcript 的 `assistant.stop_reason=end_turn`、
+Codex 明确 turn 结束/中止事件、Cursor composer 的明确终态等子来源证据才可以
+结束一张卡。服务端把权威结果保存在子 Document metadata 的
+`subagent_lifecycle_status`、`subagent_lifecycle_source`、
+`subagent_lifecycle_at` 和 `subagent_lifecycle_evidence` 字段中。终态具有
+sticky 语义：后到的 started/reparse 不能回退为 running。没有终止标记时不会按
+年龄猜 completed；只有 collector 明确报告来源缺失时才显示 disconnected。
+
 卡片运行时身份字段为可选的 `model`、`model_family` 和
 `reasoning_effort`。来源优先级是子线程实际 transcript/meta，其次是 Task
 输入中明确记录的请求值；没有权威值时字段缺省，服务端和前端都不得猜测。
@@ -282,8 +292,15 @@ Claude 当前格式的 `.meta.json` 不重复写 `agentId`；经过格式校验�
 旧格式若含 `agentId`，其值必须与文件名一致，否则拒绝配对，避免复用陈旧 sidecar。
 `GET /api/conversations/{id}` 的 `subagents[]` 与
 `GET /api/conversations/{id}/messages` 的 `agent_event` 使用同一规则。
+前者返回 `status_source`；后者保留原始 `kind` 并另外返回
+`resolved_status`、`status_source`、`status_updated_at`，终态还返回
+`completed_at`。子 transcript 更新会发布 `file_synced` SSE；路径关联的父页面
+同时失效 conversation metadata cache 并重新读取状态，无需 reload。
 历史修复由 `server.scripts.backfill_subagent_lifecycle` 完成：默认 dry-run，
-`--apply` 才提交，`--document-id` 可精确限制父线程，重复运行幂等。
+`--apply` 才提交，`--document-id` 可精确限制父线程，重复运行幂等。报告包括
+scanned、genuinely_active、completed、failed、cancelled/interrupted、
+unknown/disconnected、unchanged 和 repaired；不扫描 collector 文件系统，
+不移动 sync offset。
 
 ### 认证体系
 

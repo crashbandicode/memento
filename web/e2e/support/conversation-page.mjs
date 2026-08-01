@@ -40,13 +40,68 @@ export async function seedAuth(page) {
  * @param {any} scenario
  */
 export async function installConversationMocks(page, scenario) {
+  let transitioned = false;
+  let transitionEventSent = false;
+  let conversationMetaRequests = 0;
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const method = request.method();
+    const pathname = new URL(request.url()).pathname;
 
     // Answer CORS preflights locally (harmless even when same-origin).
     if (method === "OPTIONS") {
       await route.fulfill({ status: 204, headers: CORS_HEADERS, body: "" });
+      return;
+    }
+
+    if (
+      method === "GET"
+      && pathname.endsWith("/api/events/stream")
+      && scenario.liveTransitionEvent
+    ) {
+      if (transitionEventSent) {
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
+      transitionEventSent = true;
+      if (scenario.liveTransitionDelayMs) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, Number(scenario.liveTransitionDelayMs));
+        });
+      }
+      transitioned = true;
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        headers: {
+          ...CORS_HEADERS,
+          "cache-control": "no-cache",
+        },
+        body: `event: file_synced\ndata: ${JSON.stringify({
+          type: "file_synced",
+          data: scenario.liveTransitionEvent,
+          timestamp: 1785611100,
+        })}\n\n`,
+      });
+      return;
+    }
+
+    if (
+      method === "GET"
+      && new RegExp(`/api/conversations/${scenario.docId}$`).test(pathname)
+      && scenario.liveTransitionMeta
+    ) {
+      conversationMetaRequests += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: CORS_HEADERS,
+        body: JSON.stringify(
+          transitioned && conversationMetaRequests > 1
+            ? scenario.liveTransitionMeta
+            : scenario.meta,
+        ),
+      });
       return;
     }
 

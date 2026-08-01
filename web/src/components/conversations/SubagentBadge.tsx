@@ -381,9 +381,11 @@ function formatSubagentStatus(
   return {
     running: "Running",
     completed: "Completed",
+    cancelled: "Cancelled",
     interrupted: "Interrupted",
     failed: "Failed",
     unknown: "Unknown",
+    disconnected: "Disconnected",
   }[status];
 }
 

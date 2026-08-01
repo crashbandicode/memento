@@ -18,7 +18,10 @@ from sqlalchemy import and_, false, or_
 
 from .conversation_activity import effective_conversation_activity
 from .subagent_lifecycle import (
+    SUBAGENT_TERMINAL_STATUSES,
     normalized_subagent_runtime,
+    normalized_subagent_status,
+    persisted_child_lifecycle,
     subagent_runtime_from_metadata,
 )
 
@@ -420,6 +423,13 @@ def build_subagent_summaries(
             parent_thread_id = metadata.get("parent_thread_id")
             timestamp = effective_conversation_timestamp(child)
             runtime = subagent_runtime_from_metadata(metadata)
+            lifecycle = persisted_child_lifecycle(metadata)
+            lifecycle_status = (
+                lifecycle.get("status") if lifecycle is not None else None
+            )
+            lifecycle_at = (
+                lifecycle.get("timestamp") if lifecycle is not None else None
+            )
             children.append({
                 "id": str(child.document_id),
                 "session_id": thread_id,
@@ -452,8 +462,17 @@ def build_subagent_summaries(
                 "model": runtime.get("model"),
                 "model_family": runtime.get("model_family"),
                 "reasoning_effort": runtime.get("reasoning_effort"),
+                "status": lifecycle_status or "unknown",
+                "status_source": (
+                    lifecycle.get("source") if lifecycle is not None else None
+                ),
+                "last_event_at": lifecycle_at,
                 "started_at": None,
-                "completed_at": None,
+                "completed_at": (
+                    lifecycle_at
+                    if lifecycle_status in SUBAGENT_TERMINAL_STATUSES
+                    else None
+                ),
             })
         if children:
             summaries[parent_id] = children
@@ -490,7 +509,7 @@ def merge_subagent_event_summaries(
     for summary in merged:
         register(summary)
 
-    terminal_statuses = {"completed", "interrupted", "failed"}
+    terminal_statuses = set(SUBAGENT_TERMINAL_STATUSES)
     for item in events:
         thread_id = str(item.get("agent_thread_id") or "").strip()
         tool_use_id = str(item.get("agent_tool_use_id") or "").strip()
@@ -498,14 +517,22 @@ def merge_subagent_event_summaries(
         if not thread_id and not tool_use_id:
             continue
         kind = str(item.get("kind") or "updated").strip().casefold()
-        status = {
+        status = normalized_subagent_status(item.get("resolved_status"))
+        raw_status = normalized_subagent_status(item.get("status"))
+        if status is None and kind == "interrupted" and raw_status == "cancelled":
+            status = "cancelled"
+        status = status or {
             "started": "running",
             "updated": "running",
             "completed": "completed",
             "interrupted": "interrupted",
             "failed": "failed",
         }.get(kind, "unknown")
-        event_timestamp = item.get("timestamp")
+        event_timestamp = (
+            item.get("status_updated_at")
+            if item.get("resolved_status")
+            else None
+        ) or item.get("timestamp")
         event_runtime = normalized_subagent_runtime(
             model=item.get("model"),
             reasoning_effort=item.get("reasoning_effort"),
@@ -515,7 +542,7 @@ def merge_subagent_event_summaries(
         )
         completed_at = item.get("completed_at") or (
             event_timestamp
-            if kind in {"completed", "interrupted", "failed"}
+            if status in terminal_statuses
             else None
         )
         existing = (
@@ -559,6 +586,7 @@ def merge_subagent_event_summaries(
                 "model": event_runtime.get("model"),
                 "model_family": event_runtime.get("model_family"),
                 "reasoning_effort": event_runtime.get("reasoning_effort"),
+                "status_source": item.get("status_source"),
                 "started_at": started_at,
                 "completed_at": completed_at,
             }
@@ -609,15 +637,18 @@ def merge_subagent_event_summaries(
         # A terminal source event is sticky for a unique launch tool-use ID.
         # Replayed/out-of-order launch rows must never turn a finished child green.
         if not (
-            previous_status in terminal_statuses
+            previous_status in terminal_statuses | {"disconnected"}
             and status == "running"
         ):
             existing["status"] = status
             existing["last_event_at"] = event_timestamp
+            if item.get("status_source"):
+                existing["status_source"] = item.get("status_source")
 
     for summary in merged:
         summary.setdefault("document_ready", bool(summary.get("id")))
         summary.setdefault("status", "unknown")
+        summary.setdefault("status_source", None)
         summary.setdefault("last_event_at", None)
         summary.setdefault("agent_id", None)
         summary.setdefault("agent_tool_use_id", None)

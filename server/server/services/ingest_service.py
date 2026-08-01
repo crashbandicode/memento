@@ -34,8 +34,14 @@ from .history_recovery import (
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
 from .subagent_lifecycle import (
+    SUBAGENT_LIFECYCLE_AT_KEY,
+    SUBAGENT_LIFECYCLE_EVIDENCE_KEY,
+    SUBAGENT_LIFECYCLE_SOURCE_KEY,
+    SUBAGENT_LIFECYCLE_STATUS_KEY,
+    child_lifecycle_evidence,
     lifecycle_event_identity,
     merge_duplicate_lifecycle_events,
+    reconcile_child_lifecycle_metadata,
 )
 
 # Set of background tasks — prevents GC from collecting them before completion
@@ -152,6 +158,10 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "subagent_model",
     "subagent_model_family",
     "subagent_reasoning_effort",
+    SUBAGENT_LIFECYCLE_STATUS_KEY,
+    SUBAGENT_LIFECYCLE_SOURCE_KEY,
+    SUBAGENT_LIFECYCLE_AT_KEY,
+    SUBAGENT_LIFECYCLE_EVIDENCE_KEY,
     "codex_title_revision",
     "codex_title_revisions",
     "memento_title_source",
@@ -1940,6 +1950,38 @@ async def _invalidate_ingest_read_caches(
         pass
 
 
+def _reconcile_subagent_document_lifecycle(
+    document: Document,
+    content: str | None,
+    *,
+    source_timestamp: object = None,
+) -> bool:
+    """Persist source-backed child state without treating silence as completion."""
+    if document.category != "conversation":
+        return False
+    from .conversation_hierarchy import is_conversation_subagent
+
+    if not is_conversation_subagent(
+        document.tool_id,
+        document.relative_path,
+        document.metadata_,
+    ):
+        return False
+    evidence = child_lifecycle_evidence(
+        document.tool_id,
+        document.metadata_,
+        content,
+        source_timestamp=source_timestamp or document.source_modified_at,
+    )
+    metadata, changed = reconcile_child_lifecycle_metadata(
+        document.metadata_,
+        evidence,
+    )
+    if changed:
+        document.metadata_ = metadata
+    return changed
+
+
 def _publish_file_synced_event(document: Document, user_id: str | None) -> None:
     try:
         from .sse_service import publish_event
@@ -1974,11 +2016,19 @@ async def _reconcile_idempotent_claude_ingest(
         user_id=user_id,
         pair_locked=pair_locked,
     )
-    if enriched_child is None:
+    lifecycle_document = enriched_child or document
+    lifecycle_changed = _reconcile_subagent_document_lifecycle(
+        lifecycle_document,
+        lifecycle_document.content,
+    )
+    if enriched_child is None and not lifecycle_changed:
         return
     await db.flush()
-    await _invalidate_ingest_read_caches(user_id, enriched_child.project_id)
-    _publish_file_synced_event(enriched_child, user_id)
+    await _invalidate_ingest_read_caches(
+        user_id,
+        lifecycle_document.project_id,
+    )
+    _publish_file_synced_event(lifecycle_document, user_id)
 
 
 def _scoped_sync_state_select(
@@ -2622,7 +2672,22 @@ async def ingest_file(
         user_id=user_id,
         pair_locked=claude_pair_locked,
     )
-    if enriched_claude_child is not None:
+    lifecycle_changed = _reconcile_subagent_document_lifecycle(
+        doc,
+        content,
+        source_timestamp=source_modified_at,
+    )
+    enriched_lifecycle_changed = False
+    if enriched_claude_child is not None and enriched_claude_child.id != doc.id:
+        enriched_lifecycle_changed = _reconcile_subagent_document_lifecycle(
+            enriched_claude_child,
+            enriched_claude_child.content,
+        )
+    if (
+        enriched_claude_child is not None
+        or lifecycle_changed
+        or enriched_lifecycle_changed
+    ):
         await db.flush()
 
     # Bump the parent project's updated_at so the projects list (sorted

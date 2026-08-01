@@ -22,9 +22,15 @@ from server.db.models import ConversationMessage, Document
 from server.db.session import async_session_factory, engine
 from server.services.ingest_service import _claude_subagent_sidecar_evidence
 from server.services.subagent_lifecycle import (
+    SUBAGENT_TERMINAL_STATUSES,
+    child_lifecycle_evidence,
     enrich_lifecycle_runtime,
+    enrich_lifecycle_status,
     lifecycle_event_identity,
     merge_duplicate_lifecycle_events,
+    normalized_subagent_status,
+    persisted_child_lifecycle,
+    reconcile_child_lifecycle_metadata,
     subagent_runtime_from_metadata,
 )
 
@@ -40,6 +46,13 @@ class BackfillStats:
     duplicate_events_coalesced: int = 0
     distinct_same_description_agents_preserved: int = 0
     missing_model_metadata: int = 0
+    genuinely_active: int = 0
+    completed: int = 0
+    failed: int = 0
+    cancelled_interrupted: int = 0
+    unknown_disconnected: int = 0
+    unchanged: int = 0
+    repaired: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,9 +87,19 @@ def plan_lifecycle_repairs(
     *,
     runtime_by_tool_use: dict[tuple[uuid.UUID, str, str], dict[str, str]],
     runtime_by_thread: dict[tuple[uuid.UUID, str, str], dict[str, str]],
+    lifecycle_by_tool_use: dict[
+        tuple[uuid.UUID, str, str],
+        dict[str, str],
+    ] | None = None,
+    lifecycle_by_thread: dict[
+        tuple[uuid.UUID, str, str],
+        dict[str, str],
+    ] | None = None,
 ) -> tuple[list[LifecycleUpdate], list[int], BackfillStats]:
     """Return deterministic updates/deletes for exact lifecycle identities."""
     stats = BackfillStats(scanned=len(rows))
+    lifecycle_by_tool_use = lifecycle_by_tool_use or {}
+    lifecycle_by_thread = lifecycle_by_thread or {}
     grouped: dict[
         tuple[uuid.UUID, str, str, str],
         list[LifecycleRow],
@@ -108,6 +131,8 @@ def plan_lifecycle_repairs(
 
     updates: list[LifecycleUpdate] = []
     deletes: list[int] = []
+    resolved_agent_statuses: dict[tuple[uuid.UUID, str], str] = {}
+    changed_agent_keys: set[tuple[uuid.UUID, str]] = set()
     for group_rows in grouped.values():
         ordered = sorted(group_rows, key=lambda item: (item.line_number, item.id))
         canonical = ordered[0]
@@ -135,7 +160,38 @@ def plan_lifecycle_repairs(
         ) or (
             runtime_by_thread.get(thread_key) if thread_key else None
         )
-        enriched_event = enrich_lifecycle_runtime(merged_event, runtime)
+        lifecycle = (
+            lifecycle_by_tool_use.get(tool_use_key) if tool_use_key else None
+        ) or (
+            lifecycle_by_thread.get(thread_key) if thread_key else None
+        )
+        enriched_event = enrich_lifecycle_status(
+            enrich_lifecycle_runtime(merged_event, runtime),
+            lifecycle,
+        )
+        agent_key = (
+            canonical.document_id,
+            str(
+                merged_event.get("agent_tool_use_id")
+                or merged_event.get("agent_thread_id")
+                or merged_event.get("task_id")
+                or ""
+            ),
+        )
+        kind = str(merged_event.get("kind") or "").strip().casefold()
+        event_status = normalized_subagent_status(kind)
+        raw_status = normalized_subagent_status(merged_event.get("status"))
+        if kind == "interrupted" and raw_status == "cancelled":
+            event_status = "cancelled"
+        resolved_status = normalized_subagent_status(
+            enriched_event.get("resolved_status")
+        ) or event_status or "unknown"
+        previous_resolved = resolved_agent_statuses.get(agent_key)
+        if (
+            previous_resolved not in SUBAGENT_TERMINAL_STATUSES
+            or resolved_status in SUBAGENT_TERMINAL_STATUSES
+        ):
+            resolved_agent_statuses[agent_key] = resolved_status
         if not original_event.get("model") and enriched_event.get("model"):
             stats.model_recovered += 1
         if (
@@ -153,6 +209,7 @@ def plan_lifecycle_repairs(
             f"{enriched_event.get('kind') or 'updated'}"
         )
         if metadata != canonical.metadata or content != canonical.content:
+            changed_agent_keys.add(agent_key)
             updates.append(LifecycleUpdate(
                 id=canonical.id,
                 metadata=metadata,
@@ -161,6 +218,19 @@ def plan_lifecycle_repairs(
 
     stats.lifecycle_rows_updated = len(updates)
     stats.duplicate_events_coalesced = len(deletes)
+    for status in resolved_agent_statuses.values():
+        if status == "running":
+            stats.genuinely_active += 1
+        elif status == "completed":
+            stats.completed += 1
+        elif status == "failed":
+            stats.failed += 1
+        elif status in {"cancelled", "interrupted"}:
+            stats.cancelled_interrupted += 1
+        else:
+            stats.unknown_disconnected += 1
+    stats.repaired = len(changed_agent_keys)
+    stats.unchanged = max(0, len(resolved_agent_statuses) - stats.repaired)
     return updates, deletes, stats
 
 
@@ -256,6 +326,14 @@ async def backfill_subagent_lifecycle(
         tuple[uuid.UUID, str, str],
         dict[str, str],
     ] = {}
+    lifecycle_by_tool_use: dict[
+        tuple[uuid.UUID, str, str],
+        dict[str, str],
+    ] = {}
+    lifecycle_by_thread: dict[
+        tuple[uuid.UUID, str, str],
+        dict[str, str],
+    ] = {}
     target_tool_use_ids: set[str] = set()
     target_thread_ids: set[str] = set()
     for row in rows:
@@ -305,6 +383,17 @@ async def backfill_subagent_lifecycle(
         ):
             continue
         child_documents_scanned += 1
+        lifecycle = child_lifecycle_evidence(
+            child.tool_id,
+            merged_metadata,
+            child.content,
+            source_timestamp=child.source_modified_at,
+        )
+        merged_metadata, _ = reconcile_child_lifecycle_metadata(
+            merged_metadata,
+            lifecycle,
+        )
+        lifecycle = persisted_child_lifecycle(merged_metadata)
         runtime = subagent_runtime_from_metadata(merged_metadata)
         if runtime.get("model"):
             merged_metadata["subagent_model"] = runtime["model"]
@@ -325,6 +414,8 @@ async def backfill_subagent_lifecycle(
         )
         if tool_use_key and runtime:
             runtime_by_tool_use[tool_use_key] = runtime
+        if tool_use_key and lifecycle:
+            lifecycle_by_tool_use[tool_use_key] = lifecycle
         for field in ("agent_id", "session_id", "thread_id"):
             identity = str(merged_metadata.get(field) or "").strip()
             if not identity:
@@ -338,14 +429,19 @@ async def backfill_subagent_lifecycle(
                 thread_key = _runtime_key(child.machine_id, child.tool_id, alias)
                 if thread_key and runtime:
                     runtime_by_thread[thread_key] = runtime
+                if thread_key and lifecycle:
+                    lifecycle_by_thread[thread_key] = lifecycle
 
     updates, deletes, stats = plan_lifecycle_repairs(
         rows,
         runtime_by_tool_use=runtime_by_tool_use,
         runtime_by_thread=runtime_by_thread,
+        lifecycle_by_tool_use=lifecycle_by_tool_use,
+        lifecycle_by_thread=lifecycle_by_thread,
     )
     stats.child_documents_scanned = child_documents_scanned
     stats.child_metadata_updated = child_metadata_updated
+    stats.repaired += child_metadata_updated
 
     messages_by_id = {message.id: message for message, _, _ in message_results}
     for planned in updates:

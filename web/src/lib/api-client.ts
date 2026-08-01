@@ -74,6 +74,11 @@ export function invalidateConversationSearch(id: string) {
   invalidateApiCache(`${getApiBase()}/api/conversations/${id}/search`);
 }
 
+/** Drop one cached conversation summary before an SSE/poll refresh. */
+export function invalidateConversationMetadata(id: string) {
+  _cache.delete(`${getApiBase()}/api/conversations/${id}`);
+}
+
 function getCached<T>(cacheKey: string): T | null {
   const hit = _cache.get(cacheKey);
   if (!hit) return null;
@@ -235,7 +240,8 @@ export interface ConversationSubagentSummary {
   synced_at?: string | null;
   document_ready?: boolean;
   user_role_origin?: "parent_agent" | null;
-  status?: "running" | "completed" | "interrupted" | "failed" | "unknown";
+  status?: "running" | "completed" | "cancelled" | "interrupted" | "failed" | "unknown" | "disconnected";
+  status_source?: string | null;
   last_event_at?: string | null;
   model?: string | null;
   model_family?: string | null;
@@ -435,6 +441,9 @@ export interface ConversationAgentEvent {
   task_kind?: string;
   task_id?: string;
   status?: string;
+  resolved_status?: "running" | "completed" | "cancelled" | "interrupted" | "failed" | "unknown" | "disconnected";
+  status_source?: string;
+  status_updated_at?: string;
   tool_call_id?: string;
   result_summary?: string;
   output_path?: string;
@@ -449,7 +458,7 @@ export interface ConversationAgentEvent {
 export interface ConversationAgentStatus {
   agent_path: string;
   label: string;
-  status: "running" | "completed" | "interrupted" | "failed" | "unknown";
+  status: "running" | "completed" | "cancelled" | "interrupted" | "failed" | "unknown" | "disconnected";
 }
 
 export interface MessagesResponse {

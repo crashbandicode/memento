@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { api, ConversationMeta, ExportDiagnostics } from "@/lib/api-client";
+import {
+  api,
+  ConversationMeta,
+  ExportDiagnostics,
+  invalidateConversationMetadata,
+} from "@/lib/api-client";
 import { fmt, useI18n } from "@/lib/i18n";
 import ConversationViewer from "@/components/viewers/ConversationViewer";
 import { Icon, ToolGlyph } from "@/components/aurora/Icon";
@@ -42,6 +47,7 @@ export default function ConversationPage() {
 
   const refreshMeta = useCallback(() => {
     const request = ++metaRequestRef.current;
+    invalidateConversationMetadata(docId);
     return api.getConversation(docId)
       .then((nextMeta) => {
         if (request === metaRequestRef.current) setMeta(nextMeta);
