@@ -4227,7 +4227,11 @@ function AgentActivityCard({
     event.result_summary && event.status !== "async_launched",
   );
   const hasDetails = Boolean(
-    showResultSummary || event.output_path || event.model || eventTime,
+    showResultSummary
+      || event.output_path
+      || event.model
+      || event.reasoning_effort
+      || eventTime,
   );
 
   return (
@@ -4289,7 +4293,7 @@ function AgentActivityCard({
           <span style={{ color: presentation.color, fontWeight: 650 }}>{presentation.action}</span>
         </span>
       </div>
-      {(event.model || eventTime) && (
+      {(event.model || event.reasoning_effort || eventTime) && (
         <div
           data-agent-event-meta
           style={{
@@ -4301,7 +4305,12 @@ function AgentActivityCard({
             paddingLeft: 30,
           }}
         >
-          {event.model && <AssistantIdentityBadge model={event.model} />}
+          {(event.model || event.reasoning_effort) && (
+            <AssistantIdentityBadge
+              model={event.model}
+              reasoningEffort={event.reasoning_effort}
+            />
+          )}
           {eventTime && (
             <time
               dateTime={eventTimestamp}

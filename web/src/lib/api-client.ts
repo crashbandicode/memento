@@ -238,6 +238,8 @@ export interface ConversationSubagentSummary {
   status?: "running" | "completed" | "interrupted" | "failed" | "unknown";
   last_event_at?: string | null;
   model?: string | null;
+  model_family?: string | null;
+  reasoning_effort?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
 }
@@ -437,6 +439,8 @@ export interface ConversationAgentEvent {
   result_summary?: string;
   output_path?: string;
   model?: string;
+  model_family?: string;
+  reasoning_effort?: string;
   started_at?: string;
   completed_at?: string;
   agents?: ConversationAgentStatus[];

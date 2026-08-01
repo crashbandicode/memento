@@ -33,6 +33,10 @@ from .history_recovery import (
     recovered_occurrence_anchors,
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
+from .subagent_lifecycle import (
+    lifecycle_event_identity,
+    merge_duplicate_lifecycle_events,
+)
 
 # Set of background tasks — prevents GC from collecting them before completion
 _background_tasks: set = set()
@@ -101,6 +105,9 @@ _ESSENTIAL_METADATA_KEYS = {
     "agent_path",
     "agent_tool_use_id",
     "agent_type",
+    "subagent_model",
+    "subagent_model_family",
+    "subagent_reasoning_effort",
     "cascade_id",
     "codex_title_revision",
     "codex_title_revisions",
@@ -142,6 +149,9 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     "agent_launch_metadata_version",
     "agent_tool_use_id",
     "agent_type",
+    "subagent_model",
+    "subagent_model_family",
+    "subagent_reasoning_effort",
     "codex_title_revision",
     "codex_title_revisions",
     "memento_title_source",
@@ -238,13 +248,18 @@ def _claude_subagent_sidecar_evidence(
         return None
     if not isinstance(payload, dict):
         return None
-    agent_id = payload.get("agentId")
-    if (
-        not isinstance(agent_id, str)
-        or _CLAUDE_AGENT_ID_RE.fullmatch(agent_id) is None
-        or agent_id != filename_agent_id
+    payload_agent_id = payload.get("agentId")
+    if payload_agent_id is not None and (
+        not isinstance(payload_agent_id, str)
+        or _CLAUDE_AGENT_ID_RE.fullmatch(payload_agent_id) is None
+        or payload_agent_id != filename_agent_id
     ):
         return None
+    # Current Claude sidecars identify the child only in their filename; older
+    # variants also repeated ``agentId`` in the payload.  The validated exact
+    # sibling path is authoritative in both formats, while a contradictory
+    # payload identity remains grounds for rejection.
+    agent_id = filename_agent_id
 
     metadata: dict[str, object] = {
         "agent_id": agent_id,
@@ -3056,6 +3071,10 @@ async def _extract_messages(
     batch_bytes = 0
     delta_tail = None
     queued_claude_users: dict[str, list[ConversationMessage]] = {}
+    recent_lifecycle_rows: dict[
+        tuple[str, str, str],
+        ConversationMessage,
+    ] = {}
     initial_question_interactions: list[dict[str, object]] = []
     if mode == "delta" and start_line > 1:
         recent_rows = (
@@ -3071,6 +3090,16 @@ async def _extract_messages(
             .all()
         )
         delta_tail = recent_rows[0] if recent_rows else None
+        for recent in reversed(recent_rows):
+            recent_metadata = (
+                recent.metadata_ if isinstance(recent.metadata_, dict) else {}
+            )
+            recent_event = recent_metadata.get("agent_event")
+            event_key = lifecycle_event_identity(
+                recent_event if isinstance(recent_event, dict) else None
+            )
+            if event_key is not None:
+                recent_lifecycle_rows[event_key] = recent
         initial_question_interactions = _pending_question_interactions(recent_rows)
         for interaction in initial_question_interactions:
             interaction_id = _bounded_message_text(
@@ -3121,6 +3150,34 @@ async def _extract_messages(
         initial_task_state=initial_task_state,
         incremental=mode == "delta",
     ):
+        lifecycle_key = lifecycle_event_identity(normalized.agent_event)
+        prior_lifecycle_row = (
+            recent_lifecycle_rows.get(lifecycle_key)
+            if lifecycle_key is not None
+            else None
+        )
+        if prior_lifecycle_row is not None and normalized.agent_event is not None:
+            prior_metadata = (
+                dict(prior_lifecycle_row.metadata_)
+                if isinstance(prior_lifecycle_row.metadata_, dict)
+                else {}
+            )
+            prior_event = prior_metadata.get("agent_event")
+            if isinstance(prior_event, dict):
+                merged_event = merge_duplicate_lifecycle_events(
+                    prior_event,
+                    normalized.agent_event,
+                )
+                prior_metadata["agent_event"] = merged_event
+                prior_lifecycle_row.metadata_ = prior_metadata
+                prior_lifecycle_row.content = (
+                    f"{merged_event.get('label') or 'Subagent'} "
+                    f"{merged_event.get('kind') or 'updated'}"
+                )
+                if delta_tail is prior_lifecycle_row:
+                    delta_tail = None
+                continue
+
         pending_before = bool(pending_question_ids)
         latest_human_timestamp = _update_pending_question_ids(
             pending_question_ids,

@@ -390,6 +390,8 @@ class ConversationHierarchyTests(unittest.TestCase):
                 ),
                 "agent_id": "afceda9d5a896fb52",
                 "agent_tool_use_id": "toolu-launch-wave-engine",
+                "_assistant_model": "claude-opus-4-8",
+                "_assistant_reasoning_effort": "xhigh",
             },
             title="TOOLING — HARD RULES...",
             activity_at=child.activity_at,
@@ -411,6 +413,18 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertEqual(
             summaries["root"][0]["user_role_origin"],
             "parent_agent",
+        )
+        self.assertEqual(
+            summaries["root"][0]["model"],
+            "claude-opus-4-8",
+        )
+        self.assertEqual(
+            summaries["root"][0]["model_family"],
+            "anthropic",
+        )
+        self.assertEqual(
+            summaries["root"][0]["reasoning_effort"],
+            "xhigh",
         )
 
     def test_claude_display_title_override_is_child_only(self) -> None:
@@ -622,6 +636,7 @@ class ConversationHierarchyTests(unittest.TestCase):
                 "timestamp": "2026-07-30T12:50:50.840+00:00",
                 "started_at": "2026-07-30T12:50:50.840Z",
                 "model": "gpt-5.6-sol-xhigh",
+                "reasoning_effort": "xhigh",
             },
             {
                 "agent_thread_id": "cursor-child",
@@ -635,6 +650,8 @@ class ConversationHierarchyTests(unittest.TestCase):
 
         self.assertEqual(len(summaries), 1)
         self.assertEqual(summaries[0]["model"], "gpt-5.6-sol-xhigh")
+        self.assertEqual(summaries[0]["model_family"], "openai")
+        self.assertEqual(summaries[0]["reasoning_effort"], "xhigh")
         self.assertEqual(
             summaries[0]["started_at"],
             "2026-07-30T12:50:50.840Z",

@@ -20,6 +20,12 @@ from uuid import UUID
 
 import orjson
 
+from .subagent_lifecycle import (
+    lifecycle_event_identity,
+    merge_duplicate_lifecycle_events,
+    normalized_subagent_runtime,
+)
+
 
 @dataclass
 class NormalizedMessage:
@@ -931,9 +937,14 @@ def normalize_claude_agent_launch_event(
         "task_id": launch_id,
         "status": "running",
     }
-    requested_model = _bounded_interaction_text(payload.get("model"), 256).strip()
-    if requested_model:
-        event["model"] = requested_model
+    event.update(normalized_subagent_runtime(
+        model=payload.get("model"),
+        reasoning_effort=(
+            payload.get("effort")
+            or payload.get("reasoning_effort")
+            or payload.get("thinking_level")
+        ),
+    ))
     agent_type = _bounded_interaction_text(
         payload.get("subagent_type")
         or payload.get("subagentType")
@@ -1285,14 +1296,19 @@ def normalize_task_spawn_agent_event(
             "task_id": thread_id,
             "status": _coerce_text(status_hint).strip().casefold(),
         })
-        requested_model = _bounded_interaction_text(
-            payload.get("model")
-            or payload.get("modelSlug")
-            or payload.get("model_slug"),
-            256,
-        ).strip()
-        if requested_model:
-            event["model"] = requested_model
+        event.update(normalized_subagent_runtime(
+            model=(
+                payload.get("model")
+                or payload.get("modelSlug")
+                or payload.get("model_slug")
+            ),
+            reasoning_effort=(
+                payload.get("reasoning_effort")
+                or payload.get("reasoningEffort")
+                or payload.get("effort")
+                or payload.get("thinking_level")
+            ),
+        ))
     return event
 
 
@@ -4194,6 +4210,7 @@ def _iter_claude_conversation_messages(
     seen_source_ids: set[str] = set()
     pending_queue: dict[str, list[NormalizedMessage]] = defaultdict(list)
     agent_launches: dict[str, dict[str, object]] = {}
+    pending_lifecycle_message: NormalizedMessage | None = None
     pending_questions = {
         _coerce_text(interaction.get("id")): interaction
         for interaction in (initial_question_interactions or [])
@@ -4208,6 +4225,43 @@ def _iter_claude_conversation_messages(
             seen_source_ids.add(source_key)
         task_tracker.apply(message)
         return True
+
+    def coalesce_lifecycle_message(
+        message: NormalizedMessage,
+    ) -> list[NormalizedMessage]:
+        """Collapse only adjacent events with one exact source identity."""
+        nonlocal pending_lifecycle_message
+        identity_key = lifecycle_event_identity(message.agent_event)
+        if pending_lifecycle_message is None:
+            if identity_key is not None:
+                pending_lifecycle_message = message
+                return []
+            return [message]
+
+        pending_key = lifecycle_event_identity(
+            pending_lifecycle_message.agent_event
+        )
+        if identity_key is not None and identity_key == pending_key:
+            assert pending_lifecycle_message.agent_event is not None
+            assert message.agent_event is not None
+            merged_event = merge_duplicate_lifecycle_events(
+                pending_lifecycle_message.agent_event,
+                message.agent_event,
+            )
+            pending_lifecycle_message.agent_event = merged_event
+            pending_lifecycle_message.content = (
+                f"{merged_event.get('label') or 'Subagent'} "
+                f"{merged_event.get('kind') or 'updated'}"
+            )
+            return []
+
+        emitted = [pending_lifecycle_message]
+        pending_lifecycle_message = None
+        if identity_key is not None:
+            pending_lifecycle_message = message
+        else:
+            emitted.append(message)
+        return emitted
 
     for record_index, source_object in enumerate(
         _iter_decoded_json_objects(raw_content)
@@ -4314,7 +4368,10 @@ def _iter_claude_conversation_messages(
                 pending_questions[interaction_id] = interaction
 
             if should_emit(message):
-                yield message
+                yield from coalesce_lifecycle_message(message)
+
+    if pending_lifecycle_message is not None:
+        yield pending_lifecycle_message
 
 
 def _parse_cursor_record_messages(obj: object) -> list[NormalizedMessage]:
