@@ -32,7 +32,7 @@ hidden = (
 extra_datas = []
 extra_binaries = []
 compiler_script = (
-    Path(__file__).resolve().parents[2]
+    Path(SPECPATH).resolve().parents[1]
     / "collector"
     / "collector"
     / "canvas_compile.cjs"
