@@ -382,6 +382,50 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             "2026-07-30T12:51:53.073Z",
         )
 
+    async def test_subagent_event_recovers_actual_child_model_and_effort(self) -> None:
+        self.doc.tool_id = "claude_code"
+        launch = self.message(2, "tool")
+        launch.message_type = "agent_event"
+        launch.metadata_ = {
+            "agent_event": {
+                "version": 2,
+                "source": "claude_agent",
+                "kind": "started",
+                "activity_type": "subagent",
+                "agent_tool_use_id": "toolu-stale",
+                "agent_thread_id": "aa53b331b57f1bde5",
+                "label": "Tune stale threshold to CLEAN_PERIOD",
+            },
+        }
+        child_metadata = {
+            "is_subagent": True,
+            "agent_id": "aa53b331b57f1bde5",
+            "agent_tool_use_id": "toolu-stale",
+            "_assistant_model": "claude-opus-4-8",
+            "_assistant_reasoning_effort": "xhigh",
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(scalar_value=1),
+            _Result(rows=[launch]),
+            _Result(rows=[child_metadata]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        event = payload["messages"][0]["agent_event"]
+        self.assertEqual(event["model"], "claude-opus-4-8")
+        self.assertEqual(event["model_family"], "anthropic")
+        self.assertEqual(event["reasoning_effort"], "xhigh")
+
     async def test_around_line_uses_index_and_reports_row_offset(self) -> None:
         db = _Db(
             [

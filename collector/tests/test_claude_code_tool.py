@@ -98,3 +98,37 @@ def test_nested_jsonl_subagent_tracks_immediate_parent(
     assert classification.metadata["root_session_id"] == "session-id"
     assert classification.metadata["parent_thread_id"] == "child-id"
     assert classification.metadata["agent_depth"] == 2
+
+
+def test_same_description_sidecars_keep_distinct_source_files(
+    claude_tool: ClaudeCodeTool,
+) -> None:
+    subagents = (
+        claude_tool.root_path
+        / "projects"
+        / "demo-project"
+        / "session-id"
+        / "subagents"
+    )
+    subagents.mkdir(parents=True)
+    paths = []
+    for agent_id, tool_use_id in (
+        ("agent-one", "toolu-one"),
+        ("agent-two", "toolu-two"),
+    ):
+        path = subagents / f"agent-{agent_id}.meta.json"
+        path.write_text(
+            json.dumps({
+                "agentId": agent_id,
+                "toolUseId": tool_use_id,
+                "description": "Same description",
+            }),
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    classified = [claude_tool.classify_file(path) for path in paths]
+
+    assert all(item is not None for item in classified)
+    assert classified[0].relative_path != classified[1].relative_path
+    assert all(item.metadata["is_subagent_meta"] is True for item in classified)

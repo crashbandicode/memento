@@ -264,6 +264,27 @@ ingest_service.py
     └─ SSE 广播 file_synced 事件
 ```
 
+### Subagent lifecycle API contract
+
+Claude Agent、Cursor Task 和 Codex sub-agent activity 会投影到共享的
+`ConversationMessage.metadata.agent_event`。事件身份必须来自 source ID：
+`(activity_type, agent_tool_use_id | agent_thread_id | task_id, kind)`；显示标题
+`label` 不能作为去重键。相同标题但不同 agent/tool-use ID 的并行任务必须保留。
+同一 Claude 后台启动的 `tool_use started` 和 `tool_result async_launched`
+共享 tool-use ID 和 kind，因此合并成一张卡；合并保留最早 `started_at`，并吸收
+后续记录提供的 `agent_thread_id` / status。
+
+卡片运行时身份字段为可选的 `model`、`model_family` 和
+`reasoning_effort`。来源优先级是子线程实际 transcript/meta，其次是 Task
+输入中明确记录的请求值；没有权威值时字段缺省，服务端和前端都不得猜测。
+Claude 当前格式的 `.meta.json` 不重复写 `agentId`；经过格式校验的
+`agent-<id>.meta.json` 文件名和同目录 `.jsonl` 精确配对提供 agent identity。
+旧格式若含 `agentId`，其值必须与文件名一致，否则拒绝配对，避免复用陈旧 sidecar。
+`GET /api/conversations/{id}` 的 `subagents[]` 与
+`GET /api/conversations/{id}/messages` 的 `agent_event` 使用同一规则。
+历史修复由 `server.scripts.backfill_subagent_lifecycle` 完成：默认 dry-run，
+`--apply` 才提交，`--document-id` 可精确限制父线程，重复运行幂等。
+
 ### 认证体系
 
 ```

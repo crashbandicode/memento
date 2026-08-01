@@ -2204,6 +2204,8 @@ class ConversationParserTests(unittest.TestCase):
                         "input": {
                             "description": "Run background audit",
                             "run_in_background": True,
+                            "model": "claude-opus-4-8",
+                            "effort": "xhigh",
                         },
                     }],
                 },
@@ -2231,11 +2233,23 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertEqual(
             [message.agent_event["kind"] for message in messages],
-            ["started", "started"],
+            ["started"],
         )
         self.assertEqual(
             messages[-1].agent_event["label"],
             "Run background audit",
+        )
+        self.assertEqual(
+            messages[-1].agent_event["agent_thread_id"],
+            "background-agent",
+        )
+        self.assertEqual(messages[-1].agent_event["status"], "running")
+        self.assertEqual(messages[-1].agent_event["model"], "claude-opus-4-8")
+        self.assertEqual(messages[-1].agent_event["model_family"], "anthropic")
+        self.assertEqual(messages[-1].agent_event["reasoning_effort"], "xhigh")
+        self.assertEqual(
+            messages[-1].agent_event["started_at"],
+            "2026-07-30T10:00:00Z",
         )
 
     def test_claude_agent_duplicate_descriptions_do_not_cross_correlate(self) -> None:
@@ -2284,6 +2298,48 @@ class ConversationParserTests(unittest.TestCase):
                 ("toolu-one", "started"),
                 ("toolu-two", "started"),
                 ("toolu-two", "completed"),
+            ],
+        )
+        self.assertTrue(all(
+            "model" not in message.agent_event
+            for message in messages
+        ))
+
+    def test_claude_parallel_agents_keep_distinct_descriptions(self) -> None:
+        raw = "\n".join(
+            json.dumps({
+                "type": "assistant",
+                "uuid": f"launch-{index}",
+                "timestamp": f"2026-07-30T10:00:0{index}Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Agent",
+                        "input": {"description": description},
+                    }],
+                },
+            })
+            for index, (tool_use_id, description) in enumerate((
+                ("toolu-bjobs", "#131 attribute-grouped bjobs capture"),
+                ("toolu-stale", "Tune stale threshold to CLEAN_PERIOD"),
+            ))
+        )
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(
+            [
+                (
+                    message.agent_event["agent_tool_use_id"],
+                    message.agent_event["label"],
+                )
+                for message in messages
+            ],
+            [
+                ("toolu-bjobs", "#131 attribute-grouped bjobs capture"),
+                ("toolu-stale", "Tune stale threshold to CLEAN_PERIOD"),
             ],
         )
 

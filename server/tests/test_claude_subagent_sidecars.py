@@ -118,6 +118,25 @@ def _assert_enriched(transcript: Document) -> None:
     assert transcript.metadata_["_assistant_reasoning_effort"] == "high"
 
 
+def test_current_sidecar_uses_validated_filename_agent_identity() -> None:
+    evidence = _claude_subagent_sidecar_evidence(
+        SIDECAR_PATH,
+        json.dumps({
+            "toolUseId": TOOL_USE_ID,
+            "description": DESCRIPTION,
+            "agentType": "general-purpose",
+            "spawnDepth": 1,
+        }),
+    )
+
+    assert evidence is not None
+    transcript_path, metadata = evidence
+    assert transcript_path == TRANSCRIPT_PATH
+    assert metadata["agent_id"] == AGENT_ID
+    assert metadata["agent_tool_use_id"] == TOOL_USE_ID
+    assert metadata["agent_launch_description"] == DESCRIPTION
+
+
 @pytest.mark.asyncio
 async def test_sidecar_before_transcript_enriches_on_transcript_ingest() -> None:
     sidecar = _sidecar()

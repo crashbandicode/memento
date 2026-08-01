@@ -17,6 +17,10 @@ from typing import Any, Hashable, Iterable, Mapping
 from sqlalchemy import and_, false, or_
 
 from .conversation_activity import effective_conversation_activity
+from .subagent_lifecycle import (
+    normalized_subagent_runtime,
+    subagent_runtime_from_metadata,
+)
 
 
 FOLDABLE_CONVERSATION_TOOLS = frozenset({
@@ -415,7 +419,7 @@ def build_subagent_summaries(
                 agent_depth = None
             parent_thread_id = metadata.get("parent_thread_id")
             timestamp = effective_conversation_timestamp(child)
-            model = str(metadata.get("model") or "").strip() or None
+            runtime = subagent_runtime_from_metadata(metadata)
             children.append({
                 "id": str(child.document_id),
                 "session_id": thread_id,
@@ -445,7 +449,9 @@ def build_subagent_summaries(
                     child.relative_path,
                     metadata,
                 ),
-                "model": model,
+                "model": runtime.get("model"),
+                "model_family": runtime.get("model_family"),
+                "reasoning_effort": runtime.get("reasoning_effort"),
                 "started_at": None,
                 "completed_at": None,
             })
@@ -500,7 +506,10 @@ def merge_subagent_event_summaries(
             "failed": "failed",
         }.get(kind, "unknown")
         event_timestamp = item.get("timestamp")
-        event_model = str(item.get("model") or "").strip() or None
+        event_runtime = normalized_subagent_runtime(
+            model=item.get("model"),
+            reasoning_effort=item.get("reasoning_effort"),
+        )
         started_at = item.get("started_at") or (
             event_timestamp if kind == "started" else None
         )
@@ -547,7 +556,9 @@ def merge_subagent_event_summaries(
                 "synced_at": None,
                 "document_ready": False,
                 "user_role_origin": item.get("user_role_origin"),
-                "model": event_model,
+                "model": event_runtime.get("model"),
+                "model_family": event_runtime.get("model_family"),
+                "reasoning_effort": event_runtime.get("reasoning_effort"),
                 "started_at": started_at,
                 "completed_at": completed_at,
             }
@@ -582,8 +593,14 @@ def merge_subagent_event_summaries(
             if item.get("agent_depth") is not None and existing.get("agent_depth") is None:
                 existing["agent_depth"] = item.get("agent_depth")
             register(existing)
-        if event_model and not existing.get("model"):
-            existing["model"] = event_model
+        if event_runtime.get("model") and not existing.get("model"):
+            existing["model"] = event_runtime["model"]
+            existing["model_family"] = event_runtime.get("model_family")
+        if (
+            event_runtime.get("reasoning_effort")
+            and not existing.get("reasoning_effort")
+        ):
+            existing["reasoning_effort"] = event_runtime["reasoning_effort"]
         if started_at and not existing.get("started_at"):
             existing["started_at"] = started_at
         if completed_at:
@@ -606,6 +623,8 @@ def merge_subagent_event_summaries(
         summary.setdefault("agent_tool_use_id", None)
         summary.setdefault("user_role_origin", None)
         summary.setdefault("model", None)
+        summary.setdefault("model_family", None)
+        summary.setdefault("reasoning_effort", None)
         summary.setdefault("started_at", None)
         summary.setdefault("completed_at", None)
     return merged

@@ -69,10 +69,15 @@ class ClaudeAsyncAgentLifecycleTests(unittest.TestCase):
         events = [message.agent_event for message in messages]
         self.assertEqual(
             [event["kind"] for event in events],
-            ["started", "started"],
+            ["started"],
         )
         self.assertEqual(events[-1]["status"], "async_launched")
         self.assertTrue(events[-1]["is_background"])
+        self.assertEqual(
+            events[-1]["agent_tool_use_id"],
+            "toolu_async_launch",
+        )
+        self.assertEqual(events[-1]["agent_thread_id"], "aacbce856db239d85")
         self.assertNotIn("completed_at", events[-1])
 
         summaries = merge_subagent_event_summaries([], events)

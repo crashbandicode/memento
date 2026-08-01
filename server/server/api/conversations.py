@@ -63,6 +63,11 @@ from ..services.message_search import (
     normalize_search_query,
     suggest_corrected_query,
 )
+from ..services.subagent_lifecycle import (
+    enrich_lifecycle_runtime,
+    normalized_subagent_runtime,
+    subagent_runtime_from_metadata,
+)
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -224,6 +229,106 @@ def _stored_agent_event(metadata: object) -> dict | None:
         return None
     value = metadata.get("agent_event")
     return value if isinstance(value, dict) else None
+
+
+def _agent_id_aliases(value: object) -> set[str]:
+    identity = str(value or "").strip()
+    if not identity:
+        return set()
+    aliases = {identity}
+    if identity.startswith("agent-"):
+        aliases.add(identity[len("agent-"):])
+    else:
+        aliases.add(f"agent-{identity}")
+    return aliases
+
+
+async def _subagent_event_runtime_overrides(
+    db: AsyncSession,
+    document: Document,
+    messages: list[ConversationMessage],
+) -> dict[int, dict]:
+    """Resolve actual child runtime identity for lifecycle rows on one page."""
+    event_rows: list[tuple[int, dict]] = []
+    tool_use_ids: set[str] = set()
+    thread_ids: set[str] = set()
+    for message in messages:
+        event = _stored_agent_event(message.metadata_)
+        if event is None or event.get("activity_type", "subagent") != "subagent":
+            continue
+        tool_use_id = str(event.get("agent_tool_use_id") or "").strip()
+        thread_id = str(event.get("agent_thread_id") or "").strip()
+        if not tool_use_id and not thread_id:
+            continue
+        event_rows.append((message.id, event))
+        if tool_use_id:
+            tool_use_ids.add(tool_use_id)
+        thread_ids.update(_agent_id_aliases(thread_id))
+    if not event_rows:
+        return {}
+
+    child_filters = []
+    if tool_use_ids:
+        child_filters.append(
+            Document.metadata_["agent_tool_use_id"].astext.in_(tool_use_ids)
+        )
+    if thread_ids:
+        child_filters.extend([
+            Document.metadata_["agent_id"].astext.in_(thread_ids),
+            Document.metadata_["session_id"].astext.in_(thread_ids),
+            Document.metadata_["thread_id"].astext.in_(thread_ids),
+        ])
+    if not child_filters:
+        return {}
+
+    child_rows = (
+        await db.execute(
+            select(Document.metadata_)
+            .where(
+                Document.id != document.id,
+                Document.machine_id == document.machine_id,
+                Document.tool_id == document.tool_id,
+                Document.category == "conversation",
+                or_(*child_filters),
+            )
+        )
+    ).scalars().all()
+
+    by_tool_use: dict[str, dict[str, str]] = {}
+    by_thread: dict[str, dict[str, str]] = {}
+    for raw_metadata in child_rows:
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        runtime = subagent_runtime_from_metadata(metadata)
+        if not runtime:
+            continue
+        tool_use_id = str(metadata.get("agent_tool_use_id") or "").strip()
+        if tool_use_id:
+            by_tool_use[tool_use_id] = runtime
+        for key in ("agent_id", "session_id", "thread_id"):
+            for alias in _agent_id_aliases(metadata.get(key)):
+                by_thread[alias] = runtime
+
+    overrides: dict[int, dict] = {}
+    for message_id, event in event_rows:
+        tool_use_id = str(event.get("agent_tool_use_id") or "").strip()
+        thread_id = str(event.get("agent_thread_id") or "").strip()
+        runtime = by_tool_use.get(tool_use_id) or next(
+            (
+                by_thread[alias]
+                for alias in _agent_id_aliases(thread_id)
+                if alias in by_thread
+            ),
+            None,
+        )
+        normalized_event = enrich_lifecycle_runtime(
+            event,
+            runtime or normalized_subagent_runtime(
+                model=event.get("model"),
+                reasoning_effort=event.get("reasoning_effort"),
+            ),
+        )
+        overrides[message_id] = normalized_event
+    return overrides
 
 
 async def _get_conversation_identity(
@@ -619,6 +724,11 @@ async def get_conversation_messages(
 
         msgs_result = await db.execute(message_query)
         messages = msgs_result.scalars().all()
+        agent_event_overrides = await _subagent_event_runtime_overrides(
+            db,
+            doc,
+            messages,
+        )
         canvas_links = await _canvas_links_for_messages(
             db,
             [
@@ -660,7 +770,10 @@ async def get_conversation_messages(
                         "interaction_response",
                     ),
                     "task_state": _stored_task_state(m.metadata_),
-                    "agent_event": _stored_agent_event(m.metadata_),
+                    "agent_event": (
+                        agent_event_overrides.get(m.id)
+                        or _stored_agent_event(m.metadata_)
+                    ),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
                     **_canvas_field(m.content, canvas_links.get(m.id)),

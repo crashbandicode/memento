@@ -14,7 +14,7 @@ import { createPortal } from "react-dom";
 import { Icon } from "@/components/aurora/Icon";
 import { api } from "@/lib/api-client";
 import type { ConversationMessage, ConversationSubagentSummary } from "@/lib/api-client";
-import { formatAssistantModelLabel } from "@/components/viewers/AssistantIdentityBadge";
+import AssistantIdentityBadge from "@/components/viewers/AssistantIdentityBadge";
 import styles from "./SubagentBadge.module.css";
 
 const DEFAULT_VISIBLE_AGENTS = 80;
@@ -263,7 +263,9 @@ export default function SubagentBadge({
                   subagent.agent_nickname
                   && subagent.agent_nickname.toLocaleLowerCase() !== subagent.title.toLocaleLowerCase(),
                 );
-                const modelLabel = formatAssistantModelLabel(subagent.model);
+                const hasRuntimeIdentity = Boolean(
+                  subagent.model || subagent.reasoning_effort,
+                );
                 const startedAt = formatSubagentTime(subagent.started_at);
                 const completedAt = formatSubagentTime(subagent.completed_at);
                 const status = subagent.status || "unknown";
@@ -297,13 +299,13 @@ export default function SubagentBadge({
                           {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
                           {subagent.document_ready === false ? " · transcript syncing" : ""}
                         </span>
-                        {(modelLabel || startedAt || completedAt) && (
+                        {(hasRuntimeIdentity || startedAt || completedAt) && (
                           <span className={styles.agentFacts}>
-                            {modelLabel && (
-                              <span className={styles.agentFact} title={`Model: ${subagent.model}`}>
-                                <Icon name="sparkles" size={10} />
-                                {modelLabel}
-                              </span>
+                            {hasRuntimeIdentity && (
+                              <AssistantIdentityBadge
+                                model={subagent.model}
+                                reasoningEffort={subagent.reasoning_effort}
+                              />
                             )}
                             {startedAt && (
                               <time
