@@ -515,6 +515,29 @@ export interface DeviceSummary {
   tools?: string[];
 }
 
+export interface DeviceIdentitySummary {
+  id: string;
+  device_id: string;
+  name: string;
+  platform: string;
+  label: string;
+  last_heartbeat: string | null;
+  total_files: number;
+  tools: { id: string; file_count: number }[];
+}
+
+export interface DeviceGroupSummary {
+  id: string;
+  group_id: string;
+  device_id: string;
+  name: string;
+  total_files: number;
+  tools: { id: string; file_count: number }[];
+  machine_ids: string[];
+  device_ids: string[];
+  identities: DeviceIdentitySummary[];
+}
+
 export interface DailyDetail {
   date: string;
   total_documents: number;
@@ -798,6 +821,8 @@ export const api = {
     return apiFetch<DailyDetail>(`/api/daily/${date}?tz_offset=${tz}`, { signal });
   },
   getDevices: () => apiFetch<DeviceSummary[]>("/api/devices"),
+  getDeviceGroups: () =>
+    apiFetch<DeviceGroupSummary[]>("/api/hierarchy/devices"),
   search: (q: string, tool?: string, offset = 0, limit = 20) => {
     const params = new URLSearchParams({ q, offset: String(offset), limit: String(limit) });
     if (tool) params.set("tool", tool);

@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 
 from ..db.models import (
     ConversationMessage, Document, KnowledgeEntity, KnowledgeObservation,
-    KnowledgeRelation, Machine, Project, Tool, User,
+    KnowledgeRelation, Project, Tool, User,
 )
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
@@ -34,55 +34,19 @@ from ..services.conversation_hierarchy import (
     explicit_subagent_parent_thread_id,
     fold_conversation_subagents,
 )
+from ..services.device_grouping import resolve_device_scope_ids
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
-async def _resolve_project_device_id(
+async def _resolve_project_device_ids(
     db: AsyncSession,
     user: User,
     device_id: str,
-) -> uuid.UUID:
-    """Resolve a public collector device ID, with a database UUID fallback.
-
-    The device selector exposes ``Machine.collector_token_hash`` as
-    ``device_id``.  Older callers can still send the database UUID.  Resolve
-    the public ID first so a UUID-shaped collector ID cannot accidentally
-    select a different machine through the fallback.
-    """
-    machine = (
-        await db.execute(
-            select(Machine)
-            .options(load_only(Machine.id, Machine.user_id))
-            .where(Machine.collector_token_hash == device_id)
-        )
-    ).scalar_one_or_none()
-
-    if machine is None:
-        try:
-            machine_uuid = uuid.UUID(device_id)
-        except ValueError:
-            machine_uuid = None
-        if machine_uuid is not None:
-            machine = (
-                await db.execute(
-                    select(Machine)
-                    .options(load_only(Machine.id, Machine.user_id))
-                    .where(Machine.id == machine_uuid)
-                )
-            ).scalar_one_or_none()
-
-    if (
-        machine is None
-        or (
-            user.role not in ("admin", "owner")
-            and machine.user_id != user.id
-        )
-    ):
-        # Do not disclose whether an inaccessible device exists.
-        raise HTTPException(status_code=404, detail="Device not found")
-    return machine.id
+) -> list[uuid.UUID]:
+    """Resolve collector, legacy database, and physical-host scope IDs."""
+    return await resolve_device_scope_ids(db, user, device_id)
 
 
 @router.get("")
@@ -92,16 +56,21 @@ async def list_projects(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
-    selected_machine_id = (
-        await _resolve_project_device_id(db, _user, device_id)
+    selected_machine_ids = (
+        await _resolve_project_device_ids(db, _user, device_id)
         if device_id
+        else None
+    )
+    selected_machine_id = (
+        selected_machine_ids[0]
+        if selected_machine_ids is not None and len(selected_machine_ids) == 1
         else None
     )
     # A selected machine was already ownership-checked above.  Preserve the
     # existing all-device user filter when no explicit device is selected.
     mids = (
         None
-        if selected_machine_id is not None
+        if selected_machine_ids is not None
         else await user_machine_ids(db, _user)
     )
 
@@ -110,6 +79,8 @@ async def list_projects(
     join_cond = Document.project_id == Project.id
     if selected_machine_id is not None:
         join_cond = join_cond & (Document.machine_id == selected_machine_id)
+    elif selected_machine_ids is not None:
+        join_cond = join_cond & Document.machine_id.in_(selected_machine_ids)
     elif mids is not None:
         join_cond = join_cond & Document.machine_id.in_(mids)
 
@@ -121,7 +92,7 @@ async def list_projects(
     )
     if tool_id:
         query = query.where(Project.tool_id == tool_id)
-    if selected_machine_id is not None or mids is not None:
+    if selected_machine_ids is not None or mids is not None:
         # Exclude projects with zero visible docs for the selected scope.
         query = query.having(doc_count_col > 0)
 
@@ -163,6 +134,10 @@ async def list_projects(
         if selected_machine_id is not None:
             foldable_conversations_q = foldable_conversations_q.where(
                 Document.machine_id == selected_machine_id
+            )
+        elif selected_machine_ids is not None:
+            foldable_conversations_q = foldable_conversations_q.where(
+                Document.machine_id.in_(selected_machine_ids)
             )
         else:
             foldable_conversations_q = apply_user_filter(

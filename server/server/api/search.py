@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import and_, case, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Machine, User
+from ..db.models import ConversationMessage, Document, User
 from ..db.session import get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_hierarchy import (
@@ -31,6 +31,7 @@ from ..services.message_search import (
     normalize_search_query,
     suggest_corrected_query,
 )
+from ..services.device_grouping import resolve_device_scope_ids
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -92,6 +93,11 @@ async def search_messages(
             "corrected_query": None,
         }
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
     decoded_cursor = decode_search_cursor(cursor)
     sort_timestamp = func.coalesce(
         ConversationMessage.timestamp,
@@ -143,11 +149,7 @@ async def search_messages(
             statement = statement.where(Document.project_id == project_id)
         if device_id:
             statement = statement.where(
-                Document.machine_id.in_(
-                    select(Machine.id).where(
-                        Machine.collector_token_hash == device_id
-                    )
-                )
+                Document.machine_id.in_(selected_machine_ids)
             )
         if days:
             statement = statement.where(
@@ -226,11 +228,7 @@ async def search_messages(
             companion_query = companion_query.where(Document.project_id == project_id)
         if device_id:
             companion_query = companion_query.where(
-                Document.machine_id.in_(
-                    select(Machine.id).where(
-                        Machine.collector_token_hash == device_id
-                    )
-                )
+                Document.machine_id.in_(selected_machine_ids)
             )
         companion_query = apply_user_filter(
             companion_query,
@@ -362,6 +360,11 @@ async def search(
     from ..services.tokenize import tokenize_for_query
 
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
     search_term = f"%{q}%"
     tsquery = tokenize_for_query(q)
 
@@ -407,9 +410,7 @@ async def search(
         query = query.where(Document.category == category)
     if device_id:
         query = query.where(
-            Document.machine_id.in_(
-                select(Machine.id).where(Machine.collector_token_hash == device_id)
-            )
+            Document.machine_id.in_(selected_machine_ids)
         )
     if days:
         from datetime import datetime, timedelta, timezone
@@ -485,11 +486,7 @@ async def search(
         )
         if device_id:
             companions_q = companions_q.where(
-                Document.machine_id.in_(
-                    select(Machine.id).where(
-                        Machine.collector_token_hash == device_id
-                    )
-                )
+                Document.machine_id.in_(selected_machine_ids)
             )
         companions_q = apply_user_filter(
             companions_q,

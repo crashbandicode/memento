@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
+from ..db.models import ConversationMessage, Document, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
@@ -23,6 +23,7 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
 )
+from ..services.device_grouping import resolve_device_scope_ids
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -30,12 +31,10 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
 
 
-def _apply_device_filter(query, device_id: str | None):
-    if not device_id:
+def _apply_device_filter(query, machine_ids):
+    if machine_ids is None:
         return query
-    return query.where(Document.machine_id.in_(
-        select(Machine.id).where(Machine.collector_token_hash == device_id)
-    ))
+    return query.where(Document.machine_id.in_(machine_ids))
 
 
 @router.get("")
@@ -47,6 +46,11 @@ async def get_dashboard(
 ) -> dict:
     """Aggregated dashboard data for home page."""
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
 
     # tz_offset: JS getTimezoneOffset() value (e.g. -480 for UTC+8)
     tz = timezone(timedelta(minutes=-tz_offset))
@@ -60,7 +64,7 @@ async def get_dashboard(
     tool_records = list(tools_result.scalars().all())
 
     cat_agg_q = select(Document.tool_id, Document.category, func.count().label("n"))
-    cat_agg_q = _apply_device_filter(cat_agg_q, device_id)
+    cat_agg_q = _apply_device_filter(cat_agg_q, selected_machine_ids)
     cat_agg_q = apply_user_filter(cat_agg_q, mids, Document.machine_id)
     cat_agg_q = cat_agg_q.group_by(Document.tool_id, Document.category)
     categories_by_tool: dict[str, dict[str, int]] = {}
@@ -71,7 +75,7 @@ async def get_dashboard(
         select(Document.tool_id, func.count().label("n"))
         .where(Document.synced_at >= today_start)
     )
-    today_q = _apply_device_filter(today_q, device_id)
+    today_q = _apply_device_filter(today_q, selected_machine_ids)
     today_q = apply_user_filter(today_q, mids, Document.machine_id)
     today_q = today_q.group_by(Document.tool_id)
     today_by_tool: dict[str, int] = {tid: n for tid, n in (await db.execute(today_q)).all()}
@@ -111,7 +115,7 @@ async def get_dashboard(
         .order_by(activity_expr.desc(), Document.id.desc())
         .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
-    recent_convos_q = _apply_device_filter(recent_convos_q, device_id)
+    recent_convos_q = _apply_device_filter(recent_convos_q, selected_machine_ids)
     recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
     candidate_rows = list((await db.execute(recent_convos_q)).all())
     # Pending questions are an inbox, not merely recent activity. Pin every
@@ -138,7 +142,10 @@ async def get_dashboard(
             Document.metadata_["pending_question_count"].astext != "0",
         )
     )
-    attention_convos_q = _apply_device_filter(attention_convos_q, device_id)
+    attention_convos_q = _apply_device_filter(
+        attention_convos_q,
+        selected_machine_ids,
+    )
     attention_convos_q = apply_user_filter(
         attention_convos_q,
         mids,
@@ -187,7 +194,7 @@ async def get_dashboard(
                 ),
             )
         )
-        companions_q = _apply_device_filter(companions_q, device_id)
+        companions_q = _apply_device_filter(companions_q, selected_machine_ids)
         companions_q = apply_user_filter(companions_q, mids, Document.machine_id)
         for row in (await db.execute(companions_q)).all():
             all_convo_rows_by_id[row[0]] = row
@@ -323,7 +330,7 @@ async def get_dashboard(
         select(cast(tz_adjusted_synced, Date).label("day"), func.count().label("count"))
         .where(Document.synced_at >= cutoff)
     )
-    daily_q = _apply_device_filter(daily_q, device_id)
+    daily_q = _apply_device_filter(daily_q, selected_machine_ids)
     daily_q = apply_user_filter(daily_q, mids, Document.machine_id)
     daily_result = await db.execute(daily_q.group_by("day").order_by("day"))
     daily = [{"date": str(r.day), "count": r.count} for r in daily_result.all()]
@@ -335,7 +342,7 @@ async def get_dashboard(
                func.count().label("count"))
         .where(Document.synced_at >= cutoff)
     )
-    tool_daily_q = _apply_device_filter(tool_daily_q, device_id)
+    tool_daily_q = _apply_device_filter(tool_daily_q, selected_machine_ids)
     tool_daily_q = apply_user_filter(tool_daily_q, mids, Document.machine_id)
     tool_daily_result = await db.execute(
         tool_daily_q.group_by(Document.tool_id, "day").order_by("day")
@@ -373,20 +380,20 @@ async def get_dashboard(
 
     # Today's stats
     today_total_q = select(func.count()).where(Document.synced_at >= today_start)
-    today_total_q = _apply_device_filter(today_total_q, device_id)
+    today_total_q = _apply_device_filter(today_total_q, selected_machine_ids)
     today_total_q = apply_user_filter(today_total_q, mids, Document.machine_id)
     today_total = (await db.execute(today_total_q)).scalar() or 0
 
     today_conv_q = select(func.count()).where(
         Document.synced_at >= today_start, Document.category == "conversation",
     )
-    today_conv_q = _apply_device_filter(today_conv_q, device_id)
+    today_conv_q = _apply_device_filter(today_conv_q, selected_machine_ids)
     today_conv_q = apply_user_filter(today_conv_q, mids, Document.machine_id)
     today_conversations = (await db.execute(today_conv_q)).scalar() or 0
 
     # Total stats
     doc_count_q = select(func.count()).select_from(Document)
-    doc_count_q = _apply_device_filter(doc_count_q, device_id)
+    doc_count_q = _apply_device_filter(doc_count_q, selected_machine_ids)
     doc_count_q = apply_user_filter(doc_count_q, mids, Document.machine_id)
     total_docs = (await db.execute(doc_count_q)).scalar() or 0
     # Count only projects the user has ingested into — Project has no user_id,
@@ -395,7 +402,7 @@ async def get_dashboard(
         select(func.count(func.distinct(Document.project_id)))
         .where(Document.project_id.isnot(None))
     )
-    proj_count_q = _apply_device_filter(proj_count_q, device_id)
+    proj_count_q = _apply_device_filter(proj_count_q, selected_machine_ids)
     proj_count_q = apply_user_filter(proj_count_q, mids, Document.machine_id)
     total_projects = (await db.execute(proj_count_q)).scalar() or 0
 

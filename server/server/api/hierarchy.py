@@ -23,6 +23,11 @@ from ..services.conversation_hierarchy import (
     build_logical_activity_map,
     fold_conversation_subagents,
 )
+from ..services.device_grouping import (
+    accessible_machines,
+    build_host_groups,
+    resolve_device_scope_ids,
+)
 
 router = APIRouter(prefix="/api/hierarchy", tags=["hierarchy"])
 
@@ -77,6 +82,26 @@ def _device_file_row(row) -> dict:
         "activity_at": activity_at,
         "synced_at": synced_at.isoformat(),
     }
+
+
+def _scope_row_sort_key(row) -> tuple:
+    timestamp = (
+        effective_conversation_activity(row[6], row[7], row[8])
+        if row[3] == "conversation"
+        else row[8]
+    )
+    return timestamp is not None, timestamp, str(row[0])
+
+
+def _deduplicate_host_rows(rows: list) -> list:
+    """Keep the newest representation of one logical path across runtimes."""
+    newest_by_path: dict[tuple[str, str], tuple] = {}
+    for row in rows:
+        key = (row[3], row[2])
+        previous = newest_by_path.get(key)
+        if previous is None or _scope_row_sort_key(row) > _scope_row_sort_key(previous):
+            newest_by_path[key] = row
+    return sorted(newest_by_path.values(), key=_scope_row_sort_key, reverse=True)
 
 
 def _fold_device_file_rows(
@@ -169,63 +194,27 @@ async def _annotate_conversation_activity(
         item["is_low_activity"] = summary.is_low_activity
 
 
-def _check_machine_access(machine: Machine | None, user: User) -> Machine | None:
-    """Return None if user has no access to the machine."""
-    if machine is None:
-        return None
-    if user.role in ("admin", "owner"):
-        return machine
-    if machine.user_id != user.id:
-        return None
-    return machine
-
-
-async def _find_machine(db: AsyncSession, device_id: str) -> Machine | None:
-    """Find machine by collector_token_hash OR by primary key UUID."""
-    result = await db.execute(
-        select(Machine).where(Machine.collector_token_hash == device_id)
-    )
-    m = result.scalar_one_or_none()
-    if m:
-        return m
-    # Fallback: try as UUID primary key
-    try:
-        import uuid as _uuid
-        uid = _uuid.UUID(device_id)
-        result = await db.execute(select(Machine).where(Machine.id == uid))
-        return result.scalar_one_or_none()
-    except (ValueError, AttributeError):
-        return None
-
-
 @router.get("/devices")
 async def list_devices_with_tools(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """Level 1: All devices with tool counts."""
-    machines_q = select(Machine).order_by(Machine.name)
-    if _user.role not in ("admin", "owner"):
-        machines_q = machines_q.where(Machine.user_id == _user.id)
-    machines = await db.execute(machines_q)
-    items = []
-    for m in machines.scalars().all():
-        tools_result = await db.execute(
-            select(Document.tool_id, func.count().label("cnt"))
-            .where(Document.machine_id == m.id, Document.tool_id != "system")
-            .group_by(Document.tool_id)
+    """Level 1: physical hosts with their selectable collector identities."""
+    machines = await accessible_machines(db, _user)
+    if not machines:
+        return []
+    machine_ids = [machine.id for machine in machines]
+    document_rows = (
+        await db.execute(
+            select(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.relative_path,
+            ).where(Document.machine_id.in_(machine_ids))
         )
-        tool_counts = {r[0]: r[1] for r in tools_result.all()}
-        total = sum(tool_counts.values())
-        items.append({
-            "id": str(m.id),
-            "device_id": m.collector_token_hash,
-            "name": m.name,
-            "last_heartbeat": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
-            "total_files": total,
-            "tools": [{"id": tid, "file_count": cnt} for tid, cnt in sorted(tool_counts.items())],
-        })
-    return items
+    ).all()
+    return build_host_groups(machines, document_rows)
 
 
 @router.get("/devices/{device_id}/tools")
@@ -234,16 +223,22 @@ async def list_device_tools(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """Level 2: Tools for a specific device, with category breakdown."""
-    m = _check_machine_access(await _find_machine(db, device_id), _user)
-    if not m:
-        return []
+    """Level 2: Tools for a machine identity or physical-host group."""
+    machine_ids = await resolve_device_scope_ids(db, _user, device_id)
 
-    # Single query with JOIN — no N+1, exclude "system" pseudo-tool
+    # Count logical paths so replacement registrations do not inflate a host.
     tools_result = await db.execute(
-        select(Document.tool_id, Tool.display_name, Document.category, func.count().label("cnt"))
+        select(
+            Document.tool_id,
+            Tool.display_name,
+            Document.category,
+            func.count(func.distinct(Document.relative_path)).label("cnt"),
+        )
         .outerjoin(Tool, Document.tool_id == Tool.id)
-        .where(Document.machine_id == m.id, Document.tool_id != "system")
+        .where(
+            Document.machine_id.in_(machine_ids),
+            Document.tool_id != "system",
+        )
         .group_by(Document.tool_id, Tool.display_name, Document.category)
     )
 
@@ -268,15 +263,20 @@ async def list_device_tool_projects(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """Level 3: Projects for a device+tool, with recent file info."""
-    m = _check_machine_access(await _find_machine(db, device_id), _user)
-    if not m:
-        return []
+    """Level 3: Projects for a machine or grouped host plus tool."""
+    machine_ids = await resolve_device_scope_ids(db, _user, device_id)
 
-    # Get documents for this device+tool
+    # Get logical documents for this scope+tool.
     rows = list((await db.execute(
-        select(Document.project_id, func.count().label("cnt"), func.max(Document.synced_at).label("last"))
-        .where(Document.machine_id == m.id, Document.tool_id == tool_id)
+        select(
+            Document.project_id,
+            func.count(func.distinct(Document.relative_path)).label("cnt"),
+            func.max(Document.synced_at).label("last"),
+        )
+        .where(
+            Document.machine_id.in_(machine_ids),
+            Document.tool_id == tool_id,
+        )
         .group_by(Document.project_id)
     )).all())
 
@@ -320,14 +320,13 @@ async def list_device_tool_files(
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
-    """Level 4: Files (conversations/docs) for a device+tool, with optional project/category filter."""
-    m = _check_machine_access(await _find_machine(db, device_id), _user)
-    if not m:
-        if project_id is not None:
-            raise HTTPException(status_code=404, detail="Device not found")
-        return {"total": 0, "files": [], "project": None}
+    """Level 4: Files for a machine or grouped physical-host scope."""
+    machine_ids = await resolve_device_scope_ids(db, _user, device_id)
 
-    criteria = [Document.machine_id == m.id, Document.tool_id == tool_id]
+    criteria = [
+        Document.machine_id.in_(machine_ids),
+        Document.tool_id == tool_id,
+    ]
     project = None
     if project_id and project_id != "none":
         try:
@@ -351,7 +350,7 @@ async def list_device_tool_files(
             .join(Document, Document.project_id == Project.id)
             .where(
                 Project.id == resolved_project_id,
-                Document.machine_id == m.id,
+                Document.machine_id.in_(machine_ids),
                 Document.tool_id == tool_id,
             )
             .limit(1)
@@ -381,6 +380,8 @@ async def list_device_tool_files(
                 select(*_CODEX_DEVICE_FILE_COLUMNS).where(*criteria)
             )
         ).all()
+        if len(machine_ids) > 1:
+            folded_rows = _deduplicate_host_rows(list(folded_rows))
         total, files = _fold_device_file_rows(
             folded_rows,
             tool_id=tool_id,
@@ -389,6 +390,27 @@ async def list_device_tool_files(
         )
         await _annotate_conversation_activity(db, files)
         return {"total": total, "files": files, "project": project}
+
+    if len(machine_ids) > 1:
+        # A host group can contain old registrations of the same physical
+        # file. Fetch lightweight rows once, collapse by logical path, then
+        # paginate so total and page contents agree.
+        grouped_rows = (
+            await db.execute(
+                select(*_DEVICE_FILE_COLUMNS).where(*criteria)
+            )
+        ).all()
+        visible_rows = _deduplicate_host_rows(list(grouped_rows))
+        files = [
+            _device_file_row(row)
+            for row in visible_rows[offset:offset + limit]
+        ]
+        await _annotate_conversation_activity(db, files)
+        return {
+            "total": len(visible_rows),
+            "files": files,
+            "project": project,
+        }
 
     # Count directly against the filtered table.  Counting a subquery based
     # on ``select(Document)`` made PostgreSQL plan a projection containing the

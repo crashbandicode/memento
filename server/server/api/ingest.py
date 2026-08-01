@@ -742,6 +742,10 @@ async def heartbeat(
     )
     return {
         "status": "ok",
-        "device_id": str(machine.id),
+        # ``device_id`` is the collector's persistent public identity. Older
+        # responses returned the database UUID under this name, which invited
+        # clients to persist it and register a fresh machine on the next run.
+        "device_id": machine.collector_token_hash,
+        "machine_id": str(machine.id),
         "received_at": datetime.now(timezone.utc).isoformat(),
     }
