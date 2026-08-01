@@ -1,9 +1,9 @@
 # Regression handoff — conversation UX & live interactions
 
-**Date:** 2026-07-31
-**Covered versions:** v0.1.44 → v0.1.54
-**HEAD:** see release tag `v0.1.54`
-**Status:** v0.1.54 integrates secure Canvas previews, Cursor child/task projection fixes, and Claude live-prompt Unicode/mobile fixes.
+**Date:** 2026-08-01
+**Covered versions:** v0.1.44 → v0.1.64
+**HEAD:** see release tag `v0.1.64`
+**Status:** v0.1.64 reconciles source-backed subagent terminal states and repairs false-running historical cards.
 
 This document is the canonical bug-fix / regression handoff for conversation attention, live prompts, Cursor/Claude subagent presentation, and related navigation hardening. It is based on the actual commit diffs listed below (not release notes alone).
 
@@ -240,6 +240,15 @@ The integrated Chromium release-candidate count is recorded after the required f
 - **Key files:** `server/server/services/subagent_lifecycle.py`, parser/ingest/hierarchy/conversations API, `server/server/scripts/backfill_subagent_lifecycle.py`, shared web badges and fixture.
 - **Tests:** parser covers duplicate source event, same-description distinct agents, different-description parallel agents, explicit runtime and missing fallback; API/hierarchy cover child-runtime recovery; backfill tests cover exact coalescing and idempotency; sidecar tests cover current filename identity and contradictory legacy IDs; collector preserves same-description sidecars as distinct source files; `subagent-identity.spec.mjs` asserts the production-shaped #131/stale fixture on desktop/mobile with two cards, model + effort badges, no overflow, intact parent-agent labels, and no console/page errors.
 
+### 24. `fix/subagent-terminal-reconciliation` — authoritative terminal status
+
+- **Production evidence:** v0.1.63 correctly coalesced each Claude `tool_use started` + `tool_result async_launched` pair in root document `3f30d6db-90e4-43cc-948d-14a99eda3e1c` / session `c2badf82-0183-4c85-9191-d76222f66ede`, but the reported cards still resolved `running` from parent launch rows. The screenshot pair was `a21ae9586acc8afb8` / `toolu_017BqzhgcFNzkezabn2PCGRe` at normalized line 30487 and `aa53b331b57f1bde5` / `toolu_01JHkBjvPchXVuCH6Z2LiQiv` at line 30522. Their exact child documents continued through authoritative final assistant records at 13:52:26Z and 13:56:28Z respectively, while no matching parent terminal lifecycle rows existed. The bounded root audit found 103 parent lifecycle rows and 87 linked child documents; before repair none of those children had server-owned lifecycle status/source metadata.
+- **Root cause:** event identity/dedupe was correct; terminal state lived in child transcript content but ingest and normalized API consulted only parent lifecycle events. Companion SSE invalidated prompts/messages but the conversation metadata fetch reused its 60-second client cache, so even a child sync could not immediately change an open badge.
+- **Fix:** extract explicit Claude/Codex terminal evidence and explicit Cursor composer state into server-owned child metadata; join it back to parent events by exact tool-use id, then thread/agent id; preserve terminal states across late starts/reparse; expose failed/cancelled/interrupted/disconnected distinctly; never infer completion from age. Child ingest publishes the companion event and the parent invalidates metadata cache before SSE/poll refresh.
+- **Backfill:** the existing bounded lifecycle backfill now reconciles eligible child documents from DB content/meta, updates exact parent lifecycle rows, remains dry-run by default and idempotent, and reports genuine active/terminal/unknown/unchanged/repaired counts. It does not crawl source files or alter collector offsets.
+- **Key files:** `server/server/services/subagent_lifecycle.py`, `ingest_service.py`, `conversation_hierarchy.py`, `server/server/api/conversations.py`, `server/server/scripts/backfill_subagent_lifecycle.py`, conversation API types/viewer/badge, `web/src/app/conversations/[id]/page.tsx`.
+- **Tests:** `test_subagent_lifecycle_reconciliation.py` covers async active, explicit completion, distinct failed/cancelled/interrupted mapping, sticky terminal state, duplicate/coalesced and distinct identity, source-missing evidence, and idempotency. Sidecar tests cover child-terminal SSE publish; normalized API tests cover resolved status. `subagent-reconciliation.spec.mjs` runs real Chromium at 1440×900 and 390×844 for running/completed/failed/disconnected cards, model/effort fit and zero browser errors, then drives an EventSource child transition to completed without reload.
+
 ---
 
 ## Test coverage matrix
@@ -260,7 +269,7 @@ The integrated Chromium release-candidate count is recorded after the required f
 | Live permission / elicitation capture (`a7422d3`) | collector + `test_conversation_parser.py` + `test_thread_metadata_service.py` | unit / API | covered |
 | Cursor native message timestamps (`a7422d3`) | `test_cursor_state_export.py`, `test_conversations_normalized_api.py` | unit / API | covered |
 | Always-allow permission option (`8e88ba4`) | `test_claude_permission_request_preserves_always_allow_rule` (+ collector fixture) | unit | covered (pending-API **GAP**) |
-| Parent refresh for path-linked children (`a2d6484`) | — | — | **GAP** |
+| Parent refresh for path-linked children (`a2d6484`) | sidecar SSE publish test; `subagent-reconciliation.spec.mjs` | unit / Playwright | covered (child terminal event refreshes cached parent metadata without reload) |
 | Claude sidecar launch pairing (`790072f`) | `test_claude_subagent_sidecars.py`, hierarchy summary test | API / unit | covered |
 | Hierarchical tasks API/MCP (`d7d89df`) | `test_conversation_tasks.py`, `test_tasks_api.py`, `test_task_projection_integration.py`, `test_mcp_tasks.py` | unit / API | covered (UI **GAP**) |
 | Message order / prompt-jump windows (`83951fb`) | `web/tests/conversation-message-order.test.mjs` | unit (web) | covered |
@@ -269,7 +278,7 @@ The integrated Chromium release-candidate count is recorded after the required f
 | Cursor current-task carrier rendered once (pending) | `conversation-message-order.test.mjs`; `cursor-thread-projection.spec.mjs` | unit / Playwright | covered (desktop + mobile) |
 | AskUserQuestion vs PermissionRequest wrapper (`7cb05b0`) | collector + parser + thread_metadata + normalized API tests | unit / API | covered |
 | Metadata-only live prompt SSE publish (`7cb05b0`) | `test_thread_metadata_service.py` (publish assertions) | unit / API | covered |
-| Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs` | unit / Playwright | covered (reparse/backfill still needed; browser run verified on Node 24) |
+| Claude `async_launched` false-complete (post-v0.1.50) | `test_claude_async_agent_lifecycle.py`; `web/e2e/subagent-status.spec.mjs`; lifecycle backfill | unit / Playwright | covered (bounded authoritative repair supersedes age-based reparse) |
 | Smart file/repo/web links across Claude, Cursor, and Codex (v0.1.51) | `smart-link-classifier.test.mjs`, `smart-links.spec.mjs` | unit / Playwright | covered (3/3 tool scenarios) |
 | Inline code chips across Claude, Cursor, and Codex (v0.1.53) | `smart-links.spec.mjs` | Playwright | covered (computed style + fenced-block regression) |
 | Secure Canvas artifact viewer (`feat/canvas-viewer`) | `test_canvas_artifacts.py`, `canvas-artifact.test.mjs`, `canvas-viewer.spec.mjs` | unit / Playwright | covered (source, HTML/URL policy, fallback, desktop/mobile, security attributes) |
@@ -278,20 +287,18 @@ The integrated Chromium release-candidate count is recorded after the required f
 | URL-backed conversation location/search (`feat/url-navigation-state`) | `conversation-url-state.test.mjs`, mock-router fixture tests, `conversation-url-navigation.spec.mjs` | unit / fixture / Playwright | covered (desktop + mobile; refresh/share shape, Back/Forward, passive replace, legacy line, large around-window, clearance, zero errors) |
 | Stable physical-host device grouping (`fix/sidebar-device-grouping`) | `test_device_grouping.py`, `test_projects_device_scope.py`, `device-groups.test.mjs`, `sidebar-device-groups.spec.mjs` | unit / API / fixture / Playwright | covered (ownership boundary, identity churn, Windows+WSL, de-duplicated counts, group/child filters, desktop + mobile) |
 | Exact subagent lifecycle identity + runtime metadata (`fix/subagent-card-identity-model`) | parser/API/hierarchy/backfill/collector tests; `subagent-identity.spec.mjs` | unit / API / fixture / Playwright | covered (exact source identity, same-description preservation, model/effort, idempotency, desktop + mobile) |
+| Authoritative subagent terminal reconciliation (`fix/subagent-terminal-reconciliation`) | `test_subagent_lifecycle_reconciliation.py`, sidecar/API/backfill tests; `subagent-reconciliation.spec.mjs` | unit / API / fixture / Playwright | covered (all terminal mappings, sticky state, bounded idempotent repair, live SSE, desktop + mobile) |
 | End-to-end live conversation UX | `web/e2e/*.spec.mjs` (+ `web/e2e/fixtures/*`) | Playwright (fixture/mock) | covered; integrated release count pending |
 
 ---
 
 ## Coverage gaps / recommended follow-ups
 
-1. **Reparse/backfill false-complete rows (post-v0.1.50)** — After deploying the `async_launched` parser fix, reparse the Compare-bjobs conversation (and any other background Agent launches ingested before the fix) so stored lifecycle events flip from sticky `completed` back to `running`/`completed` correctly.
-2. **Path-linked parent SSE refresh (`a2d6484`)** — Add a focused unit test for `pathLinkedRootId` / `isCompanionConversationEvent` in `web/` (export helpers or thin test seam). Highest-priority web GAP in this range.
-2. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
-3. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
-4. **ConversationLocation / SubagentBadge UI** — Optional front-end smoke tests; server already returns the data.
-5. **Playwright / E2E** — Hermetic suite under `web/e2e/` is fixture-driven with SSE aborted. The integrated browser-free and Chromium counts will be recorded after the release-candidate run. Remaining UI gaps: path-linked companion refresh and directive title-cleaning.
-6. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
-7. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
+1. **Adjacent scroll page loading (`8ac973e`)** — Cover `loadEarlier` / downward `loadMore` threshold behavior (component test or extracted scroll policy helper). Currently UI-only.
+2. **Always-allow pending API surface (`8e88ba4`)** — Assert normalized pending-interactions payload includes the `allow-always` option id/label for a live Claude permission signal.
+3. **ConversationLocation UI** — Optional front-end smoke test; server already returns the data. SubagentBadge lifecycle states and overflow now have desktop/mobile Chromium coverage.
+4. **Hierarchical tasks UI (`d7d89df`)** — API/MCP well covered; if a web tasks browser ships later, add matching UI tests.
+5. **ConversationViewer detached-tail integration (`83951fb`)** — Pure order helpers are covered; consider one integration test that `placeTargetWindow` results drive `data-detached-*` attributes after a prompt jump.
 
 ---
 

@@ -29,6 +29,7 @@ from ..services.conversation_hierarchy import (
     build_logical_activity_map,
     build_subagent_summaries,
     conversation_display_title,
+    conversation_root_thread_id,
     conversation_user_role_origin,
     current_thread_id,
     effective_conversation_timestamp,
@@ -65,7 +66,9 @@ from ..services.message_search import (
 )
 from ..services.subagent_lifecycle import (
     enrich_lifecycle_runtime,
+    enrich_lifecycle_status,
     normalized_subagent_runtime,
+    persisted_child_lifecycle,
     subagent_runtime_from_metadata,
 )
 from ..services.user_filter import user_machine_ids
@@ -281,32 +284,48 @@ async def _subagent_event_runtime_overrides(
     if not child_filters:
         return {}
 
-    child_rows = (
-        await db.execute(
-            select(Document.metadata_)
-            .where(
-                Document.id != document.id,
-                Document.machine_id == document.machine_id,
-                Document.tool_id == document.tool_id,
-                Document.category == "conversation",
-                or_(*child_filters),
+    child_query = select(Document.metadata_).where(
+        Document.id != document.id,
+        Document.machine_id == document.machine_id,
+        Document.tool_id == document.tool_id,
+        Document.category == "conversation",
+        or_(*child_filters),
+    )
+    parent_root = conversation_root_thread_id(
+        document.tool_id,
+        document.relative_path,
+        document.metadata_,
+    )
+    if parent_root:
+        child_query = child_query.where(
+            build_conversation_companion_filter(
+                Document.tool_id,
+                Document.metadata_,
+                Document.relative_path,
+                {document.tool_id: {parent_root}},
             )
         )
-    ).scalars().all()
+    child_rows = (await db.execute(child_query)).scalars().all()
 
     by_tool_use: dict[str, dict[str, str]] = {}
     by_thread: dict[str, dict[str, str]] = {}
+    lifecycle_by_tool_use: dict[str, dict[str, str]] = {}
+    lifecycle_by_thread: dict[str, dict[str, str]] = {}
     for raw_metadata in child_rows:
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         runtime = subagent_runtime_from_metadata(metadata)
-        if not runtime:
-            continue
+        lifecycle = persisted_child_lifecycle(metadata)
         tool_use_id = str(metadata.get("agent_tool_use_id") or "").strip()
-        if tool_use_id:
+        if tool_use_id and runtime:
             by_tool_use[tool_use_id] = runtime
+        if tool_use_id and lifecycle:
+            lifecycle_by_tool_use[tool_use_id] = lifecycle
         for key in ("agent_id", "session_id", "thread_id"):
             for alias in _agent_id_aliases(metadata.get(key)):
-                by_thread[alias] = runtime
+                if runtime:
+                    by_thread[alias] = runtime
+                if lifecycle:
+                    lifecycle_by_thread[alias] = lifecycle
 
     overrides: dict[int, dict] = {}
     for message_id, event in event_rows:
@@ -320,12 +339,23 @@ async def _subagent_event_runtime_overrides(
             ),
             None,
         )
-        normalized_event = enrich_lifecycle_runtime(
-            event,
-            runtime or normalized_subagent_runtime(
-                model=event.get("model"),
-                reasoning_effort=event.get("reasoning_effort"),
+        lifecycle = lifecycle_by_tool_use.get(tool_use_id) or next(
+            (
+                lifecycle_by_thread[alias]
+                for alias in _agent_id_aliases(thread_id)
+                if alias in lifecycle_by_thread
             ),
+            None,
+        )
+        normalized_event = enrich_lifecycle_status(
+            enrich_lifecycle_runtime(
+                event,
+                runtime or normalized_subagent_runtime(
+                    model=event.get("model"),
+                    reasoning_effort=event.get("reasoning_effort"),
+                ),
+            ),
+            lifecycle,
         )
         overrides[message_id] = normalized_event
     return overrides

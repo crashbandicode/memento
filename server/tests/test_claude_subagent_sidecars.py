@@ -299,3 +299,47 @@ async def test_matching_metadata_does_not_publish_duplicate_event() -> None:
 
     assert db.flush_count == 0
     publish_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_child_terminal_reconciliation_publishes_parent_companion_event() -> None:
+    transcript = _transcript()
+    sidecar = _sidecar()
+    sidecar.machine_id = transcript.machine_id
+    await _reconcile_claude_subagent_launch_metadata(
+        _Session(sidecar),
+        transcript,
+        machine_id=str(transcript.machine_id),
+        user_id="user-id",
+    )
+    transcript.content = json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-08-01T12:05:00Z",
+        "message": {
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Done"}],
+        },
+    })
+    db = _Session(sidecar)
+
+    with (
+        patch(
+            "server.services.ingest_service._invalidate_ingest_read_caches",
+            new=AsyncMock(),
+        ),
+        patch("server.services.sse_service.publish_event") as publish_event,
+    ):
+        await _reconcile_idempotent_claude_ingest(
+            db,
+            transcript,
+            machine_id=str(transcript.machine_id),
+            user_id="user-id",
+        )
+
+    assert transcript.metadata_["subagent_lifecycle_status"] == "completed"
+    assert db.flush_count == 1
+    publish_event.assert_called_once()
+    _, event_data = publish_event.call_args.args
+    assert event_data["document_id"] == str(transcript.id)
+    assert event_data["relative_path"] == TRANSCRIPT_PATH

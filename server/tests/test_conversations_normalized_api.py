@@ -403,6 +403,9 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             "agent_tool_use_id": "toolu-stale",
             "_assistant_model": "claude-opus-4-8",
             "_assistant_reasoning_effort": "xhigh",
+            "subagent_lifecycle_status": "completed",
+            "subagent_lifecycle_source": "claude_child_transcript",
+            "subagent_lifecycle_at": "2026-08-01T13:56:28.772Z",
         }
         db = _Db([
             _Result(scalar_value=self.doc),
@@ -425,6 +428,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["model"], "claude-opus-4-8")
         self.assertEqual(event["model_family"], "anthropic")
         self.assertEqual(event["reasoning_effort"], "xhigh")
+        self.assertEqual(event["resolved_status"], "completed")
+        self.assertEqual(event["completed_at"], "2026-08-01T13:56:28.772Z")
 
     async def test_around_line_uses_index_and_reports_row_offset(self) -> None:
         db = _Db(

@@ -4104,7 +4104,7 @@ function AgentActivityCard({
 }) {
   if (event.kind === "snapshot") {
     const agents = [...(event.agents || [])].sort((left, right) => {
-      const rank = { running: 0, failed: 1, interrupted: 2, completed: 3, unknown: 4 };
+      const rank = { running: 0, failed: 1, cancelled: 2, interrupted: 3, completed: 4, disconnected: 5, unknown: 6 };
       return rank[left.status] - rank[right.status] || left.label.localeCompare(right.label);
     });
     const visibleAgents = agents.slice(0, 8);
@@ -4113,9 +4113,11 @@ function AgentActivityCard({
       const status = {
         running: { label: "Running", color: "#2563EB" },
         completed: { label: "Completed", color: "#059669" },
+        cancelled: { label: "Cancelled", color: "#B45309" },
         interrupted: { label: "Interrupted", color: "#D97706" },
         failed: { label: "Failed", color: "#DC2626" },
         unknown: { label: "Observed", color: "var(--aurora-fg4)" },
+        disconnected: { label: "Disconnected", color: "#64748B" },
       }[agent.status];
       return (
         <span
@@ -4206,13 +4208,22 @@ function AgentActivityCard({
     );
   }
 
+  const resolvedKind = event.resolved_status === "completed"
+    || event.resolved_status === "cancelled"
+    || event.resolved_status === "interrupted"
+    || event.resolved_status === "failed"
+    || event.resolved_status === "disconnected"
+    ? event.resolved_status
+    : event.kind;
   const presentation = {
     started: { action: "started", color: "#2563EB", icon: "plus" as const },
     updated: { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const },
     completed: { action: "completed", color: "#059669", icon: "check" as const },
+    cancelled: { action: "cancelled", color: "#B45309", icon: "close" as const },
     interrupted: { action: "interrupted", color: "#D97706", icon: "minus" as const },
     failed: { action: "failed", color: "#DC2626", icon: "close" as const },
-  }[event.kind] || { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const };
+    disconnected: { action: "disconnected", color: "#64748B", icon: "minus" as const },
+  }[resolvedKind] || { action: "updated", color: "var(--aurora-accent)", icon: "activity" as const };
   const activityLabel = event.activity_type === "shell"
     ? "Shell task"
     : event.activity_type === "task"
@@ -4237,7 +4248,7 @@ function AgentActivityCard({
   return (
     <div
       data-agent-event
-      data-agent-kind={event.kind}
+      data-agent-kind={resolvedKind}
       data-agent-task-id={event.task_id}
       data-agent-activity-type={event.activity_type || "subagent"}
       title={event.agent_path || event.output_path}

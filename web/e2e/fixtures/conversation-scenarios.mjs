@@ -469,6 +469,119 @@ export const dreamlandParallelSubagents = {
   latestAgentLine: 30524,
 };
 
+const lifecycleMatrixSubagents = [
+  {
+    id: "child-live",
+    session_id: "agent-live",
+    agent_tool_use_id: "toolu-live",
+    title: "Authoritative active child",
+    status: "running",
+    status_source: "claude_agent",
+    document_ready: true,
+    model: "claude-opus-4-8",
+    reasoning_effort: "xhigh",
+    started_at: "2026-08-01T15:00:00Z",
+  },
+  {
+    id: "child-complete",
+    session_id: "agent-complete",
+    agent_tool_use_id: "toolu-complete",
+    title: "Finished child transcript",
+    status: "completed",
+    status_source: "claude_child_transcript",
+    document_ready: true,
+    model: "claude-opus-4-8",
+    reasoning_effort: "xhigh",
+    started_at: "2026-08-01T14:00:00Z",
+    completed_at: "2026-08-01T14:05:00Z",
+  },
+  {
+    id: "child-failed",
+    session_id: "agent-failed",
+    agent_tool_use_id: "toolu-failed",
+    title: "Failed child transcript",
+    status: "failed",
+    status_source: "cursor_composer_state",
+    document_ready: true,
+    model: "gpt-5.6-sol-xhigh",
+    reasoning_effort: "xhigh",
+    started_at: "2026-08-01T13:00:00Z",
+    completed_at: "2026-08-01T13:02:00Z",
+  },
+  {
+    id: "child-disconnected",
+    session_id: "agent-disconnected",
+    agent_tool_use_id: "toolu-disconnected",
+    title: "Missing child source",
+    status: "disconnected",
+    status_source: "collector_source_inventory",
+    document_ready: true,
+    model: "cursor-grok-4.5-high",
+    reasoning_effort: "high",
+    started_at: "2026-08-01T12:00:00Z",
+  },
+];
+
+/** Deterministic lifecycle matrix plus a real EventSource-driven transition. */
+export const subagentLifecycleMatrix = {
+  docId: "conv-subagent-lifecycle-matrix",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-subagent-lifecycle-matrix",
+    tool_id: "claude_code",
+    title: "Subagent lifecycle reconciliation",
+    relative_path: "projects/demo/root-lifecycle.jsonl",
+    metadata: { session_id: "root-lifecycle" },
+    message_count: 1,
+    subagent_count: 4,
+    is_subagent_orphan: false,
+    subagents: lifecycleMatrixSubagents,
+    synced_at: "2026-08-01T15:01:00Z",
+    activity_at: "2026-08-01T15:01:00Z",
+  }),
+  liveTransitionMeta: /** @type {ConversationMeta} */ ({
+    id: "conv-subagent-lifecycle-matrix",
+    tool_id: "claude_code",
+    title: "Subagent lifecycle reconciliation",
+    relative_path: "projects/demo/root-lifecycle.jsonl",
+    metadata: { session_id: "root-lifecycle" },
+    message_count: 1,
+    subagent_count: 4,
+    is_subagent_orphan: false,
+    subagents: lifecycleMatrixSubagents.map((subagent) => (
+      subagent.id === "child-live"
+        ? {
+            ...subagent,
+            status: "completed",
+            status_source: "claude_child_transcript",
+            completed_at: "2026-08-01T15:05:00Z",
+          }
+        : subagent
+    )),
+    synced_at: "2026-08-01T15:05:00Z",
+    activity_at: "2026-08-01T15:05:00Z",
+  }),
+  liveTransitionEvent: {
+    document_id: "child-live",
+    tool_id: "claude_code",
+    category: "conversation",
+    relative_path: "projects/demo/root-lifecycle/subagents/agent-live.jsonl",
+    title: "Authoritative active child",
+  },
+  liveTransitionDelayMs: 2500,
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "assistant",
+      content: "Lifecycle fixture ready.",
+      timestamp: "2026-08-01T15:01:00Z",
+    },
+  ]),
+  prompts: [],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 1,
+};
+
 /**
  * Regression #5 — parent-agent labeling + launch description titles.
  *
@@ -1180,6 +1293,7 @@ export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
+  [subagentLifecycleMatrix.docId]: subagentLifecycleMatrix,
   [parentAgentLabeling.docId]: parentAgentLabeling,
   [cursorParentAgentLabeling.docId]: cursorParentAgentLabeling,
   [cursorThreadProjection.docId]: cursorThreadProjection,
