@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -100,11 +101,20 @@ async def inventory_machine_canvases(
     machine_id: uuid.UUID,
 ) -> dict[str, int]:
     """Discover a bounded set of exact references without reading source paths."""
-    state = await db.get(CanvasArtifactInventoryState, machine_id)
-    if state is None:
-        state = CanvasArtifactInventoryState(machine_id=machine_id, last_message_id=0)
-        db.add(state)
-        await db.flush()
+    await db.execute(
+        pg_insert(CanvasArtifactInventoryState)
+        .values(machine_id=machine_id, last_message_id=0)
+        .on_conflict_do_nothing(
+            index_elements=[CanvasArtifactInventoryState.machine_id]
+        )
+    )
+    state = (
+        await db.execute(
+            select(CanvasArtifactInventoryState)
+            .where(CanvasArtifactInventoryState.machine_id == machine_id)
+            .with_for_update()
+        )
+    ).scalar_one()
     rows = (
         await db.execute(
             select(ConversationMessage, Document.tool_id)
@@ -117,6 +127,10 @@ async def inventory_machine_canvases(
             )
             .order_by(ConversationMessage.id)
             .limit(MAX_INVENTORY_MESSAGES)
+            # Ingest replaces a document's normalized rows transactionally.
+            # Keep selected messages alive until their FK-backed references
+            # and the inventory high-water mark are flushed.
+            .with_for_update(of=ConversationMessage, read=True, key_share=True)
         )
     ).all()
     message_ids = [message.id for message, _tool_id in rows]

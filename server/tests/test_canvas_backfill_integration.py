@@ -7,7 +7,8 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.db.models import (
@@ -250,3 +251,49 @@ async def test_multi_artifact_backfill_is_owned_deduped_and_resumable(
         ) == 1
         assert messages[0].id != messages[1].id
         await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_inventory_locks_messages_against_concurrent_ingest_replacement(
+    session_factory,
+) -> None:
+    async with session_factory() as setup:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="racing-source",
+            collector_token_hash=uuid4().hex,
+            user_id=user.id,
+        )
+        setup.add_all([user, machine])
+        await setup.flush()
+        _document, messages = await _conversation(
+            setup,
+            user=user,
+            machine=machine,
+            tool_id="cursor",
+            paths=["/home/me/.cursor/projects/ws/canvases/race.canvas.tsx"],
+        )
+        message_id = messages[0].id
+        await setup.commit()
+
+    async with session_factory() as inventory_session:
+        async with inventory_session.begin():
+            assert await inventory_machine_canvases(inventory_session, machine.id) == {
+                "discovered": 1,
+                "unsupported": 0,
+            }
+            async with session_factory() as ingest_session:
+                await ingest_session.execute(text("SET LOCAL lock_timeout = '200ms'"))
+                with pytest.raises(DBAPIError):
+                    await ingest_session.execute(
+                        delete(ConversationMessage).where(
+                            ConversationMessage.id == message_id
+                        )
+                    )
+                await ingest_session.rollback()
