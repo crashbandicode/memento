@@ -7,6 +7,7 @@ import {
   claudeCanvas,
   codexCanvas,
   cursorCanvas,
+  urlNavigationCanvasThread,
 } from "./fixtures/conversation-scenarios.mjs";
 import { openConversation } from "./support/conversation-page.mjs";
 
@@ -175,6 +176,56 @@ test.describe("canvas viewer", () => {
 
     await page.getByTestId("canvas-viewer-close").click();
     await expect(dialog).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("Canvas close preserves URL search state across mobile refresh and history", async ({ page }) => {
+    const errors = trackErrors(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, urlNavigationCanvasThread);
+
+    const input = page.locator("[data-conversation-search-input]");
+    await input.fill(urlNavigationCanvasThread.searchQuery);
+    await input.press("Enter");
+    const hit = page.locator(
+      `[data-conversation-search-hit="${urlNavigationCanvasThread.longMessageLine}"]`,
+    );
+    await expect(hit).toBeVisible();
+    await hit.click();
+
+    const target = page.locator(
+      `#conversation-line-${urlNavigationCanvasThread.longMessageLine}`,
+    );
+    await expect(target).toBeVisible();
+    await expect.poll(
+      () => new URL(page.url()).searchParams.get("line"),
+    ).toBe(String(urlNavigationCanvasThread.longMessageLine));
+    const anchoredUrl = page.url();
+    const params = new URL(anchoredUrl).searchParams;
+    expect(params.get("q")).toBe(urlNavigationCanvasThread.searchQuery);
+    expect(params.get("scope")).toBe("messages");
+    expect(params.get("match")).not.toBeNull();
+
+    await target.getByTestId("smart-link-canvas").click();
+    await expect(page.getByTestId("canvas-viewer")).toBeVisible();
+    await page.getByTestId("canvas-viewer-close").click();
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+    expect(page.url()).toBe(anchoredUrl);
+
+    await page.reload();
+    await expect(target).toBeVisible({ timeout: 15_000 });
+    await expect(input).toHaveValue(urlNavigationCanvasThread.searchQuery);
+    expect(page.url()).toBe(anchoredUrl);
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+
+    await page.goBack();
+    await expect.poll(() => page.url()).not.toBe(anchoredUrl);
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+
+    await page.goForward();
+    await expect(target).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => page.url()).toBe(anchoredUrl);
+    await expect(input).toHaveValue(urlNavigationCanvasThread.searchQuery);
     expect(errors).toEqual([]);
   });
 });

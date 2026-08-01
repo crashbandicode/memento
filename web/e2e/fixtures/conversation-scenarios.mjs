@@ -1007,6 +1007,43 @@ export const urlNavigationLargeThread = {
   latestAgentLine: 260,
 };
 
+export const urlNavigationCanvasThread = {
+  ...urlNavigationLargeThread,
+  docId: "conv-url-navigation-canvas",
+  meta: {
+    ...urlNavigationLargeThread.meta,
+    id: "conv-url-navigation-canvas",
+    title: "Canvas URL navigation regression",
+    relative_path: "cursor/sessions/url-navigation-canvas.jsonl",
+  },
+  messages: urlNavigationLargeThread.messages.map((message) =>
+    message.line_number === urlNavigationLargeThread.longMessageLine
+      ? {
+        ...message,
+        content: `${message.content} [billing-review](${CURSOR_CANVAS_PATH})`,
+        canvases: [
+          {
+            name: "billing-review",
+            path: CURSOR_CANVAS_PATH,
+            href: CURSOR_CANVAS_PATH,
+            source_kind: "interactive",
+            artifact_id: CURSOR_CANVAS_ARTIFACT_ID,
+            render_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/render`,
+            source_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/source`,
+            capture_status: "renderable",
+          },
+        ],
+      }
+      : message
+  ),
+  canvasArtifacts: {
+    [CURSOR_CANVAS_ARTIFACT_ID]: {
+      render: CURSOR_CANVAS_SHELL,
+      source: CURSOR_CANVAS_SOURCE,
+    },
+  },
+};
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -1023,4 +1060,5 @@ export const scenarios = {
   [codexCanvas.docId]: codexCanvas,
   [claudeCanvas.docId]: claudeCanvas,
   [urlNavigationLargeThread.docId]: urlNavigationLargeThread,
+  [urlNavigationCanvasThread.docId]: urlNavigationCanvasThread,
 };

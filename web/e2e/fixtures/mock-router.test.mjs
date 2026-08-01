@@ -226,17 +226,19 @@ test("smart-link fixtures cover the shared Claude, Cursor, and Codex render laye
   }
 });
 
-test("canvas fixtures cover source, embed, and unsupported across three tools", () => {
+test("canvas fixtures cover captured, embed, and unsupported across three tools", () => {
   assert.deepEqual(
     canvasScenarios.map((scenario) => scenario.meta.tool_id),
     ["cursor", "codex", "claude_code"],
   );
 
-  // Cursor: transcript embeds the TSX source → read-only source preview.
+  // Cursor: collector uploaded an authenticated interactive artifact + source.
   const cursorArtifact = cursorCanvas.messages[1].canvases[0];
-  assert.equal(cursorArtifact.source_kind, "source");
+  assert.equal(cursorArtifact.source_kind, "interactive");
   assert.match(cursorArtifact.path, /\.canvas\.tsx$/);
-  assert.match(cursorArtifact.source, /export default function BillingReview/);
+  assert.match(cursorArtifact.render_url, /\/canvas-artifacts\/.+\/render$/);
+  assert.match(cursorArtifact.source_url, /\/canvas-artifacts\/.+\/source$/);
+  assert.ok(cursorCanvas.canvasArtifacts[cursorArtifact.artifact_id]);
 
   // Codex: a self-contained HTML export → sandboxed embed.
   const codexArtifact = codexCanvas.messages[1].canvases[0];
