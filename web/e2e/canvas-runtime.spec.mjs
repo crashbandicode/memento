@@ -7,6 +7,28 @@ import { expect, test } from "@playwright/test";
 const runtimePath = process.env.MEMENTO_CURSOR_CANVAS_RUNTIME;
 const typescriptPath = process.env.MEMENTO_CURSOR_TYPESCRIPT;
 
+test("Canvas compiler rejects browser globals at the AST boundary", () => {
+  test.skip(!typescriptPath, "installed Cursor TypeScript path is not configured");
+  const repository = path.resolve(process.cwd(), "..");
+  const compile = spawnSync(
+    process.execPath,
+    [
+      path.join(repository, "collector", "collector", "canvas_compile.cjs"),
+      /** @type {string} */ (typescriptPath),
+      path.join(
+        repository,
+        "collector",
+        "tests",
+        "fixtures",
+        "unsafe-global.canvas.tsx",
+      ),
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  expect(compile.status).toBe(3);
+  expect(compile.stderr).toBe("forbidden_syntax");
+});
+
 test("captured Cursor runtime mounts deterministic compiled Canvas", async ({ page }) => {
   test.skip(
     !runtimePath || !typescriptPath,

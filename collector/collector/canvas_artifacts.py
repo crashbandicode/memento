@@ -53,8 +53,6 @@ _FORBIDDEN_SOURCE = re.compile(
     r"""(?x)
     \b(?:eval|Function|fetch|XMLHttpRequest|WebSocket|EventSource|Worker|
     SharedWorker|importScripts|require)\s*\(
-    |\b(?:window|document|globalThis|localStorage|sessionStorage|indexedDB|
-    parent|top|opener)\b
     |<\s*(?:script|iframe|object|embed|form)\b
     |dangerouslySetInnerHTML
     """
@@ -64,8 +62,6 @@ _FORBIDDEN_COMPILED = re.compile(
     \b(?:eval|Function|fetch|XMLHttpRequest|WebSocket|EventSource|Worker|
     SharedWorker|importScripts|require|setInterval|setTimeout|
     requestAnimationFrame|queueMicrotask)\s*\(
-    |\b(?:window|document|globalThis|localStorage|sessionStorage|indexedDB|
-    parent|top|opener)\b
     """
 )
 
@@ -373,6 +369,11 @@ def compile_canvas_source(
         "TEMP": os.environ.get("TEMP", ""),
         "TMP": os.environ.get("TMP", ""),
     }
+    if os.name == "nt":
+        # Node's Windows crypto initialization needs the OS root available even
+        # though the compiler subprocess otherwise receives a minimal environment.
+        environment["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
+        environment["WINDIR"] = os.environ.get("WINDIR", environment["SYSTEMROOT"])
     try:
         result = subprocess.run(
             [str(node), str(compiler), str(typescript), str(source_path)],

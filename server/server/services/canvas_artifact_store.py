@@ -58,8 +58,8 @@ _FORBIDDEN_SOURCE = re.compile(
     r"""(?x)
     \b(?:eval|Function|fetch|XMLHttpRequest|WebSocket|EventSource|Worker|
     SharedWorker|importScripts|require)\s*\(
-    |\b(?:window|document|globalThis|localStorage|sessionStorage|indexedDB|
-    parent|top|opener)\b
+    |<\s*(?:script|iframe|object|embed|form)\b
+    |dangerouslySetInnerHTML
     """
 )
 _FORBIDDEN_COMPILED = re.compile(
@@ -68,8 +68,6 @@ _FORBIDDEN_COMPILED = re.compile(
     SharedWorker|importScripts|require|setInterval|setTimeout|
     requestAnimationFrame|queueMicrotask)\s*\(
     |\b(?:while|for)\s*\(
-    |\b(?:window|document|globalThis|localStorage|sessionStorage|indexedDB|
-    parent|top|opener)\b
     """
 )
 _SECRETS = (

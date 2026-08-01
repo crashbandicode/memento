@@ -40,6 +40,18 @@ def test_rejects_source_network_api_and_hash_mismatch() -> None:
         validate_source(SOURCE, "0" * 64)
 
 
+def test_security_words_in_payload_text_are_not_global_api_usage() -> None:
+    prose_source = SOURCE + b'\nconst note = "document parent top";'
+    assert "document parent top" in validate_source(
+        prose_source, _sha(prose_source)
+    )
+    prose_compiled = (
+        b'const note="document parent top";'
+        b"const Report=()=>React.createElement(Card,null);export default Report;"
+    )
+    validate_compiled(prose_compiled, _sha(prose_compiled))
+
+
 def test_static_source_may_contain_loop_but_compiled_output_may_not() -> None:
     static_source = SOURCE + b"\nfor (const item of []) { console.log(item); }"
     assert validate_source(static_source, _sha(static_source))

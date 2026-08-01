@@ -114,6 +114,15 @@ def test_valid_source_is_accepted() -> None:
     assert "export default" in validate_canvas_source(SAFE_SOURCE)
 
 
+def test_security_words_in_text_are_not_global_api_usage() -> None:
+    prose = (
+        b'import { Card, Text } from "cursor/canvas"; '
+        b'const note = "document parent top"; '
+        b"export default function X() { return <Card><Text>{note}</Text></Card>; }"
+    )
+    assert "document parent top" in validate_canvas_source(prose)
+
+
 def test_oversized_source_is_rejected_before_unbounded_read(tmp_path: Path) -> None:
     home, path = _canvas(tmp_path, b"x" * (MAX_SOURCE_BYTES + 1))
     with pytest.raises(CanvasCaptureError, match="source_size"):

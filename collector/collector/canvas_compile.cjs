@@ -22,6 +22,32 @@ const file = ts.createSourceFile(
 
 let defaultExports = 0;
 let invalid = "";
+const forbiddenGlobals = new Set([
+  "eval",
+  "Function",
+  "fetch",
+  "XMLHttpRequest",
+  "WebSocket",
+  "EventSource",
+  "Worker",
+  "SharedWorker",
+  "importScripts",
+  "require",
+  "setInterval",
+  "setTimeout",
+  "requestAnimationFrame",
+  "queueMicrotask",
+  "window",
+  "document",
+  "globalThis",
+  "localStorage",
+  "sessionStorage",
+  "indexedDB",
+  "parent",
+  "top",
+  "opener",
+]);
+const forbiddenElements = new Set(["script", "iframe", "object", "embed", "form"]);
 
 function moduleName(node) {
   return node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)
@@ -74,6 +100,28 @@ function walk(node) {
       "requestAnimationFrame",
       "queueMicrotask",
     ].includes(node.expression.text)
+  ) {
+    invalid = "forbidden_syntax";
+  }
+  if (ts.isIdentifier(node) && forbiddenGlobals.has(node.text)) {
+    const parent = node.parent;
+    const isPropertyName = (
+      (ts.isPropertyAccessExpression(parent) && parent.name === node)
+      || (ts.isPropertyAssignment(parent) && parent.name === node)
+      || (ts.isMethodDeclaration(parent) && parent.name === node)
+    );
+    if (!isPropertyName) invalid = "forbidden_syntax";
+  }
+  if (
+    (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node))
+    && ts.isIdentifier(node.tagName)
+    && forbiddenElements.has(node.tagName.text.toLowerCase())
+  ) {
+    invalid = "forbidden_syntax";
+  }
+  if (
+    ts.isJsxAttribute(node)
+    && node.name.text === "dangerouslySetInnerHTML"
   ) {
     invalid = "forbidden_syntax";
   }

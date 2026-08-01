@@ -4,7 +4,7 @@ export default function SafeCanvas() {
   return (
     <Card>
       <Stack>
-        <Text>Safe compiler fixture</Text>
+        <Text>Safe compiler fixture — document parent top</Text>
       </Stack>
     </Card>
   );
