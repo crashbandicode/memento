@@ -117,7 +117,7 @@ jobs:
           git commit -m "ci(deploy): memento 镜像 -> ${SHA} [skip ci]"
           # 串行 run 之间可能有新 commit 落到 main,push 前先 rebase,失败重试
           for i in 1 2 3; do
-            if git pull --rebase origin main && git push; then
+            if git pull --rebase origin main && git push origin HEAD:main; then
               echo "已回写并推送,Fleet 将拉取部署"
               exit 0
             fi
