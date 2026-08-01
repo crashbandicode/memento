@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import { useAuth } from "@/lib/auth-context";
 import { getApiBase, authFetch } from "@/lib/api-client";
+import type { DeviceGroupSummary, DeviceIdentitySummary } from "@/lib/api-client";
 import { getStoredAuthToken } from "@/lib/auth-storage";
 import { Icon, ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
 // Read version from package.json so the sidebar footer tracks releases
@@ -13,20 +14,13 @@ import { Icon, ToolGlyph, PlatformGlyph } from "@/components/aurora/Icon";
 import pkg from "../../../package.json";
 const WEB_VERSION = `v${(pkg as { version: string }).version}`;
 
-interface SidebarDevice {
-  device_id: string;
-  name: string;
-  total_files: number;
-  tools: { id: string; file_count: number }[];
-}
-
 type IconName = Parameters<typeof Icon>[0]["name"];
 
 export default function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const pathname = usePathname();
   const { t } = useI18n();
   const { user } = useAuth();
-  const [devices, setDevices] = useState<SidebarDevice[]>([]);
+  const [devices, setDevices] = useState<DeviceGroupSummary[]>([]);
 
   useEffect(() => {
     const token = getStoredAuthToken();
@@ -46,15 +40,22 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
   const currentToolId = pathParts[4] || "";
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const defaultCollapsed = (id: string) => devices.length > 1 && id !== currentDeviceId;
-  const toggleDevice = (id: string) => setCollapsed((previous) => {
-    const current = id in previous ? previous[id] : defaultCollapsed(id);
+  const [identityCollapsed, setIdentityCollapsed] = useState<Record<string, boolean>>({});
+  const toggleDevice = (id: string, initiallyCollapsed: boolean) => setCollapsed((previous) => {
+    const current = id in previous ? previous[id] : initiallyCollapsed;
     return { ...previous, [id]: !current };
   });
-  const isCollapsed = (id: string) => {
+  const isCollapsed = (id: string, initiallyCollapsed: boolean) => {
     if (id in collapsed) return collapsed[id];
-    return defaultCollapsed(id);
+    return initiallyCollapsed;
   };
+  const toggleIdentity = (id: string, initiallyCollapsed: boolean) =>
+    setIdentityCollapsed((previous) => {
+      const current = id in previous ? previous[id] : initiallyCollapsed;
+      return { ...previous, [id]: !current };
+    });
+  const isIdentityCollapsed = (id: string, initiallyCollapsed: boolean) =>
+    id in identityCollapsed ? identityCollapsed[id] : initiallyCollapsed;
 
   const isAdmin = user?.role === "admin" || user?.role === "owner";
   const STATIC_NAV: { href: string; label: string; icon: IconName }[] = [
@@ -72,9 +73,17 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
 
   return (
     <>
-      {open && <div className="fixed inset-0 bg-black/50 z-30 lg:hidden" onClick={onClose} />}
+      {open && (
+        <div
+          data-testid="sidebar-overlay"
+          className="fixed inset-0 bg-black/50 z-30 lg:hidden"
+          onClick={onClose}
+        />
+      )}
 
       <aside
+        aria-label="Memento sidebar"
+        data-testid="app-sidebar"
         className={[
           "fixed left-0 top-0 z-40 w-60 flex flex-col h-screen",
           "transition-transform duration-200 ease-in-out",
@@ -125,6 +134,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
             </div>
           </Link>
           <button
+            type="button"
             onClick={onClose}
             aria-label="Close"
             className="lg:hidden"
@@ -136,7 +146,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
 
         <div style={{ height: 1, background: "var(--aurora-border)", margin: "0 16px" }} />
 
-        <nav className="flex-1 overflow-y-auto py-2">
+        <nav aria-label="Primary navigation" className="flex-1 overflow-y-auto py-2">
           {/* Overview link (dashboard) */}
           <NavRow
             href={OVERVIEW_HREF}
@@ -158,30 +168,43 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
           )}
 
           {devices.map((device) => {
-            const shortName = device.name.replace(/ \(\w+\)$/, "");
-            const isCurrentDevice = device.device_id === currentDeviceId;
-            const deviceCollapsed = isCollapsed(device.device_id);
+            const isCurrentGroupScope = device.device_id === currentDeviceId;
+            const isCurrentDevice = isCurrentGroupScope
+              || device.identities.some((identity) => identity.device_id === currentDeviceId);
+            const initiallyCollapsed = devices.length > 1 && !isCurrentDevice;
+            const deviceCollapsed = isCollapsed(device.group_id, initiallyCollapsed);
+            const groupPanelId = `sidebar-host-${device.group_id}`;
 
             return (
-              <div key={device.device_id} style={{ marginTop: 6 }}>
+              <div
+                key={device.group_id}
+                data-testid="sidebar-host"
+                data-host-name={device.name}
+                style={{ marginTop: 6 }}
+              >
                 <button
-                  onClick={() => toggleDevice(device.device_id)}
+                  type="button"
+                  onClick={() => toggleDevice(device.group_id, initiallyCollapsed)}
+                  aria-expanded={!deviceCollapsed}
+                  aria-controls={groupPanelId}
+                  aria-label={`${device.name}, ${device.total_files} files`}
                   style={{
                     width: "100%",
                     display: "flex",
                     alignItems: "center",
                     gap: 8,
                     padding: "6px 18px 6px 14px",
-                    color: "var(--aurora-fg3)",
+                    color: isCurrentDevice ? "var(--aurora-accent)" : "var(--aurora-fg3)",
                     fontSize: 11,
                     fontWeight: 500,
                     letterSpacing: "-0.005em",
-                    background: "transparent",
+                    background: isCurrentDevice ? "var(--aurora-accent-soft)" : "transparent",
                     border: 0,
                     cursor: "pointer",
+                    borderRadius: 10,
                   }}
                 >
-                  <PlatformGlyph name={device.name} size={18} />
+                  <Icon name="devices" size={18} />
                   <span
                     style={{
                       flex: 1,
@@ -192,7 +215,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
                       color: "var(--aurora-fg2)",
                     }}
                   >
-                    {shortName}
+                    {device.name}
                   </span>
                   <span style={{ color: "var(--aurora-fg4)", fontSize: 11 }}>{device.total_files}</span>
                   <Icon
@@ -207,10 +230,10 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
                 </button>
 
                 {!deviceCollapsed && (
-                  <div style={{ padding: "2px 0" }}>
+                  <div id={groupPanelId} style={{ padding: "2px 0" }}>
                     {device.tools.map((tool) => {
                       const href = `/devices/${device.device_id}/tools/${tool.id}`;
-                      const active = isCurrentDevice && tool.id === currentToolId;
+                      const active = isCurrentGroupScope && tool.id === currentToolId;
                       return (
                         <ToolRow
                           key={tool.id}
@@ -218,10 +241,40 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
                           toolId={tool.id}
                           fileCount={tool.file_count}
                           active={active}
+                          aggregate={device.identities.length > 1}
+                          deviceScope={device.device_id}
                           onClick={handleNavClick}
                         />
                       );
                     })}
+                    {device.identities.length > 1 && (
+                      <div
+                        data-testid="sidebar-identities"
+                        style={{
+                          margin: "3px 10px 0",
+                          paddingTop: 3,
+                          borderTop: "1px solid var(--aurora-border)",
+                        }}
+                      >
+                        {device.identities.map((identity) => (
+                          <IdentityRows
+                            key={identity.device_id}
+                            identity={identity}
+                            currentDeviceId={currentDeviceId}
+                            currentToolId={currentToolId}
+                            collapsed={isIdentityCollapsed(
+                              identity.device_id,
+                              identity.device_id !== currentDeviceId,
+                            )}
+                            onToggle={() => toggleIdentity(
+                              identity.device_id,
+                              identity.device_id !== currentDeviceId,
+                            )}
+                            onNavClick={handleNavClick}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -244,6 +297,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
 
         <div className="p-3">
           <div
+            data-testid="sidebar-version"
             style={{
               fontSize: 10.5,
               color: "var(--aurora-fg4)",
@@ -295,10 +349,98 @@ function NavRow({
   );
 }
 
-function ToolRow({
-  href, toolId, fileCount, active, onClick,
+function IdentityRows({
+  identity,
+  currentDeviceId,
+  currentToolId,
+  collapsed,
+  onToggle,
+  onNavClick,
 }: {
-  href: string; toolId: string; fileCount: number; active: boolean; onClick?: () => void;
+  identity: DeviceIdentitySummary;
+  currentDeviceId: string;
+  currentToolId: string;
+  collapsed: boolean;
+  onToggle: () => void;
+  onNavClick: () => void;
+}) {
+  const panelId = `sidebar-identity-${identity.device_id}`;
+  const current = identity.device_id === currentDeviceId;
+  return (
+    <div data-testid="sidebar-identity" data-device-id={identity.device_id}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        aria-controls={panelId}
+        aria-label={`${identity.label}, ${identity.total_files} files`}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          padding: "5px 6px",
+          color: current ? "var(--aurora-accent)" : "var(--aurora-fg3)",
+          fontSize: 10.5,
+          background: current ? "var(--aurora-accent-soft)" : "transparent",
+          border: 0,
+          borderRadius: 9,
+          cursor: "pointer",
+        }}
+      >
+        <PlatformGlyph name={identity.name} size={16} />
+        <span
+          style={{
+            flex: 1,
+            textAlign: "left",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {identity.label}
+        </span>
+        <span style={{ color: "var(--aurora-fg4)" }}>{identity.total_files}</span>
+        <Icon
+          name="chevron_right"
+          size={10}
+          style={{
+            color: "var(--aurora-fg4)",
+            transform: collapsed ? "rotate(0)" : "rotate(90deg)",
+          }}
+        />
+      </button>
+      {!collapsed && (
+        <div id={panelId}>
+          {identity.tools.map((tool) => (
+            <ToolRow
+              key={tool.id}
+              href={`/devices/${identity.device_id}/tools/${tool.id}`}
+              toolId={tool.id}
+              fileCount={tool.file_count}
+              active={current && tool.id === currentToolId}
+              deviceScope={identity.device_id}
+              indent
+              onClick={onNavClick}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolRow({
+  href, toolId, fileCount, active, aggregate = false, deviceScope, indent = false, onClick,
+}: {
+  href: string;
+  toolId: string;
+  fileCount: number;
+  active: boolean;
+  aggregate?: boolean;
+  deviceScope: string;
+  indent?: boolean;
+  onClick?: () => void;
 }) {
   const [hover, setHover] = useState(false);
   const bg = active ? "var(--aurora-chip)" : hover ? "var(--aurora-chip)" : "transparent";
@@ -306,6 +448,10 @@ function ToolRow({
   return (
     <Link
       href={href}
+      aria-current={active ? "page" : undefined}
+      data-testid="sidebar-tool-link"
+      data-device-scope={deviceScope}
+      data-tool-id={toolId}
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -313,8 +459,8 @@ function ToolRow({
         display: "flex",
         alignItems: "center",
         gap: 10,
-        padding: "6px 14px",
-        margin: "1px 10px",
+        padding: indent ? "5px 6px 5px 22px" : "6px 14px",
+        margin: indent ? "1px 0" : "1px 10px",
         borderRadius: 12,
         color,
         background: bg,
@@ -333,6 +479,7 @@ function ToolRow({
           whiteSpace: "nowrap",
         }}
       >
+        {aggregate ? "All " : ""}
         {toolId.replace("_", " ")}
       </span>
       <span style={{ fontSize: 11, color: "var(--aurora-fg4)" }}>{fileCount}</span>

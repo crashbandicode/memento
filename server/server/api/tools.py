@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
-from ..db.models import Document, Machine, Tool, User
+from ..db.models import Document, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..tool_catalog import tool_display_name
@@ -26,6 +26,7 @@ from ..services.conversation_hierarchy import (
     build_logical_activity_map,
     fold_conversation_subagents,
 )
+from ..services.device_grouping import resolve_device_scope_ids
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
@@ -96,13 +97,11 @@ def _document_summary(
     )
 
 
-def _device_filter(query, device_id: str | None):
-    """Add device filter by looking up machine_id from collector_token_hash."""
-    if not device_id:
+def _device_filter(query, machine_ids):
+    """Add an already-authorized machine or host-group scope."""
+    if machine_ids is None:
         return query
-    return query.where(Document.machine_id.in_(
-        select(Machine.id).where(Machine.collector_token_hash == device_id)
-    ))
+    return query.where(Document.machine_id.in_(machine_ids))
 
 
 @router.get("", response_model=list[ToolSummary])
@@ -112,6 +111,11 @@ async def list_tools(
     _user: User = Depends(get_current_user),
 ) -> list[ToolSummary]:
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
 
     if not device_id and mids is None:
         # Admin/owner without device filter — return raw Tool stats
@@ -126,11 +130,11 @@ async def list_tools(
         ]
 
     # Device-specific or user-filtered tool stats
-    query = select(Document.tool_id, func.count().label("cnt"))
-    if device_id:
-        query = query.where(Document.machine_id.in_(
-            select(Machine.id).where(Machine.collector_token_hash == device_id)
-        ))
+    query = select(
+        Document.tool_id,
+        func.count(func.distinct(Document.relative_path)).label("cnt"),
+    )
+    query = _device_filter(query, selected_machine_ids)
     query = apply_user_filter(query, mids, Document.machine_id)
     query = query.group_by(Document.tool_id)
     result = await db.execute(query)
@@ -156,6 +160,11 @@ async def get_tool(
     _user: User = Depends(get_current_user),
 ) -> dict:
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
 
     result = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = result.scalar_one_or_none()
@@ -167,10 +176,13 @@ async def get_tool(
         }
 
     cat_query = (
-        select(Document.category, func.count())
+        select(
+            Document.category,
+            func.count(func.distinct(Document.relative_path)),
+        )
         .where(Document.tool_id == tool_id)
     )
-    cat_query = _device_filter(cat_query, device_id)
+    cat_query = _device_filter(cat_query, selected_machine_ids)
     cat_query = apply_user_filter(cat_query, mids, Document.machine_id)
     cat_result = await db.execute(cat_query.group_by(Document.category))
     categories = {row[0]: row[1] for row in cat_result.all()}
@@ -197,6 +209,11 @@ async def list_tool_files(
     _user: User = Depends(get_current_user),
 ) -> list[DocumentSummary]:
     mids = await user_machine_ids(db, _user)
+    selected_machine_ids = (
+        await resolve_device_scope_ids(db, _user, device_id)
+        if device_id
+        else None
+    )
 
     query = (
         select(Document)
@@ -221,7 +238,7 @@ async def list_tool_files(
     )
     if category:
         query = query.where(Document.category == category)
-    query = _device_filter(query, device_id)
+    query = _device_filter(query, selected_machine_ids)
     query = apply_user_filter(query, mids, Document.machine_id)
     hierarchy = None
     logical_activity_by_document: dict = {}

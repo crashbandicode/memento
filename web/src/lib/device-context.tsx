@@ -1,10 +1,10 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
-import { api, DeviceSummary } from "./api-client";
+import { api, DeviceGroupSummary } from "./api-client";
 import { getStoredAuthToken } from "./auth-storage";
 
-type Device = DeviceSummary;
+type Device = DeviceGroupSummary;
 
 interface DeviceState {
   devices: Device[];
@@ -33,15 +33,28 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     // Only fetch if logged in
     const token = getStoredAuthToken();
     if (token) {
-      api.getDevices()
+      api.getDeviceGroups()
         .then((nextDevices) => {
           setDevices(nextDevices);
           setSelectedDeviceId((current) => {
-            if (current && !nextDevices.some((device) => device.device_id === current)) {
+            if (!current) return null;
+            if (nextDevices.some((device) => device.device_id === current)) {
+              return current;
+            }
+            // Existing installs stored an individual collector ID. Migrate it
+            // to the containing physical-host scope without losing the filter.
+            const containingGroup = nextDevices.find((device) =>
+              device.identities.some((identity) => identity.device_id === current)
+            );
+            if (containingGroup) {
+              localStorage.setItem("dr_device_id", containingGroup.device_id);
+              return containingGroup.device_id;
+            }
+            if (current) {
               localStorage.setItem("dr_device_id", "all");
               return null;
             }
-            return current;
+            return null;
           });
         })
         .catch(() => {});
