@@ -28,6 +28,8 @@ import {
 import { useI18n, fmt } from "@/lib/i18n";
 import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
+import SessionContextBody from "./SessionContextBody";
+import { contextUsageSummary } from "./sessionContextParse";
 import TaskProgressCard from "./TaskProgressCard";
 import { Icon } from "@/components/aurora/Icon";
 import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
@@ -3520,6 +3522,8 @@ function sessionContextSummary(
   if (isScheduledSystemContent(content)) {
     return scheduledSystemSummary(content) || t.conversation.scheduledAutomation;
   }
+  const usageSummary = contextUsageSummary(content);
+  if (usageSummary) return usageSummary;
   if (/<recommended_plugins\b/i.test(content)) return t.conversation.recommendedPlugins;
   if (/<external_links\b/i.test(content)) return t.conversation.webSearchContext;
   if (/<plugin_info\b/i.test(content)) return t.conversation.pluginContext;
@@ -3554,7 +3558,7 @@ function ConversationContextCard({
       ).slice(0, 180)
     : sessionContextSummary(content, t);
   const isScheduled = isScheduledSystemContent(content);
-  const usesMarkdown = isScheduled || isDirectives;
+  const preferMarkdown = isScheduled || isDirectives;
 
   return (
     <div
@@ -3639,43 +3643,7 @@ function ConversationContextCard({
         />
       </button>
       {expanded && (
-        usesMarkdown ? (
-          <div
-            className="prose prose-sm max-w-none"
-            style={{
-              maxHeight: "min(50vh, 480px)",
-              overflow: "auto",
-              padding: "12px 14px",
-              borderTop: "1px solid var(--aurora-border)",
-              color: "var(--aurora-fg3)",
-              background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
-              fontSize: 12,
-              lineHeight: 1.55,
-              overflowWrap: "anywhere",
-            }}
-          >
-            <MarkdownViewer content={content} />
-          </div>
-        ) : (
-          <pre
-            style={{
-              margin: 0,
-              maxHeight: "min(50vh, 480px)",
-              overflow: "auto",
-              padding: "12px 14px",
-              borderTop: "1px solid var(--aurora-border)",
-              color: "var(--aurora-fg3)",
-              background: "color-mix(in srgb, var(--aurora-surface-solid) 84%, transparent)",
-              fontFamily: "ui-monospace,SFMono-Regular,Consolas,monospace",
-              fontSize: 11,
-              lineHeight: 1.5,
-              whiteSpace: "pre-wrap",
-              overflowWrap: "anywhere",
-            }}
-          >
-            {content}
-          </pre>
-        )
+        <SessionContextBody content={content} preferMarkdown={preferMarkdown} />
       )}
     </div>
   );
