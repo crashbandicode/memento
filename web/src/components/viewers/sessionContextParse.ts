@@ -193,12 +193,11 @@ export function parseContextUsageReport(content: string): ContextUsageReport | n
 
 function prettyModelLabel(modelId: string | undefined): string | undefined {
   if (!modelId) return undefined;
-  const opus = modelId.match(/opus[-_]?(\d+(?:\.\d+)?)/i);
-  if (opus) return `Opus ${opus[1]}`;
-  const sonnet = modelId.match(/sonnet[-_]?(\d+(?:\.\d+)?)/i);
-  if (sonnet) return `Sonnet ${sonnet[1]}`;
-  const haiku = modelId.match(/haiku[-_]?(\d+(?:\.\d+)?)/i);
-  if (haiku) return `Haiku ${haiku[1]}`;
+  const family = modelId.match(/\b(opus|sonnet|haiku)[-_]?(\d+)(?:[-_.](\d+))?/i);
+  if (family) {
+    const name = family[1][0].toUpperCase() + family[1].slice(1).toLowerCase();
+    return family[3] ? `${name} ${family[2]}.${family[3]}` : `${name} ${family[2]}`;
+  }
   return modelId;
 }
 
