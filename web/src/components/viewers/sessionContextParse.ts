@@ -134,10 +134,18 @@ export function parseContextUsageReport(content: string): ContextUsageReport | n
 
   if (categories.length === 0) return null;
 
+  const labeledModel = text.match(/\*\*Model:\*\*\s*([^\n*]+)/i)?.[1]?.trim();
+  const labeledTokens = text.match(/\*\*Tokens:\*\*\s*([^\n*]+)/i)?.[1]?.trim();
   const modelMatch = text.match(
     /(?:^|\n)\s*(?:#{1,3}\s*)?(Opus[\w.\s-]*|Sonnet[\w.\s-]*|Haiku[\w.\s-]*)\s*\n\s*`?([a-z0-9._-]+)`?\s*\n\s*([0-9.]+\s*[km]?\/[0-9.]+\s*[km]?\s*tokens?\s*\(\d+(?:\.\d+)?%\))/im,
   );
-  const totalMatch = text.match(/([0-9.]+\s*[km]?\/[0-9.]+\s*[km]?\s*tokens?\s*\(\d+(?:\.\d+)?%\))/i);
+  const totalMatch = text.match(
+    /([0-9.]+\s*[km]?\s*\/\s*[0-9.]+\s*[km]?\s*(?:tokens?)?\s*\(\d+(?:\.\d+)?%\))/i,
+  );
+
+  const modelId = labeledModel || modelMatch?.[2]?.trim();
+  const totalLabel = labeledTokens || modelMatch?.[3]?.trim() || totalMatch?.[1]?.trim();
+  const modelLabel = modelMatch?.[1]?.trim() || prettyModelLabel(modelId);
 
   let suggestion: ContextUsageReport["suggestion"];
   const fileReads = text.match(/File reads using[^\n]+/i)?.[0]?.trim();
@@ -175,12 +183,23 @@ export function parseContextUsageReport(content: string): ContextUsageReport | n
   return {
     categories,
     mcpTools,
-    modelLabel: modelMatch?.[1]?.trim(),
-    modelId: modelMatch?.[2]?.trim(),
-    totalLabel: modelMatch?.[3]?.trim() || totalMatch?.[1]?.trim(),
+    modelLabel,
+    modelId,
+    totalLabel,
     suggestion,
     remainder: remainderParts.length ? remainderParts.join("\n\n") : undefined,
   };
+}
+
+function prettyModelLabel(modelId: string | undefined): string | undefined {
+  if (!modelId) return undefined;
+  const opus = modelId.match(/opus[-_]?(\d+(?:\.\d+)?)/i);
+  if (opus) return `Opus ${opus[1]}`;
+  const sonnet = modelId.match(/sonnet[-_]?(\d+(?:\.\d+)?)/i);
+  if (sonnet) return `Sonnet ${sonnet[1]}`;
+  const haiku = modelId.match(/haiku[-_]?(\d+(?:\.\d+)?)/i);
+  if (haiku) return `Haiku ${haiku[1]}`;
+  return modelId;
 }
 
 export function looksLikeMarkdownContext(content: string): boolean {
