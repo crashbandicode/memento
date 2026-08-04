@@ -50,6 +50,7 @@ class NormalizedMessage:
     # A response remains its own source row, but carries a stable link back to
     # the interaction so the viewer can present the pair as one decision card.
     tool_call_id: str = ""
+    tool_status: str = ""
     timestamp: str = ""
     raw_type: str = ""  # Original message type
     # Stable identity from the source transcript when one exists.  This is
@@ -2055,6 +2056,10 @@ def parse_conversation_object(
                 tool_name=display_tool_name,
                 tool_input=tool_input,
                 tool_call_id=tool_call_id,
+                tool_status=_bounded_interaction_text(
+                    obj.get("tool_status"),
+                    80,
+                ).strip().casefold(),
                 timestamp=timestamp,
                 raw_type=raw_type,
                 source_id=_cursor_source_id(obj, obj.get("message")),

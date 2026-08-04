@@ -416,6 +416,8 @@ export interface ConversationMessage {
   attachments?: ConversationAttachment[];
   tool_name?: string;
   tool_input?: string;
+  tool_call_id?: string;
+  tool_status?: string;
   tool_calls?: ConversationToolCall[];
   interaction?: QuestionInteraction | null;
   interaction_response?: QuestionInteractionResponse | null;
@@ -474,6 +476,8 @@ export interface PendingConversationInteraction {
   message_id: number;
   line_number: number;
   interaction: QuestionInteraction;
+  response?: QuestionInteractionResponse | null;
+  status?: "pending" | "answered" | "cancelled";
   model?: string | null;
   reasoning_effort?: string | null;
   service_tier?: string | null;
@@ -489,9 +493,25 @@ export interface InferredConversationInteractionResponse {
   timestamp: string | null;
 }
 
+export interface LiveConversationActivity {
+  document_id: string;
+  source_title?: string | null;
+  message_id: number;
+  line_number: number;
+  activity_id: string;
+  activity_type: "shell";
+  status: "running" | "completed" | "failed" | "cancelled";
+  tool_name: string;
+  command: string;
+  started_at: string | null;
+  updated_at: string | null;
+}
+
 export interface PendingConversationInteractionsResponse {
   count: number;
   interactions: PendingConversationInteraction[];
+  inline_interactions: PendingConversationInteraction[];
+  live_activities: LiveConversationActivity[];
   inferred_responses: InferredConversationInteractionResponse[];
 }
 

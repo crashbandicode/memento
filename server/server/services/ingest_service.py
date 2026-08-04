@@ -95,6 +95,8 @@ CURRENT_ASSISTANT_MODE_KEY = "_assistant_agent_mode"
 CURRENT_PENDING_QUESTIONS_KEY = "_pending_question_ids"
 PENDING_QUESTION_COUNT_KEY = "pending_question_count"
 LIVE_INTERACTION_SIGNALS_KEY = "_live_interaction_signals"
+LIVE_SHELL_ACTIVITIES_KEY = "_live_shell_activities"
+INTERACTION_HISTORY_KEY = "_interaction_history"
 LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY = "_latest_meaningful_human_timestamp"
 PENDING_QUESTION_RECONCILIATION_VERSION_KEY = (
     "_pending_question_reconciliation_version"
@@ -122,6 +124,7 @@ _ESSENTIAL_METADATA_KEYS = {
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     CURRENT_PENDING_QUESTIONS_KEY,
+    INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
@@ -168,6 +171,7 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
@@ -514,6 +518,16 @@ def _conversation_message_metadata(normalized) -> dict:
         meta["tool_input"] = _bounded_message_text(
             strip_terminal_sequences(normalized.tool_input).replace("\x00", ""),
             MAX_STORED_AUXILIARY_CHARS,
+        )
+    if normalized.tool_call_id:
+        meta["tool_call_id"] = _bounded_message_text(
+            str(normalized.tool_call_id),
+            512,
+        )
+    if normalized.tool_status:
+        meta["tool_status"] = _bounded_message_text(
+            str(normalized.tool_status),
+            80,
         )
     if normalized.session_context:
         meta["session_context"] = _bounded_message_text(
@@ -863,6 +877,56 @@ def _reconcile_live_interaction_signals(
         metadata[LIVE_INTERACTION_SIGNALS_KEY] = signals
     else:
         metadata.pop(LIVE_INTERACTION_SIGNALS_KEY, None)
+    doc.metadata_ = metadata
+
+
+def _normalized_terminal_tool_call_ids(normalized) -> set[str]:
+    tool_call_id = _bounded_message_text(
+        str(getattr(normalized, "tool_call_id", "") or ""),
+        512,
+    )
+    if not tool_call_id:
+        return set()
+    raw_type = str(getattr(normalized, "raw_type", "") or "").casefold()
+    tool_status = str(getattr(normalized, "tool_status", "") or "").casefold()
+    if raw_type in {
+        "tool_result",
+        "tool_output",
+        "question_tool_output",
+    } or tool_status in {
+        "cancelled",
+        "canceled",
+        "completed",
+        "done",
+        "error",
+        "failed",
+        "interrupted",
+        "success",
+    }:
+        return {tool_call_id}
+    return set()
+
+
+def _reconcile_live_shell_activities(
+    doc: Document,
+    terminal_tool_call_ids: set[str],
+) -> None:
+    """Retire transient shell cards once canonical terminal rows arrive."""
+    metadata = dict(doc.metadata_ or {})
+    raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
+    if not isinstance(raw_activities, dict):
+        return
+    activities = {
+        str(key): value
+        for key, value in raw_activities.items()
+        if isinstance(value, dict)
+    }
+    for tool_call_id in terminal_tool_call_ids:
+        activities.pop(tool_call_id, None)
+    if activities:
+        metadata[LIVE_SHELL_ACTIVITIES_KEY] = activities
+    else:
+        metadata.pop(LIVE_SHELL_ACTIVITIES_KEY, None)
     doc.metadata_ = metadata
 
 
@@ -3130,6 +3194,7 @@ async def _extract_messages(
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
     latest_human_timestamp = _latest_human_timestamp_for_ingest(doc, mode)
     canonical_interaction_ids: set[str] = set()
+    terminal_tool_call_ids: set[str] = set()
     clear_live_interaction_signals = False
     line_num = start_line
     batch: list[ConversationMessage] = []
@@ -3250,6 +3315,9 @@ async def _extract_messages(
             latest_human_timestamp,
         )
         canonical_interaction_ids.update(_normalized_interaction_ids(normalized))
+        terminal_tool_call_ids.update(
+            _normalized_terminal_tool_call_ids(normalized)
+        )
         if (
             pending_before
             and not pending_question_ids
@@ -3400,6 +3468,7 @@ async def _extract_messages(
         canonical_interaction_ids,
         clear_all=clear_live_interaction_signals,
     )
+    _reconcile_live_shell_activities(doc, terminal_tool_call_ids)
     _store_pending_question_ids(doc, pending_question_ids)
     _store_latest_human_timestamp(doc, latest_human_timestamp)
     _store_assistant_identity(doc, assistant_identity)

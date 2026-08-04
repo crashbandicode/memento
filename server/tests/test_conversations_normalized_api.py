@@ -53,7 +53,7 @@ class _Db:
 
     async def execute(self, statement):
         self.statements.append(statement)
-        return self.results.pop(0)
+        return self.results.pop(0) if self.results else _Result()
 
 
 class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
@@ -768,6 +768,157 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             [option["id"] for option in interaction["questions"][0]["options"]],
             ["allow", "allow-always", "deny"],
         )
+        self.assertEqual(len(payload["inline_interactions"]), 1)
+        self.assertEqual(
+            payload["inline_interactions"][0]["status"],
+            "pending",
+        )
+
+    async def test_answered_permission_history_is_inline_not_pending(self) -> None:
+        self.doc.tool_id = "claude_code"
+        interaction = {
+            "id": "permission-answered",
+            "kind": "question",
+            "interaction_type": "permission_request",
+            "source": "claude_code",
+            "tool_name": "PermissionRequest",
+            "requested_tool": "Bash",
+            "questions": [{
+                "id": "permission-decision",
+                "header": "Bash",
+                "prompt": "Claude Code wants permission to use Bash.",
+                "type": "single_select",
+                "allow_custom": False,
+                "options": [
+                    {"id": "allow", "label": "Yes"},
+                    {"id": "deny", "label": "No"},
+                ],
+            }],
+        }
+        response = {
+            "kind": "question_response",
+            "interaction_id": "permission-answered",
+            "status": "answered",
+            "answers": [],
+            "raw_text": "",
+        }
+        self.doc.metadata_["_interaction_history"] = [
+            {
+                "interaction": interaction,
+                "timestamp": "2026-07-30T16:06:52Z",
+                "status": "answered",
+                "response": response,
+                "anchor_line_number": 0,
+            }
+        ]
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["interactions"], [])
+        self.assertEqual(len(payload["inline_interactions"]), 1)
+        item = payload["inline_interactions"][0]
+        self.assertEqual(item["interaction"], interaction)
+        self.assertEqual(item["status"], "answered")
+        self.assertEqual(item["response"], response)
+
+    async def test_live_shell_activity_is_returned_inline(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.metadata_["_live_shell_activities"] = {
+            "toolu-shell-live": {
+                "id": "toolu-shell-live",
+                "activity_type": "shell",
+                "status": "running",
+                "tool_name": "PowerShell",
+                "command": "Start-Sleep -Seconds 30",
+                "started_at": "2026-08-04T17:00:00Z",
+                "updated_at": "2026-08-04T17:00:00Z",
+                "anchor_line_number": 34406,
+            }
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(len(payload["live_activities"]), 1)
+        activity = payload["live_activities"][0]
+        self.assertEqual(activity["activity_id"], "toolu-shell-live")
+        self.assertEqual(activity["status"], "running")
+        self.assertEqual(activity["line_number"], 34406)
+        self.assertEqual(activity["command"], "Start-Sleep -Seconds 30")
+
+    async def test_recent_canonical_shell_call_is_inferred_as_running(self) -> None:
+        self.doc.tool_id = "codex"
+        shell_call = SimpleNamespace(
+            id=101,
+            document_id=self.doc_id,
+            line_number=88,
+            message_type="tool_call",
+            timestamp=datetime.now(timezone.utc),
+            metadata_={
+                "tool_call_id": "call-shell-live",
+                "tool_name": "exec_command",
+                "tool_input": '{"command":"python -m pytest -q"}',
+            },
+        )
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+            _Result(rows=[shell_call]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(len(payload["live_activities"]), 1)
+        activity = payload["live_activities"][0]
+        self.assertEqual(activity["activity_id"], "call-shell-live")
+        self.assertEqual(activity["status"], "running")
+        self.assertEqual(activity["line_number"], 88)
+        self.assertEqual(activity["command"], "python -m pytest -q")
+
+        shell_output = SimpleNamespace(
+            id=102,
+            document_id=self.doc_id,
+            line_number=89,
+            message_type="tool_output",
+            timestamp=datetime.now(timezone.utc),
+            metadata_={"tool_call_id": "call-shell-live"},
+        )
+        resolved_db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+            _Result(rows=[shell_output, shell_call]),
+        ])
+        resolved = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=resolved_db,
+            _user=self.owner,
+        )
+        self.assertEqual(resolved["live_activities"], [])
 
     async def test_pending_interactions_recover_ask_user_permission_wrapper(
         self,

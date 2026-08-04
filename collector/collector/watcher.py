@@ -16,7 +16,10 @@ from watchdog.observers import Observer
 
 from .compat import normalize_path, path_starts_with
 from .config import CollectorConfig
-from .interaction_signals import extract_conversation_interaction_updates
+from .interaction_signals import (
+    extract_conversation_activity_updates,
+    extract_conversation_interaction_updates,
+)
 from .parsers.base import BaseParser
 from .parsers.json_parser import JsonParser
 from .parsers.jsonl import JsonlParser
@@ -516,6 +519,17 @@ class FileWatcher:
                         namespace="conversation_interactions",
                         tool_name=classification.tool_name,
                         records=interaction_updates,
+                    )
+                activity_updates = extract_conversation_activity_updates(
+                    path,
+                    tool_name=classification.tool_name,
+                    relative_path=classification.relative_path,
+                )
+                if activity_updates:
+                    self._queue.enqueue_metadata_changes(
+                        namespace="conversation_activities",
+                        tool_name=classification.tool_name,
+                        records=activity_updates,
                     )
             except Exception:
                 logger.debug(

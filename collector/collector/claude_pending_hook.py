@@ -13,14 +13,20 @@ from pathlib import Path
 from typing import Any
 
 _HOOK_SPECS = {
-    "PreToolUse": ("AskUserQuestion",),
-    "PostToolUse": ("AskUserQuestion",),
-    "PostToolUseFailure": ("AskUserQuestion",),
+    "PreToolUse": ("AskUserQuestion", "Bash", "PowerShell", "Shell"),
+    "PostToolUse": ("AskUserQuestion", "Bash", "PowerShell", "Shell"),
+    "PostToolUseFailure": (
+        "AskUserQuestion",
+        "Bash",
+        "PowerShell",
+        "Shell",
+    ),
     "PermissionRequest": (".*",),
     "Elicitation": (".*",),
     "ElicitationResult": (".*",),
     "Notification": ("agent_needs_input", "agent_completed"),
 }
+_SHELL_TOOLS = {"bash", "powershell", "shell"}
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _MEMENTO_HOOK_MARKERS = (
     "pending_question_hook.py",
@@ -67,6 +73,22 @@ def _question_input(value: object) -> dict[str, Any] | None:
     ):
         return None
     return value
+
+
+def _shell_command(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in ("command", "cmd", "script"):
+        command = value.get(key)
+        if isinstance(command, list):
+            text = " ".join(str(part) for part in command)
+        elif command is not None:
+            text = str(command)
+        else:
+            continue
+        if text.strip():
+            return text.strip()[:16_000]
+    return ""
 
 
 def _existing_question_input(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -227,11 +249,16 @@ def process_payload(payload: object) -> None:
         event_name == "notification"
         and notification_type in {"agent_needs_input", "agent_completed"}
     )
+    is_shell_event = (
+        event_name in {"pretooluse", "posttooluse", "posttoolusefailure"}
+        and _normalized_tool_name(tool_name) in _SHELL_TOOLS
+    )
     if not (
         is_question
         or is_permission
         or is_elicitation
         or is_agent_notification
+        or is_shell_event
     ):
         return
 
@@ -246,6 +273,63 @@ def process_payload(payload: object) -> None:
     path = _pending_directory() / f"{session_id}.json"
     existing = _read_mapping(path)
     existing_id = str(existing.get("interaction_id") or "").strip()
+
+    if is_shell_event:
+        activity_id = _interaction_id(payload)
+        if not activity_id:
+            return
+        raw_activities = existing.get("shell_activities")
+        activities = (
+            {
+                str(key): value
+                for key, value in raw_activities.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(raw_activities, dict)
+            else {}
+        )
+        previous = activities.get(activity_id)
+        if event_name != "pretooluse" and not isinstance(previous, dict):
+            return
+        event_timestamp = _event_timestamp(payload)
+        command = _shell_command(payload.get("tool_input"))
+        if not command and isinstance(previous, dict):
+            command = str(previous.get("command") or "")
+        if event_name == "pretooluse" and not command:
+            return
+        status = {
+            "pretooluse": "running",
+            "posttooluse": "completed",
+            "posttoolusefailure": "failed",
+        }[event_name]
+        activity = {
+            "id": activity_id,
+            "tool_name": tool_name,
+            "command": command,
+            "status": status,
+            "started_at": (
+                str(previous.get("started_at") or "")
+                if isinstance(previous, dict)
+                else ""
+            ) or event_timestamp,
+            "updated_at": event_timestamp,
+        }
+        activities.pop(activity_id, None)
+        activities[activity_id] = activity
+        record = dict(existing)
+        record.update({
+            "session_id": session_id,
+            "transcript_path": str(
+                payload.get("transcript_path")
+                or existing.get("transcript_path")
+                or ""
+            ),
+            "timestamp": event_timestamp,
+            "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
+            "shell_activities": dict(list(activities.items())[-32:]),
+        })
+        _write_atomic(path, record)
+        return
 
     if is_question:
         incoming_id = _interaction_id(payload)
@@ -406,6 +490,8 @@ def process_payload(payload: object) -> None:
     }
     if interaction_alias_ids:
         record["interaction_alias_ids"] = interaction_alias_ids
+    if isinstance(existing.get("shell_activities"), dict):
+        record["shell_activities"] = existing["shell_activities"]
     _write_atomic(path, record)
 
 

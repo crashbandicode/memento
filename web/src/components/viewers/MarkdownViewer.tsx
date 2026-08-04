@@ -109,12 +109,29 @@ const markdownComponents: Components = {
     </p>
   ),
   ul: ({ children, ...props }) => (
-    <ul {...props} style={{ margin: "7px 0 10px", paddingLeft: 22 }}>
+    <ul
+      {...props}
+      style={{
+        // Tailwind preflight sets list-style: none; restore markers for prose.
+        listStyleType: "disc",
+        listStylePosition: "outside",
+        margin: "7px 0 10px",
+        paddingLeft: 28,
+      }}
+    >
       {children}
     </ul>
   ),
   ol: ({ children, ...props }) => (
-    <ol {...props} style={{ margin: "7px 0 10px", paddingLeft: 22 }}>
+    <ol
+      {...props}
+      style={{
+        listStyleType: "decimal",
+        listStylePosition: "outside",
+        margin: "7px 0 10px",
+        paddingLeft: 28,
+      }}
+    >
       {children}
     </ol>
   ),

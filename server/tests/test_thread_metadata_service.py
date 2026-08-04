@@ -24,18 +24,21 @@ from server.api.ingest import (  # noqa: E402
     ingest_file_upload,
     ingest_metadata_endpoint,
 )
+from server.services.ingest_service import (  # noqa: E402
+    CURRENT_PENDING_QUESTIONS_KEY,
+    INTERACTION_HISTORY_KEY,
+    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
+    LIVE_SHELL_ACTIVITIES_KEY,
+    PENDING_QUESTION_COUNT_KEY,
+)
 from server.services.thread_metadata_service import (  # noqa: E402
     ThreadTitleUpdateResult,
     apply_codex_thread_title_update,
+    apply_conversation_activity_update,
     apply_conversation_interaction_update,
     codex_thread_documents_select,
     sanitize_explicit_codex_title,
-)
-from server.services.ingest_service import (  # noqa: E402
-    CURRENT_PENDING_QUESTIONS_KEY,
-    LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
-    LIVE_INTERACTION_SIGNALS_KEY,
-    PENDING_QUESTION_COUNT_KEY,
 )
 
 
@@ -285,7 +288,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(),
         ):
             result = await apply_conversation_interaction_update(
-                _Session([document]),
+                _Session([document], [34406]),
                 machine_id=machine_id,
                 user_id=user_id,
                 tool_id="claude_code",
@@ -311,6 +314,97 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             signal["interaction"]["questions"][0]["options"][0]["description"],
             "git push fork main",
         )
+        history = document.metadata_[INTERACTION_HISTORY_KEY][0]
+        self.assertEqual(history["interaction"], signal["interaction"])
+        self.assertEqual(history["timestamp"], "2026-07-30T16:06:52Z")
+        self.assertEqual(history["status"], "pending")
+        self.assertIsNone(history["response"])
+        self.assertEqual(history["anchor_line_number"], 34406)
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            answered = await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-1",
+                interaction_status="answered",
+                question_tool="PermissionRequest",
+                interaction_input={},
+            )
+
+        self.assertEqual((answered.matched, answered.updated), (1, 1))
+        self.assertNotIn(LIVE_INTERACTION_SIGNALS_KEY, document.metadata_)
+        history = document.metadata_[INTERACTION_HISTORY_KEY][0]
+        self.assertEqual(history["status"], "answered")
+        self.assertEqual(
+            history["response"],
+            {
+                "kind": "question_response",
+                "interaction_id": "permission-1",
+                "status": "answered",
+                "answers": [],
+                "raw_text": "",
+            },
+        )
+
+    async def test_live_shell_activity_tracks_running_then_completed(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            running = await apply_conversation_activity_update(
+                _Session([document], [34406]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                activity_id="toolu-shell-live",
+                activity_status="running",
+                activity_tool="PowerShell",
+                command="Start-Sleep -Seconds 30",
+                timestamp="2026-08-04T17:00:00Z",
+            )
+
+        self.assertEqual((running.matched, running.updated), (1, 1))
+        activity = document.metadata_[LIVE_SHELL_ACTIVITIES_KEY][
+            "toolu-shell-live"
+        ]
+        self.assertEqual(activity["status"], "running")
+        self.assertEqual(activity["command"], "Start-Sleep -Seconds 30")
+        self.assertEqual(activity["anchor_line_number"], 34406)
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            completed = await apply_conversation_activity_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                activity_id="toolu-shell-live",
+                activity_status="completed",
+                activity_tool="PowerShell",
+                command="",
+                timestamp="2026-08-04T17:00:30Z",
+            )
+
+        self.assertEqual((completed.matched, completed.updated), (1, 1))
+        activity = document.metadata_[LIVE_SHELL_ACTIVITIES_KEY][
+            "toolu-shell-live"
+        ]
+        self.assertEqual(activity["status"], "completed")
+        self.assertEqual(activity["command"], "Start-Sleep -Seconds 30")
 
     async def test_live_ask_user_permission_wrapper_is_question_and_closes(
         self,
@@ -362,6 +456,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         ]
         interaction = signal["interaction"]
         self.assertNotIn("interaction_type", interaction)
+        self.assertNotIn(INTERACTION_HISTORY_KEY, document.metadata_)
         self.assertEqual(interaction["questions"][0]["header"], "Fleet approach")
         self.assertEqual(
             [

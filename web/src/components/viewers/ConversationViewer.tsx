@@ -21,6 +21,7 @@ import {
   ConversationTaskState,
   ConversationToolCall,
   InferredConversationInteractionResponse,
+  LiveConversationActivity,
   PendingConversationInteraction,
   QuestionInteraction,
   QuestionInteractionResponse,
@@ -32,8 +33,18 @@ import SessionContextBody from "./SessionContextBody";
 import { contextUsageSummary } from "./sessionContextParse";
 import TaskProgressCard from "./TaskProgressCard";
 import { Icon } from "@/components/aurora/Icon";
-import { copyMarkdownToClipboard, type ClipboardFormat } from "@/lib/rich-clipboard";
+import {
+  copyMarkdownToClipboard,
+  copySlackPlainTextToClipboard,
+  isAndroidClipboardHost,
+  slackClipboardPlainText,
+  type ClipboardFormat,
+} from "@/lib/rich-clipboard";
 import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
+import { createPortal } from "react-dom";
+import { FiType } from "react-icons/fi";
+import { SiMarkdown, SiSlack } from "react-icons/si";
+import type { IconType } from "react-icons";
 import {
   DEFAULT_CONVERSATION_VISIBILITY,
   readConversationVisibility,
@@ -76,6 +87,23 @@ const ANSI_ESCAPE_RE = /\u001B(?:\][^\u0007]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[
 
 function cleanTerminalText(value: string): string {
   return value.replace(ANSI_ESCAPE_RE, "");
+}
+
+const SHELL_TOOL_NAMES = new Set([
+  "bash",
+  "execcommand",
+  "powershell",
+  "runterminalcommand",
+  "runterminalcommandv2",
+  "shell",
+  "shellcommand",
+  "terminal",
+]);
+
+function isShellToolName(value: string | null | undefined): boolean {
+  return SHELL_TOOL_NAMES.has(
+    String(value || "").toLowerCase().replace(/[^a-z0-9]/g, ""),
+  );
 }
 
 function cleanToolOutput(value: string): string {
@@ -236,6 +264,18 @@ const URL_ANCHOR_CLEARANCE = 16;
 const URL_ANCHOR_DEBOUNCE_MS = 220;
 const URL_RESTORE_SETTLE_MS = 900;
 
+/** Collapse long markdown without cutting mid-list/paragraph when possible. */
+function truncateMarkdownPreview(content: string, maxLen: number): string {
+  if (content.length <= maxLen) return content;
+  const slice = content.slice(0, maxLen);
+  const breakAt = Math.max(
+    slice.lastIndexOf("\n\n"),
+    slice.lastIndexOf("\n"),
+  );
+  const cut = breakAt > Math.floor(maxLen * 0.5) ? breakAt : maxLen;
+  return `${content.slice(0, cut).trimEnd()}\n\n…`;
+}
+
 type ConversationVisibilityKey = keyof ConversationVisibility;
 
 function isSessionContextMessage(msg: ConversationMessage): boolean {
@@ -392,6 +432,8 @@ export default function ConversationViewer({
   const [latestAgentLoading, setLatestAgentLoading] = useState(false);
   const [detachedTail, setDetachedTail] = useState<DetachedTail | null>(null);
   const [pendingInteractions, setPendingInteractions] = useState<PendingConversationInteraction[]>([]);
+  const [inlineInteractions, setInlineInteractions] = useState<PendingConversationInteraction[]>([]);
+  const [liveActivities, setLiveActivities] = useState<LiveConversationActivity[]>([]);
   const [inferredInteractionResponses, setInferredInteractionResponses] = useState<InferredConversationInteractionResponse[]>([]);
   const [urlState, setUrlState] = useState<ConversationUrlState>(
     EMPTY_CONVERSATION_URL_STATE,
@@ -453,15 +495,23 @@ export default function ConversationViewer({
       : messages,
     [messages, detachedTail],
   );
-  const { questionIds, questionResponses } = useMemo(() => {
+  const { canonicalInteractionIds, questionIds, questionResponses } = useMemo(() => {
+    const canonicalIds = new Set<string>();
     const ids = new Set<string>();
     const responses = new Map<string, PairedQuestionResponse>();
     visibleMessages.forEach((message) => {
-      if (message.interaction?.id) ids.add(message.interaction.id);
+      if (message.interaction?.id) {
+        canonicalIds.add(message.interaction.id);
+        ids.add(message.interaction.id);
+      }
       message.tool_calls?.forEach((call) => {
-        if (call.interaction?.id) ids.add(call.interaction.id);
+        if (call.interaction?.id) {
+          canonicalIds.add(call.interaction.id);
+          ids.add(call.interaction.id);
+        }
       });
       if (message.interaction_response?.interaction_id) {
+        canonicalIds.add(message.interaction_response.interaction_id);
         responses.set(message.interaction_response.interaction_id, {
           response: message.interaction_response,
           message,
@@ -482,8 +532,49 @@ export default function ConversationViewer({
         },
       });
     });
-    return { questionIds: ids, questionResponses: responses };
+    return {
+      canonicalInteractionIds: canonicalIds,
+      questionIds: ids,
+      questionResponses: responses,
+    };
   }, [visibleMessages, inferredInteractionResponses]);
+  const visibleInlineInteractions = useMemo(
+    () => inlineInteractions
+      .filter(
+        (item) => item.document_id === documentId
+          && !canonicalInteractionIds.has(item.interaction.id),
+      )
+      .sort((left, right) => {
+        const leftLine = left.line_number > 0
+          ? left.line_number
+          : Number.MAX_SAFE_INTEGER;
+        const rightLine = right.line_number > 0
+          ? right.line_number
+          : Number.MAX_SAFE_INTEGER;
+        if (leftLine !== rightLine) return leftLine - rightLine;
+        return String(left.timestamp || "").localeCompare(String(right.timestamp || ""));
+      }),
+    [canonicalInteractionIds, documentId, inlineInteractions],
+  );
+  const visibleLiveActivities = useMemo(
+    () => liveActivities
+      .filter((item) => item.document_id === documentId)
+      .sort((left, right) => {
+        const leftLine = left.line_number > 0
+          ? left.line_number
+          : Number.MAX_SAFE_INTEGER;
+        const rightLine = right.line_number > 0
+          ? right.line_number
+          : Number.MAX_SAFE_INTEGER;
+        if (leftLine !== rightLine) return leftLine - rightLine;
+        return String(left.started_at || "").localeCompare(String(right.started_at || ""));
+      }),
+    [documentId, liveActivities],
+  );
+  const visibleLiveActivityIds = useMemo(
+    () => new Set(visibleLiveActivities.map((item) => item.activity_id)),
+    [visibleLiveActivities],
+  );
 
   const preserveScrollForNextRender = useCallback((nextVisibility?: ConversationVisibility) => {
     const container = containerRef.current;
@@ -685,17 +776,23 @@ export default function ConversationViewer({
   useEffect(() => {
     let current = true;
     setPendingInteractions([]);
+    setInlineInteractions([]);
+    setLiveActivities([]);
     setInferredInteractionResponses([]);
     api.getPendingInteractions(documentId)
       .then((response) => {
         if (current) {
           setPendingInteractions(response.interactions);
+          setInlineInteractions(response.inline_interactions || []);
+          setLiveActivities(response.live_activities || []);
           setInferredInteractionResponses(response.inferred_responses);
         }
       })
       .catch((error: unknown) => {
         if (current) {
           setPendingInteractions([]);
+          setInlineInteractions([]);
+          setLiveActivities([]);
           setInferredInteractionResponses([]);
           console.error("Failed to load pending interactions:", error);
         }
@@ -1284,6 +1381,120 @@ export default function ConversationViewer({
     );
   };
 
+  const renderInlineInteraction = (item: PendingConversationInteraction) => {
+    const pairedResponse: PairedQuestionResponse | undefined = item.response
+      ? {
+          response: item.response,
+          message: {
+            id: item.message_id,
+            line_number: item.line_number,
+            role: "user",
+            content: item.response.raw_text,
+            interaction_response: item.response,
+            timestamp: item.timestamp,
+          },
+        }
+      : undefined;
+    return (
+      <div
+        key={`inline:${item.document_id}:${item.interaction.id}`}
+        data-inline-interaction={item.interaction.id}
+        style={{ scrollMarginTop: 16 }}
+      >
+        <QuestionInteractionCard
+          interaction={item.interaction}
+          pairedResponse={pairedResponse}
+          identity={item}
+          t={t}
+        />
+      </div>
+    );
+  };
+
+  const renderLiveActivity = (activity: LiveConversationActivity) => (
+    <LiveShellActivityCard
+      key={`activity:${activity.document_id}:${activity.activity_id}`}
+      activity={activity}
+      locale={locale}
+      t={t}
+    />
+  );
+
+  const renderThreadSequence = (
+    sequenceMessages: ConversationMessage[],
+    sequenceInteractions: PendingConversationInteraction[],
+    sequenceActivities: LiveConversationActivity[],
+  ) => {
+    const items: Array<
+      | { kind: "message"; line: number; order: number; message: ConversationMessage }
+      | { kind: "interaction"; line: number; order: number; interaction: PendingConversationInteraction }
+      | { kind: "activity"; line: number; order: number; activity: LiveConversationActivity }
+    > = [
+      ...sequenceMessages
+        .filter((message) => {
+          if (
+            !message.tool_call_id
+            || !visibleLiveActivityIds.has(message.tool_call_id)
+            || !isShellToolName(message.tool_name)
+          ) {
+            return true;
+          }
+          const rawType = String(message.raw_type || "").toLowerCase();
+          const status = String(message.tool_status || "").toLowerCase();
+          return ["tool_result", "tool_output", "question_tool_output"].includes(rawType)
+            || ["completed", "done", "error", "failed", "success"].includes(status);
+        })
+        .map((message) => ({
+          kind: "message" as const,
+          line: message.line_number,
+          order: 0,
+          message,
+        })),
+      ...sequenceInteractions.map((interaction) => ({
+        kind: "interaction" as const,
+        line: interaction.line_number > 0
+          ? interaction.line_number
+          : Number.MAX_SAFE_INTEGER,
+        order: 1,
+        interaction,
+      })),
+      ...sequenceActivities.map((activity) => ({
+        kind: "activity" as const,
+        line: activity.line_number > 0
+          ? activity.line_number
+          : Number.MAX_SAFE_INTEGER,
+        order: 2,
+        activity,
+      })),
+    ];
+    items.sort((left, right) => left.line - right.line || left.order - right.order);
+    return items.map((item) => {
+      if (item.kind === "message") return renderMessage(item.message);
+      if (item.kind === "interaction") return renderInlineInteraction(item.interaction);
+      return renderLiveActivity(item.activity);
+    });
+  };
+
+  const detachedStartLine = detachedTail?.messages.at(0)?.line_number ?? null;
+  const headInlineInteractions = visibleInlineInteractions.filter(
+    (item) => detachedStartLine === null
+      || (item.line_number > 0 && item.line_number < detachedStartLine),
+  );
+  const tailInlineInteractions = detachedStartLine === null
+    ? []
+    : visibleInlineInteractions.filter(
+        (item) => item.line_number <= 0 || item.line_number >= detachedStartLine,
+      );
+  const headLiveActivities = visibleLiveActivities.filter(
+    (item) => detachedStartLine === null
+      || (item.line_number > 0 && item.line_number < detachedStartLine),
+  );
+  const tailLiveActivities = detachedStartLine === null
+    ? []
+    : visibleLiveActivities.filter(
+        (item) => item.line_number <= 0 || item.line_number >= detachedStartLine,
+      );
+
   return (
     <div style={{ position: "relative" }}>
       <ConversationSearchBar
@@ -1437,7 +1648,11 @@ export default function ConversationViewer({
             </div>
           )}
 
-          {messages.map(renderMessage)}
+          {renderThreadSequence(
+            messages,
+            headInlineInteractions,
+            headLiveActivities,
+          )}
 
           {detachedTail && (
             <div
@@ -1474,7 +1689,12 @@ export default function ConversationViewer({
             </div>
           )}
 
-          {detachedTail?.messages.map(renderMessage)}
+          {detachedTail
+            && renderThreadSequence(
+              detachedTail.messages,
+              tailInlineInteractions,
+              tailLiveActivities,
+            )}
 
           {artifacts && artifacts.length > 0 && !hasMore && (
             <>
@@ -3010,12 +3230,14 @@ function ConversationToolCard({
   name,
   input = "",
   output = "",
+  status = "",
   copyControl,
   bottomCopyControl,
 }: {
   name: string;
   input?: string;
   output?: string;
+  status?: string;
   copyControl?: ReactNode;
   bottomCopyControl?: ReactNode;
 }) {
@@ -3027,10 +3249,27 @@ function ConversationToolCard({
   const hasDetails = Boolean(input.trim() || visibleOutput);
   const formattedInput = expanded ? formatToolText(input) : "";
   const formattedOutput = expanded ? formatToolText(visibleOutput) : "";
+  const normalizedStatus = status.trim().toLowerCase();
+  const statusLabel = ({
+    completed: "Completed",
+    success: "Completed",
+    done: "Completed",
+    failed: "Failed",
+    error: "Failed",
+    cancelled: "Cancelled",
+    canceled: "Cancelled",
+    interrupted: "Interrupted",
+  } as Record<string, string>)[normalizedStatus];
+  const statusColor = ["failed", "error"].includes(normalizedStatus)
+    ? "#DC2626"
+    : ["cancelled", "canceled", "interrupted"].includes(normalizedStatus)
+      ? "#B45309"
+      : "#059669";
 
   return (
     <div className="mx-0.5 flex min-w-0 justify-start sm:mx-1">
       <div
+        data-tool-status={normalizedStatus || undefined}
         className={expanded ? "w-full min-w-0" : "w-full min-w-0 sm:w-fit sm:min-w-60"}
         style={{
           background: "var(--aurora-surface-solid)",
@@ -3089,6 +3328,21 @@ function ConversationToolCard({
             >
               {toolLabel}
             </span>
+            {statusLabel && (
+              <span
+                style={{
+                  flex: "0 0 auto",
+                  padding: "2px 6px",
+                  borderRadius: 999,
+                  background: `color-mix(in srgb, ${statusColor} 11%, transparent)`,
+                  color: statusColor,
+                  fontSize: 9.5,
+                  fontWeight: 700,
+                }}
+              >
+                {statusLabel}
+              </span>
+            )}
             {!expanded && preview && (
               <span
                 title={preview}
@@ -3888,6 +4142,36 @@ export function conversationMessageMarkdown(
   return parts.filter(Boolean).join("\n\n");
 }
 
+const COPY_FORMAT_OPTIONS: Array<{
+  format: ClipboardFormat;
+  labelKey: "copyRichText" | "copyMarkdown" | "copySlack";
+  iconColor: string;
+  iconBg: string;
+  Icon: IconType;
+}> = [
+  {
+    format: "rich",
+    labelKey: "copyRichText",
+    iconColor: "#1677c8",
+    iconBg: "color-mix(in srgb, #1677c8 12%, var(--aurora-surface-solid))",
+    Icon: FiType,
+  },
+  {
+    format: "markdown",
+    labelKey: "copyMarkdown",
+    iconColor: "#0f766e",
+    iconBg: "color-mix(in srgb, #0f766e 12%, var(--aurora-surface-solid))",
+    Icon: SiMarkdown,
+  },
+  {
+    format: "slack",
+    labelKey: "copySlack",
+    iconColor: "#4A154B",
+    iconBg: "color-mix(in srgb, #4A154B 12%, var(--aurora-surface-solid))",
+    Icon: SiSlack,
+  },
+];
+
 function MessageCopyMenu({
   position,
   status,
@@ -3905,23 +4189,11 @@ function MessageCopyMenu({
     ? t.conversation.copiedRichText
     : status === "markdown"
       ? t.conversation.copiedMarkdown
-      : status === "error"
-        ? t.conversation.copyFailed
-        : t.conversation.copyMessage;
-  const optionStyle = {
-    display: "flex",
-    width: "100%",
-    alignItems: "center",
-    gap: 8,
-    padding: "8px 10px",
-    border: 0,
-    borderRadius: 8,
-    background: "transparent",
-    color: "var(--aurora-fg2)",
-    cursor: "pointer",
-    fontSize: 11.5,
-    whiteSpace: "nowrap",
-  } as const;
+      : status === "slack"
+        ? t.conversation.copiedSlack
+        : status === "error"
+          ? t.conversation.copyFailed
+          : t.conversation.copyMessage;
 
   return (
     <details
@@ -3965,7 +4237,7 @@ function MessageCopyMenu({
             ? { top: "calc(100% + 4px)" }
             : { bottom: "calc(100% + 4px)" }),
           zIndex: 30,
-          minWidth: 150,
+          minWidth: 168,
           padding: 5,
           borderRadius: 11,
           border: "1px solid var(--aurora-border)",
@@ -3973,7 +4245,7 @@ function MessageCopyMenu({
           boxShadow: "0 12px 30px rgba(15,23,42,0.16)",
         }}
       >
-        {(["rich", "markdown"] as const).map((format) => (
+        {COPY_FORMAT_OPTIONS.map(({ format, labelKey, iconColor, iconBg, Icon: FormatIcon }) => (
           <button
             key={format}
             type="button"
@@ -3983,14 +4255,214 @@ function MessageCopyMenu({
               event.currentTarget.closest("details")?.removeAttribute("open");
               void onCopy(format);
             }}
-            style={optionStyle}
+            style={{
+              display: "flex",
+              width: "100%",
+              alignItems: "center",
+              gap: 8,
+              padding: "7px 8px",
+              border: 0,
+              borderRadius: 8,
+              background: "transparent",
+              color: "var(--aurora-fg2)",
+              cursor: "pointer",
+              fontSize: 11.5,
+              whiteSpace: "nowrap",
+            }}
           >
-            <Icon name={format === "rich" ? "copy" : "file_text"} size={13} />
-            {format === "rich" ? t.conversation.copyRichText : t.conversation.copyMarkdown}
+            <span
+              aria-hidden="true"
+              style={{
+                display: "inline-flex",
+                flex: "0 0 auto",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 22,
+                height: 22,
+                borderRadius: 7,
+                border: `1px solid color-mix(in srgb, ${iconColor} 22%, var(--aurora-border))`,
+                background: iconBg,
+                color: iconColor,
+                boxShadow: "0 1px 0 color-mix(in srgb, white 45%, transparent) inset",
+              }}
+            >
+              <FormatIcon size={13} />
+            </span>
+            <span>{t.conversation[labelKey]}</span>
           </button>
         ))}
       </div>
     </details>
+  );
+}
+
+function SlackCopySheet({
+  markdown,
+  open,
+  onClose,
+  onCopied,
+  t,
+}: {
+  markdown: string;
+  open: boolean;
+  onClose: () => void;
+  onCopied: () => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [copied, setCopied] = useState(false);
+  const [plainText, setPlainText] = useState("");
+
+  useEffect(() => {
+    if (!open) {
+      const resetTimer = window.setTimeout(() => {
+        setCopied(false);
+        setPlainText("");
+      }, 0);
+      return () => window.clearTimeout(resetTimer);
+    }
+    let cancelled = false;
+    void slackClipboardPlainText(markdown)
+      .then((next) => {
+        if (!cancelled) setPlainText(next);
+      })
+      .catch(() => {
+        if (!cancelled) setPlainText(markdown);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, markdown]);
+
+  const copyPreview = useCallback(async () => {
+    if (!plainText) return false;
+    try {
+      await copySlackPlainTextToClipboard(markdown);
+      setCopied(true);
+      onCopied();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [markdown, onCopied, plainText]);
+
+  if (!open || typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={t.conversation.slackCopyTitle}
+      data-slack-copy-sheet
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 80,
+        display: "grid",
+        alignItems: "end",
+        background: "rgba(15, 23, 42, 0.45)",
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          display: "grid",
+          gap: 12,
+          maxHeight: "78vh",
+          margin: 0,
+          padding: "16px 16px calc(16px + env(safe-area-inset-bottom, 0px))",
+          borderTopLeftRadius: 18,
+          borderTopRightRadius: 18,
+          background: "var(--aurora-surface-solid)",
+          boxShadow: "0 -12px 40px rgba(15,23,42,0.28)",
+        }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span
+            aria-hidden="true"
+            style={{
+              display: "inline-flex",
+              width: 28,
+              height: 28,
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: 8,
+              background: "color-mix(in srgb, #4A154B 12%, var(--aurora-surface-solid))",
+              color: "#4A154B",
+              border: "1px solid color-mix(in srgb, #4A154B 22%, var(--aurora-border))",
+            }}
+          >
+            <SiSlack size={15} />
+          </span>
+          <div style={{ fontSize: 15, fontWeight: 650, color: "var(--aurora-fg1)" }}>
+            {t.conversation.slackCopyTitle}
+          </div>
+        </div>
+        <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.45, color: "var(--aurora-fg3)" }}>
+          {copied ? t.conversation.copiedSlack : t.conversation.slackCopyHint}
+        </p>
+        <pre
+          data-slack-copy-surface
+          tabIndex={0}
+          style={{
+            maxHeight: "46vh",
+            overflow: "auto",
+            padding: "12px 12px",
+            borderRadius: 12,
+            border: "1px solid var(--aurora-border)",
+            background: "#fff",
+            color: "#111827",
+            fontSize: 13.5,
+            lineHeight: 1.55,
+            fontFamily: "ui-sans-serif, system-ui, sans-serif",
+            WebkitUserSelect: "text",
+            userSelect: "text",
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+            outline: "none",
+          }}
+        >
+          {plainText || "…"}
+        </pre>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            onClick={() => { void copyPreview(); }}
+            style={{
+              flex: 1,
+              minHeight: 42,
+              border: 0,
+              borderRadius: 11,
+              background: "#4A154B",
+              color: "#fff",
+              fontWeight: 650,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            {copied ? t.conversation.copiedSlack : t.conversation.slackCopyAction}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              minHeight: 42,
+              padding: "0 16px",
+              borderRadius: 11,
+              border: "1px solid var(--aurora-border)",
+              background: "transparent",
+              color: "var(--aurora-fg2)",
+              fontWeight: 600,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            {t.conversation.slackCopyDone}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -4006,12 +4478,20 @@ function MessageCopyFrame({
   placement?: "edge" | "inset";
 }) {
   const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
+  const [slackSheetOpen, setSlackSheetOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
   const showBottomCopy = useOverflowsVisibleScrollport(contentRef);
   const resetTimer = useRef<number | null>(null);
   const usesManagedControls = typeof children === "function";
+  const androidHost = typeof navigator !== "undefined" && isAndroidClipboardHost();
 
   const copy = async (format: ClipboardFormat) => {
+    // Android Chrome cannot publish text/html to other apps via ClipboardItem.
+    // Open a selectable preview sheet so Slack receives a real rich selection.
+    if (format === "slack" && androidHost) {
+      setSlackSheetOpen(true);
+      return;
+    }
     try {
       const actualFormat = await copyMarkdownToClipboard(markdown, format);
       setStatus(actualFormat);
@@ -4057,6 +4537,158 @@ function MessageCopyFrame({
           <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} />
         </div>
       )}
+      <SlackCopySheet
+        markdown={markdown}
+        open={slackSheetOpen}
+        onClose={() => setSlackSheetOpen(false)}
+        onCopied={() => setStatus("slack")}
+        t={t}
+      />
+    </div>
+  );
+}
+
+function formatElapsedTime(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m ${totalSeconds % 60}s`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  return `${hours}h ${totalMinutes % 60}m`;
+}
+
+function LiveShellActivityCard({
+  activity,
+  locale,
+  t,
+}: {
+  activity: LiveConversationActivity;
+  locale: string;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  const startedAt = activity.started_at
+    ? new Date(activity.started_at).getTime()
+    : Number.NaN;
+  useEffect(() => {
+    if (activity.status !== "running" || Number.isNaN(startedAt)) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [activity.status, startedAt]);
+
+  const presentation = {
+    running: {
+      label: t.conversation.shellRunning,
+      color: "#2563EB",
+      icon: "activity" as const,
+    },
+    completed: {
+      label: t.conversation.shellCompleted,
+      color: "#059669",
+      icon: "check" as const,
+    },
+    failed: {
+      label: t.conversation.shellFailed,
+      color: "#DC2626",
+      icon: "close" as const,
+    },
+    cancelled: {
+      label: t.conversation.shellCancelled,
+      color: "#B45309",
+      icon: "minus" as const,
+    },
+  }[activity.status];
+  const elapsed = Number.isNaN(startedAt)
+    ? ""
+    : formatElapsedTime(
+        (activity.status === "running"
+          ? now
+          : new Date(activity.updated_at || activity.started_at || "").getTime())
+          - startedAt,
+      );
+
+  return (
+    <div
+      data-live-shell-activity={activity.activity_id}
+      data-shell-status={activity.status}
+      style={{
+        display: "grid",
+        gap: 8,
+        padding: "10px 12px",
+        border: `1px solid color-mix(in srgb, ${presentation.color} 28%, var(--aurora-border))`,
+        borderRadius: 13,
+        background: `color-mix(in srgb, ${presentation.color} 5%, var(--aurora-surface-solid))`,
+        boxShadow: "0 2px 9px rgba(15,23,42,0.035)",
+      }}
+    >
+      <div style={{ display: "flex", minWidth: 0, alignItems: "center", gap: 8 }}>
+        <span
+          aria-hidden="true"
+          style={{
+            width: 24,
+            height: 24,
+            flex: "0 0 auto",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: 999,
+            background: `color-mix(in srgb, ${presentation.color} 13%, transparent)`,
+            color: presentation.color,
+          }}
+        >
+          <Icon name={presentation.icon} size={13} strokeWidth={2} />
+        </span>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 6 }}>
+            <span style={{ color: "var(--aurora-fg4)", fontSize: 9.5, fontWeight: 700, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+              {t.conversation.shellActivity}
+            </span>
+            <strong style={{ color: "var(--aurora-fg1)", fontSize: 11.5 }}>
+              {activity.tool_name || "Shell"}
+            </strong>
+          </div>
+          <div
+            aria-live={activity.status === "running" ? "polite" : "off"}
+            style={{ marginTop: 1, color: presentation.color, fontSize: 10.5, fontWeight: 700 }}
+          >
+            {presentation.label}
+            {elapsed && ` · ${fmt(t.conversation.shellElapsed, { elapsed })}`}
+          </div>
+        </div>
+        {activity.started_at && (
+          <time
+            dateTime={activity.started_at}
+            title={new Date(activity.started_at).toLocaleString(locale)}
+            style={{ color: "var(--aurora-fg4)", fontSize: 9.5, whiteSpace: "nowrap" }}
+          >
+            {new Date(activity.started_at).toLocaleTimeString(locale, {
+              hour: "numeric",
+              minute: "2-digit",
+            })}
+          </time>
+        )}
+      </div>
+      <pre
+        data-shell-command
+        className="whitespace-pre-wrap break-words sm:whitespace-pre"
+        style={{
+          margin: 0,
+          padding: "9px 10px",
+          maxHeight: 220,
+          overflow: "auto",
+          border: "1px solid var(--aurora-border)",
+          borderRadius: 8,
+          background: "color-mix(in srgb, var(--aurora-chip) 65%, var(--aurora-surface-solid))",
+          color: "var(--aurora-fg2)",
+          fontFamily: "ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace",
+          fontSize: 11.5,
+          lineHeight: 1.5,
+        }}
+      >
+        {activity.command}
+      </pre>
     </div>
   );
 }
@@ -4450,7 +5082,7 @@ export const ChatBubble = memo(function ChatBubble({
     const isSubagentDispatch = isSubagentDispatchMessage(msg);
     if (isParentDispatch || isSubagentDispatch) {
       const isLong = content.length > 300;
-      const displayContent = isLong && !expanded ? content.slice(0, 300) + "..." : content;
+      const displayContent = isLong && !expanded ? truncateMarkdownPreview(content, 300) : content;
       return withCopyControls(
         <div
           data-parent-agent-message={isParentDispatch ? "true" : undefined}
@@ -4514,7 +5146,7 @@ export const ChatBubble = memo(function ChatBubble({
     }
 
     const isLong = content.length > 500;
-    const displayContent = isLong && !expanded ? content.slice(0, 500) + "..." : content;
+    const displayContent = isLong && !expanded ? truncateMarkdownPreview(content, 500) : content;
     return (
       <div style={{ display: "flex", justifyContent: "flex-start" }}>
         <div style={{ width: "100%", minWidth: 0 }}>
@@ -4588,7 +5220,7 @@ export const ChatBubble = memo(function ChatBubble({
   if (role === "assistant") {
     const { narrative, toolCalls } = assistantDisplayParts(msg, toolId);
     const isLong = narrative.length > 500;
-    const displayContent = isLong && !expanded ? narrative.slice(0, 500) + "..." : narrative;
+    const displayContent = isLong && !expanded ? truncateMarkdownPreview(narrative, 500) : narrative;
     const hasSeparateThinking = Boolean(
       showThinkingCategory
       && thinking
@@ -4782,6 +5414,7 @@ export const ChatBubble = memo(function ChatBubble({
             name={toolName || "Tool result"}
             input={toolInput}
             output={content}
+            status={msg.tool_status}
             copyControl={top}
             bottomCopyControl={bottom}
           />

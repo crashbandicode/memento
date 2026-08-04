@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@slackfmt/core": "^0.3.2",
     "@tanstack/react-virtual": "^3.13.23",
     "date-fns": "^4.1.0",
     "mermaid": "^11.16.0",

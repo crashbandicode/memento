@@ -20,12 +20,15 @@ from .conversation_parser import (
 )
 from .ingest_service import (
     CURRENT_PENDING_QUESTIONS_KEY,
+    INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
+    LIVE_SHELL_ACTIVITIES_KEY,
     MAX_SEARCH_TEXT_CHARS,
     PENDING_QUESTION_COUNT_KEY,
     _bounded_message_text,
     _conversation_title_needs_derivation,
+    _normalized_interaction_timestamp,
     _publish_file_synced_event,
     interaction_at_or_before_human,
 )
@@ -38,6 +41,29 @@ _MANUAL_TITLE_SOURCES = {
     "memento_user",
 }
 _TITLE_REVISION_MAP_LIMIT = 32
+_INTERACTION_HISTORY_LIMIT = 32
+_LIVE_SHELL_ACTIVITY_LIMIT = 16
+
+
+async def _interaction_anchor_line(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    timestamp: object,
+) -> int:
+    """Return the last transcript line that existed when an interaction opened."""
+    interaction_at = _normalized_interaction_timestamp(timestamp)
+    statement = select(func.max(ConversationMessage.line_number)).where(
+        ConversationMessage.document_id == document_id,
+    )
+    if interaction_at is not None:
+        statement = statement.where(
+            ConversationMessage.timestamp <= interaction_at,
+        )
+    line_number = (await db.execute(statement)).scalar_one_or_none()
+    try:
+        return max(0, int(line_number or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass(frozen=True)
@@ -138,6 +164,45 @@ def _has_explicit_codex_title(metadata: dict) -> bool:
         str(metadata.get("memento_title_source") or "").strip().lower()
         == "codex_explicit_rename"
     )
+
+
+def _interaction_history(metadata: dict) -> dict[str, dict]:
+    raw_history = metadata.get(INTERACTION_HISTORY_KEY)
+    if isinstance(raw_history, dict):
+        candidates = raw_history.items()
+    elif isinstance(raw_history, list):
+        candidates = (("", entry) for entry in raw_history)
+    else:
+        return {}
+
+    history: dict[str, dict] = {}
+    for key, entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        interaction = entry.get("interaction")
+        if not isinstance(interaction, dict):
+            continue
+        interaction_id = _bounded_message_text(
+            str(interaction.get("id") or key or ""),
+            512,
+        )
+        if interaction_id:
+            history[interaction_id] = entry
+    return dict(list(history.items())[-_INTERACTION_HISTORY_LIMIT:])
+
+
+def _upsert_interaction_history(
+    metadata: dict,
+    interaction_id: str,
+    entry: dict,
+) -> None:
+    """Store one recent interaction state, replacing any older state by id."""
+    history = _interaction_history(metadata)
+    history.pop(interaction_id, None)
+    history[interaction_id] = entry
+    metadata[INTERACTION_HISTORY_KEY] = list(history.values())[
+        -_INTERACTION_HISTORY_LIMIT:
+    ]
 
 
 def _title_revision_map(metadata: dict) -> dict[str, int]:
@@ -461,6 +526,26 @@ async def apply_conversation_interaction_update(
                 ),
             }
             pending_ids.add(interaction_id)
+            if interaction.get("interaction_type") == "permission_request":
+                anchor_line_number = await _interaction_anchor_line(
+                    db,
+                    document.id,
+                    timestamp,
+                )
+                _upsert_interaction_history(
+                    metadata,
+                    interaction_id,
+                    {
+                        "interaction": interaction,
+                        "timestamp": _bounded_message_text(
+                            str(timestamp or ""),
+                            128,
+                        ),
+                        "status": "pending",
+                        "response": None,
+                        "anchor_line_number": anchor_line_number,
+                    },
+                )
 
             # Also prune legacy malformed wrappers that cannot be recovered
             # well enough to fingerprint.
@@ -483,6 +568,74 @@ async def apply_conversation_interaction_update(
     else:
         signals.pop(interaction_id, None)
         pending_ids.discard(interaction_id)
+        if status in {"answered", "cancelled"}:
+            history_entry = _interaction_history(metadata).get(interaction_id)
+            previous_interaction = (
+                previous_signal.get("interaction")
+                if isinstance(previous_signal, dict)
+                else None
+            )
+            history_interaction = (
+                history_entry.get("interaction")
+                if isinstance(history_entry, dict)
+                else None
+            )
+            interaction = next(
+                (
+                    candidate
+                    for candidate in (previous_interaction, history_interaction)
+                    if isinstance(candidate, dict)
+                    and candidate.get("interaction_type") == "permission_request"
+                    and not is_claude_ask_user_permission_wrapper(candidate)
+                ),
+                None,
+            )
+            if interaction is not None:
+                history_timestamp = (
+                    history_entry.get("timestamp")
+                    if isinstance(history_entry, dict)
+                    else None
+                )
+                signal_timestamp = (
+                    previous_signal.get("timestamp")
+                    if isinstance(previous_signal, dict)
+                    else None
+                )
+                anchor_line_number = (
+                    history_entry.get("anchor_line_number", 0)
+                    if isinstance(history_entry, dict)
+                    else 0
+                )
+                try:
+                    anchor_line_number = max(0, int(anchor_line_number or 0))
+                except (TypeError, ValueError):
+                    anchor_line_number = 0
+                if anchor_line_number == 0:
+                    anchor_line_number = await _interaction_anchor_line(
+                        db,
+                        document.id,
+                        history_timestamp or signal_timestamp or timestamp,
+                    )
+                _upsert_interaction_history(
+                    metadata,
+                    interaction_id,
+                    {
+                        "interaction": interaction,
+                        "timestamp": _bounded_message_text(
+                            str(history_timestamp or signal_timestamp or ""),
+                            128,
+                        ),
+                        "status": status,
+                        "response": {
+                            "kind": "question_response",
+                            "interaction_id": interaction_id,
+                            "status": status,
+                            "answers": [],
+                            "raw_text": "",
+                        },
+                        "anchor_line_number": anchor_line_number,
+                    },
+                )
 
     bounded_ids = sorted(pending_ids)[:64]
     if signals:
@@ -500,6 +653,132 @@ async def apply_conversation_interaction_update(
         document.metadata_ or {}
     ):
         return ThreadTitleUpdateResult(1, 0, 0)
+    document.metadata_ = metadata
+    await cache_delete_prefix(f"daily:detail:{user_id}:")
+    if document.project_id:
+        await cache_delete_prefix(f"project:conv:{user_id}:{document.project_id}:")
+    _publish_file_synced_event(document, str(user_id))
+    return ThreadTitleUpdateResult(1, 1, 0)
+
+
+async def apply_conversation_activity_update(
+    db: AsyncSession,
+    *,
+    machine_id: uuid.UUID,
+    user_id: uuid.UUID,
+    tool_id: str,
+    relative_path: str,
+    activity_id: str,
+    activity_status: str,
+    activity_tool: str,
+    command: object,
+    timestamp: str = "",
+) -> ThreadTitleUpdateResult:
+    """Apply a transient shell-command lifecycle update."""
+    relative_path = str(relative_path or "").replace("\\", "/").lstrip("/")
+    activity_id = _bounded_message_text(str(activity_id or ""), 512)
+    status = str(activity_status or "").strip().lower()
+    clean_tool = _bounded_message_text(
+        strip_terminal_sequences(str(activity_tool or "")).strip(),
+        256,
+    )
+    clean_command = _bounded_message_text(
+        strip_terminal_sequences(str(command or "")).replace("\x00", "").strip(),
+        8_000,
+    )
+    if (
+        tool_id not in {"claude_code", "codex", "cursor"}
+        or not relative_path
+        or not activity_id
+        or status not in {"running", "completed", "failed", "cancelled"}
+        or (status == "running" and not clean_command)
+    ):
+        return ThreadTitleUpdateResult(0, 0, 1, valid=False)
+
+    document = (
+        await db.execute(
+            select(Document)
+            .where(
+                Document.machine_id == machine_id,
+                Document.machine_id.in_(
+                    select(Machine.id).where(Machine.user_id == user_id)
+                ),
+                Document.tool_id == tool_id,
+                Document.category == "conversation",
+                Document.relative_path == relative_path,
+            )
+            .limit(1)
+            .with_for_update(of=Document)
+        )
+    ).scalar_one_or_none()
+    if document is None:
+        return ThreadTitleUpdateResult(0, 0, 0)
+
+    original_metadata = dict(document.metadata_ or {})
+    metadata = dict(original_metadata)
+    raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
+    activities = (
+        {
+            str(key): value
+            for key, value in raw_activities.items()
+            if isinstance(value, dict)
+        }
+        if isinstance(raw_activities, dict)
+        else {}
+    )
+    previous = activities.get(activity_id)
+    if status != "running" and not isinstance(previous, dict):
+        # A canonical result may already have retired the live card. Never
+        # resurrect it when a delayed terminal metadata update arrives.
+        return ThreadTitleUpdateResult(1, 0, 0)
+
+    started_at = (
+        str(previous.get("started_at") or "")
+        if isinstance(previous, dict)
+        else ""
+    ) or str(timestamp or "")
+    anchor_line_number = (
+        previous.get("anchor_line_number", 0)
+        if isinstance(previous, dict)
+        else 0
+    )
+    try:
+        anchor_line_number = max(0, int(anchor_line_number or 0))
+    except (TypeError, ValueError):
+        anchor_line_number = 0
+    if anchor_line_number == 0:
+        anchor_line_number = await _interaction_anchor_line(
+            db,
+            document.id,
+            started_at or timestamp,
+        )
+
+    activity = {
+        "id": activity_id,
+        "activity_type": "shell",
+        "status": status,
+        "tool_name": clean_tool or (
+            str(previous.get("tool_name") or "")
+            if isinstance(previous, dict)
+            else "Shell"
+        ),
+        "command": clean_command or (
+            str(previous.get("command") or "")
+            if isinstance(previous, dict)
+            else ""
+        ),
+        "started_at": _bounded_message_text(started_at, 128),
+        "updated_at": _bounded_message_text(str(timestamp or started_at), 128),
+        "anchor_line_number": anchor_line_number,
+    }
+    activities.pop(activity_id, None)
+    activities[activity_id] = activity
+    metadata[LIVE_SHELL_ACTIVITIES_KEY] = dict(
+        list(activities.items())[-_LIVE_SHELL_ACTIVITY_LIMIT:]
+    )
+    if metadata == original_metadata:
+        return ThreadTitleUpdateResult(1, 0, 0)
+
     document.metadata_ = metadata
     await cache_delete_prefix(f"daily:detail:{user_id}:")
     if document.project_id:

@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from collector.interaction_signals import extract_conversation_interaction_updates
+from collector.interaction_signals import (
+    extract_content_activity_updates,
+    extract_conversation_activity_updates,
+    extract_conversation_interaction_updates,
+)
 
 
 def _write(path: Path, *records: dict) -> None:
@@ -241,3 +245,65 @@ def test_cursor_compat_plan_mode_request_and_non_plan_false_positive(
         tool_name="cursor",
         relative_path="projects/thread.jsonl",
     ) == {}
+
+
+def test_shell_activity_tracks_codex_call_until_output(tmp_path: Path) -> None:
+    path = tmp_path / "codex-shell.jsonl"
+    call = {
+        "type": "response_item",
+        "timestamp": "2026-08-04T17:00:00Z",
+        "payload": {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": "call-shell-1",
+            "arguments": '{"command":"python -m pytest -q"}',
+        },
+    }
+    _write(path, call)
+
+    running = extract_conversation_activity_updates(
+        path,
+        tool_name="codex",
+        relative_path="sessions/thread.jsonl",
+    )
+    signal = next(iter(running.values()))
+    assert signal["activity_id"] == "call-shell-1"
+    assert signal["activity_status"] == "running"
+    assert signal["command"] == "python -m pytest -q"
+
+    output = {
+        "type": "response_item",
+        "timestamp": "2026-08-04T17:00:05Z",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-shell-1",
+            "output": "12 passed",
+        },
+    }
+    _write(path, call, output)
+    completed = extract_conversation_activity_updates(
+        path,
+        tool_name="codex",
+        relative_path="sessions/thread.jsonl",
+    )
+    assert next(iter(completed.values()))["activity_status"] == "completed"
+
+
+def test_cursor_state_shell_activity_uses_native_status() -> None:
+    content = json.dumps({
+        "type": "cursor_state_tool",
+        "timestamp": "2026-08-04T17:01:00Z",
+        "tool_name": "PowerShell",
+        "tool_input": '{"command":"Start-Sleep -Seconds 30"}',
+        "tool_call_id": "cursor-shell-1",
+        "tool_status": "running",
+    })
+
+    records = extract_content_activity_updates(
+        content,
+        tool_name="cursor",
+        relative_path="projects/demo/thread.jsonl",
+    )
+    signal = next(iter(records.values()))
+    assert signal["activity_status"] == "running"
+    assert signal["command"] == "Start-Sleep -Seconds 30"

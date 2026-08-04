@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .interaction_signals import extract_content_activity_updates
 from .tools.base import Category, ContentType
 from .tools.cursor import CursorTool
 
@@ -877,6 +878,18 @@ def enqueue_cursor_state_snapshots(
     """Project changed composers and enqueue complete coalescible snapshots."""
     queued = 0
     for snapshot in exporter.export_changed(limit=limit):
+        activity_updates = extract_content_activity_updates(
+            snapshot.content,
+            tool_name="cursor",
+            relative_path=snapshot.relative_path,
+        )
+        enqueue_metadata = getattr(queue, "enqueue_metadata_changes", None)
+        if activity_updates and callable(enqueue_metadata):
+            enqueue_metadata(
+                namespace="conversation_activities",
+                tool_name="cursor",
+                records=activity_updates,
+            )
         snapshot_bytes = snapshot.content.encode("utf-8")
         base_hash, base_offset = queue.get_delta_base(
             "cursor", snapshot.relative_path

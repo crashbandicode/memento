@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
@@ -22,6 +24,8 @@ from ..db.models import (
 )
 from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
+from ..services.canvas_artifact_store import normalized_path_hash
+from ..services.canvas_artifacts import detect_message_canvases
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
     ConversationRef,
@@ -38,8 +42,6 @@ from ..services.conversation_hierarchy import (
     is_conversation_subagent,
     merge_subagent_event_summaries,
 )
-from ..services.canvas_artifacts import detect_message_canvases
-from ..services.canvas_artifact_store import normalized_path_hash
 from ..services.conversation_markdown import (
     is_meaningful_human_prompt,
     is_meaningful_human_turn,
@@ -54,7 +56,9 @@ from ..services.conversation_parser import (
     parse_conversation,
 )
 from ..services.ingest_service import (
+    INTERACTION_HISTORY_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
+    LIVE_SHELL_ACTIVITIES_KEY,
     interaction_at_or_before_human,
 )
 from ..services.message_search import (
@@ -74,6 +78,45 @@ from ..services.subagent_lifecycle import (
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+_SHELL_TOOL_NAMES = {
+    "bash",
+    "execcommand",
+    "powershell",
+    "runterminalcommand",
+    "runterminalcommandv2",
+    "shell",
+    "shellcommand",
+    "terminal",
+}
+
+
+def _is_shell_tool_name(value: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+    return normalized in _SHELL_TOOL_NAMES
+
+
+def _shell_command_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return text
+    if not isinstance(payload, dict):
+        return text
+    for key in ("command", "cmd", "script"):
+        command = payload.get(key)
+        if isinstance(command, list):
+            candidate = " ".join(str(part) for part in command)
+        elif command is not None:
+            candidate = str(command)
+        else:
+            continue
+        if candidate.strip():
+            return candidate.strip()
+    return text
 
 
 def _canvas_field(content: str | None, links: dict[str, dict] | None = None) -> dict:
@@ -209,6 +252,19 @@ def _stored_interaction(metadata: object, key: str) -> dict | None:
         return None
     value = metadata.get(key)
     return value if isinstance(value, dict) else None
+
+
+def _stored_interaction_history(metadata: object) -> list[dict]:
+    if not isinstance(metadata, dict):
+        return []
+    value = metadata.get(INTERACTION_HISTORY_KEY)
+    if isinstance(value, dict):
+        entries = value.values()
+    elif isinstance(value, list):
+        entries = value
+    else:
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)][-32:]
 
 
 def _stored_task_state(metadata: object) -> dict | None:
@@ -791,6 +847,8 @@ async def get_conversation_messages(
                     "agent_mode": (m.metadata_ or {}).get("agent_mode", ""),
                     "tool_name": (m.metadata_ or {}).get("tool_name", ""),
                     "tool_input": (m.metadata_ or {}).get("tool_input", ""),
+                    "tool_call_id": (m.metadata_ or {}).get("tool_call_id", ""),
+                    "tool_status": (m.metadata_ or {}).get("tool_status", ""),
                     "session_context": (m.metadata_ or {}).get("session_context", ""),
                     "attachments": _stored_attachments(m.metadata_),
                     "tool_calls": _stored_tool_calls(m.metadata_),
@@ -842,6 +900,8 @@ async def get_conversation_messages(
                     "agent_mode": m.agent_mode,
                     "tool_name": m.tool_name,
                     "tool_input": m.tool_input,
+                    "tool_call_id": m.tool_call_id,
+                    "tool_status": m.tool_status,
                     "session_context": m.session_context,
                     "attachments": normalize_message_attachments(m.attachments),
                     "tool_calls": _parsed_tool_calls(m),
@@ -945,6 +1005,21 @@ async def get_pending_conversation_interactions(
         .scalars()
         .all()
     )
+    recent_tool_rows = (
+        (
+            await db.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.metadata_.op("?")("tool_call_id"),
+                )
+                .order_by(ConversationMessage.line_number.desc())
+                .limit(512)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     questions: dict[str, tuple[ConversationMessage, dict]] = {}
     resolved_ids: set[str] = set()
@@ -1037,6 +1112,61 @@ async def get_pending_conversation_interactions(
     )
     pending = pending[-64:]
     live_pending: list[dict] = []
+    live_activities_by_key: dict[tuple[uuid.UUID, str], dict] = {}
+    for message in reversed(recent_tool_rows):
+        message_metadata = (
+            message.metadata_ if isinstance(message.metadata_, dict) else {}
+        )
+        tool_call_id = str(message_metadata.get("tool_call_id") or "").strip()
+        if not tool_call_id:
+            continue
+        activity_key = (message.document_id, tool_call_id)
+        raw_type = str(message.message_type or "").strip().casefold()
+        tool_status = str(
+            message_metadata.get("tool_status") or ""
+        ).strip().casefold()
+        if raw_type in {
+            "tool_result",
+            "tool_output",
+            "question_tool_output",
+        } or tool_status in {
+            "cancelled",
+            "canceled",
+            "completed",
+            "done",
+            "error",
+            "failed",
+            "interrupted",
+            "success",
+        }:
+            live_activities_by_key.pop(activity_key, None)
+            continue
+        tool_name = str(message_metadata.get("tool_name") or "").strip()
+        command = _shell_command_text(message_metadata.get("tool_input"))
+        if not _is_shell_tool_name(tool_name) or not command:
+            continue
+        if (
+            message.timestamp is not None
+            and datetime.now(timezone.utc)
+            - message.timestamp.astimezone(timezone.utc)
+            > timedelta(hours=24)
+        ):
+            continue
+        timestamp = message.timestamp.isoformat() if message.timestamp else None
+        live_activities_by_key[activity_key] = {
+            "document_id": str(message.document_id),
+            "source_title": source_documents.get(message.document_id),
+            "message_id": message.id,
+            "line_number": message.line_number,
+            "activity_id": tool_call_id,
+            "activity_type": "shell",
+            "status": "running",
+            "tool_name": tool_name,
+            "command": command,
+            "started_at": timestamp,
+            "updated_at": timestamp,
+        }
+    inline_interactions_by_id: dict[str, dict] = {}
     seen_question_fingerprints = {
         interaction_question_fingerprint(interaction)
         for _message, interaction in pending
@@ -1046,29 +1176,29 @@ async def get_pending_conversation_interactions(
         if not isinstance(metadata, dict):
             continue
         signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
-        if not isinstance(signals, dict):
-            continue
-        for interaction_id, signal in signals.items():
-            if (
-                interaction_id in resolved_ids
-                or interaction_id in questions
-                or not isinstance(signal, dict)
-                or interaction_at_or_before_human(
-                    signal.get("timestamp"),
-                    latest_human_timestamps.get(source_document_id),
+        if isinstance(signals, dict):
+            for interaction_id, signal in signals.items():
+                if (
+                    interaction_id in resolved_ids
+                    or interaction_id in questions
+                    or not isinstance(signal, dict)
+                    or interaction_at_or_before_human(
+                        signal.get("timestamp"),
+                        latest_human_timestamps.get(source_document_id),
+                    )
+                ):
+                    continue
+                interaction = coerce_claude_live_interaction(
+                    signal.get("interaction")
                 )
-            ):
-                continue
-            interaction = coerce_claude_live_interaction(signal.get("interaction"))
-            if not isinstance(interaction, dict):
-                continue
-            fingerprint = interaction_question_fingerprint(interaction)
-            if fingerprint and fingerprint in seen_question_fingerprints:
-                continue
-            if fingerprint:
-                seen_question_fingerprints.add(fingerprint)
-            live_pending.append(
-                {
+                if not isinstance(interaction, dict):
+                    continue
+                fingerprint = interaction_question_fingerprint(interaction)
+                if fingerprint and fingerprint in seen_question_fingerprints:
+                    continue
+                if fingerprint:
+                    seen_question_fingerprints.add(fingerprint)
+                live_item = {
                     "document_id": str(source_document_id),
                     "source_title": source_documents.get(source_document_id),
                     "message_id": 0,
@@ -1080,9 +1210,149 @@ async def get_pending_conversation_interactions(
                     "agent_mode": signal.get("agent_mode", ""),
                     "timestamp": signal.get("timestamp") or None,
                 }
+                live_pending.append(live_item)
+                canonical_id = str(interaction.get("id") or interaction_id).strip()
+                if (
+                    canonical_id
+                    and canonical_id not in questions
+                    and interaction.get("interaction_type") == "permission_request"
+                ):
+                    inline_interactions_by_id[canonical_id] = {
+                        **live_item,
+                        "status": "pending",
+                    }
+
+    for source_document_id, metadata in source_metadata.items():
+        for entry in _stored_interaction_history(metadata):
+            interaction = coerce_claude_live_interaction(entry.get("interaction"))
+            if (
+                not isinstance(interaction, dict)
+                or interaction.get("interaction_type") != "permission_request"
+            ):
+                continue
+            interaction_id = str(interaction.get("id") or "").strip()
+            if not interaction_id or interaction_id in questions:
+                continue
+            status = str(entry.get("status") or "").strip().lower()
+            if status not in {"pending", "answered", "cancelled"}:
+                continue
+            if (
+                status == "pending"
+                and interaction_id in inline_interactions_by_id
+            ):
+                continue
+            fingerprint = interaction_question_fingerprint(interaction)
+            if fingerprint and fingerprint in seen_question_fingerprints:
+                continue
+            if fingerprint:
+                seen_question_fingerprints.add(fingerprint)
+            try:
+                anchor_line_number = max(
+                    0,
+                    int(entry.get("anchor_line_number") or 0),
+                )
+            except (TypeError, ValueError):
+                anchor_line_number = 0
+            response = entry.get("response")
+            inline_interactions_by_id[interaction_id] = {
+                "document_id": str(source_document_id),
+                "source_title": source_documents.get(source_document_id),
+                "message_id": 0,
+                "line_number": anchor_line_number,
+                "interaction": interaction,
+                **({"response": response} if isinstance(response, dict) else {}),
+                "model": entry.get("model", ""),
+                "reasoning_effort": entry.get("reasoning_effort", ""),
+                "service_tier": entry.get("service_tier", ""),
+                "agent_mode": entry.get("agent_mode", ""),
+                "timestamp": entry.get("timestamp") or None,
+                "status": status,
+            }
+    for source_document_id, metadata in source_metadata.items():
+        if not isinstance(metadata, dict):
+            continue
+        raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
+        if not isinstance(raw_activities, dict):
+            continue
+        for activity_id, raw_activity in raw_activities.items():
+            if not isinstance(raw_activity, dict):
+                continue
+            canonical_id = str(raw_activity.get("id") or activity_id).strip()
+            status = str(raw_activity.get("status") or "").strip().lower()
+            command = str(raw_activity.get("command") or "").strip()
+            if (
+                not canonical_id
+                or status not in {
+                    "running",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }
+                or not command
+            ):
+                continue
+            activity_at = raw_activity.get("updated_at") or raw_activity.get(
+                "started_at"
             )
+            try:
+                parsed_activity_at = datetime.fromisoformat(
+                    str(activity_at or "").replace("Z", "+00:00")
+                )
+                if parsed_activity_at.tzinfo is None:
+                    parsed_activity_at = parsed_activity_at.replace(
+                        tzinfo=timezone.utc
+                    )
+            except (TypeError, ValueError):
+                parsed_activity_at = None
+            max_age = (
+                timedelta(hours=24)
+                if status == "running"
+                else timedelta(hours=1)
+            )
+            if (
+                parsed_activity_at is not None
+                and datetime.now(timezone.utc) - parsed_activity_at > max_age
+            ):
+                continue
+            try:
+                anchor_line_number = max(
+                    0,
+                    int(raw_activity.get("anchor_line_number") or 0),
+                )
+            except (TypeError, ValueError):
+                anchor_line_number = 0
+            live_activities_by_key[(source_document_id, canonical_id)] = {
+                "document_id": str(source_document_id),
+                "source_title": source_documents.get(source_document_id),
+                "message_id": 0,
+                "line_number": anchor_line_number,
+                "activity_id": canonical_id,
+                "activity_type": "shell",
+                "status": status,
+                "tool_name": str(raw_activity.get("tool_name") or "Shell"),
+                "command": command,
+                "started_at": raw_activity.get("started_at") or None,
+                "updated_at": raw_activity.get("updated_at") or None,
+            }
     live_pending.sort(key=lambda item: str(item.get("timestamp") or ""))
     live_pending = live_pending[-64:]
+    inline_interactions = list(inline_interactions_by_id.values())
+    inline_interactions.sort(
+        key=lambda item: (
+            int(item.get("line_number") or 0) <= 0,
+            int(item.get("line_number") or 0),
+            str(item.get("timestamp") or ""),
+        )
+    )
+    live_activities = list(live_activities_by_key.values())
+    live_activities.sort(
+        key=lambda item: (
+            int(item.get("line_number") or 0) <= 0,
+            int(item.get("line_number") or 0),
+            str(item.get("started_at") or ""),
+        )
+    )
+    live_activities = live_activities[-64:]
     return {
         "count": len(pending) + len(live_pending),
         "interactions": [
@@ -1105,6 +1375,8 @@ async def get_pending_conversation_interactions(
             for message, interaction in pending
         ]
         + live_pending,
+        "inline_interactions": inline_interactions,
+        "live_activities": live_activities,
         "inferred_responses": [
             {
                 "document_id": str(message.document_id),

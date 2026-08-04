@@ -12,10 +12,13 @@ import time
 import uuid
 from collections.abc import Callable
 
-from .claude_pending_hook import install_claude_pending_hooks
-from .claude_pending_questions import extract_claude_pending_interaction_updates
 from .canvas_sync import sync_pending_canvases
-from .config import CollectorConfig, SYSTEM, _default_data_dir
+from .claude_pending_hook import install_claude_pending_hooks
+from .claude_pending_questions import (
+    extract_claude_live_activity_updates,
+    extract_claude_pending_interaction_updates,
+)
+from .config import SYSTEM, CollectorConfig, _default_data_dir
 from .cursor_state_export import (
     CursorStateExporter,
     enqueue_cursor_state_snapshots,
@@ -92,8 +95,9 @@ def _setup_logging(config: CollectorConfig) -> None:
 def _send_discovery(config: CollectorConfig, logger: logging.Logger) -> None:
     """Send tool discovery to server (runs in background thread)."""
     try:
-        from .discovery import discover_all_tools
         import httpx
+
+        from .discovery import discover_all_tools
         from .tls import SSL_CONTEXT
         discovery = discover_all_tools()
         if discovery:
@@ -148,6 +152,7 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
     """Poll server for pending commands (resync, etc.)."""
     try:
         import httpx
+
         from .tls import SSL_CONTEXT
         try:
             from importlib.metadata import version
@@ -300,7 +305,8 @@ def _check_and_update(logger: logging.Logger) -> None:
         return
 
     try:
-        from importlib.metadata import version as get_version, PackageNotFoundError
+        from importlib.metadata import PackageNotFoundError
+        from importlib.metadata import version as get_version
 
         # Log starting state up front so the user sees the check fired even
         # if nothing needs upgrading. Guard the mcp version lookup with
@@ -407,6 +413,17 @@ def _poll_claude_pending_questions(
         )
         if queued:
             logger.info("Queued %d Claude prompt interaction update(s)", queued)
+        activity_records = extract_claude_live_activity_updates(tool)
+        activity_queued = queue.enqueue_metadata_changes(
+            namespace="conversation_activities",
+            tool_name="claude_code",
+            records=activity_records,
+        )
+        if activity_queued:
+            logger.info(
+                "Queued %d Claude shell activity update(s)",
+                activity_queued,
+            )
     except Exception:
         logger.exception("Claude prompt interaction poll failed")
     finally:

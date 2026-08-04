@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .interaction_signals import _signal_record
+from .interaction_signals import _activity_record, _signal_record
 
 if TYPE_CHECKING:
     from .tools.claude_code import ClaudeCodeTool
@@ -211,4 +211,63 @@ def extract_claude_pending_interaction_updates(
         key = f"claude_code:{relative_path}:{interaction_id}"
         records[key] = signal
 
+    return records
+
+
+def extract_claude_live_activity_updates(
+    tool: ClaudeCodeTool | Path,
+) -> dict[str, dict[str, Any]]:
+    """Resolve Claude hook side files to lightweight shell lifecycle updates."""
+    root = tool if isinstance(tool, Path) else tool.root_path
+    records: dict[str, dict[str, Any]] = {}
+    for side_file in iter_claude_pending_side_files():
+        side_record = _read_side_file(side_file)
+        session_id = str(side_record.get("session_id") or "").strip()
+        if (
+            not session_id
+            or "/" in session_id
+            or "\\" in session_id
+        ):
+            continue
+        relative_path = _relative_transcript_path(
+            root,
+            session_id,
+            side_record.get("transcript_path"),
+        )
+        if relative_path is None:
+            continue
+        raw_activities = side_record.get("shell_activities")
+        if not isinstance(raw_activities, dict):
+            continue
+        for activity_id, raw_activity in list(raw_activities.items())[-32:]:
+            if not isinstance(raw_activity, dict):
+                continue
+            canonical_id = str(raw_activity.get("id") or activity_id).strip()
+            status = str(raw_activity.get("status") or "").strip().casefold()
+            command = str(raw_activity.get("command") or "").strip()
+            if (
+                not canonical_id
+                or status not in {
+                    "running",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }
+                or not command
+            ):
+                continue
+            signal = _activity_record(
+                tool_name="claude_code",
+                relative_path=relative_path,
+                activity_id=canonical_id,
+                activity_tool=raw_activity.get("tool_name"),
+                command=command,
+                timestamp=(
+                    raw_activity.get("updated_at")
+                    or raw_activity.get("started_at")
+                ),
+                status=status,
+            )
+            key = f"claude_code:{relative_path}:{canonical_id}"
+            records[key] = signal
     return records

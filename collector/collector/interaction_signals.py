@@ -9,6 +9,7 @@ the canonical transcript ingest later replaces.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,16 @@ _QUESTION_TOOLS = {
     "request_user_input",
 }
 _CURSOR_PLAN_MODE_TOOLS = {"switchmode", "switch_mode"}
+_SHELL_TOOLS = {
+    "bash",
+    "execcommand",
+    "powershell",
+    "runterminalcommand",
+    "runterminalcommandv2",
+    "shell",
+    "shellcommand",
+    "terminal",
+}
 _PENDING_STATUSES = {"", "awaiting", "loading", "pending", "requested", "running"}
 _CANCELLED_STATUSES = {
     "aborted",
@@ -260,3 +271,234 @@ def extract_conversation_interaction_updates(
         f"{tool_name}:{relative_path}:{interaction_id}": signal
         for interaction_id, signal in latest
     }
+
+
+def _normalized_tool_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _is_shell_tool(value: object) -> bool:
+    return _normalized_tool_name(value) in _SHELL_TOOLS
+
+
+def _shell_command(value: object) -> str:
+    payload = _mapping(value)
+    for key in ("command", "cmd", "script"):
+        command = payload.get(key)
+        if isinstance(command, list):
+            text = " ".join(str(part) for part in command)
+        elif command is not None:
+            text = str(command)
+        else:
+            continue
+        if text.strip():
+            return text.strip()[:16_000]
+    if isinstance(value, str) and value.strip() and not payload:
+        return value.strip()[:16_000]
+    return ""
+
+
+def _shell_activity_status(value: object) -> str:
+    status = str(value or "").strip().casefold()
+    if status in {"failed", "error"}:
+        return "failed"
+    if status in {
+        "aborted",
+        "cancelled",
+        "canceled",
+        "interrupted",
+        "rejected",
+        "skipped",
+        "timeout",
+    }:
+        return "cancelled"
+    if status in {"completed", "complete", "done", "success", "succeeded"}:
+        return "completed"
+    return "running"
+
+
+def _activity_record(
+    *,
+    tool_name: str,
+    relative_path: str,
+    activity_id: str,
+    activity_tool: object,
+    command: object,
+    timestamp: object,
+    status: str,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous = previous or {}
+    return {
+        "metadata_type": "conversation_activity",
+        "tool": tool_name,
+        "relative_path": relative_path,
+        "activity_id": activity_id[:512],
+        "activity_status": status,
+        "activity_tool": (
+            str(activity_tool or "").strip()
+            or str(previous.get("activity_tool") or "Shell")
+        )[:256],
+        "command": (
+            str(command or "").strip()
+            or str(previous.get("command") or "")
+        )[:16_000],
+        "timestamp": str(timestamp or "")[:128],
+    }
+
+
+def _extract_shell_activity_updates(
+    lines: list[bytes | str],
+    *,
+    tool_name: str,
+    relative_path: str,
+) -> dict[str, dict[str, Any]]:
+    activities: dict[str, dict[str, Any]] = {}
+    for raw_line in lines:
+        try:
+            record = json.loads(raw_line)
+        except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        timestamp = record.get("timestamp")
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            payload_type = str(payload.get("type") or "")
+            activity_id = str(
+                payload.get("call_id") or payload.get("id") or ""
+            ).strip()
+            if (
+                payload_type in {"function_call", "custom_tool_call"}
+                and activity_id
+                and _is_shell_tool(payload.get("name"))
+            ):
+                raw_input = payload.get(
+                    "arguments",
+                    payload.get("input", {}),
+                )
+                activities[activity_id] = _activity_record(
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                    activity_id=activity_id,
+                    activity_tool=payload.get("name"),
+                    command=_shell_command(raw_input),
+                    timestamp=timestamp,
+                    status="running",
+                )
+            elif (
+                payload_type in {
+                    "function_call_output",
+                    "custom_tool_call_output",
+                }
+                and activity_id in activities
+            ):
+                activities[activity_id] = _activity_record(
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                    activity_id=activity_id,
+                    activity_tool="",
+                    command="",
+                    timestamp=timestamp,
+                    status="completed",
+                    previous=activities[activity_id],
+                )
+
+        for part in _message_parts(record):
+            part_type = str(part.get("type") or "")
+            activity_id = str(
+                part.get("id")
+                or part.get("tool_use_id")
+                or part.get("toolUseId")
+                or part.get("call_id")
+                or ""
+            ).strip()
+            if (
+                part_type in {"tool_use", "toolCall"}
+                and activity_id
+                and _is_shell_tool(part.get("name"))
+            ):
+                raw_input = part.get(
+                    "input",
+                    part.get("arguments", {}),
+                )
+                activities[activity_id] = _activity_record(
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                    activity_id=activity_id,
+                    activity_tool=part.get("name"),
+                    command=_shell_command(raw_input),
+                    timestamp=timestamp,
+                    status="running",
+                )
+            elif (
+                part_type in {"tool_result", "toolResult"}
+                and activity_id in activities
+            ):
+                activities[activity_id] = _activity_record(
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                    activity_id=activity_id,
+                    activity_tool="",
+                    command="",
+                    timestamp=timestamp,
+                    status="completed",
+                    previous=activities[activity_id],
+                )
+
+        if str(record.get("type") or "") == "cursor_state_tool":
+            activity_id = str(
+                record.get("tool_call_id") or record.get("id") or ""
+            ).strip()
+            activity_tool = record.get("tool_name")
+            if activity_id and _is_shell_tool(activity_tool):
+                activities[activity_id] = _activity_record(
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                    activity_id=activity_id,
+                    activity_tool=activity_tool,
+                    command=_shell_command(record.get("tool_input")),
+                    timestamp=timestamp,
+                    status=_shell_activity_status(record.get("tool_status")),
+                    previous=activities.get(activity_id),
+                )
+
+    latest = list(activities.items())[-_MAX_SIGNALS:]
+    return {
+        f"{tool_name}:{relative_path}:{activity_id}": activity
+        for activity_id, activity in latest
+    }
+
+
+def extract_conversation_activity_updates(
+    path: Path,
+    *,
+    tool_name: str,
+    relative_path: str,
+) -> dict[str, dict[str, Any]]:
+    """Return shell-command lifecycle state visible in a transcript tail."""
+    if tool_name not in {"claude_code", "codex", "cursor"}:
+        return {}
+    try:
+        lines = _tail_lines(path)
+    except OSError:
+        return {}
+    return _extract_shell_activity_updates(
+        lines,
+        tool_name=tool_name,
+        relative_path=relative_path,
+    )
+
+
+def extract_content_activity_updates(
+    content: str,
+    *,
+    tool_name: str,
+    relative_path: str,
+) -> dict[str, dict[str, Any]]:
+    """Return shell lifecycle state from a generated conversation snapshot."""
+    return _extract_shell_activity_updates(
+        content.splitlines(),
+        tool_name=tool_name,
+        relative_path=relative_path,
+    )

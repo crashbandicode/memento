@@ -8,12 +8,12 @@ import sys
 from pathlib import Path
 
 import pytest
-from collector.claude_pending_questions import (
-    extract_claude_pending_interaction_updates,
-)
-
 from collector import claude_pending_hook as hook_module
 from collector import claude_pending_questions as pending_module
+from collector.claude_pending_questions import (
+    extract_claude_live_activity_updates,
+    extract_claude_pending_interaction_updates,
+)
 
 
 @pytest.fixture
@@ -626,6 +626,40 @@ def test_hook_writes_permission_request_with_stable_id(tmp_path: Path) -> None:
     )
 
 
+def test_shell_hooks_emit_running_then_completed_activity(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo-project" / "session-shell.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    common = {
+        "session_id": "session-shell",
+        "transcript_path": str(transcript),
+        "tool_name": "PowerShell",
+        "tool_use_id": "toolu-shell-live",
+        "tool_input": {"command": "Start-Sleep -Seconds 30"},
+    }
+
+    hook_module.process_payload({"hook_event_name": "PreToolUse", **common})
+    running = extract_claude_live_activity_updates(claude_root)
+    key = (
+        "claude_code:projects/demo-project/session-shell.jsonl:"
+        "toolu-shell-live"
+    )
+    assert running[key]["activity_status"] == "running"
+    assert running[key]["activity_tool"] == "PowerShell"
+    assert running[key]["command"] == "Start-Sleep -Seconds 30"
+
+    hook_module.process_payload({"hook_event_name": "PostToolUse", **common})
+    completed = extract_claude_live_activity_updates(claude_root)
+    assert completed[key]["activity_status"] == "completed"
+    assert completed[key]["command"] == "Start-Sleep -Seconds 30"
+
+
 def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
     config_directory = tmp_path / ".claude"
     config_directory.mkdir()
@@ -704,3 +738,12 @@ def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
         entry["matcher"] for entry in settings["hooks"]["Notification"]
     } == {"agent_needs_input", "agent_completed"}
     assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
+    for event_name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        assert {
+            entry["matcher"]
+            for entry in settings["hooks"][event_name]
+            if any(
+                hook_module._is_memento_hook(hook)
+                for hook in entry.get("hooks", [])
+            )
+        } >= {"AskUserQuestion", "Bash", "PowerShell", "Shell"}

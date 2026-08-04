@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import Date, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Project, Tool, User
+from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (

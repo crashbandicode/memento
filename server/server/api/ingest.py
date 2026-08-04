@@ -34,6 +34,7 @@ from ..services.ingest_spool import (
 )
 from ..services.thread_metadata_service import (
     apply_codex_thread_title_update,
+    apply_conversation_activity_update,
     apply_conversation_interaction_update,
 )
 
@@ -89,7 +90,11 @@ class IngestChunkStatusResponse(BaseModel):
 
 
 class IngestMetadataRequest(BaseModel):
-    metadata_type: Literal["codex_thread_title", "conversation_interaction"]
+    metadata_type: Literal[
+        "codex_thread_title",
+        "conversation_activity",
+        "conversation_interaction",
+    ]
     tool: Literal["codex", "claude_code", "cursor"]
     thread_id: UUID | None = None
     title: str | None = Field(default=None, min_length=1, max_length=500)
@@ -100,6 +105,15 @@ class IngestMetadataRequest(BaseModel):
     interaction_status: Literal["pending", "answered", "cancelled"] | None = None
     question_tool: str = Field(default="", max_length=256)
     interaction_input: object = Field(default_factory=dict)
+    activity_id: str | None = Field(default=None, min_length=1, max_length=512)
+    activity_status: Literal[
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+    ] | None = None
+    activity_tool: str = Field(default="", max_length=256)
+    command: object = ""
     timestamp: str = Field(default="", max_length=128)
 
 
@@ -297,7 +311,7 @@ async def _stage_delta_behind_pending_revision(
         await _enqueue_spool_job(staged.job_id)
         status = "queued"
         message = f"Delta queued behind pending revision {pending_job_id}"
-    else:
+    elif req.metadata_type == "conversation_interaction":
         status = "completed"
         message = "Delta was already durably ingested"
     return IngestResponse(
@@ -380,7 +394,7 @@ async def ingest_metadata_endpoint(
             relative_path=req.relative_path,
             user_id=_collector_user.id,
         )
-    else:
+    elif req.metadata_type == "conversation_interaction":
         if (
             req.relative_path is None
             or req.interaction_id is None
@@ -400,6 +414,28 @@ async def ingest_metadata_endpoint(
             interaction_status=req.interaction_status,
             question_tool=req.question_tool,
             interaction_input=req.interaction_input,
+            timestamp=req.timestamp,
+        )
+    else:
+        if (
+            req.relative_path is None
+            or req.activity_id is None
+            or req.activity_status is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid conversation activity update",
+            )
+        result = await apply_conversation_activity_update(
+            db,
+            machine_id=machine.id,
+            user_id=_collector_user.id,
+            tool_id=req.tool,
+            relative_path=req.relative_path,
+            activity_id=req.activity_id,
+            activity_status=req.activity_status,
+            activity_tool=req.activity_tool,
+            command=req.command,
             timestamp=req.timestamp,
         )
     if result.valid and result.matched == 0:
