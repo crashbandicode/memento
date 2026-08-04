@@ -564,6 +564,58 @@ class SyncQueueTests(unittest.TestCase):
             "answered",
         )
 
+    def test_shell_activity_terminal_state_requires_observed_running(self) -> None:
+        item_key = "cursor:projects/thread.jsonl:shell-1"
+        completed = {
+            item_key: {
+                "metadata_type": "conversation_activity",
+                "tool": "cursor",
+                "relative_path": "projects/thread.jsonl",
+                "activity_id": "shell-1",
+                "activity_status": "completed",
+                "activity_tool": "PowerShell",
+                "command": "Start-Sleep -Seconds 30",
+            }
+        }
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="conversation_activities",
+                tool_name="cursor",
+                records=completed,
+            ),
+            0,
+        )
+        self.assertEqual(self.queue.claim_batch(), [])
+
+        running = {
+            item_key: {
+                **completed[item_key],
+                "activity_status": "running",
+            }
+        }
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="conversation_activities",
+                tool_name="cursor",
+                records=running,
+            ),
+            1,
+        )
+        item = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_synced(item))
+        self.assertEqual(
+            self.queue.enqueue_metadata_changes(
+                namespace="conversation_activities",
+                tool_name="cursor",
+                records=completed,
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.queue.claim_batch()[0].metadata["activity_status"],
+            "completed",
+        )
+
     def test_metadata_is_claimed_before_an_older_large_payload(self) -> None:
         self._enqueue("sessions/large.jsonl", "x" * 150_000, "large-hash")
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"

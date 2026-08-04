@@ -323,6 +323,11 @@ class SyncQueue:
                 record = dict(source_record)
                 metadata_type = str(record.get("metadata_type") or "").strip()
                 is_title_update = metadata_type == "codex_thread_title"
+                is_terminal_activity = (
+                    metadata_type == "conversation_activity"
+                    and str(record.get("activity_status") or "").casefold()
+                    in {"completed", "failed", "cancelled"}
+                )
                 current_title = str(record.get("title") or "").strip()
                 if not metadata_type or (is_title_update and not current_title):
                     continue
@@ -336,6 +341,11 @@ class SyncQueue:
                        WHERE namespace=? AND item_key=?""",
                     (namespace, item_key),
                 ).fetchone()
+                if state_row is None and is_terminal_activity:
+                    # Generated snapshots contain historical completed shell
+                    # calls. Only publish a terminal transition after this
+                    # queue has observed the matching running state.
+                    continue
                 state_values = tuple(state_row) if state_row is not None else ()
                 if (
                     is_title_update
