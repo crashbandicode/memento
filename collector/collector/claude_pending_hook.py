@@ -27,6 +27,7 @@ _HOOK_SPECS = {
     "Notification": ("agent_needs_input", "agent_completed"),
 }
 _SHELL_TOOLS = {"bash", "powershell", "shell"}
+_RESOLVED_INTERACTION_LIMIT = 16
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _MEMENTO_HOOK_MARKERS = (
     "pending_question_hook.py",
@@ -194,6 +195,52 @@ def _write_atomic(path: Path, record: dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _resolved_interactions(
+    existing: dict[str, Any],
+    replacing_interaction_id: str,
+    resolved_at: str,
+) -> list[dict[str, Any]]:
+    """Preserve terminal updates when a newer prompt replaces the side file."""
+    raw_resolved = existing.get("resolved_interactions")
+    resolved = [
+        dict(item)
+        for item in raw_resolved
+        if isinstance(item, dict)
+    ] if isinstance(raw_resolved, list) else []
+
+    existing_id = str(existing.get("interaction_id") or "").strip()
+    existing_input = existing.get("interaction_input")
+    existing_tool = str(existing.get("question_tool") or "").strip()
+    if (
+        existing_id
+        and existing_id != replacing_interaction_id
+        and isinstance(existing_input, dict)
+        and existing_tool
+    ):
+        existing_status = str(
+            existing.get("interaction_status") or ""
+        ).strip().casefold()
+        terminal_status = (
+            existing_status
+            if existing_status in {"answered", "cancelled"}
+            else "answered"
+        )
+        resolved = [
+            item
+            for item in resolved
+            if str(item.get("interaction_id") or "").strip() != existing_id
+        ]
+        resolved.append({
+            "interaction_id": existing_id,
+            "question_tool": existing_tool,
+            "interaction_input": existing_input,
+            "interaction_status": terminal_status,
+            "timestamp": str(existing.get("timestamp") or ""),
+            "resolved_at": resolved_at,
+        })
+    return resolved[-_RESOLVED_INTERACTION_LIMIT:]
 
 
 def _read_stdin_payload(stream: object | None = None) -> object:
@@ -476,6 +523,7 @@ def process_payload(payload: object) -> None:
             status = "answered"
         interaction_alias_ids = []
 
+    event_timestamp = _event_timestamp(payload)
     record = {
         "session_id": session_id,
         "transcript_path": str(
@@ -485,9 +533,16 @@ def process_payload(payload: object) -> None:
         "question_tool": question_tool,
         "interaction_input": raw_input,
         "interaction_status": status,
-        "timestamp": _event_timestamp(payload),
+        "timestamp": event_timestamp,
         "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
     }
+    resolved_interactions = _resolved_interactions(
+        existing,
+        interaction_id,
+        event_timestamp,
+    )
+    if resolved_interactions:
+        record["resolved_interactions"] = resolved_interactions
     if interaction_alias_ids:
         record["interaction_alias_ids"] = interaction_alias_ids
     if isinstance(existing.get("shell_activities"), dict):

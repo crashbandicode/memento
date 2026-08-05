@@ -251,6 +251,78 @@ def test_permission_side_file_closes_after_session_leaves_wait(
     assert record["interaction_status"] == "answered"
 
 
+def test_new_question_closes_replaced_permission_without_session_state(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root
+        / "projects"
+        / "demo-project"
+        / "session-replaced-permission.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+
+    hook_module.process_payload({
+        "hook_event_name": "PermissionRequest",
+        "session_id": "session-replaced-permission",
+        "transcript_path": str(transcript),
+        "tool_name": "PowerShell",
+        "tool_input": {"command": "git push origin HEAD:main"},
+        "timestamp": "2026-08-05T13:01:07Z",
+    })
+    side_path = pending_directory / "session-replaced-permission.json"
+    permission_id = json.loads(
+        side_path.read_text(encoding="utf-8")
+    )["interaction_id"]
+
+    hook_module.process_payload({
+        "hook_event_name": "PreToolUse",
+        "session_id": "session-replaced-permission",
+        "transcript_path": str(transcript),
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu-next-question",
+        "tool_input": {
+            "questions": [{"question": "What should happen next?"}]
+        },
+        "timestamp": "2026-08-05T13:04:08Z",
+    })
+
+    side_record = json.loads(side_path.read_text(encoding="utf-8"))
+    assert side_record["interaction_id"] == "toolu-next-question"
+    assert side_record["interaction_status"] == "pending"
+    assert side_record["resolved_interactions"] == [{
+        "interaction_id": permission_id,
+        "question_tool": "PermissionRequest",
+        "interaction_input": {
+            "interaction_type": "permission_request",
+            "requested_tool": "PowerShell",
+            "tool_input": {"command": "git push origin HEAD:main"},
+            "permission_mode": None,
+            "permission_suggestions": None,
+        },
+        "interaction_status": "answered",
+        "timestamp": "2026-08-05T13:01:07Z",
+        "resolved_at": "2026-08-05T13:04:08Z",
+    }]
+
+    records = extract_claude_pending_interaction_updates(claude_root)
+    permission = records[
+        "claude_code:projects/demo-project/"
+        f"session-replaced-permission.jsonl:{permission_id}"
+    ]
+    question = records[
+        "claude_code:projects/demo-project/"
+        "session-replaced-permission.jsonl:toolu-next-question"
+    ]
+    assert permission["interaction_status"] == "answered"
+    assert question["interaction_status"] == "pending"
+
+
 def test_unresolvable_session_is_skipped(
     tmp_path: Path,
     pending_directory: Path,

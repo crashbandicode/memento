@@ -147,6 +147,19 @@ def _effective_status(
     return "answered"
 
 
+def _interaction_side_records(
+    side_record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return bounded terminal predecessors followed by the current prompt."""
+    raw_resolved = side_record.get("resolved_interactions")
+    resolved = [
+        item
+        for item in raw_resolved
+        if isinstance(item, dict)
+    ] if isinstance(raw_resolved, list) else []
+    return [*resolved[-16:], side_record]
+
+
 def extract_claude_pending_interaction_updates(
     tool: ClaudeCodeTool | Path,
 ) -> dict[str, dict[str, Any]]:
@@ -157,17 +170,11 @@ def extract_claude_pending_interaction_updates(
     for side_file in iter_claude_pending_side_files():
         side_record = _read_side_file(side_file)
         session_id = str(side_record.get("session_id") or "").strip()
-        interaction_id = str(side_record.get("interaction_id") or "").strip()
         if (
             not session_id
-            or not interaction_id
             or "/" in session_id
             or "\\" in session_id
         ):
-            continue
-
-        status = str(side_record.get("interaction_status") or "").casefold()
-        if status not in {"pending", "answered", "cancelled"}:
             continue
 
         relative_path = _relative_transcript_path(
@@ -178,38 +185,51 @@ def extract_claude_pending_interaction_updates(
         if relative_path is None:
             continue
 
-        question_tool = str(
-            side_record.get("question_tool") or "AskUserQuestion"
-        ).strip()
-        if question_tool.casefold() not in {
-            "askuserquestion",
-            "permissionrequest",
-            "elicitation",
-            "notificationprompt",
-        }:
-            continue
-        status = _effective_status(
-            root,
-            side_record,
-            session_id,
-            question_tool,
-            status,
-        )
-        raw_input = side_record.get("interaction_input")
-        if not isinstance(raw_input, dict):
-            raw_input = {}
+        for interaction_record in _interaction_side_records(side_record):
+            interaction_id = str(
+                interaction_record.get("interaction_id") or ""
+            ).strip()
+            status = str(
+                interaction_record.get("interaction_status") or ""
+            ).casefold()
+            if (
+                not interaction_id
+                or status not in {"pending", "answered", "cancelled"}
+            ):
+                continue
 
-        signal = _signal_record(
-            tool_name="claude_code",
-            relative_path=relative_path,
-            interaction_id=interaction_id,
-            question_tool=question_tool,
-            raw_input=raw_input,
-            timestamp=side_record.get("timestamp"),
-            status=status,
-        )
-        key = f"claude_code:{relative_path}:{interaction_id}"
-        records[key] = signal
+            question_tool = str(
+                interaction_record.get("question_tool") or "AskUserQuestion"
+            ).strip()
+            if question_tool.casefold() not in {
+                "askuserquestion",
+                "permissionrequest",
+                "elicitation",
+                "notificationprompt",
+            }:
+                continue
+            status = _effective_status(
+                root,
+                interaction_record,
+                session_id,
+                question_tool,
+                status,
+            )
+            raw_input = interaction_record.get("interaction_input")
+            if not isinstance(raw_input, dict):
+                raw_input = {}
+
+            signal = _signal_record(
+                tool_name="claude_code",
+                relative_path=relative_path,
+                interaction_id=interaction_id,
+                question_tool=question_tool,
+                raw_input=raw_input,
+                timestamp=interaction_record.get("timestamp"),
+                status=status,
+            )
+            key = f"claude_code:{relative_path}:{interaction_id}"
+            records[key] = signal
 
     return records
 

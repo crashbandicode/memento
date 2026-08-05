@@ -21,6 +21,9 @@ Auto-collect AI coding conversations and memory across devices and tools, aggreg
 
 ---
 
+> [!IMPORTANT]
+> **Fork development notice:** Fork-specific changes are developed using an AI-assisted, “vibe-coding” workflow and validated against real-world coding sessions with targeted unit tests and Playwright end-to-end tests. This practical validation is not a substitute for independent code review, security assessment, or testing in your own environment.
+
 ## ✨ What it does
 
 - 🧠 **Cross-device conversation sync** — Claude Code / Codex / Cursor / Antigravity etc. on Mac / Linux / Windows, all aggregated in one place
