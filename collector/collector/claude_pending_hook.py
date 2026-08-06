@@ -237,7 +237,11 @@ def _resolved_interactions(
             "question_tool": existing_tool,
             "interaction_input": existing_input,
             "interaction_status": terminal_status,
-            "timestamp": str(existing.get("timestamp") or ""),
+            "timestamp": str(
+                existing.get("interaction_timestamp")
+                or existing.get("timestamp")
+                or ""
+            ),
             "resolved_at": resolved_at,
         })
     return resolved[-_RESOLVED_INTERACTION_LIMIT:]
@@ -371,7 +375,6 @@ def process_payload(payload: object) -> None:
                 or existing.get("transcript_path")
                 or ""
             ),
-            "timestamp": event_timestamp,
             "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
             "shell_activities": dict(list(activities.items())[-32:]),
         })
@@ -524,6 +527,13 @@ def process_payload(payload: object) -> None:
         interaction_alias_ids = []
 
     event_timestamp = _event_timestamp(payload)
+    interaction_timestamp = event_timestamp
+    if existing_id == interaction_id:
+        interaction_timestamp = str(
+            existing.get("interaction_timestamp")
+            or existing.get("timestamp")
+            or event_timestamp
+        )
     record = {
         "session_id": session_id,
         "transcript_path": str(
@@ -533,7 +543,8 @@ def process_payload(payload: object) -> None:
         "question_tool": question_tool,
         "interaction_input": raw_input,
         "interaction_status": status,
-        "timestamp": event_timestamp,
+        "timestamp": interaction_timestamp,
+        "interaction_timestamp": interaction_timestamp,
         "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
     }
     resolved_interactions = _resolved_interactions(

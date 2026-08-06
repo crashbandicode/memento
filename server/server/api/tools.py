@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
-from ..db.models import Document, Tool, User
+from ..db.models import Document, Machine, Tool, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..tool_catalog import tool_display_name

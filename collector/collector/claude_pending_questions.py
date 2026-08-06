@@ -13,6 +13,8 @@ from .interaction_signals import _activity_record, _signal_record
 if TYPE_CHECKING:
     from .tools.claude_code import ClaudeCodeTool
 
+_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+
 
 def _pending_directory() -> Path:
     if os.name == "nt":
@@ -119,6 +121,61 @@ def _session_state(root: Path, session_id: str) -> dict[str, Any]:
     return {}
 
 
+def _transcript_has_assistant_continuation(
+    root: Path,
+    side_record: dict[str, Any],
+    session_id: str,
+    interaction_at: int | None,
+) -> bool:
+    """Return whether Claude wrote a later main-thread assistant turn."""
+    if interaction_at is None:
+        return False
+    relative_path = _relative_transcript_path(
+        root,
+        session_id,
+        side_record.get("transcript_path"),
+    )
+    if relative_path is None:
+        return False
+    transcript = root / relative_path
+    try:
+        with transcript.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - _TRANSCRIPT_TAIL_BYTES)
+            stream.seek(start)
+            payload = stream.read(_TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return False
+    if start:
+        newline = payload.find(b"\n")
+        if newline < 0:
+            return False
+        payload = payload[newline + 1:]
+
+    for raw_line in payload.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or record.get("isSidechain") is True:
+            continue
+        message = record.get("message")
+        message_role = (
+            str(message.get("role") or "").casefold()
+            if isinstance(message, dict)
+            else ""
+        )
+        if (
+            str(record.get("type") or "").casefold() != "assistant"
+            and message_role != "assistant"
+        ):
+            continue
+        if (_timestamp_millis(record.get("timestamp")) or -1) > interaction_at:
+            return True
+    return False
+
+
 def _effective_status(
     root: Path,
     side_record: dict[str, Any],
@@ -129,22 +186,34 @@ def _effective_status(
     """Close permission previews once Claude leaves its permission wait."""
     if status != "pending" or question_tool.casefold() != "permissionrequest":
         return status
+    interaction_at = _timestamp_millis(
+        side_record.get("interaction_timestamp")
+        or side_record.get("timestamp")
+    )
     state = _session_state(root, session_id)
-    if not state:
-        return status
-    interaction_at = _timestamp_millis(side_record.get("timestamp"))
-    session_updated_at = _timestamp_millis(state.get("updatedAt"))
-    if (
-        interaction_at is not None
-        and session_updated_at is not None
-        and session_updated_at < interaction_at
+    if state:
+        session_updated_at = _timestamp_millis(state.get("updatedAt"))
+        state_is_current = (
+            interaction_at is None
+            or session_updated_at is None
+            or session_updated_at >= interaction_at
+        )
+        if state_is_current:
+            session_status = str(state.get("status") or "").casefold()
+            waiting_for = str(state.get("waitingFor") or "").casefold()
+            if not (
+                session_status == "waiting"
+                and "permission" in waiting_for
+            ):
+                return "answered"
+    if _transcript_has_assistant_continuation(
+        root,
+        side_record,
+        session_id,
+        interaction_at,
     ):
-        return status
-    session_status = str(state.get("status") or "").casefold()
-    waiting_for = str(state.get("waitingFor") or "").casefold()
-    if session_status == "waiting" and "permission" in waiting_for:
-        return status
-    return "answered"
+        return "answered"
+    return status
 
 
 def _interaction_side_records(
@@ -225,7 +294,10 @@ def extract_claude_pending_interaction_updates(
                 interaction_id=interaction_id,
                 question_tool=question_tool,
                 raw_input=raw_input,
-                timestamp=interaction_record.get("timestamp"),
+                timestamp=(
+                    interaction_record.get("interaction_timestamp")
+                    or interaction_record.get("timestamp")
+                ),
                 status=status,
             )
             key = f"claude_code:{relative_path}:{interaction_id}"

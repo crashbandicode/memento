@@ -251,6 +251,53 @@ def test_permission_side_file_closes_after_session_leaves_wait(
     assert record["interaction_status"] == "answered"
 
 
+def test_permission_closes_when_transcript_continues_after_stale_wait_state(
+    tmp_path: Path,
+    pending_directory: Path,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root / "projects" / "demo-project" / "session-continued.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-07-29T14:01:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Continuing work."}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    sessions = claude_root / "sessions"
+    sessions.mkdir()
+    (sessions / "44.json").write_text(
+        json.dumps({
+            "sessionId": "session-continued",
+            "status": "waiting",
+            "waitingFor": "permission prompt",
+            "updatedAt": 1785333630000,
+        }),
+        encoding="utf-8",
+    )
+    _write_side_file(
+        pending_directory,
+        session_id="session-continued",
+        transcript_path=transcript,
+        status="pending",
+        question_tool="PermissionRequest",
+        timestamp="2026-07-29T14:00:00Z",
+    )
+
+    record = next(
+        iter(extract_claude_pending_interaction_updates(claude_root).values())
+    )
+
+    assert record["interaction_status"] == "answered"
+
+
 def test_new_question_closes_replaced_permission_without_session_state(
     tmp_path: Path,
     pending_directory: Path,
@@ -730,6 +777,61 @@ def test_shell_hooks_emit_running_then_completed_activity(
     completed = extract_claude_live_activity_updates(claude_root)
     assert completed[key]["activity_status"] == "completed"
     assert completed[key]["command"] == "Start-Sleep -Seconds 30"
+
+
+def test_shell_activity_does_not_refresh_pending_permission_timestamp(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root / "projects" / "demo-project" / "session-permission-shell.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-05T14:01:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Permission resolved."}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    common = {
+        "session_id": "session-permission-shell",
+        "transcript_path": str(transcript),
+    }
+    hook_module.process_payload({
+        "hook_event_name": "PermissionRequest",
+        **common,
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+        "timestamp": "2026-08-05T14:00:00Z",
+    })
+    hook_module.process_payload({
+        "hook_event_name": "PreToolUse",
+        **common,
+        "tool_name": "PowerShell",
+        "tool_use_id": "toolu-later-shell",
+        "tool_input": {"command": "Get-Date"},
+        "timestamp": "2026-08-05T14:02:00Z",
+    })
+
+    side_record = json.loads(
+        (
+            pending_directory / "session-permission-shell.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert side_record["timestamp"] == "2026-08-05T14:00:00Z"
+    assert side_record["interaction_timestamp"] == "2026-08-05T14:00:00Z"
+    interaction = next(
+        iter(extract_claude_pending_interaction_updates(claude_root).values())
+    )
+    assert interaction["interaction_status"] == "answered"
 
 
 def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:

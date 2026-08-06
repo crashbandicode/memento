@@ -774,11 +774,14 @@ export default function ConversationViewer({
   }, [totalMessages]);
 
   useEffect(() => {
-    let current = true;
     setPendingInteractions([]);
     setInlineInteractions([]);
     setLiveActivities([]);
     setInferredInteractionResponses([]);
+  }, [documentId]);
+
+  useEffect(() => {
+    let current = true;
     api.getPendingInteractions(documentId)
       .then((response) => {
         if (current) {
@@ -790,10 +793,6 @@ export default function ConversationViewer({
       })
       .catch((error: unknown) => {
         if (current) {
-          setPendingInteractions([]);
-          setInlineInteractions([]);
-          setLiveActivities([]);
-          setInferredInteractionResponses([]);
           console.error("Failed to load pending interactions:", error);
         }
       });

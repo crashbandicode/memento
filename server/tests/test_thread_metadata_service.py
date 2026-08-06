@@ -352,6 +352,53 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_permission_terminal_update_repairs_polluted_open_timestamp(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        interaction_input = {
+            "interaction_type": "permission_request",
+            "requested_tool": "Bash",
+            "tool_input": {"command": "git status"},
+        }
+
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            await apply_conversation_interaction_update(
+                _Session([document], [36935]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-polluted",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input=interaction_input,
+                timestamp="2026-08-05T15:13:47Z",
+            )
+            answered = await apply_conversation_interaction_update(
+                _Session([document], [36910]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-polluted",
+                interaction_status="answered",
+                question_tool="PermissionRequest",
+                interaction_input=interaction_input,
+                timestamp="2026-08-05T14:59:08Z",
+            )
+
+        self.assertEqual((answered.matched, answered.updated), (1, 1))
+        history = document.metadata_[INTERACTION_HISTORY_KEY][0]
+        self.assertEqual(history["timestamp"], "2026-08-05T14:59:08Z")
+        self.assertEqual(history["anchor_line_number"], 36910)
+        self.assertEqual(history["status"], "answered")
+
     async def test_live_shell_activity_tracks_running_then_completed(self) -> None:
         machine_id = uuid.uuid4()
         user_id = uuid.uuid4()

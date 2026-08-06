@@ -76,9 +76,12 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         self.owner = SimpleNamespace(role="owner")
 
     async def test_tool_files_return_and_order_by_effective_activity(self) -> None:
+        machine_id = uuid.uuid4()
+        self.document.machine_id = machine_id
         db = _Db([
             _Result(rows=[self.document]),
             _Result(rows=[]),
+            _Result(rows=[(machine_id, "Test workstation")]),
         ])
 
         rows = await list_tool_files(
@@ -92,6 +95,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(rows[0].activity_at, self.activity.isoformat())
+        self.assertEqual(rows[0].device_name, "Test workstation")
         sql = str(db.statements[0].compile())
         self.assertNotIn("documents.content,", sql)
         self.assertIn("documents.metadata", sql)

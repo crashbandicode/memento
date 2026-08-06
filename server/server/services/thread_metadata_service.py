@@ -205,6 +205,17 @@ def _upsert_interaction_history(
     ]
 
 
+def _oldest_interaction_timestamp(*values: object) -> str:
+    candidates = [
+        (parsed, str(value))
+        for value in values
+        if (parsed := _normalized_interaction_timestamp(value)) is not None
+    ]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 def _title_revision_map(metadata: dict) -> dict[str, int]:
     raw = metadata.get("codex_title_revisions")
     if not isinstance(raw, dict):
@@ -601,6 +612,11 @@ async def apply_conversation_interaction_update(
                     if isinstance(previous_signal, dict)
                     else None
                 )
+                resolved_timestamp = _oldest_interaction_timestamp(
+                    history_timestamp,
+                    signal_timestamp,
+                    timestamp,
+                )
                 anchor_line_number = (
                     history_entry.get("anchor_line_number", 0)
                     if isinstance(history_entry, dict)
@@ -610,11 +626,17 @@ async def apply_conversation_interaction_update(
                     anchor_line_number = max(0, int(anchor_line_number or 0))
                 except (TypeError, ValueError):
                     anchor_line_number = 0
-                if anchor_line_number == 0:
+                history_at = _normalized_interaction_timestamp(history_timestamp)
+                resolved_at = _normalized_interaction_timestamp(resolved_timestamp)
+                if anchor_line_number == 0 or (
+                    history_at is not None
+                    and resolved_at is not None
+                    and resolved_at < history_at
+                ):
                     anchor_line_number = await _interaction_anchor_line(
                         db,
                         document.id,
-                        history_timestamp or signal_timestamp or timestamp,
+                        resolved_timestamp,
                     )
                 _upsert_interaction_history(
                     metadata,
@@ -622,7 +644,7 @@ async def apply_conversation_interaction_update(
                     {
                         "interaction": interaction,
                         "timestamp": _bounded_message_text(
-                            str(history_timestamp or signal_timestamp or ""),
+                            resolved_timestamp,
                             128,
                         ),
                         "status": status,
