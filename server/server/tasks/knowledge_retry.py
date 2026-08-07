@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from ..db.models import Document
 from ..db.session import async_session_factory
@@ -42,15 +43,26 @@ async def _run() -> dict:
         return {"scanned": 0, "retried": 0, "recovered": 0, "disabled": True}
 
     async with async_session_factory() as db:
+        now = datetime.now(timezone.utc)
         docs = (await db.execute(
             select(Document)
             .where(
-                # Both 'pending' (post-ingest task never ran — e.g. server
-                # restarted mid-ingest) and 'failed' (LLM errored) are
-                # retry candidates. 'ok' / 'skipped' stay put.
-                Document.knowledge_status.in_(("failed", "pending")),
+                # Pending work is immediately eligible. Transient failures
+                # honor the provider/backoff timestamp persisted by extraction;
+                # permanent_failed, ok, and skipped rows stay put.
+                or_(
+                    Document.knowledge_status == "pending",
+                    and_(
+                        Document.knowledge_status == "failed",
+                        or_(
+                            Document.knowledge_retry_at.is_(None),
+                            Document.knowledge_retry_at <= now,
+                        ),
+                    ),
+                ),
                 Document.knowledge_attempts < MAX_ATTEMPTS,
             )
+            .order_by(Document.knowledge_retry_at, Document.updated_at, Document.id)
             .limit(BATCH_SIZE)
         )).scalars().all()
 

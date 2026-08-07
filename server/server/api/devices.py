@@ -251,8 +251,8 @@ async def send_command(
     """Send a command to a collector device (picked up on next poll)."""
     machine = await _verify_device_ownership(db, device_db_id, _user)
 
-    # Resync: clear _graph_hash + embeddings + observations for this device's documents
-    # so knowledge regenerates from fresh ingest
+    # Resync: clear graph request state + embeddings + observations for this
+    # device's documents so knowledge regenerates from fresh ingest.
     if action == "resync":
         from sqlalchemy import text
         from ..db.models import DocumentEmbedding, KnowledgeObservation
@@ -266,7 +266,11 @@ async def send_command(
                 await db.execute(delete(DocumentEmbedding).where(DocumentEmbedding.document_id.in_(batch)))
                 await db.execute(delete(KnowledgeObservation).where(KnowledgeObservation.source_document_id.in_(batch)))
             await db.execute(text(
-                "UPDATE documents SET metadata = metadata - '_graph_hash' WHERE machine_id = :mid AND metadata ? '_graph_hash'"
+                "UPDATE documents SET "
+                "metadata = metadata - '_graph_hash' - '_graph_attempt_hash', "
+                "knowledge_status = 'pending', knowledge_attempts = 0, "
+                "knowledge_retry_at = NULL, knowledge_failure_kind = NULL "
+                "WHERE machine_id = :mid"
             ), {"mid": device_db_id})
 
     payload: dict | None = None

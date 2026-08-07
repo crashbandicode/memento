@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +22,11 @@ from ..db.models import (
 )
 
 logger = logging.getLogger("graph_service")
+
+_GRAPH_SCHEMA_VERSION = "knowledge-json-v1"
+_JSON_ONLY_SUFFIX = "\n\nRespond with JSON only."
+_RETRY_BASE_SECONDS = 15 * 60
+_RETRY_MAX_SECONDS = 24 * 60 * 60
 
 _EXTRACTION_TEMPLATE = (
     "分析以下 AI 编程对话，提取结构化知识。用中文回复。\n\n"
@@ -36,91 +44,211 @@ _EXTRACTION_TEMPLATE = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderConfig:
+    kind: str
+    api_key: str
+    model: str
+    base_url: str | None = None
+
+
+class _ProviderFailure(Exception):
+    def __init__(
+        self,
+        kind: str,
+        *,
+        permanent: bool,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        super().__init__(kind)
+        self.kind = kind
+        self.permanent = permanent
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _provider_config() -> _ProviderConfig | None:
+    api_key = os.environ.get("MEMENTO_AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return _ProviderConfig(
+            kind="openai_compatible",
+            api_key=api_key,
+            model=os.environ.get("MEMENTO_AI_MODEL", "kimi-k2.5"),
+            base_url=os.environ.get(
+                "MEMENTO_AI_BASE_URL",
+                "https://coding.dashscope.aliyuncs.com/v1",
+            ),
+        )
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
+        "MEMENTO_ANTHROPIC_API_KEY"
+    )
+    if anthropic_key:
+        return _ProviderConfig(
+            kind="anthropic",
+            api_key=anthropic_key,
+            model=os.environ.get(
+                "MEMENTO_ANTHROPIC_MODEL",
+                "claude-sonnet-4-20250514",
+            ),
+        )
+    return None
+
+
 def knowledge_provider_configured() -> bool:
     """Return whether graph extraction has a usable LLM credential."""
-    return bool(
-        os.environ.get("MEMENTO_AI_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("MEMENTO_ANTHROPIC_API_KEY")
+    return _provider_config() is not None
+
+
+def _request_message(prompt: str) -> str:
+    return prompt + _JSON_ONLY_SUFFIX
+
+
+def _graph_input_hash(prompt: str, config: _ProviderConfig) -> str:
+    """Fingerprint the exact provider input and its interpretation contract."""
+    payload = json.dumps(
+        {
+            "schema_version": _GRAPH_SCHEMA_VERSION,
+            "provider": config.kind,
+            "model": config.model,
+            "base_url": config.base_url,
+            "message": _request_message(prompt),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _parse_json_object(text: str) -> dict | None:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text[:-3]
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start:end])
+    except json.JSONDecodeError as exc:
+        logger.info("LLM returned invalid JSON: %s", str(exc)[:100])
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _retry_after_seconds(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    value = headers.get("retry-after") if headers else None
+    try:
+        return max(1, min(int(value), _RETRY_MAX_SECONDS)) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_provider_failure(exc: Exception) -> _ProviderFailure:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in (401, 403):
+        kind = "authentication"
+    elif status_code in (400, 404, 405, 410, 422):
+        kind = "invalid_request"
+    elif status_code == 429:
+        kind = "rate_limit"
+    elif status_code is not None and status_code >= 500:
+        kind = "provider_unavailable"
+    else:
+        kind = "transport"
+    return _ProviderFailure(
+        kind,
+        permanent=status_code in (400, 401, 403, 404, 405, 410, 422),
+        retry_after_seconds=_retry_after_seconds(exc),
     )
 
 
 async def _call_llm(prompt: str) -> dict | None:
     """Call LLM for entity extraction via OpenAI-compatible API. Returns parsed JSON or None."""
-    # Use existing MEMENTO_AI_* config
-    api_key = os.environ.get("MEMENTO_AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get(
-        "MEMENTO_AI_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1"
-    )
-    model = os.environ.get("MEMENTO_AI_MODEL", "kimi-k2.5")
-    if not api_key:
-        # Try Anthropic as fallback
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
-            "MEMENTO_ANTHROPIC_API_KEY"
-        )
-        if anthropic_key:
-            return await _call_anthropic(prompt, anthropic_key)
+    config = _provider_config()
+    if config is None:
         logger.debug("No AI API key set, skipping graph extraction")
         return None
+    if config.kind == "anthropic":
+        return await _call_anthropic(prompt, config)
 
     try:
         import openai
 
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        client = openai.AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
         response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "user", "content": prompt + "\n\nRespond with JSON only."}
-            ],
+            model=config.model,
+            messages=[{"role": "user", "content": _request_message(prompt)}],
             max_tokens=2000,
         )
         text = response.choices[0].message.content or "{}"
-        # Extract JSON from response (model may wrap in markdown code block)
-        # Strip markdown code fences if present
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]  # Remove first line
-            if text.endswith("```"):
-                text = text[:-3]
-        text = text.strip()
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            parsed = json.loads(text[start:end])
-            if isinstance(parsed, dict):
-                return parsed
-        return None
-    except json.JSONDecodeError as e:
-        logger.info("LLM returned invalid JSON: %s", str(e)[:100])
-        return None
-    except Exception as e:
-        logger.warning("LLM extraction failed: %s", e)
-        return None
+        return _parse_json_object(text)
+    except Exception as exc:
+        failure = _classify_provider_failure(exc)
+        logger.warning("LLM extraction failed (%s): %s", failure.kind, exc)
+        raise failure from exc
 
 
-async def _call_anthropic(prompt: str, api_key: str) -> dict | None:
+async def _call_anthropic(
+    prompt: str,
+    config: _ProviderConfig,
+) -> dict | None:
     """Call Anthropic Claude for entity extraction."""
     try:
         import anthropic
 
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = anthropic.AsyncAnthropic(api_key=config.api_key)
         response = await client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=config.model,
             max_tokens=2000,
-            messages=[
-                {"role": "user", "content": prompt + "\n\nRespond with JSON only."}
-            ],
+            messages=[{"role": "user", "content": _request_message(prompt)}],
         )
         text = response.content[0].text
-        # Extract JSON from response
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-    except Exception as e:
-        logger.warning("Anthropic extraction failed: %s", e)
-    return None
+        return _parse_json_object(text)
+    except Exception as exc:
+        failure = _classify_provider_failure(exc)
+        logger.warning("Anthropic extraction failed (%s): %s", failure.kind, exc)
+        raise failure from exc
+
+
+def _retry_at(
+    attempts: int,
+    *,
+    retry_after_seconds: int | None = None,
+) -> datetime:
+    delay = retry_after_seconds or min(
+        _RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+        _RETRY_MAX_SECONDS,
+    )
+    return datetime.now(timezone.utc) + timedelta(seconds=delay)
+
+
+def _mark_failure(
+    doc: Document,
+    *,
+    kind: str,
+    permanent: bool,
+    retry_after_seconds: int | None = None,
+) -> None:
+    doc.knowledge_failure_kind = kind
+    if permanent:
+        doc.knowledge_status = "permanent_failed"
+        doc.knowledge_retry_at = None
+    else:
+        doc.knowledge_status = "failed"
+        doc.knowledge_retry_at = _retry_at(
+            doc.knowledge_attempts or 1,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 async def extract_knowledge_from_document(
@@ -132,8 +260,9 @@ async def extract_knowledge_from_document(
 
     Side-effects on ``doc.knowledge_status`` / ``doc.knowledge_attempts``:
       * 'skipped' — content too short or wrong category; never tried.
-      * 'failed'  — LLM call failed (network / 401 / parse). attempts++ so
-        the knowledge_retry beat picks it up next tick.
+      * 'failed'  — transient LLM failure. The durable retry timestamp controls
+        when knowledge_retry may claim it again.
+      * 'permanent_failed' — request/auth/model errors that retries cannot fix.
       * 'ok'      — extraction completed (zero entities is still 'ok' —
         the LLM saw the doc and decided there's nothing graph-worthy).
     """
@@ -150,24 +279,6 @@ async def extract_knowledge_from_document(
     if doc.category != "conversation" and (not doc.content or len(doc.content) < 200):
         doc.knowledge_status = "skipped"
         return 0
-
-    # Skip if already extracted for this content version (hash-based dedup)
-    import hashlib
-
-    content_hash = (
-        doc.content_hash or hashlib.md5((doc.content or "")[:4000].encode()).hexdigest()
-    )
-    existing_obs = (
-        await db.execute(
-            select(KnowledgeObservation.id)
-            .where(KnowledgeObservation.source_document_id == doc.id)
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
-    if existing_obs and doc.metadata_.get("_graph_hash") == content_hash:
-        doc.knowledge_status = "ok"
-        return 0  # Already extracted for this content version
 
     # Content prep — the LLM only sees ~4000 chars, so what those 4000
     # chars ARE matters a lot. For conversation docs the raw .jsonl
@@ -229,16 +340,45 @@ async def extract_knowledge_from_document(
         return 0
 
     prompt = _EXTRACTION_TEMPLATE + content
+    config = _provider_config()
+    if config is None:
+        return 0
+    input_hash = _graph_input_hash(prompt, config)
+    meta = dict(doc.metadata_ or {})
+    if meta.get("_graph_hash") == input_hash:
+        # The hash itself is the completion marker. Requiring an observation
+        # here made valid zero-entity results run forever.
+        doc.knowledge_status = "ok"
+        doc.knowledge_retry_at = None
+        doc.knowledge_failure_kind = None
+        return 0
+
+    # Attempts are scoped to the exact request. A schema/model/prompt change is
+    # a new input and gets a fresh retry budget.
+    if meta.get("_graph_attempt_hash") != input_hash:
+        doc.knowledge_attempts = 0
+    meta["_graph_attempt_hash"] = input_hash
+    doc.metadata_ = meta
 
     # Charge an attempt up front so a hung LLM still counts toward the
     # cap (otherwise a stuck call would never block subsequent retries). Commit
     # the read/preparation transaction before the network call so Postgres does
     # not kill an idle-in-transaction connection while the model is working.
     doc.knowledge_attempts = (doc.knowledge_attempts or 0) + 1
+    _mark_failure(doc, kind="interrupted", permanent=False)
     await db.commit()
-    result = await _call_llm(prompt)
-    if not result:
-        doc.knowledge_status = "failed"
+    try:
+        result = await _call_llm(prompt)
+    except _ProviderFailure as failure:
+        _mark_failure(
+            doc,
+            kind=failure.kind,
+            permanent=failure.permanent,
+            retry_after_seconds=failure.retry_after_seconds,
+        )
+        return 0
+    if result is None:
+        _mark_failure(doc, kind="invalid_response", permanent=False)
         return 0
 
     # Keep the last good graph across transient LLM failures. Replace it only
@@ -352,9 +492,12 @@ async def extract_knowledge_from_document(
 
     # Mark this content version as extracted
     meta = dict(doc.metadata_ or {})
-    meta["_graph_hash"] = content_hash
+    meta["_graph_hash"] = input_hash
+    meta["_graph_attempt_hash"] = input_hash
     doc.metadata_ = meta
     doc.knowledge_status = "ok"
+    doc.knowledge_retry_at = None
+    doc.knowledge_failure_kind = None
 
     await db.flush()
     logger.info(

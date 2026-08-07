@@ -308,8 +308,11 @@ async def reset_memory(
         embs = (await db.execute(delete(DocumentEmbedding))).rowcount
         embs_fast = (await db.execute(delete(DocumentEmbeddingFast))).rowcount
         await db.execute(text(
-            "UPDATE documents SET metadata = metadata - '_graph_hash' "
-            "WHERE metadata ? '_graph_hash'"
+            "UPDATE documents SET "
+            "metadata = metadata - '_graph_hash' - '_graph_attempt_hash', "
+            "knowledge_status = 'pending', knowledge_attempts = 0, "
+            "knowledge_retry_at = NULL, knowledge_failure_kind = NULL "
+            "WHERE metadata ?| ARRAY['_graph_hash', '_graph_attempt_hash']"
         ))
     else:
         obs = (await db.execute(
@@ -336,8 +339,11 @@ async def reset_memory(
             )
         )).rowcount
         await db.execute(text(
-            "UPDATE documents SET metadata = metadata - '_graph_hash' "
-            "WHERE metadata ? '_graph_hash' "
+            "UPDATE documents SET "
+            "metadata = metadata - '_graph_hash' - '_graph_attempt_hash', "
+            "knowledge_status = 'pending', knowledge_attempts = 0, "
+            "knowledge_retry_at = NULL, knowledge_failure_kind = NULL "
+            "WHERE metadata ?| ARRAY['_graph_hash', '_graph_attempt_hash'] "
             "AND machine_id IN (SELECT id FROM machines WHERE user_id = :uid)"
         ), {"uid": _user.id})
 

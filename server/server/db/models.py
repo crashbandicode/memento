@@ -148,14 +148,16 @@ class Document(Base):
     # (384-d small-model table). Historical rows default to quality; the
     # sticky policy never auto-demotes quality → fast.
     embedding_tier: Mapped[str] = mapped_column(String(20), default="quality")
-    # Knowledge-graph extraction pipeline status. Same shape as the
-    # embedding pair above. Values: pending (just ingested), ok
-    # (extracted), failed (LLM errored — retry candidate via
-    # tasks/knowledge_retry.py), skipped (content too short / wrong
-    # category — never run). Without this, an LLM hiccup at ingest
-    # time silently dropped a doc out of the knowledge graph forever.
+    # Knowledge-graph extraction pipeline status. Values: pending (just
+    # ingested), ok (including successful zero-entity results), failed
+    # (transient provider error), permanent_failed (bad auth/request/model),
+    # and skipped (content too short / wrong category).
     knowledge_status: Mapped[str] = mapped_column(String(20), default="pending")
     knowledge_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    knowledge_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    knowledge_failure_kind: Mapped[str | None] = mapped_column(String(50))
 
     # Timestamps
     source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -285,7 +287,6 @@ class ConversationMessage(Base):
     document: Mapped[Document] = relationship(back_populates="messages")
 
     __table_args__ = (
-        Index("idx_conv_msg_document", "document_id", "line_number"),
         Index("uq_conv_msg_doc_line", "document_id", "line_number", unique=True),
         Index("idx_conv_msg_timestamp", "timestamp"),
         Index("idx_conv_msg_doc_ts", "document_id", "timestamp"),

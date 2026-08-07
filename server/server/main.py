@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .api import admin, auth, canvas_artifacts, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
+from .db.online_migrations import run_online_index_migrations
 from .db.session import engine
 from .logging_filters import install_sensitive_query_filter
 from .services.conversation_identity import (
@@ -282,23 +283,22 @@ def _run_migrations(conn) -> None:
             "ALTER TABLE documents ADD COLUMN knowledge_attempts INTEGER "
             "NOT NULL DEFAULT 0"
         ))
+    if "knowledge_retry_at" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN knowledge_retry_at TIMESTAMPTZ"
+        ))
+    if "knowledge_failure_kind" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN knowledge_failure_kind VARCHAR(50)"
+        ))
 
     # Document.content_tsv: tsvector of jieba-tokenized content+title for
     # full-text search fallback when the embedding server is slow/down. We
-    # populate it from Python (jieba) on ingest; Postgres just stores +
-    # indexes. Backfill is done by a one-shot script, not here, to avoid
-    # blocking startup on large tables.
+    # populate it from Python (jieba) on ingest. The required GIN index is
+    # created by the AUTOCOMMIT/CONCURRENTLY online migration after this
+    # transaction; ordinary CREATE INDEX here would block writers.
     if "content_tsv" not in doc_cols:
         conn.execute(text("ALTER TABLE documents ADD COLUMN content_tsv tsvector"))
-    sp3 = conn.begin_nested()
-    try:
-        conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_documents_content_tsv "
-            "ON documents USING gin (content_tsv)"
-        ))
-        sp3.commit()
-    except Exception:
-        sp3.rollback()
 
     # DailySummary.user_id + swap unique index so each user has their own digest
     # per date+tool. Before this, the table was globally scoped and any user's
@@ -537,7 +537,6 @@ def _run_migrations(conn) -> None:
         CODEX_SESSION_UNIQUE_INDEX_SQL,
         "CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_path_trgm ON documents USING gin (relative_path gin_trgm_ops)",
-        "CREATE INDEX IF NOT EXISTS idx_documents_content_trgm ON documents USING gin (content gin_trgm_ops)",
         # Vector ANN index for semantic search. Without this, /api/memory/semantic
         # seq-scans document_embeddings — fine at 50 rows, fatal at 1M. HNSW
         # preferred over IVFFlat: no training step, better recall, pgvector
@@ -689,6 +688,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await conn.run_sync(_run_migrations)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_configure_hot_storage)
+    # PostgreSQL rejects CREATE/DROP INDEX CONCURRENTLY in a transaction block.
+    # Apply the explicit idempotent plan only after the schema transaction ends.
+    await run_online_index_migrations(engine)
     await _require_fast_embedding_server()
     # Start daily compaction in background
     compaction_task = asyncio.create_task(_schedule_daily_compaction())
