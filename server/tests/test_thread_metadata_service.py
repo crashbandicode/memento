@@ -32,6 +32,10 @@ from server.services.ingest_service import (  # noqa: E402
     LIVE_SHELL_ACTIVITIES_KEY,
     PENDING_QUESTION_COUNT_KEY,
 )
+from server.services.conversation_metadata_inbox import (  # noqa: E402
+    defer_conversation_metadata,
+    normalized_metadata_session_id,
+)
 from server.services.thread_metadata_service import (  # noqa: E402
     ThreadTitleUpdateResult,
     apply_codex_thread_title_update,
@@ -129,6 +133,19 @@ class ThreadMetadataValidationTests(unittest.TestCase):
                 revision=0,
             )
 
+    def test_cursor_metadata_uses_stable_session_from_transcript_path(self) -> None:
+        session_id = uuid.uuid4()
+        self.assertEqual(
+            normalized_metadata_session_id(
+                "cursor",
+                (
+                    "projects/workspace/agent-transcripts/"
+                    f"{session_id}/{session_id}.jsonl"
+                ),
+            ),
+            str(session_id),
+        )
+
     def test_lookup_is_owner_scoped_locked_and_matches_thread_id_only(self) -> None:
         user_id = uuid.uuid4()
         thread_id = uuid.uuid4()
@@ -166,6 +183,38 @@ class ThreadMetadataValidationTests(unittest.TestCase):
 
 
 class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmatched_activity_is_one_versioned_inbox_upsert(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        session_id = uuid.uuid4()
+        db = _Session([], [])
+
+        deferred = await defer_conversation_metadata(
+            db,
+            machine_id=machine_id,
+            user_id=user_id,
+            payload={
+                "metadata_type": "conversation_activity",
+                "tool": "cursor",
+                "relative_path": (
+                    "projects/workspace/agent-transcripts/"
+                    f"{session_id}/{session_id}.jsonl"
+                ),
+                "session_id": str(session_id),
+                "activity_id": "shell-1",
+                "activity_status": "running",
+                "activity_tool": "Shell",
+                "command": "python worker.py",
+                "timestamp": "2026-08-07T16:00:00Z",
+            },
+        )
+
+        self.assertTrue(deferred)
+        self.assertEqual(len(db.statements), 1)
+        compiled = db.statements[0].compile(dialect=postgresql.dialect())
+        self.assertIn("ON CONFLICT ON CONSTRAINT", str(compiled))
+        self.assertIn(str(session_id), compiled.params.values())
+
     async def test_cursor_plan_mode_signal_updates_pending_inbox_state(self) -> None:
         machine_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -1143,7 +1192,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunk_exc.exception.status_code, 400)
         self.assertFalse(chunk_upload.read_called)
 
-    async def test_missing_transcript_returns_404_for_durable_retry(self) -> None:
+    async def test_missing_transcript_is_durably_deferred_once(self) -> None:
         user_id = uuid.uuid4()
         request = IngestMetadataRequest(
             metadata_type="codex_thread_title",
@@ -1164,9 +1213,12 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                     return_value=ThreadTitleUpdateResult(0, 0, 0)
                 ),
             ),
-            self.assertRaises(HTTPException) as exc,
+            patch(
+                "server.api.ingest.defer_conversation_metadata",
+                new=AsyncMock(return_value=True),
+            ) as defer,
         ):
-            await ingest_metadata_endpoint(
+            response = await ingest_metadata_endpoint(
                 request,
                 _collector_user=SimpleNamespace(id=user_id),
                 _throttle=None,
@@ -1175,7 +1227,9 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 x_device_name="Device",
                 x_device_platform="Windows",
             )
-        self.assertEqual(exc.exception.status_code, 404)
+        self.assertEqual(response.status, "deferred")
+        self.assertEqual(response.matched, 0)
+        defer.assert_awaited_once()
 
     async def test_exact_path_fallback_requires_one_row(self) -> None:
         machine_id = uuid.uuid4()

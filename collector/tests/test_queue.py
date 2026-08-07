@@ -344,6 +344,23 @@ class SyncQueueTests(unittest.TestCase):
             ["synced", "superseded", "superseded"],
         )
 
+    def test_delta_conflict_adopts_server_committed_base(self) -> None:
+        self._enqueue("history.jsonl", "tail", "hash-2", "delta", True, 30)
+        active = self.queue.claim_batch()[0]
+        expected_hash = "d2:" + ("c" * 61)
+
+        self.assertTrue(
+            self.queue.mark_delta_conflict(
+                active,
+                expected_hash=expected_hash,
+                expected_offset=20,
+            )
+        )
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            (expected_hash, 20),
+        )
+
     def test_mixed_strategies_cannot_claim_same_path_concurrently(self) -> None:
         self._enqueue("same.jsonl", "delta", "hash-delta", "delta", True, 10)
         self._enqueue("same.jsonl", "full", "hash-full", "full", False, 20)

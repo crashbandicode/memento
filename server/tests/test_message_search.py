@@ -20,6 +20,7 @@ from server.services.message_search import (  # noqa: E402
     make_search_snippet,
     normalize_search_query,
     suggest_corrected_query,
+    upsert_search_terms,
 )
 
 
@@ -124,6 +125,20 @@ class _LexiconDb:
 
 
 class MessageCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_vocabulary_registration_does_not_recount_known_terms(self) -> None:
+        statements = []
+
+        class _Db:
+            async def execute(self, statement):
+                statements.append(statement)
+
+        await upsert_search_terms(_Db(), {"lookup", "stale"})
+        compiled = statements[0].compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        self.assertIn("ON CONFLICT", sql)
+        self.assertIn("DO NOTHING", sql)
+        self.assertNotIn("DO UPDATE", sql)
+
     async def test_correction_preserves_known_tokens_and_repairs_typo(self) -> None:
         db = _LexiconDb([
             None,

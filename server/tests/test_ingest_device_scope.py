@@ -154,15 +154,24 @@ class _MachineResult:
 
 
 class _DeviceSession:
-    def __init__(self, machine) -> None:
-        self.machine = machine
-        self.calls = 0
+    def __init__(self, *results) -> None:
+        self.results = list(results)
+        self.statements = []
+        self.parameters = []
+        self.added = []
+        self.flushed = False
 
-    async def execute(self, _statement, _parameters=None):
-        self.calls += 1
-        if self.calls == 1:
-            return _NoRowResult()
-        return _MachineResult(self.machine)
+    async def execute(self, statement, parameters=None):
+        self.statements.append(statement)
+        self.parameters.append(parameters)
+        result = self.results.pop(0)
+        return _NoRowResult() if result is None else _MachineResult(result)
+
+    def add(self, value) -> None:
+        self.added.append(value)
+
+    async def flush(self) -> None:
+        self.flushed = True
 
 
 class DeviceOwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -187,6 +196,68 @@ class DeviceOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(machine.user_id, owner_id)
         self.assertEqual(machine.name, "Original")
+
+    async def test_existing_device_skips_registration_lock_and_heartbeat_write(self) -> None:
+        owner_id = uuid.uuid4()
+        machine = SimpleNamespace(
+            user_id=owner_id,
+            name="Original",
+            last_heartbeat=None,
+        )
+        db = _DeviceSession(machine)
+
+        result = await ensure_device(
+            db,
+            "known-device-id",
+            "Renamed",
+            "Windows",
+            user_id=owner_id,
+        )
+
+        self.assertIs(result, machine)
+        self.assertEqual(len(db.statements), 1)
+        self.assertNotIn("pg_advisory_xact_lock", str(_compile(db.statements[0])))
+        self.assertIsNone(machine.last_heartbeat)
+        self.assertEqual(machine.name, "Renamed")
+
+    async def test_missing_device_locks_then_rechecks_before_insert(self) -> None:
+        owner_id = uuid.uuid4()
+        db = _DeviceSession(None, None, None)
+
+        machine = await ensure_device(
+            db,
+            "new-device-id",
+            "New Device",
+            "Linux",
+            user_id=owner_id,
+        )
+
+        self.assertEqual(len(db.statements), 3)
+        self.assertIn("pg_advisory_xact_lock", str(db.statements[1]))
+        self.assertEqual(db.added, [machine])
+        self.assertTrue(db.flushed)
+        self.assertEqual(machine.user_id, owner_id)
+        self.assertIsNotNone(machine.last_heartbeat)
+
+    async def test_explicit_heartbeat_touches_existing_device(self) -> None:
+        owner_id = uuid.uuid4()
+        machine = SimpleNamespace(
+            user_id=owner_id,
+            name="Original",
+            last_heartbeat=None,
+        )
+        db = _DeviceSession(machine)
+
+        await ensure_device(
+            db,
+            "known-device-id",
+            "Original",
+            "Windows",
+            user_id=owner_id,
+            touch_heartbeat=True,
+        )
+
+        self.assertIsNotNone(machine.last_heartbeat)
 
 
 if __name__ == "__main__":

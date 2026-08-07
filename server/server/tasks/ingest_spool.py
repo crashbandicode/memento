@@ -48,7 +48,10 @@ from .celery_app import INGEST_RECOVERY_EXPIRES_SECONDS, celery_app
 logger = logging.getLogger("ingest_spool")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_FINALIZE_RETRIES = 12
-DATABASE_CONTENT_MAX_BYTES = 64 * 1024 * 1024
+# Conversation source blobs are immutable archival inputs, not the live query
+# model. Keep large TEXT values out of the update-heavy documents row early;
+# normalized ConversationMessage rows remain the authoritative live history.
+DATABASE_CONTENT_MAX_BYTES = 1024 * 1024
 
 
 class RetryLimitExceeded(RuntimeError):
@@ -87,6 +90,7 @@ async def _ingest_ready_job(
     externalize_content = (
         payload_bytes > DATABASE_CONTENT_MAX_BYTES
         and meta.get("category") == "conversation"
+        and meta.get("mode", "full") == "full"
     )
     # Device registration/heartbeat is its own short transaction. Holding the
     # machine row lock through a multi-minute transcript parse starves normal

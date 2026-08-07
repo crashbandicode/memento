@@ -59,7 +59,7 @@ def _run_migrations(conn) -> None:
 
     # A collector starts with a concurrent upload burst.  Enforce one machine
     # row per persistent device ID at the database boundary; ensure_device()
-    # also takes a transaction-scoped advisory lock to avoid insert races.
+    # takes a transaction-scoped advisory lock only after a missing-row lookup.
     conn.execute(text(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_machines_collector_token_hash "
         "ON machines (collector_token_hash)"
@@ -562,8 +562,12 @@ async def _schedule_daily_compaction():
     while True:
         try:
             from .db.session import async_session_factory
+            from .services.conversation_metadata_inbox import (
+                purge_expired_conversation_metadata,
+            )
             from .services.memory_compaction import run_compaction
             async with async_session_factory() as db:
+                await purge_expired_conversation_metadata(db)
                 await run_compaction(db)
         except Exception as e:
             import logging

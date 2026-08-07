@@ -89,7 +89,7 @@ export function formatAssistantModelLabel(value?: string | null): string {
 export function formatReasoningEffortLabel(value?: string | null): string {
   const effort = cleanIdentityValue(value).toLowerCase().replace(/_/g, "-");
   if (!effort) return "";
-  if (effort === "xhigh" || effort === "x-high") return "X-high";
+  if (effort === "xhigh" || effort === "x-high") return "Extra High";
   return titleCaseToken(effort);
 }
 

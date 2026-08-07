@@ -233,7 +233,11 @@ def _model_selection(config: object) -> tuple[str, str]:
         or config_map.get("modelId")
         or config_map.get("model")
     ).strip()
-    effort = ""
+    effort = _coerce_text(
+        config_map.get("reasoningEffort")
+        or config_map.get("thinkingLevel")
+        or config_map.get("effort")
+    ).strip()
     selected = config_map.get("selectedModels")
     if isinstance(selected, list):
         for item in selected:
@@ -249,7 +253,18 @@ def _model_selection(config: object) -> tuple[str, str]:
                 for parameter in parameters:
                     if not isinstance(parameter, dict):
                         continue
-                    if _coerce_text(parameter.get("id")).lower() == "effort":
+                    parameter_id = (
+                        _coerce_text(parameter.get("id"))
+                        .strip()
+                        .casefold()
+                        .replace("_", "-")
+                    )
+                    if parameter_id in {
+                        "effort",
+                        "reasoning",
+                        "reasoning-effort",
+                        "thinking-level",
+                    }:
                         effort = _coerce_text(parameter.get("value")).strip()
                         break
             if effort:
@@ -883,6 +898,10 @@ def enqueue_cursor_state_snapshots(
             tool_name="cursor",
             relative_path=snapshot.relative_path,
         )
+        session_id = str(snapshot.metadata.get("session_id") or "").strip()
+        if session_id:
+            for activity in activity_updates.values():
+                activity.setdefault("session_id", session_id)
         enqueue_metadata = getattr(queue, "enqueue_metadata_changes", None)
         if activity_updates and callable(enqueue_metadata):
             enqueue_metadata(

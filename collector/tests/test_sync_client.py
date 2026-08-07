@@ -43,6 +43,7 @@ class _FakeQueue:
         self.stream = _BoundedStream(size)
         self.renewals = 0
         self.delta_conflicts: list[QueueItem] = []
+        self.delta_conflict_bases: list[tuple[str | None, int]] = []
 
     @contextmanager
     def open_payload(self, _item: QueueItem):
@@ -55,8 +56,15 @@ class _FakeQueue:
     def read_payload_text(self, _item: QueueItem) -> str:
         return "payload"
 
-    def mark_delta_conflict(self, item: QueueItem) -> bool:
+    def mark_delta_conflict(
+        self,
+        item: QueueItem,
+        *,
+        expected_hash: str | None = None,
+        expected_offset: int = 0,
+    ) -> bool:
         self.delta_conflicts.append(item)
+        self.delta_conflict_bases.append((expected_hash, expected_offset))
         return True
 
 
@@ -209,6 +217,7 @@ class SyncClientStreamingTests(unittest.TestCase):
         client._pause_requested = threading.Event()
         client._client = http_client
         client._full_resync_callback = None
+        client._delta_catchup_callback = None
         return client
 
     def test_all_upload_routes_use_source_mtime_and_legacy_fallback(self) -> None:
@@ -458,6 +467,59 @@ class SyncClientStreamingTests(unittest.TestCase):
         self.assertEqual(captured[0]["base_hash"], "base-hash")
         self.assertEqual(queue.delta_conflicts, [item])
         self.assertEqual(requested, ["/tmp/thread.jsonl"])
+
+    def test_delta_conflict_reads_server_committed_revision(self) -> None:
+        response = _Response(
+            409,
+            {
+                "detail": {
+                    "code": "delta_base_mismatch",
+                    "expected_hash": "d2:" + ("b" * 61),
+                    "expected_offset": 125,
+                }
+            },
+        )
+
+        with self.assertRaises(DeltaBaseConflict) as raised:
+            SyncClient._raise_delta_conflict(
+                response,
+                {"mode": "delta", "relative_path": "thread.jsonl"},
+            )
+
+        self.assertEqual(raised.exception.expected_hash, "d2:" + ("b" * 61))
+        self.assertEqual(raised.exception.expected_offset, 125)
+
+    def test_delta_base_conflict_resumes_reproducible_server_prefix(self) -> None:
+        queue = _FakeQueue(100)
+        client = self._client(queue, _FakeHttpClient())
+        resumed: list[str] = []
+        rebuilt: list[str] = []
+        client._delta_catchup_callback = resumed.append
+        client._full_resync_callback = rebuilt.append
+
+        def reject(payload: dict) -> bool:
+            raise DeltaBaseConflict(
+                payload["relative_path"],
+                expected_hash="d2:" + ("a" * 61),
+                expected_offset=150,
+            )
+
+        client._upload_json = reject
+        item = self._item(100)
+        item.sync_strategy = "delta"
+        item.is_partial = True
+        item.offset = 200
+        item.base_hash = "stale-base"
+        item.base_offset = 100
+        item.source_path = "/tmp/thread.jsonl"
+
+        self.assertTrue(client._upload(item))
+        self.assertEqual(
+            queue.delta_conflict_bases,
+            [("d2:" + ("a" * 61), 150)],
+        )
+        self.assertEqual(resumed, [item.source_path])
+        self.assertEqual(rebuilt, [])
 
     def test_response_lost_retries_same_accepted_chunk_then_continues(self) -> None:
         total_size = CHUNK_SIZE + 123

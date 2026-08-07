@@ -26,11 +26,27 @@ from collector.tools.base import (
     FileClassification,
     SyncStrategy,
 )
-from collector.watcher import FileWatcher, _DebouncedHandler
+from collector.watcher import FileWatcher, _DebouncedHandler, _delta_hash_revision
 
 
 def _modified(path: Path) -> FileModifiedEvent:
     return FileModifiedEvent(str(path))
+
+
+def test_delta_revision_token_is_reproducible_for_an_append_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    first = b'{"message":"first"}\n'
+    path.write_bytes(first)
+    original = _delta_hash_revision(path, size=len(first))
+    os.utime(path, (1_700_000_100, 1_700_000_100))
+
+    assert _delta_hash_revision(path, size=len(first)) == original
+    with path.open("ab") as stream:
+        stream.write(b'{"message":"second"}\n')
+    assert _delta_hash_revision(path, size=len(first)) == original
+    assert _delta_hash_revision(path, size=path.stat().st_size) != original
 
 
 def test_read_only_events_never_enter_debounce_queue(tmp_path: Path) -> None:
@@ -386,6 +402,60 @@ def test_delta_processing_uses_guarded_base_and_force_full_fallback(
     repair_nonce = complete["metadata"].get("_queue_force_reprocess_nonce")
     assert isinstance(repair_nonce, str)
     assert len(repair_nonce) == 32
+
+
+def test_delta_processing_rebases_when_reproducible_prefix_changed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    first = '{"role":"user","message":{"content":"first"}}\n'
+    replacement = '{"role":"user","message":{"content":"other"}}\n'
+    second = '{"role":"assistant","message":{"content":"second"}}\n'
+    path.write_text(first + second, encoding="utf-8")
+    base_offset = len(first.encode("utf-8"))
+    committed_hash = _delta_hash_revision(path, size=base_offset)
+    path.write_text(replacement + second, encoding="utf-8")
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return committed_hash, base_offset
+
+        def get_delta_base(self, _tool_name: str, _relative_path: str):
+            return committed_hash, base_offset
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/thread.jsonl",
+        metadata={},
+    )
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    watcher._process_file_changed(path)
+
+    rebased = queue.enqueued[0]
+    assert rebased["is_partial"] is False
+    assert rebased["base_hash"] is None
+    assert rebased["base_offset"] == 0
+    assert "other" in rebased["content"]
+    assert "second" in rebased["content"]
+    assert len(rebased["metadata"]["_queue_force_reprocess_nonce"]) == 32
 
 
 def test_force_full_captures_append_only_prefix_then_queues_guarded_tail(

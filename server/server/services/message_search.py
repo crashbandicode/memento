@@ -139,7 +139,13 @@ def extract_search_terms(content: str) -> set[str]:
 
 
 async def upsert_search_terms(db: AsyncSession, terms: set[str]) -> None:
-    """Make newly ingested vocabulary available to fuzzy search immediately."""
+    """Register new vocabulary without rewriting every known term on each sync.
+
+    Exact corpus frequencies are rebuilt from normalized messages by the
+    backfill job. Incrementing a term on every transport DELTA or FULL retry
+    counted delivery attempts rather than documents and turned each transcript
+    append into thousands of hot-row updates.
+    """
     if not terms:
         return
     ordered = sorted(terms)
@@ -147,12 +153,8 @@ async def upsert_search_terms(db: AsyncSession, terms: set[str]) -> None:
         rows = [{"term": term, "frequency": 1} for term in ordered[start:start + 2_000]]
         statement = pg_insert(ConversationSearchTerm).values(rows)
         await db.execute(
-            statement.on_conflict_do_update(
+            statement.on_conflict_do_nothing(
                 index_elements=[ConversationSearchTerm.term],
-                set_={
-                    "frequency": ConversationSearchTerm.frequency + 1,
-                    "updated_at": func.now(),
-                },
             )
         )
 

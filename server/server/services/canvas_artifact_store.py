@@ -94,6 +94,45 @@ def _is_collector_eligible(path: str) -> bool:
     )
 
 
+async def project_message_canvases(
+    db: AsyncSession,
+    document: Document,
+    messages: list[ConversationMessage],
+) -> int:
+    """Persist Canvas references with the messages that introduced them."""
+    if (
+        document.machine_id is None
+        or document.tool_id not in ALLOWED_TOOLS
+        or not messages
+    ):
+        return 0
+    projected = 0
+    for message in messages:
+        if message.id is None or ".canvas.tsx" not in message.content.casefold():
+            continue
+        for descriptor in detect_message_canvases(message.content):
+            path = str(descriptor.get("path") or "")
+            if not path:
+                continue
+            eligible = _is_collector_eligible(path)
+            db.add(
+                CanvasArtifactReference(
+                    document_id=document.id,
+                    message_id=message.id,
+                    machine_id=document.machine_id,
+                    recorded_path=path,
+                    path_hash=normalized_path_hash(path),
+                    name=str(descriptor.get("name") or "canvas")[:120],
+                    status="discovered" if eligible else "unsupported",
+                    reason=None if eligible else "non_local_or_unsupported_path",
+                )
+            )
+            projected += 1
+    if projected:
+        await db.flush()
+    return projected
+
+
 async def inventory_machine_canvases(
     db: AsyncSession,
     machine_id: uuid.UUID,
@@ -113,6 +152,8 @@ async def inventory_machine_canvases(
             .with_for_update()
         )
     ).scalar_one()
+    if state.last_message_id < 0:
+        return {"discovered": 0, "unsupported": 0}
     rows = (
         await db.execute(
             select(ConversationMessage, Document.tool_id)
@@ -173,7 +214,12 @@ async def inventory_machine_canvases(
                 discovered += 1
             else:
                 unsupported += 1
-    if rows:
+    if len(rows) < MAX_INVENTORY_MESSAGES:
+        # New ingests project references transactionally. Once the historical
+        # candidate set is exhausted, retire this compatibility scan instead
+        # of re-reading the same nonmatching tail on every collector poll.
+        state.last_message_id = -1
+    elif rows:
         state.last_message_id = max(message.id for message, _tool_id in rows)
     await db.flush()
     return {"discovered": discovered, "unsupported": unsupported}

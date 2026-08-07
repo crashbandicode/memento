@@ -21,17 +21,17 @@ async def ensure_device(
     device_name: str,
     device_platform: str,
     user_id: uuid.UUID | None = None,
+    *,
+    touch_heartbeat: bool = False,
 ) -> Machine:
-    """Find or create a machine record for this device."""
-    # The collector drains its initial queue concurrently.  Serialize the
-    # first registration for a given device inside Postgres so two requests
-    # cannot both observe a missing row and insert duplicates.  The schema's
-    # unique index remains the final integrity guard.
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:device_id))"),
-        {"device_id": device_id},
-    )
+    """Find or create a device without serializing its ordinary ingest work.
 
+    The advisory lock protects only the one-time missing-row race.  Taking a
+    transaction-scoped device lock before every ingest made all uploads from a
+    collector wait for the slowest transcript transaction.  Heartbeats already
+    have dedicated endpoints, so normal content and metadata requests only
+    validate ownership.
+    """
     result = await db.execute(
         select(Machine).where(Machine.collector_token_hash == device_id)
     )
@@ -39,22 +39,36 @@ async def ensure_device(
     now = datetime.now(timezone.utc)
 
     if machine is None:
-        machine = Machine(
-            name=device_name,
-            collector_token_hash=device_id,
-            user_id=user_id,
-            last_heartbeat=now,
+        # The collector drains its initial queue concurrently. Serialize only
+        # first registration, then re-check after the winner commits.
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:device_id))"),
+            {"device_id": device_id},
         )
-        db.add(machine)
-        await db.flush()
-    else:
-        if user_id and machine.user_id and machine.user_id != user_id:
-            raise DeviceOwnershipError("collector device belongs to another user")
-        machine.name = device_name
+        machine = (
+            await db.execute(
+                select(Machine).where(Machine.collector_token_hash == device_id)
+            )
+        ).scalar_one_or_none()
+        if machine is None:
+            machine = Machine(
+                name=device_name,
+                collector_token_hash=device_id,
+                user_id=user_id,
+                last_heartbeat=now,
+            )
+            db.add(machine)
+            await db.flush()
+            return machine
+
+    if user_id and machine.user_id and machine.user_id != user_id:
+        raise DeviceOwnershipError("collector device belongs to another user")
+    machine.name = device_name
+    if touch_heartbeat:
         machine.last_heartbeat = now
-        # Bind to user if not already bound
-        if user_id and not machine.user_id:
-            machine.user_id = user_id
+    # Bind to user if not already bound
+    if user_id and not machine.user_id:
+        machine.user_id = user_id
 
     return machine
 

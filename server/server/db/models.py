@@ -212,6 +212,65 @@ class ConversationMessage(Base):
 
 
 # ---------------------------------------------------------------------------
+# Durable metadata that can arrive before its conversation content
+# ---------------------------------------------------------------------------
+class ConversationMetadataInbox(Base):
+    """Latest unapplied collector signal for one logical conversation item."""
+
+    __tablename__ = "conversation_metadata_inbox"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    tool_id: Mapped[str] = mapped_column(
+        ForeignKey("tools.id", ondelete="CASCADE"), nullable=False
+    )
+    route_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(64))
+    metadata_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    signal_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    source_timestamp: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "machine_id",
+            "tool_id",
+            "route_hash",
+            "metadata_type",
+            "signal_id",
+            name="uq_conversation_metadata_inbox_signal",
+        ),
+        Index(
+            "idx_conversation_metadata_inbox_session",
+            "machine_id",
+            "tool_id",
+            "session_id",
+        ),
+        Index("idx_conversation_metadata_inbox_expiry", "expires_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Captured Cursor Canvas artifacts
 # ---------------------------------------------------------------------------
 class CanvasArtifactBlob(Base):

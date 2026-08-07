@@ -60,6 +60,24 @@ def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
         return ""
 
 
+def _delta_hash_revision(path: Path, *, size: int) -> str:
+    """Return a reproducible append-prefix token for guarded JSONL deltas.
+
+    A file mtime changes on every append, so the old token could not be
+    reconstructed for a previously committed offset after queue recovery.
+    Prefixing this deterministic scheme lets newer collectors verify and
+    resume a server-advertised base without rereading the whole transcript.
+    """
+    try:
+        h = hashlib.sha256()
+        h.update(f"append-prefix:{size}:".encode())
+        with open(path, "rb") as stream:
+            h.update(stream.read(min(_FAST_HASH_READ, size)))
+        return f"d2:{h.hexdigest()[:61]}"
+    except OSError:
+        return ""
+
+
 def _file_hash(path: Path) -> str:
     """Fast file change detection: size + mtime + hash of first 256KB.
 
@@ -570,10 +588,14 @@ class FileWatcher:
         source_revision = (source_stat.st_size, source_stat.st_mtime_ns)
 
         # Check if file content actually changed
-        current_hash = _file_hash_revision(
-            path,
-            size=file_size,
-            mtime_ns=source_stat.st_mtime_ns,
+        current_hash = (
+            _delta_hash_revision(path, size=file_size)
+            if classification.sync_strategy == SyncStrategy.DELTA
+            else _file_hash_revision(
+                path,
+                size=file_size,
+                mtime_ns=source_stat.st_mtime_ns,
+            )
         )
         if not current_hash:
             return
@@ -614,6 +636,21 @@ class FileWatcher:
                     base_offset = 0
                 else:
                     read_offset = base_offset
+                    if base_hash and base_hash.startswith("d2:"):
+                        local_base_hash = _delta_hash_revision(
+                            path,
+                            size=base_offset,
+                        )
+                        if local_base_hash != base_hash:
+                            logger.warning(
+                                "Committed delta prefix no longer matches %s; "
+                                "capturing a bounded authoritative base",
+                                path,
+                            )
+                            force_full = True
+                            read_offset = 0
+                            base_hash = None
+                            base_offset = 0
             if file_size - read_offset > max_delta_bytes:
                 read_end_offset = read_offset + max_delta_bytes
                 logger.info(
@@ -671,10 +708,14 @@ class FileWatcher:
             return
 
         if append_only_snapshot or read_end_offset < file_size:
-            current_hash = _file_hash_revision(
-                path,
-                size=new_offset,
-                mtime_ns=source_stat.st_mtime_ns,
+            current_hash = (
+                _delta_hash_revision(path, size=new_offset)
+                if classification.sync_strategy == SyncStrategy.DELTA
+                else _file_hash_revision(
+                    path,
+                    size=new_offset,
+                    mtime_ns=source_stat.st_mtime_ns,
+                )
             )
             if not current_hash:
                 return

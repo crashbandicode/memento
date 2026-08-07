@@ -18,6 +18,11 @@ from ..db.models import Document, User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
+from ..services.conversation_metadata_inbox import (
+    defer_conversation_metadata,
+    normalized_metadata_session_id,
+    resolve_metadata_relative_path,
+)
 from ..services.ingest_service import (
     STORED_SOURCE_REVISION_KEY,
     DeltaBaseMismatch,
@@ -101,6 +106,7 @@ class IngestMetadataRequest(BaseModel):
     title_kind: Literal["custom", "fallback", "unknown"] = "unknown"
     revision: int | None = Field(default=None, gt=0, le=2**63 - 1)
     relative_path: str | None = Field(default=None, max_length=2000)
+    session_id: UUID | None = None
     interaction_id: str | None = Field(default=None, min_length=1, max_length=512)
     interaction_status: Literal["pending", "answered", "cancelled"] | None = None
     question_tool: str = Field(default="", max_length=256)
@@ -118,7 +124,7 @@ class IngestMetadataRequest(BaseModel):
 
 
 class IngestMetadataResponse(BaseModel):
-    status: Literal["ok", "ignored"]
+    status: Literal["ok", "deferred", "ignored"]
     matched: int
     updated: int
     ignored: int
@@ -311,7 +317,7 @@ async def _stage_delta_behind_pending_revision(
         await _enqueue_spool_job(staged.job_id)
         status = "queued"
         message = f"Delta queued behind pending revision {pending_job_id}"
-    elif req.metadata_type == "conversation_interaction":
+    else:
         status = "completed"
         message = "Delta was already durably ingested"
     return IngestResponse(
@@ -376,6 +382,21 @@ async def ingest_metadata_endpoint(
         x_device_platform,
         user_id=_collector_user.id,
     )
+    relative_path = req.relative_path or ""
+    if relative_path:
+        session_id = normalized_metadata_session_id(
+            req.tool,
+            relative_path,
+            req.session_id,
+        )
+        relative_path = await resolve_metadata_relative_path(
+            db,
+            machine_id=machine.id,
+            user_id=_collector_user.id,
+            tool_id=req.tool,
+            relative_path=relative_path,
+            session_id=session_id,
+        )
     if req.metadata_type == "codex_thread_title":
         if (
             req.tool != "codex"
@@ -391,7 +412,7 @@ async def ingest_metadata_endpoint(
             title=req.title,
             title_kind=req.title_kind,
             revision=req.revision,
-            relative_path=req.relative_path,
+            relative_path=relative_path or None,
             user_id=_collector_user.id,
         )
     elif req.metadata_type == "conversation_interaction":
@@ -409,7 +430,7 @@ async def ingest_metadata_endpoint(
             machine_id=machine.id,
             user_id=_collector_user.id,
             tool_id=req.tool,
-            relative_path=req.relative_path,
+            relative_path=relative_path,
             interaction_id=req.interaction_id,
             interaction_status=req.interaction_status,
             question_tool=req.question_tool,
@@ -431,7 +452,7 @@ async def ingest_metadata_endpoint(
             machine_id=machine.id,
             user_id=_collector_user.id,
             tool_id=req.tool,
-            relative_path=req.relative_path,
+            relative_path=relative_path,
             activity_id=req.activity_id,
             activity_status=req.activity_status,
             activity_tool=req.activity_tool,
@@ -439,9 +460,25 @@ async def ingest_metadata_endpoint(
             timestamp=req.timestamp,
         )
     if result.valid and result.matched == 0:
-        # Keep the collector's durable item pending when its transcript upload
-        # is still in flight. The same idempotent update will succeed later.
-        raise HTTPException(status_code=404, detail="conversation not ingested yet")
+        # Metadata has its own durable ordering boundary. A content upload may
+        # still be in flight, or a relocatable Cursor thread may not have
+        # established its canonical path yet. Persist the latest signal once
+        # instead of making every collector retry it forever.
+        payload = req.model_dump(mode="json")
+        payload["relative_path"] = req.relative_path
+        deferred = await defer_conversation_metadata(
+            db,
+            machine_id=machine.id,
+            user_id=_collector_user.id,
+            payload=payload,
+        )
+        if deferred:
+            return IngestMetadataResponse(
+                status="deferred",
+                matched=0,
+                updated=0,
+                ignored=0,
+            )
     return IngestMetadataResponse(
         status="ok" if result.valid else "ignored",
         matched=result.matched,
@@ -468,7 +505,11 @@ async def ingest_file_endpoint(
         relative_path=req.relative_path,
     )
     machine = await ensure_device(
-        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
+        db,
+        x_device_id,
+        x_device_name,
+        x_device_platform,
+        user_id=_collector_user.id,
     )
     measured_size = len(req.content.encode("utf-8"))
 
@@ -774,7 +815,12 @@ async def heartbeat(
 ) -> dict:
     """Collector heartbeat — also registers/updates the device."""
     machine = await ensure_device(
-        db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
+        db,
+        x_device_id,
+        x_device_name,
+        x_device_platform,
+        user_id=_collector_user.id,
+        touch_heartbeat=True,
     )
     return {
         "status": "ok",

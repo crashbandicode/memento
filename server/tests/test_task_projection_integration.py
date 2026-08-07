@@ -9,10 +9,13 @@ import pytest_asyncio
 from server.api.tasks import get_tasks
 from server.db.models import (
     Base,
+    ConversationMetadataInbox,
     ConversationMessage,
     ConversationTaskState,
     Document,
+    DocumentVersion,
     Machine,
+    SyncState,
     Tool,
     User,
 )
@@ -22,8 +25,17 @@ from server.services.conversation_tasks import (
     current_projected_task_state,
     refresh_task_projection,
 )
-from server.services.ingest_service import _extract_messages
-from sqlalchemy import select, text
+from server.services.conversation_metadata_inbox import (
+    apply_deferred_conversation_metadata,
+    defer_conversation_metadata,
+)
+from server.services.ingest_service import (
+    LIVE_SHELL_ACTIVITIES_KEY,
+    _extract_messages,
+    _set_stored_source_identity,
+    ingest_file,
+)
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
@@ -189,6 +201,196 @@ def _claude_tool_row(
             },
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_full_rebase_preserves_unchanged_message_prefix(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session)
+        first = _claude_tool_row(
+            "Read",
+            {"file_path": "one.py"},
+            source_id="stable-first",
+        )
+        await _extract_messages(session, document, first, "full")
+        await session.commit()
+        original = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assert len(original) == 1
+        original_id = original[0].id
+
+        second = _claude_tool_row(
+            "Read",
+            {"file_path": "two.py"},
+            source_id="new-second",
+        )
+        await _extract_messages(session, document, f"{first}\n{second}", "full")
+        await session.commit()
+        rebased = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+
+        assert len(rebased) == 2
+        assert rebased[0].id == original_id
+        assert rebased[1].id != original_id
+
+
+@pytest.mark.asyncio
+async def test_metadata_inbox_replays_across_cursor_path_promotion(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="metadata-source",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="cursor"))
+        session.add_all([user, machine])
+        await session.flush()
+        session_id = uuid4()
+        old_path = (
+            "projects/empty-window/agent-transcripts/"
+            f"{session_id}/{session_id}.jsonl"
+        )
+        assert await defer_conversation_metadata(
+            session,
+            machine_id=machine.id,
+            user_id=user.id,
+            payload={
+                "metadata_type": "conversation_activity",
+                "tool": "cursor",
+                "relative_path": old_path,
+                "session_id": str(session_id),
+                "activity_id": "shell-promoted",
+                "activity_status": "running",
+                "activity_tool": "Shell",
+                "command": "python worker.py",
+                "timestamp": "2026-08-07T16:00:00Z",
+            },
+        )
+        document = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=(
+                "projects/real-workspace/agent-transcripts/"
+                f"{session_id}/{session_id}.jsonl"
+            ),
+            category="conversation",
+            content_type="jsonl",
+            content_hash="c" * 64,
+            file_size_bytes=1,
+            metadata_={"session_id": str(session_id)},
+        )
+        session.add(document)
+        await session.flush()
+
+        assert await apply_deferred_conversation_metadata(
+            session,
+            document=document,
+            user_id=user.id,
+        ) == 1
+        await session.flush()
+        assert "shell-promoted" in document.metadata_[LIVE_SHELL_ACTIVITIES_KEY]
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(ConversationMetadataInbox)
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_delta_keeps_immutable_raw_snapshot(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session)
+        raw_snapshot = _claude_tool_row(
+            "Read",
+            {"file_path": "snapshot.py"},
+            source_id="snapshot",
+        )
+        base_hash = "a" * 64
+        document.content = raw_snapshot
+        document.content_hash = base_hash
+        document.file_size_bytes = len(raw_snapshot.encode("utf-8"))
+        _set_stored_source_identity(
+            document,
+            raw_snapshot,
+            revision_hash=base_hash,
+        )
+        session.add(
+            SyncState(
+                machine_id=document.machine_id,
+                tool_id=document.tool_id,
+                relative_path=document.relative_path,
+                last_hash=base_hash,
+                last_offset=document.file_size_bytes,
+            )
+        )
+        user_id = (
+            await session.execute(
+                select(Machine.user_id).where(Machine.id == document.machine_id)
+            )
+        ).scalar_one()
+        await session.commit()
+
+        delta = _claude_tool_row(
+            "Read",
+            {"file_path": "delta.py"},
+            source_id="delta",
+        )
+        new_offset = document.file_size_bytes + len(delta.encode("utf-8"))
+        await ingest_file(
+            session,
+            tool_id=document.tool_id,
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=delta,
+            content_hash="b" * 64,
+            file_size=len(delta.encode("utf-8")),
+            mode="delta",
+            offset=new_offset,
+            base_hash=base_hash,
+            base_offset=document.file_size_bytes,
+            metadata={},
+            timestamp=1_700_000_200.0,
+            machine_id=document.machine_id,
+            user_id=str(user_id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        assert document.content == raw_snapshot
+        assert document.content_hash == "b" * 64
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(DocumentVersion)
+                .where(DocumentVersion.document_id == document.id)
+            )
+        ) == 0
 
 
 @pytest.mark.asyncio

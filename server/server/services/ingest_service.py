@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -2648,24 +2648,20 @@ async def ingest_file(
         if not persist_content:
             doc.content = None
             doc.content_s3_key = content_s3_key
-        elif preserve_externalized_delta:
-            # A small incremental append must not replace a large archived
-            # transcript with only the tail. ConversationMessage rows retain
-            # the complete normalized history; the immutable S3 object remains
-            # the last full source snapshot until the next externalized FULL.
-            doc.content = None
+        elif category == "conversation" and mode == "delta":
+            # Raw conversation blobs are immutable snapshots. The old code
+            # rebuilt Document.content for every append, forcing PostgreSQL to
+            # rewrite a multi-megabyte TOAST value and its indexes even though
+            # reads use normalized ConversationMessage rows. Keep the last FULL
+            # snapshot (inline or in object storage) and append only normalized
+            # messages until another FULL source snapshot arrives.
             preserve_stored_source_identity = True
         elif mode == "delta" and doc.content:
-            # For large files, replace instead of append to avoid unbounded growth
-            if len(doc.content) + len(content) > 10_000_000:
-                doc.content = content  # Replace with latest delta
-                stored_revision_hash = None
+            doc.content = doc.content + "\n" + content
+            if previous_stored_revision == base_hash:
+                stored_revision_hash = content_hash
             else:
-                doc.content = doc.content + "\n" + content
-                if previous_stored_revision == base_hash:
-                    stored_revision_hash = content_hash
-                else:
-                    stored_revision_hash = None
+                stored_revision_hash = None
             stored_blob_content = doc.content
         else:
             doc.content = content
@@ -2710,13 +2706,17 @@ async def ingest_file(
         if project_id and doc.project_id != project_id:
             doc.project_id = project_id
 
-        # Save version history
-        version = DocumentVersion(
-            document_id=doc.id,
-            content_hash=content_hash,
-            file_size_bytes=file_size,
-        )
-        db.add(version)
+        # Conversation DELTAs are transport fragments, not independently
+        # restorable document versions (content_delta is not populated). Keep
+        # checkpoints for FULL snapshots while avoiding one extra row/write for
+        # every filesystem append.
+        if category != "conversation" or mode == "full":
+            version = DocumentVersion(
+                document_id=doc.id,
+                content_hash=content_hash,
+                file_size_bytes=file_size,
+            )
+            db.add(version)
 
     if category == "conversation" and not preserve_stored_source_identity:
         _set_stored_source_identity(
@@ -2729,6 +2729,19 @@ async def ingest_file(
     from sqlalchemy import update as _update
 
     await db.flush()
+    if category == "conversation" and user_id:
+        # Content and lightweight metadata travel independently. Reconcile any
+        # signal accepted before this document existed while the canonical
+        # path/session identity and source lock are both authoritative.
+        from .conversation_metadata_inbox import (
+            apply_deferred_conversation_metadata,
+        )
+
+        await apply_deferred_conversation_metadata(
+            db,
+            document=doc,
+            user_id=uuid.UUID(str(user_id)),
+        )
     enriched_claude_child = await _reconcile_claude_subagent_launch_metadata(
         db,
         doc,
@@ -3066,6 +3079,29 @@ async def _run_post_ingest_inner(
         logger.info("Post-ingest error for %s/%s: %s", tool_id, doc_id, e)
 
 
+def _stored_message_matches(
+    existing: ConversationMessage,
+    *,
+    message_type: str,
+    role: str,
+    content: str,
+    metadata: dict,
+    timestamp: datetime | None,
+) -> bool:
+    return (
+        existing.message_type == message_type
+        and existing.role == role
+        and existing.content == content
+        and (existing.metadata_ or {}) == metadata
+        and existing.timestamp == timestamp
+    )
+
+
+def _stored_message_source_id(message: ConversationMessage) -> str:
+    metadata = message.metadata_ if isinstance(message.metadata_, dict) else {}
+    return str(metadata.get("source_id") or "")
+
+
 async def _extract_messages(
     db: AsyncSession,
     doc: Document,
@@ -3087,6 +3123,7 @@ async def _extract_messages(
         extract_search_terms,
         upsert_search_terms,
     )
+    from .canvas_artifact_store import project_message_canvases
 
     search_parts: list[str] = []
     search_bytes = 0
@@ -3110,8 +3147,6 @@ async def _extract_messages(
     # Hermes stores a whole session as a single top-level JSON, not JSONL.
     # Always full-replace (file is rewritten on each turn).
     if doc.tool_id == "hermes":
-        from sqlalchemy import delete
-
         from .conversation_parser import parse_conversation
 
         await db.execute(
@@ -3152,15 +3187,29 @@ async def _extract_messages(
             if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
                 db.add_all(batch)
                 await db.flush()
+                await project_message_canvases(db, doc, batch)
                 batch = []
                 batch_bytes = 0
         if batch:
             db.add_all(batch)
             await db.flush()
+            await project_message_canvases(db, doc, batch)
         await upsert_search_terms(db, search_terms)
         return "".join(search_parts)
 
-    # Get current max line number for delta mode
+    tool_id = doc.tool_id
+    preserve_full_rebase = (
+        mode != "delta"
+        and tool_id in {"claude_code", "cursor"}
+        and not user_history
+    )
+    full_existing_max = 0
+    full_existing_rows: dict[int, ConversationMessage] = {}
+    full_loaded_through = 0
+    full_prefix_intact = preserve_full_rebase
+
+    # DELTA appends after the committed tail. A FULL/rebase keeps the exact
+    # normalized prefix and only replaces the first changed suffix.
     if mode == "delta":
         result = await db.execute(
             select(ConversationMessage.line_number)
@@ -3170,16 +3219,24 @@ async def _extract_messages(
         )
         row = result.scalar_one_or_none()
         start_line = (row or 0) + 1
+    elif preserve_full_rebase:
+        full_existing_max = int(
+            (
+                await db.execute(
+                    select(func.max(ConversationMessage.line_number)).where(
+                        ConversationMessage.document_id == doc.id
+                    )
+                )
+            ).scalar_one_or_none()
+            or 0
+        )
+        start_line = 1
     else:
-        # Full mode: clear existing messages
-        from sqlalchemy import delete
-
         await db.execute(
             delete(ConversationMessage).where(ConversationMessage.document_id == doc.id)
         )
         start_line = 1
 
-    tool_id = doc.tool_id
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
     from .conversation_tasks import (
         current_projected_task_state,
@@ -3434,14 +3491,82 @@ async def _extract_messages(
             add_search_text(normalized.role, clean_content)
             delta_tail = None
             continue
+        message_type = _bounded_message_text(
+            normalized.raw_type or normalized.role,
+            50,
+        )
+        if full_prefix_intact:
+            if line_num > full_loaded_through:
+                block_end = min(full_existing_max, line_num + 255)
+                if block_end >= line_num:
+                    existing_block = (
+                        (
+                            await db.execute(
+                                select(ConversationMessage).where(
+                                    ConversationMessage.document_id == doc.id,
+                                    ConversationMessage.line_number >= line_num,
+                                    ConversationMessage.line_number <= block_end,
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    full_existing_rows.update(
+                        {row.line_number: row for row in existing_block}
+                    )
+                full_loaded_through = max(full_loaded_through, block_end)
+            existing_message = full_existing_rows.pop(line_num, None)
+            if existing_message is not None and _stored_message_matches(
+                existing_message,
+                message_type=message_type,
+                role=normalized.role,
+                content=clean_content,
+                metadata=meta,
+                timestamp=ts,
+            ):
+                add_search_text(normalized.role, clean_content)
+                line_num += 1
+                continue
+            existing_source_id = (
+                _stored_message_source_id(existing_message)
+                if existing_message is not None
+                else ""
+            )
+            incoming_source_id = str(meta.get("source_id") or "")
+            if (
+                existing_message is not None
+                and incoming_source_id
+                and incoming_source_id == existing_source_id
+                and ".canvas.tsx" not in existing_message.content.casefold()
+                and ".canvas.tsx" not in clean_content.casefold()
+            ):
+                # Mutable projections (notably Cursor's current-task row) keep
+                # one stable source identity. Update that row without forcing
+                # the immutable transcript suffix through every GIN index.
+                existing_message.message_type = message_type
+                existing_message.role = normalized.role
+                existing_message.content = clean_content
+                existing_message.metadata_ = meta
+                existing_message.timestamp = ts
+                add_search_text(normalized.role, clean_content)
+                line_num += 1
+                continue
+            await db.execute(
+                delete(ConversationMessage).where(
+                    ConversationMessage.document_id == doc.id,
+                    ConversationMessage.line_number >= line_num,
+                )
+            )
+            await db.flush()
+            full_prefix_intact = False
+            full_existing_rows.clear()
+
         batch.append(
             ConversationMessage(
                 document_id=doc.id,
                 line_number=line_num,
-                message_type=_bounded_message_text(
-                    normalized.raw_type or normalized.role,
-                    50,
-                ),
+                message_type=message_type,
                 role=normalized.role,
                 content=clean_content,
                 metadata_=meta,
@@ -3460,8 +3585,18 @@ async def _extract_messages(
         if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
             db.add_all(batch)
             await db.flush()
+            await project_message_canvases(db, doc, batch)
             batch = []
             batch_bytes = 0
+
+    if full_prefix_intact and line_num <= full_existing_max:
+        await db.execute(
+            delete(ConversationMessage).where(
+                ConversationMessage.document_id == doc.id,
+                ConversationMessage.line_number >= line_num,
+            )
+        )
+        await db.flush()
 
     _reconcile_live_interaction_signals(
         doc,
@@ -3476,6 +3611,7 @@ async def _extract_messages(
     if batch:
         db.add_all(batch)
         await db.flush()
+        await project_message_canvases(db, doc, batch)
 
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.

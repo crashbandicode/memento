@@ -26,6 +26,7 @@ from server.services.canvas_artifact_store import (
     inventory_machine_canvases,
     normalized_path_hash,
     pending_machine_canvases,
+    project_message_canvases,
     record_canvas_outcome,
     store_captured_canvas,
 )
@@ -251,6 +252,44 @@ async def test_multi_artifact_backfill_is_owned_deduped_and_resumable(
         ) == 1
         assert messages[0].id != messages[1].id
         await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_new_messages_project_canvas_references_without_inventory_scan(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="projected-source",
+            collector_token_hash=uuid4().hex,
+            user_id=user.id,
+        )
+        session.add_all([user, machine])
+        await session.flush()
+        document, messages = await _conversation(
+            session,
+            user=user,
+            machine=machine,
+            tool_id="cursor",
+            paths=["/home/me/.cursor/projects/ws/canvases/projected.canvas.tsx"],
+        )
+
+        assert await project_message_canvases(session, document, messages) == 1
+        reference = (
+            await session.execute(
+                select(CanvasArtifactReference).where(
+                    CanvasArtifactReference.document_id == document.id
+                )
+            )
+        ).scalar_one()
+        assert reference.status == "discovered"
 
 
 @pytest.mark.asyncio

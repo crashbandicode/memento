@@ -28,6 +28,18 @@ CHUNK_COMMIT_TIMEOUT_SECONDS = 30 * 60
 class DeltaBaseConflict(RuntimeError):
     """The server no longer has the exact revision a tail extends."""
 
+    def __init__(
+        self,
+        relative_path: str,
+        *,
+        expected_hash: str | None = None,
+        expected_offset: int = 0,
+    ) -> None:
+        super().__init__(relative_path)
+        self.relative_path = relative_path
+        self.expected_hash = expected_hash
+        self.expected_offset = max(0, int(expected_offset or 0))
+
 
 class SyncClient:
     """Background worker that safely drains leased queue items."""
@@ -285,21 +297,40 @@ class SyncClient:
                     return self._upload_multipart(payload, stream)
             return self._upload_chunked(payload, item)
 
-        except DeltaBaseConflict:
-            if not self._queue.mark_delta_conflict(item):
+        except DeltaBaseConflict as conflict:
+            if not self._queue.mark_delta_conflict(
+                item,
+                expected_hash=conflict.expected_hash,
+                expected_offset=conflict.expected_offset,
+            ):
                 logger.warning(
                     "Delta base conflict could not retire queue item %s/%s",
                     item.tool_name,
                     item.relative_path,
                 )
                 return False
-            logger.warning(
-                "Delta base changed for %s/%s; scheduling a complete snapshot",
-                item.tool_name,
-                item.relative_path,
+            resumable = (
+                bool(conflict.expected_hash)
+                and conflict.expected_hash.startswith("d2:")
+                and conflict.expected_offset > 0
+                and getattr(self, "_delta_catchup_callback", None)
             )
-            if self._full_resync_callback and item.source_path:
-                self._full_resync_callback(item.source_path)
+            if resumable and item.source_path:
+                logger.warning(
+                    "Delta base advanced for %s/%s; resuming from server offset %d",
+                    item.tool_name,
+                    item.relative_path,
+                    conflict.expected_offset,
+                )
+                self._delta_catchup_callback(item.source_path)
+            else:
+                logger.warning(
+                    "Delta base changed for %s/%s; scheduling a complete snapshot",
+                    item.tool_name,
+                    item.relative_path,
+                )
+                if self._full_resync_callback and item.source_path:
+                    self._full_resync_callback(item.source_path)
             return True
         except httpx.ConnectError:
             logger.warning("Server unreachable, will retry later")
@@ -595,7 +626,26 @@ class SyncClient:
     @staticmethod
     def _raise_delta_conflict(response, payload: dict) -> None:
         if response.status_code == 409 and payload.get("mode") == "delta":
-            raise DeltaBaseConflict(payload["relative_path"])
+            expected_hash = None
+            expected_offset = 0
+            try:
+                body = response.json()
+                detail = body.get("detail") if isinstance(body, dict) else None
+                if isinstance(detail, dict):
+                    raw_hash = detail.get("expected_hash")
+                    if isinstance(raw_hash, str) and raw_hash:
+                        expected_hash = raw_hash
+                    expected_offset = max(
+                        0,
+                        int(detail.get("expected_offset") or 0),
+                    )
+            except (TypeError, ValueError, AttributeError):
+                pass
+            raise DeltaBaseConflict(
+                payload["relative_path"],
+                expected_hash=expected_hash,
+                expected_offset=expected_offset,
+            )
 
     @property
     def is_connected(self) -> bool:

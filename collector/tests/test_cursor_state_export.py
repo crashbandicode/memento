@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from collector.cursor_state_export import (
     CursorStateExporter,
     _iso_timestamp,
+    _model_selection,
     _tool_record,
     _workspace_folder_path,
     enqueue_cursor_state_snapshots,
@@ -23,6 +24,21 @@ class FixtureCursorTool(CursorTool):
     @property
     def root_path(self) -> Path:
         return self._root
+
+
+def test_model_selection_reads_current_cursor_reasoning_parameter() -> None:
+    assert _model_selection({
+        "modelName": "gpt-5.6-sol",
+        "maxMode": True,
+        "selectedModels": [{
+            "modelId": "gpt-5.6-sol",
+            "parameters": [
+                {"id": "context", "value": "272k"},
+                {"id": "reasoning", "value": "xhigh"},
+                {"id": "fast", "value": "false"},
+            ],
+        }],
+    }) == ("gpt-5.6-sol", "xhigh")
 
 
 def test_pending_question_uses_cursor_interaction_status() -> None:
@@ -683,14 +699,17 @@ def test_empty_header_does_not_starve_older_valid_composers(tmp_path):
 
 
 def test_enqueue_uses_complete_snapshot_and_state_database_source(tmp_path):
-    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
-    queue = SimpleNamespace(items=[])
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    queue = SimpleNamespace(items=[], metadata_items=[])
 
     def enqueue(**kwargs):
         queue.items.append(kwargs)
         return 1
 
     queue.enqueue = enqueue
+    queue.enqueue_metadata_changes = lambda **kwargs: (
+        queue.metadata_items.append(kwargs) or 1
+    )
     queue.get_delta_base = lambda _tool, _path: (None, 0)
     queued = enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue)
 
@@ -698,6 +717,11 @@ def test_enqueue_uses_complete_snapshot_and_state_database_source(tmp_path):
     assert queue.items[0]["sync_strategy"] == "full"
     assert queue.items[0]["tool_name"] == "cursor"
     assert queue.items[0]["source_path"].endswith("state.vscdb")
+    assert queue.metadata_items[0]["namespace"] == "conversation_activities"
+    assert {
+        record["session_id"]
+        for record in queue.metadata_items[0]["records"].values()
+    } == {session_id}
 
 
 def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_path):

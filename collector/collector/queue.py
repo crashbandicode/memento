@@ -1183,8 +1183,14 @@ class SyncQueue:
         return True
 
     @_rollback_on_error
-    def mark_delta_conflict(self, item: QueueItem) -> bool:
-        """Discard a rejected delta chain and require one complete snapshot."""
+    def mark_delta_conflict(
+        self,
+        item: QueueItem,
+        *,
+        expected_hash: str | None = None,
+        expected_offset: int = 0,
+    ) -> bool:
+        """Discard a rejected tail and adopt the server's committed base."""
         if not item.lease_token:
             return False
         payload_paths: list[str] = []
@@ -1227,16 +1233,49 @@ class SyncQueue:
                      AND sync_strategy='delta' AND is_partial=1""",
                 (row[0], row[1]),
             )
-            self._conn.execute(
-                """UPDATE file_state
-                   SET last_hash=synced_hash,
-                       last_offset=COALESCE(synced_offset, 0),
-                       observed_hash=synced_hash,
-                       observed_offset=COALESCE(synced_offset, 0),
-                       observed_at=synced_at
-                   WHERE tool_name=? AND relative_path=?""",
-                (row[0], row[1]),
-            )
+            if expected_hash:
+                now = time.time()
+                self._conn.execute(
+                    """INSERT INTO file_state (
+                           tool_name, relative_path, last_hash, last_offset,
+                           last_synced_at, observed_hash, observed_offset,
+                           observed_at, synced_hash, synced_offset, synced_at
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(tool_name, relative_path) DO UPDATE SET
+                           last_hash=excluded.last_hash,
+                           last_offset=excluded.last_offset,
+                           last_synced_at=excluded.last_synced_at,
+                           observed_hash=excluded.observed_hash,
+                           observed_offset=excluded.observed_offset,
+                           observed_at=excluded.observed_at,
+                           synced_hash=excluded.synced_hash,
+                           synced_offset=excluded.synced_offset,
+                           synced_at=excluded.synced_at""",
+                    (
+                        row[0],
+                        row[1],
+                        expected_hash,
+                        max(0, int(expected_offset or 0)),
+                        now,
+                        expected_hash,
+                        max(0, int(expected_offset or 0)),
+                        now,
+                        expected_hash,
+                        max(0, int(expected_offset or 0)),
+                        now,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """UPDATE file_state
+                       SET last_hash=synced_hash,
+                           last_offset=COALESCE(synced_offset, 0),
+                           observed_hash=synced_hash,
+                           observed_offset=COALESCE(synced_offset, 0),
+                           observed_at=synced_at
+                       WHERE tool_name=? AND relative_path=?""",
+                    (row[0], row[1]),
+                )
             self._conn.commit()
 
         for payload_path in payload_paths:
