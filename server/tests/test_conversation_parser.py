@@ -711,6 +711,54 @@ class ConversationParserTests(unittest.TestCase):
         self.assertIn("Investigating tool paths", messages[1].thinking)
         self.assertEqual(messages[2].tool_name, "Ripgrep")
 
+    def test_cursor_terminal_file_read_is_normalized_as_terminal(self) -> None:
+        terminal_path = (
+            r"C:\Users\intpa\.cursor\projects\c-Users-intpa-demo"
+            r"\terminals\292839.txt"
+        )
+        raw = "\n".join([
+            json.dumps({
+                "type": "cursor_state_tool",
+                "role": "tool",
+                "id": "terminal-read:tool",
+                "timestamp": "2026-08-07T13:51:22.000Z",
+                "tool_name": "Read",
+                "tool_input": json.dumps({
+                    "path": terminal_path,
+                    "offset": -5,
+                    "limit": 5,
+                }),
+                "content": json.dumps({
+                    "contents": "status: running\n---\nWATCH baseline_utc=...",
+                    "totalLinesInFile": 11,
+                }),
+            }),
+            json.dumps({
+                "type": "cursor_state_tool",
+                "role": "tool",
+                "id": "ordinary-read:tool",
+                "timestamp": "2026-08-07T13:51:23.000Z",
+                "tool_name": "Read",
+                "tool_input": json.dumps({
+                    "path": r"C:\Users\intpa\project\terminals\notes.txt",
+                }),
+                "content": "ordinary project file",
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual([message.tool_name for message in messages], [
+            "Terminal",
+            "Read",
+        ])
+        self.assertEqual(messages[0].tool_input, json.dumps({
+            "path": terminal_path,
+            "offset": -5,
+            "limit": 5,
+        }))
+        self.assertIn("WATCH baseline_utc", messages[0].content)
+
     def test_cursor_cancelled_task_without_agent_id_is_not_an_agent_event(self) -> None:
         raw = json.dumps({
             "type": "cursor_state_tool",

@@ -133,6 +133,10 @@ _CURSOR_TIMESTAMP_VALUE_RE = re.compile(
     r"[A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2} (?:AM|PM)"
     r") \(UTC(?P<offset>[+-]\d{1,2}(?::\d{2})?)?\)\Z"
 )
+_CURSOR_TERMINAL_PATH_RE = re.compile(
+    r"(?:^|/)\.cursor/projects/.+/terminals/[^/]+\.txt\Z",
+    re.IGNORECASE,
+)
 _CURSOR_USER_QUERY_ENVELOPE_RE = re.compile(
     r"\A\s*<user_query>\s*(?P<content>[\s\S]*?)\s*</user_query>\s*\Z",
     re.IGNORECASE,
@@ -160,6 +164,30 @@ _CURSOR_TASK_RESULT_FOLLOWUP_RE = re.compile(
     r"</user_query>\s*\Z",
     re.IGNORECASE,
 )
+
+
+def _is_cursor_terminal_read(tool_name: object, tool_input: object) -> bool:
+    """Identify Cursor's internal terminal snapshot reads.
+
+    Cursor persists a terminal pane as ``.cursor/projects/.../terminals/<id>.txt``
+    and exposes refreshes through the ordinary ``read_file_v2`` transport.  A
+    normal file read must remain a Read card; only that product-owned terminal
+    path is semantically a Terminal card.
+    """
+    normalized_name = re.sub(
+        r"[^a-z0-9]",
+        "",
+        _coerce_text(tool_name).casefold(),
+    )
+    if normalized_name not in {"read", "readfile", "readfilev2"}:
+        return False
+    payload = _json_mapping(tool_input)
+    path = _coerce_text(payload.get("path") or payload.get("file_path")).strip()
+    if not path:
+        return False
+    return _CURSOR_TERMINAL_PATH_RE.search(path.replace("\\", "/")) is not None
+
+
 _CURSOR_TASK_COMPLETION_RE = re.compile(
     r"<system_notification\b[^>]*>\s*"
     r"The following task has finished\b[\s\S]*?"
@@ -2007,6 +2035,8 @@ def parse_conversation_object(
             content = _extract_content(obj.get("content", ""))
             tool_name = _coerce_text(obj.get("tool_name") or "Cursor")
             tool_input = _coerce_text(obj.get("tool_input"))
+            if _is_cursor_terminal_read(tool_name, tool_input):
+                tool_name = "Terminal"
             tool_call_id = _bounded_interaction_text(
                 obj.get("tool_call_id") or obj.get("id"),
                 512,

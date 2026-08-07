@@ -227,6 +227,21 @@ function toolPreview(toolName: string, input: string, output: string): string {
   try {
     const parsed = JSON.parse(input) as Record<string, unknown>;
     const normalizedName = toolName.toLowerCase();
+    if (normalizedName === "terminal" && output.trim()) {
+      let terminalOutput = output;
+      try {
+        const parsedOutput = JSON.parse(output) as Record<string, unknown>;
+        if (typeof parsedOutput.contents === "string") terminalOutput = parsedOutput.contents;
+      } catch {
+        // A native terminal result is already plain text.
+      }
+      const lastLine = terminalOutput
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .at(-1);
+      if (lastLine) return lastLine.slice(0, 240);
+    }
     if (normalizedName === "todowrite" && Array.isArray(parsed.todos)) {
       const counts = new Map<string, number>();
       parsed.todos.forEach((todo) => {
@@ -251,6 +266,21 @@ function toolPreview(toolName: string, input: string, output: string): string {
     // Keep the compact raw fallback when a legacy payload is not valid JSON.
   }
   return fallback;
+}
+
+function formatToolOutput(toolName: string, output: string): string {
+  if (toolName.toLowerCase() !== "terminal" || !output.trim().startsWith("{")) {
+    return formatToolText(output);
+  }
+  try {
+    const parsed = JSON.parse(output) as Record<string, unknown>;
+    if (typeof parsed.contents === "string") {
+      return cleanTerminalText(parsed.contents).trim();
+    }
+  } catch {
+    // Preserve the raw terminal output when it is not structured JSON.
+  }
+  return formatToolText(output);
 }
 
 const MESSAGE_PAGE_SIZE = 50;
@@ -3247,7 +3277,7 @@ function ConversationToolCard({
   const preview = toolPreview(toolLabel, input, visibleOutput);
   const hasDetails = Boolean(input.trim() || visibleOutput);
   const formattedInput = expanded ? formatToolText(input) : "";
-  const formattedOutput = expanded ? formatToolText(visibleOutput) : "";
+  const formattedOutput = expanded ? formatToolOutput(toolLabel, visibleOutput) : "";
   const normalizedStatus = status.trim().toLowerCase();
   const statusLabel = ({
     completed: "Completed",
