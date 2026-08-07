@@ -104,7 +104,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
         self._db_path = db_path
@@ -113,11 +113,48 @@ class SyncQueue:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._spool_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._change_condition = threading.Condition()
+        self._change_token = 0
+        self._fair_lane_cursor = 0
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
         self._remove_orphaned_spool_files()
+
+    def _signal_change(self) -> None:
+        """Wake consumers without requiring them to poll SQLite."""
+        with self._change_condition:
+            self._change_token += 1
+            self._change_condition.notify_all()
+
+    def change_token(self) -> int:
+        with self._change_condition:
+            return self._change_token
+
+    def wait_for_change(self, token: int, timeout: float | None = None) -> int:
+        """Wait until queue ownership state changes or a retry timer expires."""
+        with self._change_condition:
+            if self._change_token == token:
+                self._change_condition.wait(timeout=timeout)
+            return self._change_token
+
+    def wake_waiters(self) -> None:
+        """Interrupt queue waits during pause and shutdown."""
+        self._signal_change()
+
+    def next_deferred_delay(self, maximum: float = 60.0) -> float | None:
+        """Return the next future retry deadline, excluding ready work."""
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT MIN(available_at) FROM queue
+                   WHERE status='pending' AND available_at > ?""",
+                (now,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return min(maximum, max(0.0, float(row[0]) - now))
 
     def _create_tables(self) -> None:
         self._conn.executescript("""
@@ -161,6 +198,8 @@ class SyncQueue:
                 synced_hash TEXT,
                 synced_offset INTEGER NOT NULL DEFAULT 0,
                 synced_at REAL,
+                source_size INTEGER,
+                source_mtime_ns INTEGER,
                 PRIMARY KEY (tool_name, relative_path)
             );
             CREATE TABLE IF NOT EXISTS metadata_state (
@@ -203,6 +242,8 @@ class SyncQueue:
             "synced_hash": "TEXT",
             "synced_offset": "INTEGER NOT NULL DEFAULT 0",
             "synced_at": "REAL",
+            "source_size": "INTEGER",
+            "source_mtime_ns": "INTEGER",
         }
         for name, definition in state_additions.items():
             if name not in state_columns:
@@ -317,6 +358,7 @@ class SyncQueue:
         """
         now = time.time()
         queued = 0
+        queue_changed = False
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             for item_key, source_record in records.items():
@@ -412,6 +454,7 @@ class SyncQueue:
                             "UPDATE queue SET status='superseded' WHERE id=?",
                             (int(pending[0]),),
                         )
+                        queue_changed = True
                     continue
 
                 if pending:
@@ -465,9 +508,12 @@ class SyncQueue:
                             0,
                         ),
                     )
+                queue_changed = True
                 queued += 1
 
             self._conn.commit()
+        if queue_changed:
+            self._signal_change()
         return queued
 
     def _column_names(self, table: str) -> set[str]:
@@ -564,6 +610,26 @@ class SyncQueue:
         ).fetchone()
         return row[0] if row else None
 
+    def _record_source_revision_locked(
+        self,
+        tool_name: str,
+        relative_path: str,
+        source_size: int | None,
+        source_mtime_ns: int | None,
+    ) -> None:
+        if source_size is None or source_mtime_ns is None:
+            return
+        self._conn.execute(
+            """UPDATE file_state SET source_size=?, source_mtime_ns=?
+               WHERE tool_name=? AND relative_path=?""",
+            (
+                max(0, int(source_size)),
+                max(0, int(source_mtime_ns)),
+                tool_name,
+                relative_path,
+            ),
+        )
+
     def get_delta_base(
         self,
         tool_name: str,
@@ -658,6 +724,8 @@ class SyncQueue:
         base_hash: str | None = None,
         base_offset: int = 0,
         source_path: str | None = None,
+        source_size: int | None = None,
+        source_mtime_ns: int | None = None,
     ) -> int:
         del file_size  # payload byte size is measured after sanitization below
         is_complete_snapshot = sync_strategy in {"full", "delta"} and not is_partial
@@ -679,6 +747,13 @@ class SyncQueue:
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
                     ).fetchone()
+                    self._record_source_revision_locked(
+                        tool_name,
+                        relative_path,
+                        source_size,
+                        source_mtime_ns,
+                    )
+                    self._conn.commit()
                     return int(row[0]) if row else 0
 
         inline_content, payload_path, payload_bytes = self._store_payload(content)
@@ -705,6 +780,12 @@ class SyncQueue:
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
                     ).fetchone()
+                    self._record_source_revision_locked(
+                        tool_name,
+                        relative_path,
+                        source_size,
+                        source_mtime_ns,
+                    )
                     self._conn.commit()
                     self._discard_payload(payload_path)
                     return int(row[0]) if row else 0
@@ -813,14 +894,21 @@ class SyncQueue:
                 self._conn.execute(
                     """INSERT INTO file_state (
                            tool_name, relative_path, last_hash, last_offset,
-                           observed_hash, observed_offset, observed_at
-                       ) VALUES (?,?,?,?,?,?,?)
+                           observed_hash, observed_offset, observed_at,
+                           source_size, source_mtime_ns
+                       ) VALUES (?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(tool_name, relative_path) DO UPDATE SET
                            last_hash=excluded.last_hash,
                            last_offset=excluded.last_offset,
                            observed_hash=excluded.observed_hash,
                            observed_offset=excluded.observed_offset,
-                           observed_at=excluded.observed_at""",
+                           observed_at=excluded.observed_at,
+                           source_size=COALESCE(
+                               excluded.source_size, file_state.source_size
+                           ),
+                           source_mtime_ns=COALESCE(
+                               excluded.source_mtime_ns, file_state.source_mtime_ns
+                           )""",
                     (
                         tool_name,
                         relative_path,
@@ -829,6 +917,8 @@ class SyncQueue:
                         content_hash,
                         offset,
                         now,
+                        source_size,
+                        source_mtime_ns,
                     ),
                 )
                 self._conn.commit()
@@ -843,6 +933,7 @@ class SyncQueue:
         for stale_payload_path in superseded_payload_paths:
             if stale_payload_path != payload_path:
                 self._discard_payload(stale_payload_path)
+        self._signal_change()
         return item_id
 
     @_rollback_on_error
@@ -863,6 +954,15 @@ class SyncQueue:
         selected: list[tuple[Any, ...]] = []
         tokens: dict[int, str] = {}
         with self._lock:
+            actionable = self._conn.execute(
+                """SELECT 1 FROM queue
+                   WHERE (status='pending' AND COALESCE(available_at, 0) <= ?)
+                      OR (status='uploading' AND COALESCE(lease_until, 0) <= ?)
+                   LIMIT 1""",
+                (now, now),
+            ).fetchone()
+            if actionable is None:
+                return []
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """UPDATE queue SET status='pending', lease_token=NULL, lease_until=NULL
@@ -878,8 +978,8 @@ class SyncQueue:
                     (now,),
                 ).fetchone()[0]
             )
-            candidates = self._conn.execute(
-                """SELECT q.id, q.tool_name, q.category, q.content_type,
+            candidate_sql = """
+                   SELECT q.id, q.tool_name, q.category, q.content_type,
                           q.relative_path, q.content_hash, q.file_size,
                           q.sync_strategy, q.is_partial, q.offset, q.metadata,
                           q.created_at, q.source_modified_at, q.retry_count,
@@ -904,21 +1004,62 @@ class SyncQueue:
                               AND older.status='pending' AND older.id < q.id
                         )
                      )
-                   ORDER BY CASE
-                                WHEN q.created_at <= 0 THEN -1
-                                WHEN q.sync_strategy='metadata' THEN 0
-                                WHEN q.sync_strategy='delta' AND q.is_partial=1 THEN 1
-                                ELSE 2
-                            END,
-                            q.created_at ASC, q.id ASC
-                   LIMIT ?""",
-                (now, now, max(batch_size * 8, batch_size)),
-            ).fetchall()
+                     AND ({lane_predicate})
+                   ORDER BY q.created_at ASC, q.id ASC
+                   LIMIT ?"""
+            lane_limit = max(batch_size * 4, 8)
+
+            def lane_rows(predicate: str) -> list[tuple[Any, ...]]:
+                return self._conn.execute(
+                    candidate_sql.format(lane_predicate=predicate),
+                    (now, now, lane_limit),
+                ).fetchall()
+
+            urgent = lane_rows("q.created_at <= 0")
+            lanes = {
+                "metadata": lane_rows(
+                    "q.created_at > 0 AND q.sync_strategy='metadata'"
+                ),
+                "live": lane_rows(
+                    "q.created_at > 0 AND q.sync_strategy='delta' "
+                    "AND q.is_partial=1"
+                ),
+                "canonical": lane_rows(
+                    "q.created_at > 0 AND q.sync_strategy<>'metadata' "
+                    "AND NOT (q.sync_strategy='delta' AND q.is_partial=1)"
+                ),
+            }
+            # Two prompt/metadata turns, one live tail, and one canonical turn
+            # keep interactive state quick without allowing metadata catch-up
+            # to hide durable conversation content indefinitely.
+            lane_cycle = ("metadata", "live", "metadata", "canonical")
+            lane_indices = {name: 0 for name in lanes}
+            fair_cursor = self._fair_lane_cursor % len(lane_cycle)
+            ordered_candidates: list[tuple[tuple[Any, ...], int | None]] = [
+                (row, None) for row in urgent
+            ]
+            while any(lane_indices[name] < len(rows) for name, rows in lanes.items()):
+                appended = False
+                for _attempt in range(len(lane_cycle)):
+                    lane_name = lane_cycle[fair_cursor]
+                    fair_cursor = (fair_cursor + 1) % len(lane_cycle)
+                    lane_index = lane_indices[lane_name]
+                    if lane_index >= len(lanes[lane_name]):
+                        continue
+                    ordered_candidates.append(
+                        (lanes[lane_name][lane_index], fair_cursor)
+                    )
+                    lane_indices[lane_name] += 1
+                    appended = True
+                    break
+                if not appended:
+                    break
 
             total_bytes = in_flight_bytes
             live_delta_bytes = 0
             selected_paths: set[tuple[str, str]] = set()
-            for row in candidates:
+            selected_fair_cursor: int | None = None
+            for row, next_fair_cursor in ordered_candidates:
                 path_key = (str(row[1]), str(row[4]))
                 if path_key in selected_paths:
                     continue
@@ -942,6 +1083,8 @@ class SyncQueue:
                     ):
                         continue
                 selected.append(row)
+                if next_fair_cursor is not None:
+                    selected_fair_cursor = next_fair_cursor
                 selected_paths.add(path_key)
                 total_bytes += size
                 if is_live_delta:
@@ -950,6 +1093,8 @@ class SyncQueue:
                 # added. Zero-byte metadata selected before it is harmless.
                 if in_flight_bytes == 0 and size > max_bytes:
                     break
+            if selected_fair_cursor is not None:
+                self._fair_lane_cursor = selected_fair_cursor
 
             for row in selected:
                 item_id = int(row[0])
@@ -963,6 +1108,8 @@ class SyncQueue:
                 if cursor.rowcount == 1:
                     tokens[item_id] = token
             self._conn.commit()
+        if tokens:
+            self._signal_change()
 
         items: list[QueueItem] = []
         for row in selected:
@@ -1117,6 +1264,7 @@ class SyncQueue:
                 )
             self._conn.commit()
         self._discard_payload(payload_path)
+        self._signal_change()
         return True
 
     @_rollback_on_error
@@ -1180,6 +1328,7 @@ class SyncQueue:
                 )
             self._conn.commit()
         self._discard_payload(payload_path)
+        self._signal_change()
         return True
 
     @_rollback_on_error
@@ -1280,6 +1429,7 @@ class SyncQueue:
 
         for payload_path in payload_paths:
             self._discard_payload(payload_path)
+        self._signal_change()
         return True
 
     def get_file_state(
@@ -1293,6 +1443,25 @@ class SyncQueue:
                 (tool_name, relative_path),
             ).fetchone()
             return (row[0], int(row[1])) if row else (None, 0)
+
+    def get_source_revision(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> tuple[int | None, int | None]:
+        """Return the last fully observed filesystem revision."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT source_size, source_mtime_ns FROM file_state
+                   WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+        if row is None:
+            return None, None
+        return (
+            int(row[0]) if row[0] is not None else None,
+            int(row[1]) if row[1] is not None else None,
+        )
 
     @_rollback_on_error
     def update_file_state(
@@ -1375,6 +1544,7 @@ class SyncQueue:
             self._conn.commit()
         for row in rows:
             self._discard_payload(row[0])
+        self._signal_change()
 
     @_rollback_on_error
     def clear_file_state(self, tool_name: str, relative_path: str) -> None:
@@ -1386,6 +1556,7 @@ class SyncQueue:
                 (tool_name, relative_path),
             )
             self._conn.commit()
+        self._signal_change()
 
     @_rollback_on_error
     def prioritize_file(self, tool_name: str, relative_path: str) -> int:
@@ -1406,7 +1577,10 @@ class SyncQueue:
                 (tool_name, relative_path),
             )
             self._conn.commit()
-            return cursor.rowcount
+            changed = cursor.rowcount
+        if changed:
+            self._signal_change()
+        return changed
 
     def close(self) -> None:
         with self._lock:

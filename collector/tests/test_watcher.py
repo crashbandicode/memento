@@ -345,6 +345,47 @@ def test_file_processing_enqueues_source_filesystem_mtime(tmp_path: Path) -> Non
     assert queue.enqueued[0]["source_modified_at"] == expected_mtime
 
 
+def test_restarted_scan_skips_durable_unchanged_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        '{"role":"user","message":{"content":"hello"}}\n',
+        encoding="utf-8",
+    )
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    database = tmp_path / "queue" / "sync.db"
+
+    queue = SyncQueue(database)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._process_file_changed(path, emit_live_signals=False)
+    queue.close()
+
+    queue = SyncQueue(database)
+    watcher._queue = queue
+    monkeypatch.setattr(
+        "collector.watcher._file_hash_revision",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged source was reread")
+        ),
+    )
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+    finally:
+        queue.close()
+
+
 def test_delta_processing_uses_guarded_base_and_force_full_fallback(
     tmp_path: Path,
 ) -> None:

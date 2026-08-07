@@ -91,6 +91,7 @@ class CursorTool(BaseTool):
         self._state_database_path_override = state_database_path
         self._state_session_ids: frozenset[str] = frozenset()
         self._state_session_ids_checked_at = 0.0
+        self._state_session_misses: dict[str, float] = {}
 
     @property
     def state_database_path(self) -> Path:
@@ -163,10 +164,65 @@ class CursorTool(BaseTool):
 
         self._state_session_ids = session_ids
         self._state_session_ids_checked_at = now
+        self._state_session_misses.clear()
         return session_ids
 
-    def has_authoritative_state(self, session_id: str) -> bool:
-        return session_id in self.authoritative_session_ids()
+    def remember_authoritative_sessions(self, session_ids: set[str]) -> None:
+        """Share projector discoveries with the compatibility-file watcher."""
+        if not session_ids:
+            return
+        self._state_session_ids = self._state_session_ids.union(session_ids)
+        for session_id in session_ids:
+            self._state_session_misses.pop(session_id, None)
+
+    def has_authoritative_state(self, session_id: str, *, max_age: float = 2.0) -> bool:
+        """Check one unknown composer instead of rescanning every header."""
+        if session_id in self._state_session_ids:
+            return True
+        now = time.monotonic()
+        if now - self._state_session_misses.get(session_id, 0.0) < max_age:
+            return False
+
+        database = self.state_database_path
+        found = False
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"{database.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=1,
+            )
+            connection.execute("PRAGMA query_only=ON")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT 1
+                    FROM composerHeaders AS h
+                    WHERE h.composerId=?
+                      AND EXISTS (
+                        SELECT 1 FROM cursorDiskKV AS kv
+                        WHERE kv.key='composerData:' || h.composerId
+                      )
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = connection.execute(
+                    "SELECT 1 FROM composerHeaders WHERE composerId=? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            found = row is not None
+        except (OSError, sqlite3.Error):
+            found = False
+        finally:
+            if connection is not None:
+                connection.close()
+        if found:
+            self.remember_authoritative_sessions({session_id})
+        else:
+            self._state_session_misses[session_id] = now
+        return found
 
     def _get_workspace_map(self) -> dict[str, str]:
         if self._workspace_map is None:

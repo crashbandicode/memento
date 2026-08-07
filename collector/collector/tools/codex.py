@@ -237,6 +237,9 @@ def _load_threads_from_sqlite(
 
 
 class CodexTool(BaseTool):
+    def __init__(self) -> None:
+        self._last_thread_title_poll_token: tuple[object, ...] | None = None
+        self._last_thread_title_values: dict[str, tuple[str, str]] = {}
 
     @property
     def name(self) -> str:
@@ -475,9 +478,23 @@ class CodexTool(BaseTool):
         if user_inputs:
             meta["user_history"] = user_inputs
 
-    def thread_title_records(self) -> dict[str, dict]:
+    def invalidate_thread_title_poll(self) -> None:
+        self._last_thread_title_poll_token = None
+        self._last_thread_title_values.clear()
+
+    def thread_titles_changed(self) -> bool:
+        return (
+            self._last_thread_title_poll_token is None
+            or _thread_info_signature(self.root_path)
+            != self._last_thread_title_poll_token
+        )
+
+    def thread_title_records(self, *, changed_only: bool = False) -> dict[str, dict]:
         """Return a fresh, compact state snapshot for explicit-rename polling."""
-        threads = _load_threads_from_sqlite(self.root_path, force_refresh=True)
+        source_token = _thread_info_signature(self.root_path)
+        if changed_only and source_token == self._last_thread_title_poll_token:
+            return {}
+        threads = _load_threads_from_sqlite(self.root_path)
         records: dict[str, dict] = {}
         for thread_id, info in threads.items():
             thread_source = str(info.get("thread_source") or "").strip().lower()
@@ -512,7 +529,20 @@ class CodexTool(BaseTool):
             if relative_path and len(relative_path) <= 2000:
                 record["relative_path"] = relative_path
             records[thread_id] = record
-        return records
+        if not changed_only:
+            return records
+        changed_records = {
+            thread_id: record
+            for thread_id, record in records.items()
+            if self._last_thread_title_values.get(thread_id)
+            != (str(record["title"]), str(record["title_kind"]))
+        }
+        self._last_thread_title_values = {
+            thread_id: (str(record["title"]), str(record["title_kind"]))
+            for thread_id, record in records.items()
+        }
+        self._last_thread_title_poll_token = source_token
+        return changed_records
 
     def _state_rollout_relative_path(self, rollout_path: str) -> str:
         """Normalize the state DB rollout path to the collector document key."""

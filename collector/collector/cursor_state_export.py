@@ -580,15 +580,56 @@ class CursorStateExporter:
         self.tool = tool
         self._seen_revisions: dict[str, str] = {}
         self._transcript_paths: dict[str, Path] | None = None
+        self._last_source_token: tuple[object, ...] | None = None
+        self._backlog_pending = False
 
     def invalidate(self) -> None:
         self._seen_revisions.clear()
         self._transcript_paths = None
+        self._last_source_token = None
+        self._backlog_pending = False
         self.tool._state_session_ids_checked_at = 0.0
+
+    def _source_token(self) -> tuple[object, ...]:
+        """Track SQLite and its WAL without opening the database."""
+        database = self.tool.state_database_path
+        token: list[object] = [str(database)]
+        for path in (database, Path(f"{database}-wal")):
+            try:
+                stat = path.stat()
+                token.extend(
+                    (
+                        stat.st_dev,
+                        stat.st_ino,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                    )
+                )
+            except OSError:
+                token.extend((None, None, None, None))
+        return tuple(token)
+
+    def needs_export(self) -> bool:
+        """Return whether a real SQLite revision or catch-up batch is pending."""
+        if not self.tool.state_database_path.is_file():
+            self._last_source_token = self._source_token()
+            return False
+        return (
+            self._backlog_pending
+            or self._last_source_token is None
+            or self._source_token() != self._last_source_token
+        )
 
     def export_changed(self, *, limit: int = 8) -> list[CursorStateSnapshot]:
         database = self.tool.state_database_path
         if not database.is_file():
+            return []
+        source_token = self._source_token()
+        if (
+            not self._backlog_pending
+            and self._last_source_token is not None
+            and source_token == self._last_source_token
+        ):
             return []
         connection: sqlite3.Connection | None = None
         try:
@@ -600,9 +641,13 @@ class CursorStateExporter:
             connection.execute("PRAGMA query_only=ON")
             headers = self._composer_headers(connection)
             snapshots: list[CursorStateSnapshot] = []
+            backlog_pending = False
             for header in headers:
                 if self._seen_revisions.get(header.composer_id) == header.revision:
                     continue
+                if len(snapshots) >= limit:
+                    backlog_pending = True
+                    break
                 snapshot = self._snapshot(connection, header)
                 # A stale header can outlive its composerData row. Mark that
                 # exact revision observed so it cannot monopolize every poll;
@@ -610,9 +655,10 @@ class CursorStateExporter:
                 self._seen_revisions[header.composer_id] = header.revision
                 if snapshot is None:
                     continue
+                self.tool.remember_authoritative_sessions({header.composer_id})
                 snapshots.append(snapshot)
-                if len(snapshots) >= limit:
-                    break
+            self._backlog_pending = backlog_pending
+            self._last_source_token = source_token
             return snapshots
         except (OSError, sqlite3.Error):
             return []

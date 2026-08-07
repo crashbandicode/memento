@@ -50,6 +50,7 @@ class SyncClient:
         config: CollectorConfig,
         full_resync_callback: Callable[[str], None] | None = None,
         delta_catchup_callback: Callable[[str], None] | None = None,
+        upload_synced_callback: Callable[[QueueItem], None] | None = None,
     ) -> None:
         self._queue = queue
         self._config = config
@@ -60,6 +61,7 @@ class SyncClient:
         self._idle.set()
         self._full_resync_callback = full_resync_callback
         self._delta_catchup_callback = delta_catchup_callback
+        self._upload_synced_callback = upload_synced_callback
         try:
             from importlib.metadata import version
 
@@ -99,6 +101,9 @@ class SyncClient:
     def stop(self) -> None:
         self._running = False
         self._pause_requested.clear()
+        wake_waiters = getattr(self._queue, "wake_waiters", None)
+        if callable(wake_waiters):
+            wake_waiters()
         if self._thread:
             # An in-flight HTTP request has a 60-second timeout. Waiting here
             # prevents queue/client teardown from racing upload callbacks.
@@ -110,12 +115,18 @@ class SyncClient:
     def pause(self, timeout: float = 75) -> bool:
         """Stop claiming work and wait for the active upload batch to drain."""
         self._pause_requested.set()
+        wake_waiters = getattr(self._queue, "wake_waiters", None)
+        if callable(wake_waiters):
+            wake_waiters()
         if not self._running:
             return True
         return self._idle.wait(timeout=timeout)
 
     def resume(self) -> None:
         self._pause_requested.clear()
+        wake_waiters = getattr(self._queue, "wake_waiters", None)
+        if callable(wake_waiters):
+            wake_waiters()
 
     def _sleep_interruptibly(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
@@ -128,6 +139,11 @@ class SyncClient:
     def _run(self) -> None:
         futures: dict[Future[bool], QueueItem] = {}
         poll_interval = max(0.05, self._config.sync_interval)
+        queue_token = getattr(self._queue, "change_token", None)
+        wait_for_change = getattr(self._queue, "wait_for_change", None)
+        next_deferred_delay = getattr(self._queue, "next_deferred_delay", None)
+        last_claim_token = -1
+        next_retry_check = 0.0
 
         # Keep polling while uploads are in flight. The old batch barrier waited
         # for a large archive to finish before it even looked for a newly queued
@@ -157,7 +173,17 @@ class SyncClient:
                 continue
 
             available_slots = self._config.max_concurrent_uploads - len(futures)
-            if available_slots > 0:
+            current_token = queue_token() if callable(queue_token) else None
+            should_claim = (
+                available_slots > 0
+                and (
+                    current_token is None
+                    or current_token != last_claim_token
+                    or time.monotonic() >= next_retry_check
+                )
+            )
+            items: list[QueueItem] = []
+            if should_claim:
                 try:
                     items = self._queue.claim_batch(
                         batch_size=min(self._config.batch_size, available_slots),
@@ -168,6 +194,21 @@ class SyncClient:
                 except Exception:
                     logger.exception("Sync worker claim error")
                     items = []
+                if callable(queue_token):
+                    last_claim_token = queue_token()
+                    if items:
+                        next_retry_check = float("inf")
+                    else:
+                        delay = (
+                            next_deferred_delay()
+                            if callable(next_deferred_delay)
+                            else None
+                        )
+                        next_retry_check = (
+                            time.monotonic() + max(0.05, delay)
+                            if delay is not None
+                            else float("inf")
+                        )
                 for item in items:
                     futures[self._pool.submit(self._upload, item)] = item
 
@@ -176,7 +217,23 @@ class SyncClient:
                 wait(tuple(futures), timeout=poll_interval, return_when=FIRST_COMPLETED)
             else:
                 self._idle.set()
-                self._sleep_interruptibly(poll_interval)
+                if callable(queue_token) and callable(wait_for_change):
+                    token_before_wait = queue_token()
+                    deferred_wait = (
+                        max(0.05, next_retry_check - time.monotonic())
+                        if next_retry_check != float("inf")
+                        else 60.0
+                    )
+                    observed_token = wait_for_change(
+                        token_before_wait,
+                        timeout=min(60.0, deferred_wait),
+                    )
+                    if observed_token == token_before_wait:
+                        # Retry deadlines and a sparse safety check do not need
+                        # a producer signal, but ordinary enqueues always do.
+                        next_retry_check = time.monotonic()
+                else:
+                    self._sleep_interruptibly(poll_interval)
 
         self._idle.set()
 
@@ -193,6 +250,13 @@ class SyncClient:
                 if future.result():
                     if self._queue.mark_synced(item):
                         synced = True
+                        upload_synced_callback = getattr(
+                            self,
+                            "_upload_synced_callback",
+                            None,
+                        )
+                        if callable(upload_synced_callback):
+                            upload_synced_callback(item)
                         if (
                             item.sync_strategy == "delta"
                             and item.source_path

@@ -670,6 +670,50 @@ def test_exporter_emits_only_changed_revisions_and_resync_can_invalidate(tmp_pat
     assert len(exporter.export_changed()) == 1
 
 
+def test_unchanged_state_token_skips_sqlite_and_real_change_is_visible(
+    tmp_path,
+    monkeypatch,
+):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    exporter = CursorStateExporter(tool)
+    assert len(exporter.export_changed()) == 1
+    assert exporter.needs_export() is False
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            "collector.cursor_state_export.sqlite3.connect",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("unchanged database was reopened")
+            ),
+        )
+        assert exporter.export_changed() == []
+
+    connection = sqlite3.connect(tool.state_database_path)
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:22:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+
+    assert exporter.needs_export() is True
+    assert len(exporter.export_changed()) == 1
+
+
+def test_authoritative_ownership_is_cached_per_session(tmp_path, monkeypatch):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+
+    assert tool.has_authoritative_state(session_id) is True
+    with monkeypatch.context() as context:
+        context.setattr(
+            "collector.tools.cursor.sqlite3.connect",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("known composer triggered another database scan")
+            ),
+        )
+        assert tool.has_authoritative_state(session_id) is True
+
+
 def test_empty_header_does_not_starve_older_valid_composers(tmp_path):
     tool, _transcript, _session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)

@@ -231,13 +231,20 @@ def _interaction_side_records(
 
 def extract_claude_pending_interaction_updates(
     tool: ClaudeCodeTool | Path,
+    *,
+    side_records: list[tuple[Path, dict[str, Any]]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Resolve hook side files to lightweight conversation interaction updates."""
     root = tool if isinstance(tool, Path) else tool.root_path
     records: dict[str, dict[str, Any]] = {}
 
-    for side_file in iter_claude_pending_side_files():
-        side_record = _read_side_file(side_file)
+    source_records = side_records
+    if source_records is None:
+        source_records = [
+            (side_file, _read_side_file(side_file))
+            for side_file in iter_claude_pending_side_files()
+        ]
+    for _side_file, side_record in source_records:
         session_id = str(side_record.get("session_id") or "").strip()
         if (
             not session_id
@@ -308,12 +315,19 @@ def extract_claude_pending_interaction_updates(
 
 def extract_claude_live_activity_updates(
     tool: ClaudeCodeTool | Path,
+    *,
+    side_records: list[tuple[Path, dict[str, Any]]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Resolve Claude hook side files to lightweight shell lifecycle updates."""
     root = tool if isinstance(tool, Path) else tool.root_path
     records: dict[str, dict[str, Any]] = {}
-    for side_file in iter_claude_pending_side_files():
-        side_record = _read_side_file(side_file)
+    source_records = side_records
+    if source_records is None:
+        source_records = [
+            (side_file, _read_side_file(side_file))
+            for side_file in iter_claude_pending_side_files()
+        ]
+    for _side_file, side_record in source_records:
         session_id = str(side_record.get("session_id") or "").strip()
         if (
             not session_id
@@ -363,3 +377,151 @@ def extract_claude_live_activity_updates(
             key = f"claude_code:{relative_path}:{canonical_id}"
             records[key] = signal
     return records
+
+
+class ClaudePendingPoller:
+    """Project only changed hook files and active permission dependencies."""
+
+    def __init__(self) -> None:
+        self._file_tokens: dict[Path, tuple[int, int, int]] = {}
+        self._side_records: dict[Path, dict[str, Any]] = {}
+        self._dependency_tokens: dict[Path, tuple[object, ...]] = {}
+        self._interaction_values: dict[str, str] = {}
+        self._activity_values: dict[str, str] = {}
+        self._initialized = False
+
+    @staticmethod
+    def _file_token(path: Path) -> tuple[int, int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _is_pending_permission(record: dict[str, Any]) -> bool:
+        return (
+            str(record.get("interaction_status") or "").casefold() == "pending"
+            and str(record.get("question_tool") or "").casefold()
+            == "permissionrequest"
+        )
+
+    def _dependency_token(
+        self,
+        root: Path,
+        record: dict[str, Any],
+    ) -> tuple[object, ...]:
+        if not self._is_pending_permission(record):
+            return ()
+        session_id = str(record.get("session_id") or "").strip()
+        relative_path = _relative_transcript_path(
+            root,
+            session_id,
+            record.get("transcript_path"),
+        )
+        token: list[object] = [relative_path]
+        if relative_path:
+            transcript_token = self._file_token(root / relative_path)
+            token.append(transcript_token)
+        sessions_directory = root / "sessions"
+        try:
+            session_tokens = tuple(
+                (path.name, self._file_token(path))
+                for path in sorted(sessions_directory.glob("*.json"))
+                if path.is_file()
+            )
+        except OSError:
+            session_tokens = ()
+        token.append(session_tokens)
+        return tuple(token)
+
+    def needs_poll(self, tool: ClaudeCodeTool | Path) -> bool:
+        root = tool if isinstance(tool, Path) else tool.root_path
+        paths = iter_claude_pending_side_files()
+        if not self._initialized or set(paths) != set(self._file_tokens):
+            return True
+        for path in paths:
+            if self._file_token(path) != self._file_tokens.get(path):
+                return True
+            record = self._side_records.get(path, {})
+            if (
+                self._is_pending_permission(record)
+                and self._dependency_token(root, record)
+                != self._dependency_tokens.get(path)
+            ):
+                return True
+        return False
+
+    def poll(
+        self,
+        tool: ClaudeCodeTool | Path,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        root = tool if isinstance(tool, Path) else tool.root_path
+        paths = iter_claude_pending_side_files()
+        current_paths = set(paths)
+        for removed in set(self._file_tokens) - current_paths:
+            self._file_tokens.pop(removed, None)
+            self._side_records.pop(removed, None)
+            self._dependency_tokens.pop(removed, None)
+
+        changed_records: list[tuple[Path, dict[str, Any]]] = []
+        for path in paths:
+            file_token = self._file_token(path)
+            record = self._side_records.get(path)
+            changed = file_token != self._file_tokens.get(path)
+            if changed or record is None:
+                record = _read_side_file(path)
+                self._side_records[path] = record
+            dependency_token = self._dependency_token(root, record)
+            if (
+                changed
+                or path not in self._dependency_tokens
+                or dependency_token != self._dependency_tokens[path]
+            ):
+                changed_records.append((path, record))
+            if file_token is not None:
+                self._file_tokens[path] = file_token
+            self._dependency_tokens[path] = dependency_token
+
+        self._initialized = True
+        if not changed_records:
+            return {}, {}
+        interactions = extract_claude_pending_interaction_updates(
+            tool,
+            side_records=changed_records,
+        )
+        activities = extract_claude_live_activity_updates(
+            tool,
+            side_records=changed_records,
+        )
+        return (
+            self._changed_records(interactions, self._interaction_values),
+            self._changed_records(activities, self._activity_values),
+        )
+
+    @staticmethod
+    def _changed_records(
+        records: dict[str, dict[str, Any]],
+        observed: dict[str, str],
+    ) -> dict[str, dict[str, Any]]:
+        changed: dict[str, dict[str, Any]] = {}
+        for key, record in records.items():
+            value = json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if observed.get(key) != value:
+                changed[key] = record
+            observed[key] = value
+        return changed
+
+    def invalidate(self) -> None:
+        self._file_tokens.clear()
+        self._side_records.clear()
+        self._dependency_tokens.clear()
+        self._interaction_values.clear()
+        self._activity_values.clear()
+        self._initialized = False

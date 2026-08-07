@@ -15,8 +15,7 @@ from collections.abc import Callable
 from .canvas_sync import sync_pending_canvases
 from .claude_pending_hook import install_claude_pending_hooks
 from .claude_pending_questions import (
-    extract_claude_live_activity_updates,
-    extract_claude_pending_interaction_updates,
+    ClaudePendingPoller,
 )
 from .config import SYSTEM, CollectorConfig, _default_data_dir
 from .cursor_state_export import (
@@ -39,9 +38,56 @@ COMMAND_POLL_INTERVAL = 10    # Check server commands every 10s
 AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
-CURSOR_STATE_POLL_INTERVAL = 5  # Keep live state current without hot-looping SQLite
-CLAUDE_PENDING_POLL_INTERVAL = 5  # Surface live questions before JSONL flush
+SOURCE_CHANGE_CHECK_INTERVAL = 1  # Cheap stat tokens; expensive work is change-driven
 _canvas_sync_lock = threading.Lock()
+_command_poll_lock = threading.Lock()
+
+
+class _CanvasPollSchedule:
+    """Back off empty network polls and reset promptly after conversation sync."""
+
+    def __init__(self, *, minimum: float = 5.0, maximum: float = 300.0) -> None:
+        self._minimum = minimum
+        self._maximum = maximum
+        self._delay = minimum
+        self._next_due = 0.0
+        self._active = False
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    def notify_upload(self, item, now: float | None = None) -> None:
+        if getattr(item, "category", "") != "conversation":
+            return
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._generation += 1
+            self._delay = self._minimum
+            self._next_due = min(self._next_due, now + 2.0)
+
+    def claim_due(self, now: float | None = None) -> int | None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._active or now < self._next_due:
+                return None
+            self._active = True
+            return self._generation
+
+    def complete(
+        self,
+        generation: int,
+        counts: dict[str, int],
+        now: float | None = None,
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._active = False
+            if generation != self._generation:
+                return
+            if counts.get("requested") or counts.get("failed"):
+                self._delay = self._minimum
+            else:
+                self._delay = min(self._maximum, max(self._minimum, self._delay * 2))
+            self._next_due = now + self._delay
 
 
 def _load_saved_config() -> CollectorConfig:
@@ -123,10 +169,25 @@ def _run_initial_scan(watcher: FileWatcher, logger: logging.Logger) -> None:
         logger.exception("Initial scan failed")
 
 
-def _poll_canvas_artifacts(config: CollectorConfig, logger: logging.Logger) -> None:
+def _poll_canvas_artifacts(
+    config: CollectorConfig,
+    logger: logging.Logger,
+    schedule: _CanvasPollSchedule | None = None,
+    generation: int = 0,
+) -> None:
     """Run one bounded artifact batch without overlapping a prior batch."""
     if not _canvas_sync_lock.acquire(blocking=False):
+        if schedule is not None:
+            schedule.complete(generation, {"requested": 0, "failed": 1})
         return
+    counts = {
+        "requested": 0,
+        "renderable": 0,
+        "static_only": 0,
+        "missing": 0,
+        "rejected": 0,
+        "failed": 0,
+    }
     try:
         counts = sync_pending_canvases(config, logger)
         if counts["requested"]:
@@ -141,9 +202,12 @@ def _poll_canvas_artifacts(config: CollectorConfig, logger: logging.Logger) -> N
                 counts["failed"],
             )
     except Exception:
+        counts["failed"] += 1
         logger.exception("Canvas backfill poll failed")
     finally:
         _canvas_sync_lock.release()
+        if schedule is not None:
+            schedule.complete(generation, counts)
 
 
 def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatcher,
@@ -245,6 +309,16 @@ def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatch
                     logger.info("Ignoring update command: auto-update is disabled")
     except Exception:
         pass  # Server unreachable, skip
+
+
+def _poll_commands_nonoverlap(*args) -> None:
+    """Keep the control-plane request off the latency-sensitive main loop."""
+    if not _command_poll_lock.acquire(blocking=False):
+        return
+    try:
+        _poll_commands(*args)
+    finally:
+        _command_poll_lock.release()
 
 
 def _get_pypi_latest(package: str) -> str | None:
@@ -400,24 +474,32 @@ def _poll_claude_pending_questions(
     tool: ClaudeCodeTool,
     queue: SyncQueue,
     logger: logging.Logger,
+    poller: ClaudePendingPoller,
 ) -> None:
     """Queue live prompt state captured by the Claude Code hook."""
     if not _claude_pending_poll_lock.acquire(blocking=False):
         return
     try:
-        records = extract_claude_pending_interaction_updates(tool)
-        queued = queue.enqueue_metadata_changes(
-            namespace="conversation_interactions",
-            tool_name="claude_code",
-            records=records,
+        records, activity_records = poller.poll(tool)
+        queued = (
+            queue.enqueue_metadata_changes(
+                namespace="conversation_interactions",
+                tool_name="claude_code",
+                records=records,
+            )
+            if records
+            else 0
         )
         if queued:
             logger.info("Queued %d Claude prompt interaction update(s)", queued)
-        activity_records = extract_claude_live_activity_updates(tool)
-        activity_queued = queue.enqueue_metadata_changes(
-            namespace="conversation_activities",
-            tool_name="claude_code",
-            records=activity_records,
+        activity_queued = (
+            queue.enqueue_metadata_changes(
+                namespace="conversation_activities",
+                tool_name="claude_code",
+                records=activity_records,
+            )
+            if activity_records
+            else 0
         )
         if activity_queued:
             logger.info(
@@ -439,7 +521,9 @@ def _poll_codex_thread_titles(
     if not _codex_metadata_poll_lock.acquire(blocking=False):
         return
     try:
-        records = tool.thread_title_records()
+        records = tool.thread_title_records(changed_only=True)
+        if not records:
+            return
         valid_records: dict[str, dict] = {}
         for thread_id, record in records.items():
             try:
@@ -485,6 +569,23 @@ def _invalidate_cursor_state(exporter: CursorStateExporter) -> None:
     """Reset projector state without racing an in-flight read."""
     with _cursor_state_poll_lock:
         exporter.invalidate()
+
+
+def _log_queue_heartbeat(
+    queue: SyncQueue,
+    logger: logging.Logger,
+    last_token: int,
+) -> int:
+    """Log only queue transitions; unchanged idle state performs no SQL."""
+    token = queue.change_token()
+    if token == last_token:
+        return last_token
+    pending = queue.pending_count()
+    if pending > 0:
+        logger.info("Heartbeat: %d items pending sync", pending)
+    else:
+        logger.info("Heartbeat: idle, watching for changes")
+    return token
 
 
 def _run_antigravity_export(queue: SyncQueue, logger: logging.Logger) -> None:
@@ -608,6 +709,8 @@ def main() -> None:
     codex_tool = CodexTool()
     cursor_tool = CursorTool()
     cursor_exporter = CursorStateExporter(cursor_tool)
+    claude_pending_poller = ClaudePendingPoller()
+    canvas_schedule = _CanvasPollSchedule()
     tools = [
         claude_tool, OpenClawTool(), codex_tool,
         AntigravityTool(), ObsidianTool(vault_path=config.obsidian_vault_path),
@@ -632,7 +735,15 @@ def main() -> None:
         config,
         full_resync_callback=watcher.request_full_resync,
         delta_catchup_callback=watcher.request_delta_catchup,
+        upload_synced_callback=canvas_schedule.notify_upload,
     )
+
+    def _invalidate_source_pollers() -> None:
+        _invalidate_cursor_state(cursor_exporter)
+        with _codex_metadata_poll_lock:
+            codex_tool.invalidate_thread_title_poll()
+        with _claude_pending_poll_lock:
+            claude_pending_poller.invalidate()
 
     # Graceful shutdown
     shutdown = False
@@ -667,7 +778,7 @@ def main() -> None:
     if claude_tool in available:
         threading.Thread(
             target=_poll_claude_pending_questions,
-            args=(claude_tool, queue, logger),
+            args=(claude_tool, queue, logger, claude_pending_poller),
             daemon=True,
         ).start()
 
@@ -696,42 +807,49 @@ def main() -> None:
         ).start()
 
     # --- Main loop: heartbeat + periodic tasks ---
-    last_heartbeat = time.time()
-    last_command_poll = time.time()
-    last_update_check = time.time()
-    last_codex_metadata_poll = time.time()
-    last_claude_pending_poll = time.time()
-    last_cursor_state_poll = time.time()
+    last_heartbeat = time.monotonic()
+    last_heartbeat_token = -1
+    last_command_poll = time.monotonic()
+    last_update_check = time.monotonic()
+    last_codex_metadata_poll = time.monotonic()
+    last_source_change_check = time.monotonic()
 
     try:
         while not shutdown:
             time.sleep(1)
 
-            now = time.time()
+            now = time.monotonic()
 
             # Heartbeat log every 30s
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 last_heartbeat = now
-                pending = queue.pending_count()
-                if pending > 0:
-                    logger.info("Heartbeat: %d items pending sync", pending)
-                else:
-                    logger.info("Heartbeat: idle, watching for changes")
+                last_heartbeat_token = _log_queue_heartbeat(
+                    queue,
+                    logger,
+                    last_heartbeat_token,
+                )
 
-            # Poll server commands every 30s
+            # Poll server commands every 10s
             if now - last_command_poll > COMMAND_POLL_INTERVAL:
                 last_command_poll = now
-                _poll_commands(
-                    config,
-                    queue,
-                    watcher,
-                    sync_client,
-                    logger,
-                    on_resync=lambda: _invalidate_cursor_state(cursor_exporter),
-                )
+                threading.Thread(
+                    target=_poll_commands_nonoverlap,
+                    args=(
+                        config,
+                        queue,
+                        watcher,
+                        sync_client,
+                        logger,
+                        _invalidate_source_pollers,
+                    ),
+                    daemon=True,
+                ).start()
+
+            canvas_generation = canvas_schedule.claim_due(now)
+            if canvas_generation is not None:
                 threading.Thread(
                     target=_poll_canvas_artifacts,
-                    args=(config, logger),
+                    args=(config, logger, canvas_schedule, canvas_generation),
                     daemon=True,
                 ).start()
 
@@ -743,6 +861,7 @@ def main() -> None:
             if (
                 codex_tool in available
                 and now - last_codex_metadata_poll > config.sqlite_poll_interval
+                and codex_tool.thread_titles_changed()
             ):
                 last_codex_metadata_poll = now
                 threading.Thread(
@@ -751,28 +870,34 @@ def main() -> None:
                     daemon=True,
                 ).start()
 
-            if (
-                claude_tool in available
-                and now - last_claude_pending_poll > CLAUDE_PENDING_POLL_INTERVAL
-            ):
-                last_claude_pending_poll = now
-                threading.Thread(
-                    target=_poll_claude_pending_questions,
-                    args=(claude_tool, queue, logger),
-                    daemon=True,
-                ).start()
+            if now - last_source_change_check > SOURCE_CHANGE_CHECK_INTERVAL:
+                last_source_change_check = now
+                if (
+                    claude_tool in available
+                    and not _claude_pending_poll_lock.locked()
+                    and claude_pending_poller.needs_poll(claude_tool)
+                ):
+                    threading.Thread(
+                        target=_poll_claude_pending_questions,
+                        args=(
+                            claude_tool,
+                            queue,
+                            logger,
+                            claude_pending_poller,
+                        ),
+                        daemon=True,
+                    ).start()
 
-            if (
-                cursor_tool in available
-                and cursor_tool.state_database_path.is_file()
-                and now - last_cursor_state_poll > CURSOR_STATE_POLL_INTERVAL
-            ):
-                last_cursor_state_poll = now
-                threading.Thread(
-                    target=_poll_cursor_state,
-                    args=(cursor_exporter, queue, logger),
-                    daemon=True,
-                ).start()
+                if (
+                    cursor_tool in available
+                    and not _cursor_state_poll_lock.locked()
+                    and cursor_exporter.needs_export()
+                ):
+                    threading.Thread(
+                        target=_poll_cursor_state,
+                        args=(cursor_exporter, queue, logger),
+                        daemon=True,
+                    ).start()
 
     except KeyboardInterrupt:
         pass

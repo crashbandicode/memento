@@ -208,6 +208,34 @@ def test_state_title_records_refresh_and_include_revision_and_path(
     assert second["revision"] == 200_456
 
 
+def test_changed_only_title_poll_skips_unchanged_sqlite(
+    codex_tool: CodexTool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    _create_state_db(codex_tool.root_path, path, "Original title")
+
+    assert ROOT_ID in codex_tool.thread_title_records(changed_only=True)
+    with sqlite3.connect(codex_tool.root_path / "state_5.sqlite") as connection:
+        connection.execute(
+            "UPDATE threads SET updated_at_ms=? WHERE id=?",
+            (200_456, ROOT_ID),
+        )
+    assert codex_tool.thread_titles_changed() is True
+    assert codex_tool.thread_title_records(changed_only=True) == {}
+
+    monkeypatch.setattr(
+        codex_module,
+        "_load_threads_from_sqlite",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged state database was reopened")
+        ),
+    )
+
+    assert codex_tool.thread_title_records(changed_only=True) == {}
+
+
 def test_session_index_rename_overrides_newer_state_fallback(
     codex_tool: CodexTool,
 ) -> None:

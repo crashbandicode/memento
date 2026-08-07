@@ -651,6 +651,60 @@ class SyncQueueTests(unittest.TestCase):
             "large-hash",
         )
 
+    def test_empty_claim_is_read_only(self) -> None:
+        statements: list[str] = []
+        self.queue._conn.set_trace_callback(statements.append)
+
+        self.assertEqual(self.queue.claim_batch(), [])
+
+        write_prefixes = ("BEGIN", "COMMIT", "UPDATE", "INSERT", "DELETE")
+        self.assertFalse(
+            any(statement.lstrip().upper().startswith(write_prefixes) for statement in statements),
+            statements,
+        )
+
+    def test_metadata_lane_cannot_starve_canonical_content(self) -> None:
+        self._enqueue("sessions/canonical.jsonl", "canonical", "canonical-hash")
+        records: dict[str, dict] = {}
+        for index in range(12):
+            thread_id = f"019f144c-82d6-70d0-95e8-e01e7b813{index:02d}"
+            records.update(self._metadata_record(thread_id, f"Title {index}", index + 1))
+        self.queue.enqueue_metadata_changes(
+            namespace="codex_thread_titles",
+            tool_name="codex",
+            records=records,
+        )
+
+        claimed_paths: list[str] = []
+        for _attempt in range(3):
+            item = self.queue.claim_batch(batch_size=1)[0]
+            claimed_paths.append(item.relative_path)
+            self.assertTrue(self.queue.mark_synced(item))
+
+        self.assertIn("sessions/canonical.jsonl", claimed_paths)
+
+    def test_source_revision_is_durable_across_reopen(self) -> None:
+        self.queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path="sessions/revision.jsonl",
+            content="payload",
+            content_hash="revision-hash",
+            file_size=7,
+            sync_strategy="full",
+            offset=7,
+            source_size=7,
+            source_mtime_ns=123_456_789,
+        )
+        self.queue.close()
+        self.queue = SyncQueue(self.db_path, spool_threshold=64 * 1024)
+
+        self.assertEqual(
+            self.queue.get_source_revision("codex", "sessions/revision.jsonl"),
+            (7, 123_456_789),
+        )
+
     def test_inflight_oversize_payload_does_not_block_metadata(self) -> None:
         self._enqueue("sessions/large.jsonl", "x" * 150_000, "large-hash")
         large = self.queue.claim_batch(batch_size=1, max_bytes=100_000)[0]

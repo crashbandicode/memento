@@ -586,6 +586,17 @@ class FileWatcher:
         except OSError:
             return
         source_revision = (source_stat.st_size, source_stat.st_mtime_ns)
+        get_source_revision = getattr(self._queue, "get_source_revision", None)
+        if not force_full and callable(get_source_revision):
+            observed_source_revision = get_source_revision(
+                classification.tool_name,
+                classification.relative_path,
+            )
+            if observed_source_revision == source_revision:
+                # Startup/catch-up scans can contain thousands of durable,
+                # unchanged files. Their exact stat token is enough to avoid
+                # rereading the first 256 KiB and reparsing the full payload.
+                return
 
         # Check if file content actually changed
         current_hash = (
@@ -731,6 +742,13 @@ class FileWatcher:
         else:
             san = sanitize_text(parsed_content)
         parsed_content = san.content
+        if classification.sync_strategy == SyncStrategy.FULL:
+            # Filesystem mtimes are observation tokens, not document identity.
+            # Hash the sanitized payload so a touch cannot create a duplicate
+            # canonical upload after the one necessary verification read.
+            current_hash = hashlib.sha256(
+                parsed_content.encode("utf-8")
+            ).hexdigest()
 
         # Hash, parse, and timestamp must describe one stable source revision.
         # A concurrent append generates another watcher event; returning here
@@ -788,6 +806,8 @@ class FileWatcher:
             base_hash=base_hash if is_partial else None,
             base_offset=base_offset if is_partial else 0,
             source_path=str(path),
+            source_size=new_offset,
+            source_mtime_ns=source_stat.st_mtime_ns,
         )
 
         logger.info(

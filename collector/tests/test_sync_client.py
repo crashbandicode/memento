@@ -172,6 +172,46 @@ class _ConcurrentQueue:
         return None
 
 
+class _SignaledQueue(_ConcurrentQueue):
+    def __init__(self) -> None:
+        super().__init__([])
+        self._token = 0
+        self._condition = threading.Condition()
+        self.waiting = threading.Event()
+
+    def change_token(self) -> int:
+        with self._condition:
+            return self._token
+
+    def wait_for_change(self, token: int, timeout: float | None = None) -> int:
+        with self._condition:
+            self.waiting.set()
+            if self._token == token:
+                self._condition.wait(timeout)
+            return self._token
+
+    def next_deferred_delay(self) -> None:
+        return None
+
+    def add(self, item: QueueItem) -> None:
+        with self._condition:
+            self.items.append(item)
+            self._token += 1
+            self._condition.notify_all()
+
+    def mark_synced(self, item: QueueItem) -> bool:
+        result = super().mark_synced(item)
+        with self._condition:
+            self._token += 1
+            self._condition.notify_all()
+        return result
+
+    def wake_waiters(self) -> None:
+        with self._condition:
+            self._token += 1
+            self._condition.notify_all()
+
+
 class SyncClientStreamingTests(unittest.TestCase):
     @staticmethod
     def _item(
@@ -310,6 +350,44 @@ class SyncClientStreamingTests(unittest.TestCase):
             client._pool.shutdown(wait=True)
 
         self.assertEqual(sorted(queue.synced), [1, 2])
+
+    def test_idle_scheduler_waits_for_change_and_new_work_is_prompt(self) -> None:
+        queue = _SignaledQueue()
+        client = object.__new__(SyncClient)
+        client._queue = queue
+        client._config = SimpleNamespace(
+            batch_size=20,
+            max_concurrent_uploads=1,
+            max_in_flight_bytes=64 * 1024 * 1024,
+            max_delta_upload_bytes=16 * 1024 * 1024,
+            queue_lease_seconds=300,
+            sync_interval=0.01,
+        )
+        client._running = True
+        client._pause_requested = threading.Event()
+        client._idle = threading.Event()
+        client._pool = ThreadPoolExecutor(max_workers=1)
+        client._delta_catchup_callback = None
+        client._upload_synced_callback = None
+        uploaded = threading.Event()
+        client._upload = lambda _item: uploaded.set() or True
+
+        worker = threading.Thread(target=client._run)
+        worker.start()
+        try:
+            self.assertTrue(queue.waiting.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(queue.claim_calls, 1)
+
+            queue.add(self._item(100))
+            self.assertTrue(uploaded.wait(timeout=0.5))
+        finally:
+            client._running = False
+            queue.wake_waiters()
+            worker.join(timeout=2)
+            client._pool.shutdown(wait=True)
+
+        self.assertFalse(worker.is_alive())
 
     def test_successful_delta_base_schedules_the_next_bounded_window(self) -> None:
         item = self._item(100)

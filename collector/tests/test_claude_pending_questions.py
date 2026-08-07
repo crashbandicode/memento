@@ -11,6 +11,7 @@ import pytest
 from collector import claude_pending_hook as hook_module
 from collector import claude_pending_questions as pending_module
 from collector.claude_pending_questions import (
+    ClaudePendingPoller,
     extract_claude_live_activity_updates,
     extract_claude_pending_interaction_updates,
 )
@@ -87,6 +88,49 @@ def test_pending_side_file_emits_interaction_update(
         },
         "timestamp": "2026-07-29T14:00:00Z",
     }
+
+
+def test_change_poller_does_not_reread_unchanged_side_file(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo-project" / "session-1.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    _write_side_file(
+        pending_directory,
+        session_id="session-1",
+        transcript_path=transcript,
+        status="pending",
+    )
+    poller = ClaudePendingPoller()
+
+    interactions, activities = poller.poll(claude_root)
+    assert len(interactions) == 1
+    assert activities == {}
+    assert poller.needs_poll(claude_root) is False
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            pending_module,
+            "_read_side_file",
+            lambda _path: (_ for _ in ()).throw(
+                AssertionError("unchanged side file was reread")
+            ),
+        )
+        assert poller.poll(claude_root) == ({}, {})
+
+    _write_side_file(
+        pending_directory,
+        session_id="session-1",
+        transcript_path=transcript,
+        status="answered",
+    )
+    assert poller.needs_poll(claude_root) is True
+    interactions, _activities = poller.poll(claude_root)
+    assert next(iter(interactions.values()))["interaction_status"] == "answered"
 
 
 def test_utf8_question_survives_windows_hook_pipe_and_collector(
