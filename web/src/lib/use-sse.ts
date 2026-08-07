@@ -3,22 +3,14 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { api, getApiBase } from "./api-client";
 import { getStoredAuthToken } from "./auth-storage";
+import {
+  buildEventStreamUrl,
+  RealtimeEventData,
+  RealtimeEventLike,
+} from "./realtime-events";
 
-export interface SSEEvent {
-  type: string;
-  data: {
-    document_id?: string;
-    tool_id?: string;
-    category?: string;
-    relative_path?: string;
-    title?: string;
-  };
-  timestamp: number;
-}
-
-interface UseSSEOptions {
-  /** Refresh page state after a suspended/backgrounded tab becomes active. */
-  onResume?: () => void;
+export interface SSEEvent extends RealtimeEventLike {
+  data: RealtimeEventData;
 }
 
 function documentIsHidden(): boolean {
@@ -32,16 +24,13 @@ function documentIsHidden(): boolean {
  */
 export function useSSE(
   onEvent: (event: SSEEvent) => void,
-  { onResume }: UseSSEOptions = {},
 ) {
   const onEventRef = useRef(onEvent);
-  const onResumeRef = useRef(onResume);
   // Sync the latest onEvent handler into ref AFTER render, not during.
   // This avoids the React 19 "refs during render" rule violation while
   // preserving the "always-fresh-callback" semantics inside the effect below.
   useLayoutEffect(() => {
     onEventRef.current = onEvent;
-    onResumeRef.current = onResume;
   });
 
   useEffect(() => {
@@ -52,6 +41,8 @@ export function useSSE(
     let generation = 0;
     let windowBlurred = false;
     let lastResumeAt = 0;
+    let lastEventId = "";
+    let streamAttempted = false;
 
     function clearReconnectTimer() {
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
@@ -88,16 +79,30 @@ export function useSSE(
       try {
         await api.createEventSession(token);
         if (stopped || attempt !== generation || documentIsHidden()) return;
-        const next = new EventSource(`${base}/api/events/stream`, {
+        const next = new EventSource(buildEventStreamUrl(base, lastEventId), {
           withCredentials: true,
         });
+        streamAttempted = true;
         es = next;
 
-        next.addEventListener("file_synced", (e) => {
+        const handleEvent = (e: MessageEvent<string>) => {
           try {
             const event: SSEEvent = JSON.parse(e.data);
+            if (e.lastEventId) {
+              lastEventId = e.lastEventId;
+              event.id = e.lastEventId;
+            } else if (event.type === "realtime_reset") {
+              // An expired Redis stream has no resumable watermark.
+              lastEventId = "";
+            }
             onEventRef.current(event);
           } catch {}
+        };
+
+        next.addEventListener("file_synced", handleEvent);
+        next.addEventListener("realtime_reset", handleEvent);
+        next.addEventListener("stream_ready", (e) => {
+          if (e.lastEventId) lastEventId = e.lastEventId;
         });
 
         next.addEventListener("keepalive", () => {
@@ -124,8 +129,15 @@ export function useSSE(
       // One reconnect/catch-up is sufficient for the whole resume transition.
       if (now - lastResumeAt < 750) return;
       lastResumeAt = now;
+      const needsReconciliation = streamAttempted && !lastEventId;
       closeStream();
-      onResumeRef.current?.();
+      if (needsReconciliation) {
+        onEventRef.current({
+          type: "realtime_reset",
+          data: { reason: "missing_initial_watermark" },
+          timestamp: Date.now() / 1_000,
+        });
+      }
       void connect();
     }
 

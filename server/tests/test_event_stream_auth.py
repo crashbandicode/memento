@@ -2,6 +2,7 @@ import logging
 from types import SimpleNamespace
 import unittest
 import uuid
+from unittest.mock import patch
 
 from fastapi import HTTPException, Response
 from starlette.requests import Request
@@ -66,6 +67,31 @@ class EventStreamAuthTests(unittest.IsolatedAsyncioTestCase):
                 token=None,
             )
         self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_stream_forwards_query_cursor_for_resumable_replay(self) -> None:
+        user_id = str(uuid.uuid4())
+        captured: list[tuple[str, str | None]] = []
+
+        async def subscribed(current_user_id: str, cursor: str | None):
+            captured.append((current_user_id, cursor))
+            yield {
+                "id": "43-0",
+                "type": "file_synced",
+                "data": {"document_id": "doc"},
+                "timestamp": 1.0,
+            }
+
+        with patch("server.api.events.subscribe", new=subscribed):
+            response = await event_stream(
+                event_session=create_event_stream_token(user_id),
+                token=None,
+                last_event_id="41-0",
+                cursor="42-0",
+            )
+            frame = await anext(response.body_iterator)
+
+        self.assertEqual(captured, [(user_id, "42-0")])
+        self.assertTrue(frame.startswith("id: 43-0\n"))
 
 
 class SensitiveQueryFilterTests(unittest.TestCase):

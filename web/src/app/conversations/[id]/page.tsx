@@ -40,7 +40,7 @@ export default function ConversationPage() {
   const metaRequestRef = useRef(0);
   const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
-  const { prompts, syncVersion } = useConversationPrompts(docId, {
+  const { prompts, syncVersions } = useConversationPrompts(docId, {
     toolId: meta?.tool_id,
     relativePath: meta?.relative_path,
   });
@@ -63,12 +63,12 @@ export default function ConversationPage() {
   }, [docId, refreshMeta]);
 
   useEffect(() => {
-    if (syncVersion === 0 || metaRefreshTimerRef.current !== null) return;
+    if (syncVersions.metadata === 0 || metaRefreshTimerRef.current !== null) return;
     metaRefreshTimerRef.current = window.setTimeout(() => {
       metaRefreshTimerRef.current = null;
       void refreshMeta();
     }, 500);
-  }, [refreshMeta, syncVersion]);
+  }, [refreshMeta, syncVersions.metadata]);
 
   const pendingSubagentCount = meta?.id === docId
     ? (meta.subagents || []).filter((subagent) => subagent.document_ready === false).length
@@ -242,7 +242,9 @@ export default function ConversationPage() {
       <ConversationViewer
         documentId={docId}
         prompts={prompts}
-        syncVersion={syncVersion}
+        messageSyncVersion={syncVersions.messages}
+        pendingInteractionsSyncVersion={syncVersions.pendingInteractions}
+        searchSyncVersion={syncVersions.search}
         toolId={currentMeta?.tool_id}
         userRoleOrigin={currentMeta?.user_role_origin}
         totalMessages={currentMeta?.message_count}

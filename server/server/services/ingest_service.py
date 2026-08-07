@@ -2160,23 +2160,79 @@ def _reconcile_subagent_document_lifecycle(
     return changed
 
 
-def _publish_file_synced_event(document: Document, user_id: str | None) -> None:
-    try:
-        from .sse_service import publish_event
-
-        publish_event(
-            "file_synced",
-            {
-                "document_id": str(document.id),
-                "tool_id": document.tool_id,
-                "category": document.category,
-                "relative_path": document.relative_path,
-                "title": document.title,
-            },
-            user_id=user_id,
+def _interaction_event_signature(metadata: object) -> str:
+    values = metadata if isinstance(metadata, dict) else {}
+    scoped = {
+        key: values.get(key)
+        for key in (
+            CURRENT_PENDING_QUESTIONS_KEY,
+            INTERACTION_HISTORY_KEY,
+            LIVE_INTERACTION_SIGNALS_KEY,
+            LIVE_SHELL_ACTIVITIES_KEY,
+            PENDING_QUESTION_COUNT_KEY,
         )
-    except Exception:
-        pass
+        if key in values
+    }
+    return json.dumps(scoped, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _conversation_event_changes(
+    *,
+    mode: str,
+    search_text: str,
+    title_changed: bool,
+    interactions_changed: bool,
+) -> list[str]:
+    changes = {
+        "conversation.messages",
+        "conversation.metadata",
+        "dashboard",
+    }
+    if mode == "full" or "[user]" in search_text:
+        changes.add("conversation.prompts")
+    if mode == "full" or search_text or title_changed:
+        changes.add("conversation.search")
+    if interactions_changed:
+        changes.add("conversation.pending_interactions")
+    return sorted(changes)
+
+
+def _publish_file_synced_event(
+    db: AsyncSession,
+    document: Document,
+    user_id: str | None,
+    *,
+    changes: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> None:
+    from ..db.session import queue_realtime_event
+
+    event_changes = changes
+    if event_changes is None:
+        event_changes = (
+            {
+                "conversation.messages",
+                "conversation.metadata",
+                "conversation.pending_interactions",
+                "conversation.prompts",
+                "conversation.search",
+                "dashboard",
+            }
+            if document.category == "conversation"
+            else {"dashboard"}
+        )
+    queue_realtime_event(
+        db,
+        "file_synced",
+        {
+            "document_id": str(document.id),
+            "tool_id": document.tool_id,
+            "category": document.category,
+            "relative_path": document.relative_path,
+            "title": document.title,
+            "changes": sorted(set(event_changes)),
+        },
+        user_id=user_id,
+    )
 
 
 async def _reconcile_idempotent_claude_ingest(
@@ -2209,7 +2265,12 @@ async def _reconcile_idempotent_claude_ingest(
         daily=False,
         project=True,
     )
-    _publish_file_synced_event(lifecycle_document, user_id)
+    _publish_file_synced_event(
+        db,
+        lifecycle_document,
+        user_id,
+        changes={"conversation.metadata"},
+    )
 
 
 def _scoped_sync_state_select(
@@ -2500,6 +2561,9 @@ async def ingest_file(
         update_document_source_modified(doc, current_source_modified_at)
     is_new_document = doc is None
     previous_title = doc.title if doc is not None else None
+    previous_interaction_signature = _interaction_event_signature(
+        doc.metadata_ if doc is not None else {}
+    )
     previous_embedding_content_hash: str | None = None
     logical_file_size = _logical_document_file_size(
         mode=mode,
@@ -2985,6 +3049,7 @@ async def ingest_file(
     # Extract conversation messages into conversation_messages table
     # For DELTA mode, only parse new content; for FULL mode, re-parse all
     conversation_search_text = ""
+    new_conversation_search_text = ""
     refresh_content_tsv = category != "conversation"
     activity_advanced = False
     if category == "conversation" and (
@@ -3144,12 +3209,35 @@ async def ingest_file(
     # ingested transcript, publish that child too so parent companion refresh
     # logic sees a conversation-path event. A transcript that enriches itself
     # already has the ordinary event and must not receive a duplicate.
-    _publish_file_synced_event(doc, user_id)
+    if category == "conversation":
+        event_changes = _conversation_event_changes(
+            mode=mode,
+            search_text=new_conversation_search_text,
+            title_changed=doc.title != previous_title,
+            interactions_changed=(
+                bool(getattr(doc, "_memento_interactions_changed", False))
+                or _interaction_event_signature(doc.metadata_)
+                != previous_interaction_signature
+            ),
+        )
+    else:
+        event_changes = ["dashboard"]
+    _publish_file_synced_event(
+        db,
+        doc,
+        user_id,
+        changes=event_changes,
+    )
     if (
         enriched_claude_child is not None
         and enriched_claude_child.id != doc.id
     ):
-        _publish_file_synced_event(enriched_claude_child, user_id)
+        _publish_file_synced_event(
+            db,
+            enriched_claude_child,
+            user_id,
+            changes={"conversation.metadata"},
+        )
 
     # Generate embeddings + extract knowledge graph (async, non-blocking)
     # Must keep a reference to the task to prevent GC
@@ -3480,6 +3568,7 @@ async def _extract_messages(
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
     latest_human_timestamp = _latest_human_timestamp_for_ingest(doc, mode)
     canonical_interaction_ids: set[str] = set()
+    interactions_changed = mode == "full"
     terminal_tool_call_ids: set[str] = set()
     clear_live_interaction_signals = False
     line_num = start_line
@@ -3612,7 +3701,11 @@ async def _extract_messages(
             normalized,
             latest_human_timestamp,
         )
-        canonical_interaction_ids.update(_normalized_interaction_ids(normalized))
+        normalized_interaction_ids = _normalized_interaction_ids(normalized)
+        canonical_interaction_ids.update(normalized_interaction_ids)
+        interactions_changed = interactions_changed or bool(
+            normalized_interaction_ids
+        )
         terminal_tool_call_ids.update(
             _normalized_terminal_tool_call_ids(normalized)
         )
@@ -4050,6 +4143,7 @@ async def _extract_messages(
     # and DELTA updates are seeded from the previously committed projection.
     await refresh_task_projection(db, doc)
     await upsert_search_terms(db, search_terms)
+    setattr(doc, "_memento_interactions_changed", interactions_changed)
     return "".join(search_parts)
 
 

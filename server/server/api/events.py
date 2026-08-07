@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Cookie,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.responses import StreamingResponse
 
 from ..db.models import User
@@ -61,6 +70,8 @@ async def clear_event_session(response: Response) -> dict[str, bool]:
 async def event_stream(
     event_session: str | None = Cookie(None, alias=EVENT_STREAM_COOKIE),
     token: str | None = Query(None, deprecated=True),
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+    cursor: str | None = Query(None),
 ) -> StreamingResponse:
     """Stream live updates using a scoped cookie.
 
@@ -81,15 +92,19 @@ async def event_stream(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
+    resume_id = cursor if isinstance(cursor, str) else None
+    if resume_id is None and isinstance(last_event_id, str):
+        resume_id = last_event_id
+
     async def generate():
-        async for event in subscribe(user_id):
+        async for event in subscribe(user_id, resume_id):
             yield format_sse(event)
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

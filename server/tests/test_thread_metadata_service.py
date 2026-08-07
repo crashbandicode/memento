@@ -700,6 +700,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 "server.services.thread_metadata_service.cache_delete_prefix",
                 new=AsyncMock(),
             ),
+            patch("server.db.session.queue_realtime_event") as queue_event,
             patch("server.services.sse_service.publish_event") as publish_event,
         ):
             question = await apply_conversation_interaction_update(
@@ -738,12 +739,21 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             list(document.metadata_[LIVE_INTERACTION_SIGNALS_KEY]),
             ["toolu-drift"],
         )
-        publish_event.assert_called_once()
-        event_type, event_data = publish_event.call_args.args
+        publish_event.assert_not_called()
+        queue_event.assert_called_once()
+        _, event_type, event_data = queue_event.call_args.args
         self.assertEqual(event_type, "file_synced")
         self.assertEqual(event_data["document_id"], str(document.id))
         self.assertEqual(
-            publish_event.call_args.kwargs["user_id"],
+            event_data["changes"],
+            [
+                "conversation.metadata",
+                "conversation.pending_interactions",
+                "dashboard",
+            ],
+        )
+        self.assertEqual(
+            queue_event.call_args.kwargs["user_id"],
             str(user_id),
         )
 

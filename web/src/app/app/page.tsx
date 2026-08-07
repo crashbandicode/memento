@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
+import { eventInvalidatesDashboard } from "@/lib/realtime-events";
 import { useSSE } from "@/lib/use-sse";
 import { useNow } from "@/lib/use-now";
 import { timeAgo } from "@/lib/constants";
@@ -144,7 +145,10 @@ export default function Dashboard() {
     };
   }, [clearScheduledRefresh, fetchData, scheduleRefresh]);
   useSSE((event) => {
-    setLastEvent(`${event.data.tool_id}: ${event.data.title || event.data.relative_path}`);
+    if (!eventInvalidatesDashboard(event)) return;
+    if (event.type === "file_synced") {
+      setLastEvent(`${event.data.tool_id}: ${event.data.title || event.data.relative_path}`);
+    }
     scheduleRefresh();
   });
 

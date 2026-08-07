@@ -472,7 +472,8 @@ async def apply_conversation_interaction_update(
     if document is None:
         return ThreadTitleUpdateResult(0, 0, 0)
 
-    metadata = dict(document.metadata_ or {})
+    original_metadata = document_metadata(document)
+    metadata = dict(original_metadata)
     raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
     signals = (
         {
@@ -701,9 +702,7 @@ async def apply_conversation_interaction_update(
         metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
         metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
 
-    if previous_signal == signals.get(interaction_id) and metadata == dict(
-        document.metadata_ or {}
-    ):
+    if previous_signal == signals.get(interaction_id) and metadata == original_metadata:
         return ThreadTitleUpdateResult(1, 0, 0)
     delivery_state = await ensure_document_delivery_state(db, document)
     attach_document_delivery(document, delivery_state, runtime_only=True)
@@ -713,7 +712,16 @@ async def apply_conversation_interaction_update(
             db,
             project_conversations_cache_namespace(user_id, document.project_id),
         )
-    _publish_file_synced_event(document, str(user_id))
+    _publish_file_synced_event(
+        db,
+        document,
+        str(user_id),
+        changes={
+            "conversation.metadata",
+            "conversation.pending_interactions",
+            "dashboard",
+        },
+    )
     return ThreadTitleUpdateResult(1, 1, 0)
 
 
@@ -770,7 +778,7 @@ async def apply_conversation_activity_update(
     if document is None:
         return ThreadTitleUpdateResult(0, 0, 0)
 
-    original_metadata = dict(document.metadata_ or {})
+    original_metadata = document_metadata(document)
     metadata = dict(original_metadata)
     raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
     activities = (
@@ -843,5 +851,13 @@ async def apply_conversation_activity_update(
             db,
             project_conversations_cache_namespace(user_id, document.project_id),
         )
-    _publish_file_synced_event(document, str(user_id))
+    _publish_file_synced_event(
+        db,
+        document,
+        str(user_id),
+        changes={
+            "conversation.metadata",
+            "conversation.pending_interactions",
+        },
+    )
     return ThreadTitleUpdateResult(1, 1, 0)

@@ -35,6 +35,7 @@ class _Session:
         self.counterpart = counterpart
         self.statements = []
         self.flush_count = 0
+        self.info = {}
 
     async def execute(self, statement, parameters=None):
         self.statements.append((statement, parameters))
@@ -257,6 +258,7 @@ async def test_existing_child_enrichment_publishes_one_child_event() -> None:
             "server.services.ingest_service._invalidate_ingest_read_caches",
             new=AsyncMock(),
         ),
+        patch("server.db.session.queue_realtime_event") as queue_event,
         patch("server.services.sse_service.publish_event") as publish_event,
     ):
         await _reconcile_idempotent_claude_ingest(
@@ -267,12 +269,14 @@ async def test_existing_child_enrichment_publishes_one_child_event() -> None:
         )
 
     assert db.flush_count == 1
-    publish_event.assert_called_once()
-    event_type, event_data = publish_event.call_args.args
+    publish_event.assert_not_called()
+    queue_event.assert_called_once()
+    _, event_type, event_data = queue_event.call_args.args
     assert event_type == "file_synced"
     assert event_data["document_id"] == str(transcript.id)
     assert event_data["category"] == "conversation"
     assert event_data["relative_path"] == TRANSCRIPT_PATH
+    assert event_data["changes"] == ["conversation.metadata"]
 
 
 @pytest.mark.asyncio
@@ -289,7 +293,10 @@ async def test_matching_metadata_does_not_publish_duplicate_event() -> None:
     )
     db = _Session(transcript)
 
-    with patch("server.services.sse_service.publish_event") as publish_event:
+    with (
+        patch("server.db.session.queue_realtime_event") as queue_event,
+        patch("server.services.sse_service.publish_event") as publish_event,
+    ):
         await _reconcile_idempotent_claude_ingest(
             db,
             sidecar,
@@ -298,6 +305,7 @@ async def test_matching_metadata_does_not_publish_duplicate_event() -> None:
         )
 
     assert db.flush_count == 0
+    queue_event.assert_not_called()
     publish_event.assert_not_called()
 
 
@@ -328,6 +336,7 @@ async def test_child_terminal_reconciliation_publishes_parent_companion_event() 
             "server.services.ingest_service._invalidate_ingest_read_caches",
             new=AsyncMock(),
         ),
+        patch("server.db.session.queue_realtime_event") as queue_event,
         patch("server.services.sse_service.publish_event") as publish_event,
     ):
         await _reconcile_idempotent_claude_ingest(
@@ -339,7 +348,8 @@ async def test_child_terminal_reconciliation_publishes_parent_companion_event() 
 
     assert transcript.metadata_["subagent_lifecycle_status"] == "completed"
     assert db.flush_count == 1
-    publish_event.assert_called_once()
-    _, event_data = publish_event.call_args.args
+    publish_event.assert_not_called()
+    queue_event.assert_called_once()
+    _, _, event_data = queue_event.call_args.args
     assert event_data["document_id"] == str(transcript.id)
     assert event_data["relative_path"] == TRANSCRIPT_PATH

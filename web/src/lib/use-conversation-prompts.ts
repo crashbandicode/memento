@@ -8,45 +8,19 @@ import {
   invalidateConversationPrompts,
   invalidateConversationSearch,
 } from "./api-client";
+import {
+  ConversationInvalidation,
+  ConversationSyncScope,
+  conversationInvalidationForEvent,
+  NO_CONVERSATION_INVALIDATION,
+} from "./realtime-events";
 import { useSSE } from "./use-sse";
 
-interface ConversationSyncScope {
-  toolId?: string | null;
-  relativePath?: string | null;
-}
-
-function pathLinkedRootId(relativePath: string): string {
-  const normalized = relativePath.replaceAll("\\", "/");
-  const childMatch = normalized.match(/\/([^/]+)\/subagents\/[^/]+$/);
-  if (childMatch?.[1]) return childMatch[1];
-  const filename = normalized.split("/").at(-1) || "";
-  return filename.replace(/\.[^.]+$/, "");
-}
-
-function isCompanionConversationEvent(
-  event: {
-    data: {
-      tool_id?: string;
-      category?: string;
-      relative_path?: string;
-    };
-  },
-  scope: ConversationSyncScope,
-): boolean {
-  const eventPath = event.data.relative_path || "";
-  if (
-    event.data.category !== "conversation"
-    || !eventPath.replaceAll("\\", "/").includes("/subagents/")
-  ) return false;
-
-  // If metadata has not loaded yet, one extra refresh is safer than missing a
-  // newly created child. SSE is already user-scoped, and child creation is rare.
-  if (!scope.toolId || !scope.relativePath) return true;
-  if (
-    event.data.tool_id !== scope.toolId
-    || !["claude_code", "cursor"].includes(scope.toolId)
-  ) return false;
-  return pathLinkedRootId(eventPath) === pathLinkedRootId(scope.relativePath);
+interface ConversationSyncVersions {
+  messages: number;
+  metadata: number;
+  pendingInteractions: number;
+  search: number;
 }
 
 /**
@@ -62,57 +36,113 @@ export function useConversationPrompts(
     documentId: string;
     prompts: ConversationPrompt[];
   }>({ documentId, prompts: [] });
-  const [syncVersion, setSyncVersion] = useState(0);
+  const [syncVersions, setSyncVersions] = useState<ConversationSyncVersions>({
+    messages: 0,
+    metadata: 0,
+    pendingInteractions: 0,
+    search: 0,
+  });
   const refreshTimer = useRef<number | null>(null);
+  const projectionRef = useRef<{
+    documentId: string;
+    generation?: number;
+    projectedThroughLine?: number;
+  }>({ documentId });
+  const pendingInvalidation = useRef<ConversationInvalidation>({
+    ...NO_CONVERSATION_INVALIDATION,
+  });
   const prompts = promptState.documentId === documentId
     ? promptState.prompts
     : [];
 
   const refresh = useCallback(async () => {
     try {
-      const response = await api.getPrompts(documentId);
-      setPromptState({ documentId, prompts: response.prompts });
+      const cursor = projectionRef.current.documentId === documentId
+        ? projectionRef.current
+        : { documentId };
+      const response = await api.getPrompts(
+        documentId,
+        cursor.projectedThroughLine,
+        cursor.generation,
+      );
+      setPromptState((previous) => {
+        if (
+          response.reset
+          || previous.documentId !== documentId
+          || cursor.projectedThroughLine === undefined
+        ) {
+          return { documentId, prompts: response.prompts };
+        }
+        const byId = new Map(previous.prompts.map((prompt) => [prompt.id, prompt]));
+        response.prompts.forEach((prompt) => byId.set(prompt.id, prompt));
+        return {
+          documentId,
+          prompts: Array.from(byId.values()).sort(
+            (left, right) => left.line_number - right.line_number,
+          ),
+        };
+      });
+      projectionRef.current = {
+        documentId,
+        generation: response.generation,
+        projectedThroughLine: response.projected_through_line,
+      };
     } catch (error) {
       console.error("Failed to load prompt outline:", error);
     }
   }, [documentId]);
 
   useEffect(() => {
+    projectionRef.current = { documentId };
     const timer = window.setTimeout(() => void refresh(), 0);
     return () => window.clearTimeout(timer);
   }, [documentId, refresh]);
 
-  const scheduleCatchUp = useCallback((delay: number) => {
+  const scheduleCatchUp = useCallback((
+    invalidation: ConversationInvalidation,
+    delay: number,
+  ) => {
+    if (!Object.values(invalidation).some(Boolean)) return;
+    pendingInvalidation.current = {
+      messages: pendingInvalidation.current.messages || invalidation.messages,
+      metadata: pendingInvalidation.current.metadata || invalidation.metadata,
+      pendingInteractions: (
+        pendingInvalidation.current.pendingInteractions
+        || invalidation.pendingInteractions
+      ),
+      prompts: pendingInvalidation.current.prompts || invalidation.prompts,
+      search: pendingInvalidation.current.search || invalidation.search,
+    };
     if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = null;
-      invalidateConversationPrompts(documentId);
-      invalidateConversationMessages(documentId);
-      invalidateConversationSearch(documentId);
-      setSyncVersion((version) => version + 1);
-      void refresh();
+      const next = pendingInvalidation.current;
+      pendingInvalidation.current = { ...NO_CONVERSATION_INVALIDATION };
+      if (next.prompts) invalidateConversationPrompts(documentId);
+      if (next.messages) invalidateConversationMessages(documentId);
+      if (next.search) invalidateConversationSearch(documentId);
+      setSyncVersions((versions) => ({
+        messages: versions.messages + Number(next.messages),
+        metadata: versions.metadata + Number(next.metadata),
+        pendingInteractions: (
+          versions.pendingInteractions + Number(next.pendingInteractions)
+        ),
+        search: versions.search + Number(next.search),
+      }));
+      if (next.prompts) void refresh();
     }, delay);
   }, [documentId, refresh]);
 
-  useSSE(
-    (event) => {
-      if (
-        event.data.document_id !== documentId
-        && !isCompanionConversationEvent(event, scope)
-      ) return;
-      scheduleCatchUp(250);
-    },
-    {
-      // Mobile browsers may suspend EventSource without firing `error`.
-      // Always reconcile the prompt outline and message tail on resume even
-      // if no replayable SSE event survived the suspension window.
-      onResume: () => scheduleCatchUp(0),
-    },
-  );
+  useSSE((event) => {
+    scheduleCatchUp(
+      conversationInvalidationForEvent(event, documentId, scope),
+      event.type === "realtime_reset" ? 0 : 250,
+    );
+  });
 
   useEffect(() => () => {
     if (refreshTimer.current !== null) clearTimeout(refreshTimer.current);
   }, []);
 
-  return { prompts, syncVersion };
+  return { prompts, syncVersions };
 }

@@ -3,17 +3,49 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ..config import settings
 
+_PENDING_REALTIME_EVENTS = "memento_pending_realtime_events"
+
+
+def queue_realtime_event(
+    session: AsyncSession,
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    user_id: str | None,
+) -> None:
+    """Queue an event that may become visible only after this transaction commits."""
+    pending = session.info.setdefault(_PENDING_REALTIME_EVENTS, [])
+    pending.append((event_type, dict(data), user_id))
+
+
+async def _publish_committed_realtime_events(
+    pending: list[tuple[str, dict[str, Any], str | None]],
+) -> None:
+    if not pending:
+        return
+    from ..services.sse_service import publish_event
+
+    for event_type, data, user_id in pending:
+        try:
+            await publish_event(event_type, data, user_id=user_id)
+        except Exception:
+            # The database commit remains authoritative. Redis/local realtime
+            # delivery is an acceleration path and must degrade independently.
+            continue
+
 
 class TransactionalAsyncSession(AsyncSession):
-    """Async session with rollback-safe, post-commit side-effect delivery."""
+    """Publish cache generations and realtime events only after commit."""
 
     async def commit(self) -> None:
         await super().commit()
+        pending = list(self.info.pop(_PENDING_REALTIME_EVENTS, []))
         try:
             from ..services.cache import publish_staged_cache_invalidations
 
@@ -22,13 +54,25 @@ class TransactionalAsyncSession(AsyncSession):
             # A committed transaction must not look failed because an optional
             # cache backend is unavailable.
             pass
+        await _publish_committed_realtime_events(pending)
 
     async def rollback(self) -> None:
-        await super().rollback()
+        self.info.pop(_PENDING_REALTIME_EVENTS, None)
         from ..services.cache import discard_staged_cache_invalidations
 
         discard_staged_cache_invalidations(self)
+        await super().rollback()
 
+    async def close(self) -> None:
+        self.info.pop(_PENDING_REALTIME_EVENTS, None)
+        from ..services.cache import discard_staged_cache_invalidations
+
+        discard_staged_cache_invalidations(self)
+        await super().close()
+
+
+# Compatibility for callers and tests introduced with resumable realtime.
+RealtimeAsyncSession = TransactionalAsyncSession
 
 engine = create_async_engine(
     settings.database_url,

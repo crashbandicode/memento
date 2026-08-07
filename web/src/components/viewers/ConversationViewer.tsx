@@ -435,7 +435,9 @@ function promptLineAtOrBefore(promptLines: number[], lineNumber: number): number
 export default function ConversationViewer({
   documentId,
   prompts,
-  syncVersion,
+  messageSyncVersion,
+  pendingInteractionsSyncVersion,
+  searchSyncVersion,
   toolId,
   userRoleOrigin,
   totalMessages,
@@ -444,7 +446,9 @@ export default function ConversationViewer({
 }: {
   documentId: string;
   prompts: ConversationPrompt[];
-  syncVersion: number;
+  messageSyncVersion: number;
+  pendingInteractionsSyncVersion: number;
+  searchSyncVersion: number;
   toolId?: string;
   userRoleOrigin?: "parent_agent" | null;
   totalMessages?: number;
@@ -474,6 +478,8 @@ export default function ConversationViewer({
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
+  const startLineRef = useRef<number | null>(null);
+  const endLineRef = useRef<number | null>(null);
   const rangeLoadedRef = useRef(false);
   const loadingRef = useRef(false);
   const syncingTailRef = useRef(false);
@@ -676,13 +682,19 @@ export default function ConversationViewer({
     loadingRef.current = true;
     setLoading(true);
     try {
-      const res = await api.getMessages(documentId, offsetRef.current, MESSAGE_PAGE_SIZE);
+      const res = await api.getMessagesAfter(
+        documentId,
+        rangeLoadedRef.current ? endLineRef.current : null,
+        MESSAGE_PAGE_SIZE,
+      );
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
         if (!rangeLoadedRef.current) {
           startOffsetRef.current = res.offset;
+          startLineRef.current = res.messages[0].line_number;
           rangeLoadedRef.current = true;
         }
+        endLineRef.current = res.messages.at(-1)?.line_number ?? endLineRef.current;
         let nextMessages = res.messages;
         let nextOffset = Math.max(
           offsetRef.current,
@@ -697,8 +709,8 @@ export default function ConversationViewer({
         setMessages((prev) => mergeMessagesChronologically(prev, nextMessages));
         offsetRef.current = nextOffset;
       }
-      setHasMore(offsetRef.current < res.total);
-      setHasEarlier(startOffsetRef.current > 0);
+      setHasMore(res.has_more ?? offsetRef.current < res.total);
+      setHasEarlier(res.has_earlier ?? startOffsetRef.current > 0);
     } catch (e) {
       console.error("Failed to load messages:", e);
     } finally {
@@ -709,22 +721,25 @@ export default function ConversationViewer({
 
   const loadEarlier = async () => {
     if (loadingRef.current || !hasEarlier) return;
-    const previousStart = startOffsetRef.current;
-    const nextOffset = Math.max(0, previousStart - MESSAGE_PAGE_SIZE);
-    const nextLimit = previousStart - nextOffset;
-    if (nextLimit <= 0) return;
+    const beforeLine = startLineRef.current;
+    if (beforeLine === null) return;
 
     loadingRef.current = true;
     setLoading(true);
     try {
-      const res = await api.getMessages(documentId, nextOffset, nextLimit);
+      const res = await api.getMessagesBefore(
+        documentId,
+        beforeLine,
+        MESSAGE_PAGE_SIZE,
+      );
       setKnownTotal(res.total);
       if (res.messages.length > 0) {
         preserveScrollForNextRender();
         startOffsetRef.current = res.offset;
+        startLineRef.current = res.messages[0].line_number;
         setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
       }
-      setHasEarlier(startOffsetRef.current > 0);
+      setHasEarlier(res.has_earlier ?? startOffsetRef.current > 0);
       setHasMore(offsetRef.current < res.total);
     } catch (error) {
       console.error("Failed to load earlier messages:", error);
@@ -745,11 +760,17 @@ export default function ConversationViewer({
         const tailEnd = res.offset + res.messages.length;
         if (!rangeLoadedRef.current) {
           startOffsetRef.current = res.offset;
+          startLineRef.current = res.messages[0].line_number;
+          endLineRef.current = res.messages.at(-1)?.line_number ?? null;
           offsetRef.current = tailEnd;
           rangeLoadedRef.current = true;
           setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
           updateDetachedTail(null);
         } else if (res.offset <= offsetRef.current) {
+          endLineRef.current = Math.max(
+            endLineRef.current ?? 0,
+            res.messages.at(-1)?.line_number ?? 0,
+          );
           offsetRef.current = Math.max(offsetRef.current, tailEnd);
           setMessages((prev) => mergeMessagesChronologically(prev, res.messages));
           updateDetachedTail(null);
@@ -761,7 +782,7 @@ export default function ConversationViewer({
           });
         }
       }
-      setHasEarlier(startOffsetRef.current > 0);
+      setHasEarlier(res.has_earlier ?? startOffsetRef.current > 0);
       setHasMore(offsetRef.current < res.total);
     } catch (error) {
       console.error("Failed to load latest messages:", error);
@@ -774,6 +795,8 @@ export default function ConversationViewer({
     setMessages([]);
     startOffsetRef.current = 0;
     offsetRef.current = 0;
+    startLineRef.current = null;
+    endLineRef.current = null;
     rangeLoadedRef.current = false;
     loadingRef.current = false;
     syncingTailRef.current = false;
@@ -795,9 +818,9 @@ export default function ConversationViewer({
   // a prompt-centered window loaded. Fetch the actual server tail rather than
   // the next historical page so new questions and responses appear live.
   useEffect(() => {
-    if (syncVersion === 0) return;
+    if (messageSyncVersion === 0) return;
     void loadLatestTail();
-  }, [syncVersion, loadLatestTail]);
+  }, [messageSyncVersion, loadLatestTail]);
 
   useEffect(() => {
     if (typeof totalMessages === "number") setKnownTotal(totalMessages);
@@ -829,7 +852,7 @@ export default function ConversationViewer({
     return () => {
       current = false;
     };
-  }, [documentId, syncVersion]);
+  }, [documentId, pendingInteractionsSyncVersion]);
 
   useEffect(() => {
     promptLinesRef.current = prompts.map((prompt) => prompt.line_number);
@@ -1528,7 +1551,7 @@ export default function ConversationViewer({
     <div style={{ position: "relative" }}>
       <ConversationSearchBar
         documentId={documentId}
-        syncVersion={syncVersion}
+        searchSyncVersion={searchSyncVersion}
         userRoleOrigin={userRoleOrigin}
         urlState={urlState}
         onCommitQuery={commitConversationSearch}
@@ -1919,7 +1942,7 @@ function ConversationVisibilityControls({
 
 function ConversationSearchBar({
   documentId,
-  syncVersion,
+  searchSyncVersion,
   userRoleOrigin,
   urlState,
   onCommitQuery,
@@ -1927,7 +1950,7 @@ function ConversationSearchBar({
   t,
 }: {
   documentId: string;
-  syncVersion: number;
+  searchSyncVersion: number;
   userRoleOrigin?: "parent_agent" | null;
   urlState: ConversationUrlState;
   onCommitQuery: (query: string) => void;
@@ -2031,7 +2054,7 @@ function ConversationSearchBar({
     return () => controller.abort();
   }, [
     documentId,
-    syncVersion,
+    searchSyncVersion,
     urlState.hit,
     urlState.match,
     urlState.query,
