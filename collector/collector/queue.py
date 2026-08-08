@@ -36,6 +36,29 @@ RETRY_JITTER_MIN = 0.75
 RETRY_JITTER_MAX = 1.25
 DEFAULT_TERMINAL_SPOOL_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TERMINAL_SPOOL_MAX_BYTES = 128 * 1024 * 1024
+LEGACY_FULL_RECONCILIATION_GATE = "legacy_full_reconciliation_active"
+
+
+_LEGACY_FULL_CANDIDATE_PREDICATE = """
+    q.legacy_reconciled_at IS NULL
+    AND q.sync_strategy='full'
+    AND q.is_partial=0
+    AND q.source_path IS NOT NULL
+    AND q.source_path<>''
+    AND q.offset > 0
+    AND length(q.content_hash)=64
+    AND q.content_hash NOT GLOB '*[^0-9a-fA-F]*'
+    AND s.identity_version IS NULL
+    AND s.synced_at IS NOT NULL
+    AND s.synced_hash IS NOT NULL
+    AND length(s.synced_hash)=64
+    AND s.synced_hash NOT GLOB '*[^0-9a-fA-F]*'
+    AND s.synced_hash<>q.content_hash
+    AND s.synced_offset=q.offset
+    AND s.observed_hash=q.content_hash
+    AND s.source_size=q.offset
+    AND s.source_mtime_ns IS NOT NULL
+"""
 
 
 def _retry_delay_seconds(retry_count: int) -> float:
@@ -104,6 +127,20 @@ class PreparedPayload:
     payload_path: str | None
     payload_bytes: int
     has_non_whitespace: bool
+
+
+@dataclass(frozen=True)
+class LegacyFullCandidate:
+    """One narrowly identified pre-upgrade canonical FULL queue row."""
+
+    id: int
+    tool_name: str
+    relative_path: str
+    source_path: str
+    canonical_hash: str
+    legacy_hash: str
+    source_size: int
+    source_mtime_ns: int
 
 
 class PayloadWriter:
@@ -232,7 +269,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def __init__(
         self,
@@ -333,7 +370,10 @@ class SyncQueue:
                 http_status INTEGER,
                 terminal_at REAL,
                 blocked_config_fingerprint TEXT,
-                payload_discarded_at REAL
+                payload_discarded_at REAL,
+                legacy_reconcile_after REAL NOT NULL DEFAULT 0,
+                legacy_reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+                legacy_reconciled_at REAL
             );
             CREATE TABLE IF NOT EXISTS file_state (
                 tool_name TEXT NOT NULL,
@@ -389,6 +429,9 @@ class SyncQueue:
             "terminal_at": "REAL",
             "blocked_config_fingerprint": "TEXT",
             "payload_discarded_at": "REAL",
+            "legacy_reconcile_after": "REAL NOT NULL DEFAULT 0",
+            "legacy_reconcile_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "legacy_reconciled_at": "REAL",
         }
         for name, definition in queue_additions.items():
             if name not in queue_columns:
@@ -949,7 +992,6 @@ class SyncQueue:
             return None
         return candidate
 
-    @_rollback_on_error
     def adopt_legacy_full_source(
         self,
         tool_name: str,
@@ -961,6 +1003,33 @@ class SyncQueue:
         source_mtime_ns: int,
         identity_version: str,
     ) -> bool:
+        """Compatibility wrapper returning whether exact adoption succeeded."""
+
+        return (
+            self.adopt_legacy_full_source_result(
+                tool_name,
+                relative_path,
+                legacy_hash=legacy_hash,
+                canonical_hash=canonical_hash,
+                source_size=source_size,
+                source_mtime_ns=source_mtime_ns,
+                identity_version=identity_version,
+            )
+            == "adopted"
+        )
+
+    @_rollback_on_error
+    def adopt_legacy_full_source_result(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        legacy_hash: str,
+        canonical_hash: str,
+        source_size: int,
+        source_mtime_ns: int,
+        identity_version: str,
+    ) -> str:
         """Adopt one unchanged acknowledged legacy FULL revision.
 
         The caller must reproduce the historical source hash from the current
@@ -988,7 +1057,9 @@ class SyncQueue:
                 or state[0] not in {legacy_hash, canonical_hash}
             ):
                 self._conn.rollback()
-                return False
+                if state is not None and state[1] == legacy_hash:
+                    return "canonical_mismatch"
+                return "state_changed"
 
             active = self._conn.execute(
                 """SELECT id, status, content_hash, sync_strategy, is_partial,
@@ -1002,14 +1073,14 @@ class SyncQueue:
                 (tool_name, relative_path),
             ).fetchall()
             if any(
-                row[1] == "uploading"
-                or row[3] != "full"
-                or bool(row[4])
-                or row[2] not in {legacy_hash, canonical_hash}
+                row[1] == "uploading" or row[3] != "full" or bool(row[4])
                 for row in active
             ):
                 self._conn.rollback()
-                return False
+                return "blocked"
+            if any(row[2] not in {legacy_hash, canonical_hash} for row in active):
+                self._conn.rollback()
+                return "canonical_mismatch"
 
             payload_paths.extend(str(row[5]) for row in active if row[5])
             if active:
@@ -1027,7 +1098,7 @@ class SyncQueue:
                 )
 
             now = time.time()
-            self._conn.execute(
+            state_cursor = self._conn.execute(
                 """UPDATE file_state
                    SET last_hash=?, last_offset=?, observed_hash=?,
                        observed_offset=?, observed_at=?, synced_hash=?,
@@ -1051,13 +1122,229 @@ class SyncQueue:
                     legacy_hash,
                 ),
             )
+            if state_cursor.rowcount != 1:
+                self._conn.rollback()
+                return "state_changed"
             self._conn.commit()
 
         for payload_path in payload_paths:
             self._discard_payload(payload_path)
         if changed_queue:
             self._signal_change()
-        return True
+        return "adopted"
+
+    def _legacy_full_candidate_count_locked(self) -> int:
+        return int(
+            self._conn.execute(
+                f"""SELECT COUNT(*)
+                    FROM queue AS q
+                    JOIN file_state AS s
+                      ON s.tool_name=q.tool_name
+                     AND s.relative_path=q.relative_path
+                    WHERE q.status IN (
+                        'pending','auth_blocked',
+                        'repair_required','quarantined'
+                    )
+                      AND {_LEGACY_FULL_CANDIDATE_PREDICATE}"""
+            ).fetchone()[0]
+        )
+
+    def _finish_legacy_full_reconciliation_locked(self) -> int:
+        remaining = self._legacy_full_candidate_count_locked()
+        if remaining == 0:
+            self._conn.execute(
+                "DELETE FROM queue_meta WHERE key=?",
+                (LEGACY_FULL_RECONCILIATION_GATE,),
+            )
+        return remaining
+
+    @_rollback_on_error
+    def begin_legacy_full_reconciliation(self) -> int:
+        """Durably gate only exact legacy-transition candidates from claims."""
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            remaining = self._legacy_full_candidate_count_locked()
+            if remaining:
+                self._set_meta_value_locked(LEGACY_FULL_RECONCILIATION_GATE, "1")
+            else:
+                self._conn.execute(
+                    "DELETE FROM queue_meta WHERE key=?",
+                    (LEGACY_FULL_RECONCILIATION_GATE,),
+                )
+            self._conn.commit()
+        if remaining:
+            self._signal_change()
+        return remaining
+
+    def legacy_full_reconciliation_candidates(
+        self,
+        *,
+        limit: int,
+        now: float | None = None,
+    ) -> list[LegacyFullCandidate]:
+        """Return a bounded fair batch, excluding paths with a live lease."""
+
+        if limit <= 0:
+            return []
+        due = time.time() if now is None else float(now)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT q.id, q.tool_name, q.relative_path, q.source_path,
+                           q.content_hash, s.synced_hash, s.source_size,
+                           s.source_mtime_ns
+                    FROM queue AS q
+                    JOIN file_state AS s
+                      ON s.tool_name=q.tool_name
+                     AND s.relative_path=q.relative_path
+                    WHERE q.status IN (
+                        'pending','auth_blocked',
+                        'repair_required','quarantined'
+                    )
+                      AND {_LEGACY_FULL_CANDIDATE_PREDICATE}
+                      AND COALESCE(q.legacy_reconcile_after, 0) <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM queue AS leased
+                          WHERE leased.tool_name=q.tool_name
+                            AND leased.relative_path=q.relative_path
+                            AND leased.status='uploading'
+                      )
+                    ORDER BY COALESCE(q.legacy_reconcile_after, 0), q.id
+                    LIMIT ?""",
+                (due, max(1, int(limit))),
+            ).fetchall()
+        return [
+            LegacyFullCandidate(
+                id=int(row[0]),
+                tool_name=str(row[1]),
+                relative_path=str(row[2]),
+                source_path=str(row[3]),
+                canonical_hash=str(row[4]),
+                legacy_hash=str(row[5]),
+                source_size=max(0, int(row[6] or 0)),
+                source_mtime_ns=max(0, int(row[7] or 0)),
+            )
+            for row in rows
+        ]
+
+    def is_legacy_full_reconciliation_candidate(self, item_id: int) -> bool:
+        """Return whether the exact queue row still needs a disposition."""
+
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT 1
+                    FROM queue AS q
+                    JOIN file_state AS s
+                      ON s.tool_name=q.tool_name
+                     AND s.relative_path=q.relative_path
+                    WHERE q.id=?
+                      AND q.status IN (
+                          'pending','auth_blocked',
+                          'repair_required','quarantined'
+                      )
+                      AND {_LEGACY_FULL_CANDIDATE_PREDICATE}
+                    LIMIT 1""",
+                (int(item_id),),
+            ).fetchone()
+        return row is not None
+
+    @_rollback_on_error
+    def release_legacy_full_reconciliation_candidate(self, item_id: int) -> bool:
+        """Release an unproven row without changing its payload or status."""
+
+        changed = False
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"""SELECT 1
+                    FROM queue AS q
+                    JOIN file_state AS s
+                      ON s.tool_name=q.tool_name
+                     AND s.relative_path=q.relative_path
+                    WHERE q.id=?
+                      AND q.status IN (
+                          'pending','auth_blocked',
+                          'repair_required','quarantined'
+                      )
+                      AND {_LEGACY_FULL_CANDIDATE_PREDICATE}
+                    LIMIT 1""",
+                (int(item_id),),
+            ).fetchone()
+            if row is not None:
+                cursor = self._conn.execute(
+                    """UPDATE queue
+                       SET legacy_reconciled_at=?, legacy_reconcile_after=0
+                       WHERE id=?
+                         AND status IN (
+                            'pending','auth_blocked',
+                            'repair_required','quarantined'
+                         )""",
+                    (time.time(), int(item_id)),
+                )
+                changed = cursor.rowcount == 1
+            self._finish_legacy_full_reconciliation_locked()
+            self._conn.commit()
+        if changed:
+            self._signal_change()
+        return changed
+
+    @_rollback_on_error
+    def defer_legacy_full_reconciliation_candidate(
+        self,
+        item_id: int,
+        *,
+        delay_seconds: float = 60.0,
+    ) -> bool:
+        """Back off an interrupted proof so another candidate gets a turn."""
+
+        changed = False
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                f"""SELECT 1
+                    FROM queue AS q
+                    JOIN file_state AS s
+                      ON s.tool_name=q.tool_name
+                     AND s.relative_path=q.relative_path
+                    WHERE q.id=?
+                      AND q.status IN (
+                          'pending','auth_blocked',
+                          'repair_required','quarantined'
+                      )
+                      AND {_LEGACY_FULL_CANDIDATE_PREDICATE}
+                    LIMIT 1""",
+                (int(item_id),),
+            ).fetchone()
+            if row is not None:
+                cursor = self._conn.execute(
+                    """UPDATE queue
+                       SET legacy_reconcile_attempts=legacy_reconcile_attempts+1,
+                           legacy_reconcile_after=?
+                       WHERE id=?
+                         AND status IN (
+                            'pending','auth_blocked',
+                            'repair_required','quarantined'
+                         )""",
+                    (
+                        time.time() + max(1.0, float(delay_seconds)),
+                        int(item_id),
+                    ),
+                )
+                changed = cursor.rowcount == 1
+            self._conn.commit()
+        return changed
+
+    @_rollback_on_error
+    def finish_legacy_full_reconciliation_pass(self) -> int:
+        """Clear the durable claim gate after the last candidate is disposed."""
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            remaining = self._finish_legacy_full_reconciliation_locked()
+            self._conn.commit()
+        if remaining == 0:
+            self._signal_change()
+        return remaining
 
     def _record_source_revision_locked(
         self,
@@ -1519,6 +1806,34 @@ class SyncQueue:
                           q.base_hash, q.base_offset, q.source_path
                    FROM queue AS q
                    WHERE q.status='pending' AND COALESCE(q.available_at, 0) <= ?
+                     AND NOT EXISTS (
+                        SELECT 1
+                        FROM queue_meta AS migration_gate
+                        JOIN file_state AS legacy_state
+                          ON legacy_state.tool_name=q.tool_name
+                         AND legacy_state.relative_path=q.relative_path
+                        WHERE migration_gate.key='legacy_full_reconciliation_active'
+                          AND migration_gate.value='1'
+                          AND q.legacy_reconciled_at IS NULL
+                          AND q.sync_strategy='full'
+                          AND q.is_partial=0
+                          AND q.source_path IS NOT NULL
+                          AND q.source_path<>''
+                          AND q.offset > 0
+                          AND length(q.content_hash)=64
+                          AND q.content_hash NOT GLOB '*[^0-9a-fA-F]*'
+                          AND legacy_state.identity_version IS NULL
+                          AND legacy_state.synced_at IS NOT NULL
+                          AND legacy_state.synced_hash IS NOT NULL
+                          AND length(legacy_state.synced_hash)=64
+                          AND legacy_state.synced_hash
+                              NOT GLOB '*[^0-9a-fA-F]*'
+                          AND legacy_state.synced_hash<>q.content_hash
+                          AND legacy_state.synced_offset=q.offset
+                          AND legacy_state.observed_hash=q.content_hash
+                          AND legacy_state.source_size=q.offset
+                          AND legacy_state.source_mtime_ns IS NOT NULL
+                     )
                      AND NOT EXISTS (
                         SELECT 1 FROM queue AS active
                         WHERE active.tool_name=q.tool_name

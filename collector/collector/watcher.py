@@ -54,6 +54,11 @@ _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
 # Bump this whenever sanitization/parsing can change server-visible FULL
 # content. A matching stat token may skip work only within the same epoch.
 FULL_IDENTITY_VERSION = "sanitized-payload-v1"
+LEGACY_RECONCILE_MAX_FILES = 16
+LEGACY_RECONCILE_MAX_SOURCE_BYTES = 1024 * 1024 * 1024
+LEGACY_RECONCILE_MAX_SINGLE_SOURCE_BYTES = 256 * 1024 * 1024
+LEGACY_RECONCILE_MAX_SECONDS = 30.0
+LEGACY_RECONCILE_RETRY_SECONDS = 60.0
 
 
 def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
@@ -254,6 +259,7 @@ class FileWatcher:
         self._stop_event = threading.Event()
         self._scan_cancel_event = threading.Event()
         self._scan_lock = threading.Lock()
+        self._legacy_reconcile_lock = threading.Lock()
         self._processing_lock = threading.Lock()
         self._resync_lock = threading.Lock()
         self._resyncing_paths: set[str] = set()
@@ -892,23 +898,57 @@ class FileWatcher:
             and legacy_source_hash == legacy_adoption_hash
             and classification.sync_strategy == SyncStrategy.FULL
         ):
-            adopt_legacy = getattr(
+            adopt_legacy_result = getattr(
                 self._queue,
-                "adopt_legacy_full_source",
+                "adopt_legacy_full_source_result",
                 None,
             )
-            if callable(adopt_legacy) and adopt_legacy(
-                classification.tool_name,
-                classification.relative_path,
-                legacy_hash=legacy_adoption_hash,
-                canonical_hash=current_hash,
-                source_size=new_offset,
-                source_mtime_ns=source_stat.st_mtime_ns,
-                identity_version=FULL_IDENTITY_VERSION,
-            ):
+            if callable(adopt_legacy_result):
+                adoption_result = adopt_legacy_result(
+                    classification.tool_name,
+                    classification.relative_path,
+                    legacy_hash=legacy_adoption_hash,
+                    canonical_hash=current_hash,
+                    source_size=new_offset,
+                    source_mtime_ns=source_stat.st_mtime_ns,
+                    identity_version=FULL_IDENTITY_VERSION,
+                )
+            else:
+                adopt_legacy = getattr(
+                    self._queue,
+                    "adopt_legacy_full_source",
+                    None,
+                )
+                adoption_result = (
+                    "adopted"
+                    if callable(adopt_legacy)
+                    and adopt_legacy(
+                        classification.tool_name,
+                        classification.relative_path,
+                        legacy_hash=legacy_adoption_hash,
+                        canonical_hash=current_hash,
+                        source_size=new_offset,
+                        source_mtime_ns=source_stat.st_mtime_ns,
+                        identity_version=FULL_IDENTITY_VERSION,
+                    )
+                    else "state_changed"
+                )
+            if adoption_result == "adopted":
                 if prepared_payload is not None:
                     self._queue.discard_prepared_payload(prepared_payload)
                 logger.info("Adopted unchanged legacy FULL state for %s", path)
+                return
+            # A second collector may have leased a same-path row while this
+            # source was being parsed. Keep the legacy state eligible for a
+            # later proof rather than stamping it canonical and allowing the
+            # duplicate transition row to escape reconciliation.
+            if callable(get_legacy_adoption) and get_legacy_adoption(
+                classification.tool_name,
+                classification.relative_path,
+                identity_version=FULL_IDENTITY_VERSION,
+            ) and adoption_result != "canonical_mismatch":
+                if prepared_payload is not None:
+                    self._queue.discard_prepared_payload(prepared_payload)
                 return
 
         if (
@@ -977,6 +1017,176 @@ class FileWatcher:
             classification.content_type.value,
             " delta" if is_partial else "",
         )
+
+    def reconcile_legacy_full_queue(
+        self,
+        *,
+        max_files: int = LEGACY_RECONCILE_MAX_FILES,
+        max_source_bytes: int = LEGACY_RECONCILE_MAX_SOURCE_BYTES,
+        max_single_source_bytes: int = LEGACY_RECONCILE_MAX_SINGLE_SOURCE_BYTES,
+        max_seconds: float = LEGACY_RECONCILE_MAX_SECONDS,
+    ) -> dict[str, int]:
+        """Reconcile a bounded batch before legacy-transition rows can upload.
+
+        Candidate selection is deliberately narrow and durable in ``SyncQueue``.
+        Exact legacy and canonical proofs still happen through the normal FULL
+        processing path, including its final stat race check and atomic adoption.
+        Negative or oversized cases are released unchanged; interrupted proof is
+        durably backed off so it cannot create a startup or maintenance busy loop.
+        """
+
+        reconcile_lock = getattr(self, "_legacy_reconcile_lock", None)
+        if reconcile_lock is None:
+            reconcile_lock = threading.Lock()
+            self._legacy_reconcile_lock = reconcile_lock
+        if not reconcile_lock.acquire(blocking=False):
+            return {
+                "examined": 0,
+                "resolved": 0,
+                "released": 0,
+                "deferred": 0,
+                "remaining": 0,
+            }
+
+        result = {
+            "examined": 0,
+            "resolved": 0,
+            "released": 0,
+            "deferred": 0,
+            "remaining": 0,
+        }
+        try:
+            remaining = self._queue.begin_legacy_full_reconciliation()
+            if remaining == 0:
+                return result
+
+            candidates = self._queue.legacy_full_reconciliation_candidates(
+                limit=max(0, int(max_files)),
+            )
+            deadline = time.monotonic() + max(0.0, float(max_seconds))
+            total_source_bytes = 0
+            for candidate in candidates:
+                if result["examined"] and time.monotonic() >= deadline:
+                    break
+
+                path = Path(candidate.source_path)
+                try:
+                    source_stat = path.stat()
+                except FileNotFoundError:
+                    if self._queue.release_legacy_full_reconciliation_candidate(
+                        candidate.id
+                    ):
+                        result["released"] += 1
+                    result["examined"] += 1
+                    continue
+                except OSError:
+                    if self._queue.defer_legacy_full_reconciliation_candidate(
+                        candidate.id,
+                        delay_seconds=LEGACY_RECONCILE_RETRY_SECONDS,
+                    ):
+                        result["deferred"] += 1
+                    result["examined"] += 1
+                    continue
+
+                source_bytes = max(
+                    candidate.source_size,
+                    max(0, int(source_stat.st_size)),
+                )
+                if source_bytes > max(0, int(max_single_source_bytes)):
+                    if self._queue.release_legacy_full_reconciliation_candidate(
+                        candidate.id
+                    ):
+                        result["released"] += 1
+                    result["examined"] += 1
+                    continue
+                if (
+                    result["examined"]
+                    and total_source_bytes + source_bytes
+                    > max(0, int(max_source_bytes))
+                ):
+                    break
+                total_source_bytes += source_bytes
+
+                try:
+                    tool = self._find_tool(path)
+                    classification = tool.classify_file(path) if tool else None
+                except Exception:
+                    if self._queue.defer_legacy_full_reconciliation_candidate(
+                        candidate.id,
+                        delay_seconds=LEGACY_RECONCILE_RETRY_SECONDS,
+                    ):
+                        result["deferred"] += 1
+                    result["examined"] += 1
+                    continue
+
+                if (
+                    classification is None
+                    or classification.tool_name != candidate.tool_name
+                    or classification.relative_path != candidate.relative_path
+                    or classification.sync_strategy != SyncStrategy.FULL
+                    or classification.metadata.get("__antigravity_pb__")
+                ):
+                    if self._queue.release_legacy_full_reconciliation_candidate(
+                        candidate.id
+                    ):
+                        result["released"] += 1
+                    result["examined"] += 1
+                    continue
+
+                source_revision_matches = (
+                    int(source_stat.st_size) == candidate.source_size
+                    and int(source_stat.st_mtime_ns) == candidate.source_mtime_ns
+                )
+                legacy_hash_matches = (
+                    source_revision_matches
+                    and _legacy_full_hash_revision(
+                        path,
+                        size=source_stat.st_size,
+                        mtime_ns=source_stat.st_mtime_ns,
+                    )
+                    == candidate.legacy_hash
+                )
+
+                try:
+                    self._on_file_changed(path, emit_live_signals=False)
+                except Exception:
+                    logger.debug(
+                        "Legacy FULL startup reconciliation failed for %s",
+                        path,
+                        exc_info=True,
+                    )
+
+                if self._queue.is_legacy_full_reconciliation_candidate(
+                    candidate.id
+                ):
+                    if legacy_hash_matches:
+                        changed = (
+                            self._queue.defer_legacy_full_reconciliation_candidate(
+                                candidate.id,
+                                delay_seconds=LEGACY_RECONCILE_RETRY_SECONDS,
+                            )
+                        )
+                        if changed:
+                            result["deferred"] += 1
+                    else:
+                        changed = (
+                            self._queue.release_legacy_full_reconciliation_candidate(
+                                candidate.id
+                            )
+                        )
+                        if changed:
+                            result["released"] += 1
+                else:
+                    result["resolved"] += 1
+                result["examined"] += 1
+        finally:
+            try:
+                result["remaining"] = (
+                    self._queue.finish_legacy_full_reconciliation_pass()
+                )
+            finally:
+                reconcile_lock.release()
+        return result
 
     def initial_scan(self) -> int:
         """Scan newest files first while keeping the durable spool bounded."""

@@ -38,6 +38,7 @@ HEARTBEAT_INTERVAL = 30       # Log heartbeat every 30s
 COMMAND_POLL_INTERVAL = 10    # Check server commands every 10s
 AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
 QUEUE_MAINTENANCE_INTERVAL = 3600
+LEGACY_RECONCILIATION_INTERVAL = 60
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
 SOURCE_CHANGE_CHECK_INTERVAL = 1  # Cheap stat tokens; expensive work is change-driven
@@ -169,6 +170,36 @@ def _run_initial_scan(watcher: FileWatcher, logger: logging.Logger) -> None:
         logger.info("Initial scan complete: %d files queued", count)
     except Exception:
         logger.exception("Initial scan failed")
+
+
+def _run_legacy_full_reconciliation(
+    watcher: FileWatcher,
+    logger: logging.Logger,
+) -> dict[str, int]:
+    """Run and report one bounded legacy-transition reconciliation pass."""
+
+    try:
+        result = watcher.reconcile_legacy_full_queue()
+        if result["examined"] or result["remaining"]:
+            logger.info(
+                "Legacy FULL reconciliation: examined=%d resolved=%d "
+                "preserved=%d deferred=%d remaining=%d",
+                result["examined"],
+                result["resolved"],
+                result["released"],
+                result["deferred"],
+                result["remaining"],
+            )
+        return result
+    except Exception:
+        logger.exception("Legacy FULL reconciliation failed")
+        return {
+            "examined": 0,
+            "resolved": 0,
+            "released": 0,
+            "deferred": 0,
+            "remaining": 0,
+        }
 
 
 def _poll_canvas_artifacts(
@@ -781,10 +812,17 @@ def main() -> None:
 
     # --- All blocking operations run in background threads ---
 
-    # 1. Discovery (non-blocking)
+    # 1. Start watching before proof so a source change in the reconciliation
+    # window cannot fall between the startup scan and observer activation.
+    # Upgrade-only canonical FULL rows are gated durably while this synchronous
+    # bounded pass runs; unfinished candidates remain gated for later passes.
+    watcher.start()
+    _run_legacy_full_reconciliation(watcher, logger)
+
+    # 2. Discovery (non-blocking)
     threading.Thread(target=_send_discovery, args=(config, logger), daemon=True).start()
 
-    # 2. Initial scan (non-blocking)
+    # 3. Initial scan (non-blocking)
     threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
 
     # Establish the durable state_5.sqlite title baseline without uploading the
@@ -811,17 +849,16 @@ def main() -> None:
             daemon=True,
         ).start()
 
-    # 3. Start file watcher + sync client
-    watcher.start()
+    # 4. Start uploader only after the startup reconciliation pass.
     sync_client.start()
 
     logger.info("Collector running. Watching for file changes...")
 
-    # 4. Auto-update check on startup (non-blocking)
+    # 5. Auto-update check on startup (non-blocking)
     if config.auto_update_enabled:
         threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
 
-    # 5. Antigravity export on startup (real-time updates handled by main FileWatcher)
+    # 6. Antigravity export on startup (real-time updates handled by main FileWatcher)
     has_antigravity = any(t.name == "antigravity" for t in available)
     if has_antigravity:
         threading.Thread(
@@ -834,6 +871,7 @@ def main() -> None:
     last_command_poll = time.monotonic()
     last_update_check = time.monotonic()
     last_queue_maintenance = time.monotonic()
+    last_legacy_reconciliation = time.monotonic()
     last_codex_metadata_poll = time.monotonic()
     last_source_change_check = time.monotonic()
 
@@ -889,6 +927,18 @@ def main() -> None:
                         "Released %d rebuildable terminal spool payload(s)",
                         discarded,
                     )
+
+            if (
+                now - last_legacy_reconciliation
+                > LEGACY_RECONCILIATION_INTERVAL
+            ):
+                last_legacy_reconciliation = now
+                threading.Thread(
+                    target=_run_legacy_full_reconciliation,
+                    args=(watcher, logger),
+                    daemon=True,
+                    name="legacy-full-reconciliation",
+                ).start()
 
             if (
                 codex_tool in available
