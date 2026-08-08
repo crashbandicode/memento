@@ -616,6 +616,7 @@ class CursorActivityProjection:
         projection_id: str,
         composer_status: object,
         source_modified_at: float | None,
+        initial_content: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Return only current starts and bounded terminal transitions."""
@@ -635,7 +636,11 @@ class CursorActivityProjection:
         composer_is_active = composer_state in _ACTIVE_CURSOR_COMPOSER_STATUSES
         composer_is_terminal = composer_state in _TERMINAL_CURSOR_COMPOSER_STATUSES
         extracted = extract_content_activity_updates(
-            content,
+            (
+                initial_content
+                if initial_projection and initial_content is not None
+                else content
+            ),
             tool_name="cursor",
             relative_path=relative_path,
         )

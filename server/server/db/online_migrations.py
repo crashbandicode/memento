@@ -44,6 +44,16 @@ ONLINE_INDEX_MIGRATIONS = (
             "ON documents USING gin (content_tsv)"
         ),
     ),
+    # Cursor state deltas carry only changed/new projected records. Resolve
+    # their stable source identities without scanning the document transcript.
+    OnlineIndexMigration(
+        name="idx_conv_msg_doc_source_id",
+        operation="create",
+        ddl=(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conv_msg_doc_source_id "
+            "ON conversation_messages (document_id, (metadata ->> 'source_id'))"
+        ),
+    ),
     # No query uses documents.content ILIKE after the bounded tsvector path
     # landed, so this large GIN index only adds ingest/update maintenance.
     OnlineIndexMigration(
@@ -199,6 +209,15 @@ async def _replacement_validity(connection) -> bool | None:
         {"name": REPLACEMENT_INDEX_NAME},
     )
     return None if value is None else bool(value)
+
+
+async def _create_index_validity(
+    connection,
+    migration: OnlineIndexMigration,
+) -> bool | None:
+    if migration.name == REPLACEMENT_INDEX_NAME:
+        return await _replacement_validity(connection)
+    return await _index_validity(connection, migration.name)
 
 
 def _executor_id() -> str:
@@ -395,8 +414,11 @@ async def run_online_index_migrations(engine: AsyncEngine) -> dict:
             for migration in ONLINE_INDEX_MIGRATIONS:
                 validity = await _index_validity(connection, migration.name)
                 if migration.operation == "create":
-                    replacement_validity = await _replacement_validity(connection)
-                    if replacement_validity is True:
+                    create_validity = await _create_index_validity(
+                        connection,
+                        migration,
+                    )
+                    if create_validity is True:
                         skipped.append(migration.name)
                         await _mark_terminal(
                             connection,
@@ -422,9 +444,12 @@ async def run_online_index_migrations(engine: AsyncEngine) -> dict:
                                 )
                             )
                         await connection.execute(text(migration.ddl))
-                        if await _replacement_validity(connection) is not True:
+                        if (
+                            await _create_index_validity(connection, migration)
+                            is not True
+                        ):
                             raise RuntimeError(
-                                f"Replacement index {migration.name} did not "
+                                f"Created index {migration.name} did not "
                                 "become valid and ready"
                             )
                     except asyncio.CancelledError:

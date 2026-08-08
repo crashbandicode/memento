@@ -22,6 +22,7 @@ def test_online_plan_creates_required_index_before_concurrent_drops() -> None:
 
     assert [step["name"] for step in plan] == [
         "idx_documents_content_tsv",
+        "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
     ]
@@ -325,6 +326,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
     assert first["locked"] is False
     assert first["applied"] == [
         "idx_documents_content_tsv",
+        "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
     ]
@@ -334,6 +336,10 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_content_tsv "
             "ON documents USING gin (content_tsv)"
         ),
+        (
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conv_msg_doc_source_id "
+            "ON conversation_messages (document_id, (metadata ->> 'source_id'))"
+        ),
         "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_content_trgm",
         "DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_document",
     ]
@@ -341,6 +347,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
     assert second["applied"] == []
     assert second["skipped"] == [
         "idx_documents_content_tsv",
+        "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
     ]
@@ -391,6 +398,7 @@ async def test_wrong_replacement_definition_is_rebuilt_before_old_drops() -> Non
 
     assert result["applied"] == [
         "idx_documents_content_tsv",
+        "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
     ]
@@ -399,6 +407,10 @@ async def test_wrong_replacement_definition_is_rebuilt_before_old_drops() -> Non
         (
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_content_tsv "
             "ON documents USING gin (content_tsv)"
+        ),
+        (
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conv_msg_doc_source_id "
+            "ON conversation_messages (document_id, (metadata ->> 'source_id'))"
         ),
         "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_content_trgm",
         "DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_document",
@@ -482,11 +494,16 @@ async def test_cancelled_build_is_recorded_and_next_run_repairs_it() -> None:
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_content_tsv "
             "ON documents USING gin (content_tsv)"
         ),
+        (
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conv_msg_doc_source_id "
+            "ON conversation_messages (document_id, (metadata ->> 'source_id'))"
+        ),
         "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_content_trgm",
         "DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_document",
     ]
     assert result["applied"] == [
         "idx_documents_content_tsv",
+        "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
     ]

@@ -14,6 +14,7 @@ from collector.cursor_state_export import (
     _workspace_folder_path,
     enqueue_cursor_state_snapshots,
 )
+from collector.queue import SyncQueue
 from collector.tools.cursor import CursorTool
 
 
@@ -743,6 +744,18 @@ def test_empty_header_does_not_starve_older_valid_composers(tmp_path):
     assert exporter.export_changed(limit=1) == []
 
 
+def _recording_queue(
+    base: tuple[str | None, int] = (None, 0),
+) -> SimpleNamespace:
+    queue = SimpleNamespace(items=[], metadata_items=[], base=base)
+    queue.enqueue = lambda **kwargs: queue.items.append(kwargs) or 1
+    queue.enqueue_metadata_changes = lambda **kwargs: (
+        queue.metadata_items.append(kwargs) or 1
+    )
+    queue.get_delta_base = lambda _tool, _path: queue.base
+    return queue
+
+
 def test_cold_completed_composer_does_not_replay_historical_activity(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
@@ -757,17 +770,34 @@ def test_cold_completed_composer_does_not_replay_historical_activity(tmp_path):
     )
     connection.commit()
     connection.close()
-    queue = SimpleNamespace(items=[], metadata_items=[])
+    queue = _recording_queue()
 
-    def enqueue(**kwargs):
-        queue.items.append(kwargs)
-        return 1
+    queued = enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue)
 
-    queue.enqueue = enqueue
-    queue.enqueue_metadata_changes = lambda **kwargs: (
-        queue.metadata_items.append(kwargs) or 1
+    assert queued == 1
+    assert queue.items[0]["sync_strategy"] == "full"
+    assert queue.items[0]["tool_name"] == "cursor"
+    assert queue.items[0]["source_path"].endswith("state.vscdb")
+    assert queue.metadata_items == []
+
+
+def _update_header_revision(
+    tool: FixtureCursorTool,
+    session_id: str,
+    revision: str,
+) -> None:
+    connection = sqlite3.connect(tool.state_database_path)
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        (revision, session_id),
     )
-    queue.get_delta_base = lambda _tool, _path: (None, 0)
+    connection.commit()
+    connection.close()
+
+
+def test_enqueue_uses_complete_snapshot_and_state_database_source(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    queue = _recording_queue()
     queued = enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue)
 
     assert queued == 1
@@ -851,6 +881,29 @@ def test_cold_live_composer_publishes_current_unresolved_shell(tmp_path):
     assert activity["session_id"] == session_id
 
 
+def test_restarted_exporter_publishes_current_shell_before_content_noop(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="generating",
+        tool_status="running",
+        timestamp=now,
+    )
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+    initial = queue.items.pop()
+    queue.base = (initial["content_hash"], initial["offset"])
+    queue.metadata_items.clear()
+
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 0
+    assert queue.items == []
+    activity = next(iter(queue.metadata_items[0]["records"].values()))
+    assert activity["activity_status"] == "running"
+    assert activity["session_id"] == session_id
+
+
 def test_cold_cursor_shell_with_unknown_status_is_not_running(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     _set_cursor_shell_state(
@@ -911,6 +964,56 @@ def test_cursor_running_to_terminal_transition_is_published(tmp_path):
     assert activity["activity_status"] == "completed"
 
 
+def test_cursor_terminal_noop_still_closes_published_running_shell(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    started_at = datetime.now(timezone.utc).replace(microsecond=0)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="generating",
+        tool_status="running",
+        timestamp=started_at,
+    )
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+    assert next(
+        iter(queue.metadata_items[0]["records"].values())
+    )["activity_status"] == "running"
+
+    connection = sqlite3.connect(tool.state_database_path)
+    composer_key = f"composerData:{session_id}"
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["status"] = "completed"
+    finished_at = started_at + timedelta(seconds=30)
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    connection.execute(
+        """
+        UPDATE composerHeaders
+        SET lastUpdatedAt=?, checkpointAt=?
+        WHERE composerId=?
+        """,
+        (finished_at.isoformat(), finished_at.isoformat(), session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+    queue.metadata_items.clear()
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 0
+    assert queue.items == []
+    activity = next(iter(queue.metadata_items[0]["records"].values()))
+    assert activity["activity_status"] == "cancelled"
+    assert activity["timestamp"] == finished_at.isoformat().replace("+00:00", "Z")
+
+
 def test_state_snapshot_uses_native_time_not_projection_observation(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
@@ -963,7 +1066,9 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
     connection.close()
 
     exporter = CursorStateExporter(tool)
-    initial = exporter.export_changed()[0]
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
 
     connection = sqlite3.connect(tool.state_database_path)
     composer = json.loads(connection.execute(
@@ -998,20 +1103,244 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
     connection.commit()
     connection.close()
 
-    queue = SimpleNamespace(items=[])
-    queue.enqueue = lambda **kwargs: queue.items.append(kwargs) or 1
-    queue.get_delta_base = lambda _tool, _path: (
-        initial.content_hash,
-        len(initial.content.encode("utf-8")),
-    )
+    queue.base = (initial["content_hash"], initial["offset"])
 
     assert enqueue_cursor_state_snapshots(exporter, queue) == 1
     item = queue.items[0]
     assert item["sync_strategy"] == "delta"
     assert item["is_partial"] is True
-    assert item["base_hash"] == initial.content_hash
+    assert item["base_hash"] == initial["content_hash"]
     assert "The resources are free." in item["content"]
     assert "Free the resources" not in item["content"]
+
+
+def test_enqueue_sends_mutable_last_row_by_stable_source_id(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer_key = f"composerData:{session_id}"
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["status"] = "generating"
+    composer["todos"] = []
+    composer["fullConversationHeadersOnly"] = composer[
+        "fullConversationHeadersOnly"
+    ][:4]
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    connection.commit()
+    connection.close()
+
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+
+    connection = sqlite3.connect(tool.state_database_path)
+    tool_key = f"bubbleId:{session_id}:tool-1"
+    tool_row = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (tool_key,),
+    ).fetchone()[0])
+    tool_row["toolFormerData"]["status"] = "completed"
+    tool_row["toolFormerData"]["result"] = {"output": "updated result"}
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(tool_row), tool_key),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:21:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    item = queue.items[0]
+    records = [json.loads(line) for line in item["content"].splitlines()]
+    assert item["sync_strategy"] == "delta"
+    assert [record["id"] for record in records] == ["tool-1:tool"]
+    assert records[0]["tool_status"] == "completed"
+    assert "updated result" in records[0]["content"]
+
+
+def test_enqueue_skips_revision_with_unchanged_projection(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer_key = f"composerData:{session_id}"
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["status"] = "generating"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    connection.commit()
+    connection.close()
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    _update_header_revision(tool, session_id, "2026-07-18T14:22:00Z")
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 0
+    assert queue.items == []
+
+
+def test_enqueue_falls_back_to_full_when_projected_row_is_removed(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+
+    connection = sqlite3.connect(tool.state_database_path)
+    composer_key = f"composerData:{session_id}"
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["fullConversationHeadersOnly"] = [
+        header
+        for header in composer["fullConversationHeadersOnly"]
+        if header["bubbleId"] != "assistant-1"
+    ]
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    connection.execute(
+        "DELETE FROM cursorDiskKV WHERE key=?",
+        (f"bubbleId:{session_id}:assistant-1",),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:22:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    assert queue.items[0]["sync_strategy"] == "full"
+    assert queue.items[0]["is_partial"] is False
+
+
+def test_enqueue_falls_back_to_full_when_canvas_row_changes(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    assistant_key = f"bubbleId:{session_id}:assistant-1"
+    connection = sqlite3.connect(tool.state_database_path)
+    assistant = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (assistant_key,),
+    ).fetchone()[0])
+    assistant["text"] = (
+        "Open [status.canvas.tsx]"
+        "(/home/me/.cursor/projects/demo/canvases/status.canvas.tsx)."
+    )
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(assistant), assistant_key),
+    )
+    connection.commit()
+    connection.close()
+
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+
+    connection = sqlite3.connect(tool.state_database_path)
+    assistant["text"] = "The status Canvas was removed."
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(assistant), assistant_key),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:22:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    assert queue.items[0]["sync_strategy"] == "full"
+
+
+def test_restarted_exporter_falls_back_to_full_for_unknown_base(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+    initial = queue.items.pop()
+
+    connection = sqlite3.connect(tool.state_database_path)
+    tool_key = f"bubbleId:{session_id}:tool-1"
+    tool_row = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (tool_key,),
+    ).fetchone()[0])
+    tool_row["toolFormerData"]["status"] = "completed"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(tool_row), tool_key),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:22:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+    assert queue.items[0]["sync_strategy"] == "full"
+
+
+def test_projection_delta_waits_behind_uploading_base(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    exporter = CursorStateExporter(tool)
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    try:
+        assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+        base = queue.claim_batch()[0]
+        assert base.sync_strategy == "full"
+
+        connection = sqlite3.connect(tool.state_database_path)
+        tool_key = f"bubbleId:{session_id}:tool-1"
+        tool_row = json.loads(connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (tool_key,),
+        ).fetchone()[0])
+        tool_row["toolFormerData"]["status"] = "completed"
+        connection.execute(
+            "UPDATE cursorDiskKV SET value=? WHERE key=?",
+            (json.dumps(tool_row), tool_key),
+        )
+        connection.execute(
+            "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+            ("2026-07-18T14:22:00Z", session_id),
+        )
+        connection.commit()
+        connection.close()
+
+        assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+        assert queue.claim_batch() == []
+        assert queue.mark_synced(base) is True
+        delta = queue.claim_batch()[0]
+        assert delta.sync_strategy == "delta"
+        assert delta.base_hash == base.content_hash
+        assert delta.base_offset == base.offset
+    finally:
+        queue.close()
 
 
 def test_state_export_captures_task_notification_without_compat_transcript(tmp_path):

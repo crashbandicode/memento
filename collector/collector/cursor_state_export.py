@@ -15,6 +15,7 @@ import json
 import math
 import re
 import sqlite3
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,11 @@ from .tools.base import Category, ContentType
 from .tools.cursor import CursorTool
 
 _MAX_TOOL_FIELD_CHARS = 262_144
+_MAX_PROJECTION_BASELINE_RECORDS = 100_000
+_MAX_PROJECTION_BASELINE_BYTES = 8 * 1024 * 1024
+_MAX_PROJECTION_BASELINES_BYTES = 32 * 1024 * 1024
+_MAX_PROJECTION_DELTA_RECORDS = 10_000
+_MAX_PROJECTION_DELTA_BYTES = 16 * 1024 * 1024
 _INTERRUPTED_STATES = {"aborted", "cancelled", "canceled", "interrupted"}
 _TERMINAL_COMPOSER_STATES = _INTERRUPTED_STATES | {
     "complete",
@@ -46,12 +52,30 @@ _TOOL_LABELS = {
 
 
 @dataclass(frozen=True)
+class CursorProjectionRecord:
+    source_id: str
+    digest: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class CursorStateSnapshot:
     relative_path: str
     content: str
     content_hash: str
+    content_size: int
+    projection_records: tuple[CursorProjectionRecord, ...]
     metadata: dict[str, object]
     source_modified_at: float | None
+
+
+@dataclass(frozen=True)
+class _ProjectionBaseline:
+    source_order: tuple[str, ...]
+    digests: dict[str, str]
+    canvas_source_ids: frozenset[str]
+    memory_bytes: int
 
 
 @dataclass(frozen=True)
@@ -610,6 +634,11 @@ class CursorStateExporter:
         self._last_source_token: tuple[object, ...] | None = None
         self._backlog_pending = False
         self._activity_projection = CursorActivityProjection()
+        self._projection_baselines: OrderedDict[
+            tuple[str, str, int],
+            _ProjectionBaseline,
+        ] = OrderedDict()
+        self._projection_baseline_bytes = 0
 
     def invalidate(self) -> None:
         self._seen_revisions.clear()
@@ -617,20 +646,134 @@ class CursorStateExporter:
         self._last_source_token = None
         self._backlog_pending = False
         self._activity_projection.reset()
+        self._projection_baselines.clear()
+        self._projection_baseline_bytes = 0
         self.tool._state_session_ids_checked_at = 0.0
 
     def activity_updates(
         self,
         snapshot: CursorStateSnapshot,
+        *,
+        content: str | None = None,
     ) -> dict[str, dict[str, object]]:
-        """Select lifecycle metadata for this snapshot revision."""
+        """Select lifecycle metadata from this revision's effective payload."""
         return self._activity_projection.select_updates(
-            snapshot.content,
+            snapshot.content if content is None else content,
             relative_path=snapshot.relative_path,
             projection_id=str(snapshot.metadata.get("session_id") or ""),
             composer_status=snapshot.metadata.get("composer_status"),
             source_modified_at=snapshot.source_modified_at,
+            initial_content=snapshot.content,
         )
+
+    def projection_delta(
+        self,
+        snapshot: CursorStateSnapshot,
+        *,
+        base_hash: str,
+        base_offset: int,
+    ) -> str | None:
+        """Return changed/appended rows, or None when a FULL is required."""
+        key = (snapshot.relative_path, base_hash, int(base_offset))
+        baseline = self._projection_baselines.get(key)
+        if baseline is None or not snapshot.projection_records:
+            return None
+        self._projection_baselines.move_to_end(key)
+
+        current_order = tuple(
+            record.source_id for record in snapshot.projection_records
+        )
+        # A row removal, reorder, or insertion before the committed tail changes
+        # presentation order. Only a complete snapshot can safely express it.
+        if current_order[: len(baseline.source_order)] != baseline.source_order:
+            return None
+
+        changed_lines: list[str] = []
+        changed_bytes = 0
+        for record in snapshot.projection_records:
+            if baseline.digests.get(record.source_id) == record.digest:
+                continue
+            line = snapshot.content[record.start:record.end]
+            # Canvas references have their own FK-backed projection. Existing
+            # FULL ingest replaces those rows and references transactionally;
+            # a sparse in-place row update cannot safely express removal or
+            # replacement of a referenced Canvas path.
+            if (
+                record.source_id in baseline.canvas_source_ids
+                or ".canvas.tsx" in line.casefold()
+            ):
+                return None
+            changed_lines.append(line)
+            changed_bytes += len(line.encode("utf-8"))
+            if (
+                len(changed_lines) > _MAX_PROJECTION_DELTA_RECORDS
+                or changed_bytes > _MAX_PROJECTION_DELTA_BYTES
+            ):
+                return None
+        return "\n".join(changed_lines)
+
+    def remember_queued_projection(
+        self,
+        snapshot: CursorStateSnapshot,
+        *,
+        retain_base: tuple[str, int] | None = None,
+    ) -> None:
+        """Retain only bounded digests needed by queued/synced revisions."""
+        records = snapshot.projection_records
+        if (
+            not records
+            or len(records) > _MAX_PROJECTION_BASELINE_RECORDS
+        ):
+            return
+        memory_bytes = sum(
+            len(record.source_id.encode("utf-8")) + len(record.digest) + 128
+            for record in records
+        )
+        if memory_bytes > _MAX_PROJECTION_BASELINE_BYTES:
+            return
+
+        key = (
+            snapshot.relative_path,
+            snapshot.content_hash,
+            snapshot.content_size,
+        )
+        retained_keys = {key}
+        if retain_base is not None:
+            retained_keys.add((
+                snapshot.relative_path,
+                retain_base[0],
+                int(retain_base[1]),
+            ))
+        for candidate in list(self._projection_baselines):
+            if (
+                candidate[0] == snapshot.relative_path
+                and candidate not in retained_keys
+            ):
+                removed = self._projection_baselines.pop(candidate)
+                self._projection_baseline_bytes -= removed.memory_bytes
+
+        previous = self._projection_baselines.pop(key, None)
+        if previous is not None:
+            self._projection_baseline_bytes -= previous.memory_bytes
+        baseline = _ProjectionBaseline(
+            source_order=tuple(record.source_id for record in records),
+            digests={record.source_id: record.digest for record in records},
+            canvas_source_ids=frozenset(
+                record.source_id
+                for record in records
+                if ".canvas.tsx"
+                in snapshot.content[record.start:record.end].casefold()
+            ),
+            memory_bytes=memory_bytes,
+        )
+        self._projection_baselines[key] = baseline
+        self._projection_baseline_bytes += memory_bytes
+        while (
+            self._projection_baseline_bytes > _MAX_PROJECTION_BASELINES_BYTES
+            and self._projection_baselines
+        ):
+            _, removed = self._projection_baselines.popitem(last=False)
+            self._projection_baseline_bytes -= removed.memory_bytes
 
     def _source_token(self) -> tuple[object, ...]:
         """Track SQLite and its WAL without opening the database."""
@@ -804,10 +947,33 @@ class CursorStateExporter:
         )
         if not records:
             return None
-        content = "\n".join(
-            json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
-            for record in records
-        )
+        content_parts: list[str] = []
+        projection_records: list[CursorProjectionRecord] = []
+        projection_source_ids: set[str] = set()
+        projection_is_valid = True
+        content_position = 0
+        for record in records:
+            line = json.dumps(
+                record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            content_parts.append(line)
+            source_id = _coerce_text(record.get("id")).strip()
+            if not source_id or source_id in projection_source_ids:
+                projection_is_valid = False
+            else:
+                projection_source_ids.add(source_id)
+                projection_records.append(CursorProjectionRecord(
+                    source_id=source_id,
+                    digest=hashlib.sha256(line.encode("utf-8")).hexdigest(),
+                    start=content_position,
+                    end=content_position + len(line),
+                ))
+            content_position += len(line) + 1
+        content = "\n".join(content_parts)
+        content_bytes = content.encode("utf-8")
         metadata, relative_path = self._metadata_and_path(
             header,
             composer,
@@ -816,7 +982,11 @@ class CursorStateExporter:
         return CursorStateSnapshot(
             relative_path=relative_path,
             content=content,
-            content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            content_hash=hashlib.sha256(content_bytes).hexdigest(),
+            content_size=len(content_bytes),
+            projection_records=(
+                tuple(projection_records) if projection_is_valid else ()
+            ),
             metadata=metadata,
             source_modified_at=_snapshot_source_modified_at(
                 header,
@@ -978,10 +1148,34 @@ def enqueue_cursor_state_snapshots(
     *,
     limit: int = 8,
 ) -> int:
-    """Project changed composers and enqueue complete coalescible snapshots."""
+    """Enqueue guarded row deltas while preserving complete projection semantics."""
     queued = 0
     for snapshot in exporter.export_changed(limit=limit):
-        activity_updates = exporter.activity_updates(snapshot)
+        base_hash, base_offset = queue.get_delta_base(
+            "cursor", snapshot.relative_path
+        )
+        base_is_current = (
+            base_hash == snapshot.content_hash
+            and int(base_offset) == snapshot.content_size
+        )
+        is_projection_delta = False
+        payload = snapshot.content
+        if base_is_current:
+            payload = ""
+        elif base_hash and base_offset > 0:
+            delta = exporter.projection_delta(
+                snapshot,
+                base_hash=base_hash,
+                base_offset=base_offset,
+            )
+            if delta is not None:
+                payload = delta
+                is_projection_delta = True
+
+        # Activity metadata must observe only changed/new projection rows. Feed
+        # it before no-op handling so a composer-only terminal transition can
+        # still close a previously published running shell.
+        activity_updates = exporter.activity_updates(snapshot, content=payload)
         session_id = str(snapshot.metadata.get("session_id") or "").strip()
         if session_id:
             for activity in activity_updates.values():
@@ -993,20 +1187,14 @@ def enqueue_cursor_state_snapshots(
                 tool_name="cursor",
                 records=activity_updates,
             )
-        snapshot_bytes = snapshot.content.encode("utf-8")
-        base_hash, base_offset = queue.get_delta_base(
-            "cursor", snapshot.relative_path
-        )
-        is_append = False
-        payload = snapshot.content
-        if (
-            base_hash
-            and 0 < base_offset < len(snapshot_bytes)
-            and snapshot_bytes[base_offset:base_offset + 1] == b"\n"
-            and hashlib.sha256(snapshot_bytes[:base_offset]).hexdigest() == base_hash
-        ):
-            payload = snapshot_bytes[base_offset + 1:].decode("utf-8")
-            is_append = bool(payload)
+
+        if base_is_current or (is_projection_delta and not payload):
+            exporter.remember_queued_projection(
+                snapshot,
+                retain_base=(base_hash, base_offset),
+            )
+            continue
+
         queue.enqueue(
             tool_name="cursor",
             category=Category.CONVERSATION.value,
@@ -1014,15 +1202,23 @@ def enqueue_cursor_state_snapshots(
             relative_path=snapshot.relative_path,
             content=payload,
             content_hash=snapshot.content_hash,
-            file_size=len(snapshot_bytes),
-            sync_strategy="delta" if is_append else "full",
-            is_partial=is_append,
-            offset=len(snapshot_bytes),
+            file_size=snapshot.content_size,
+            sync_strategy="delta" if is_projection_delta else "full",
+            is_partial=is_projection_delta,
+            offset=snapshot.content_size,
             metadata=snapshot.metadata,
             source_modified_at=snapshot.source_modified_at,
-            base_hash=base_hash if is_append else None,
-            base_offset=base_offset if is_append else 0,
+            base_hash=base_hash if is_projection_delta else None,
+            base_offset=base_offset if is_projection_delta else 0,
             source_path=str(exporter.tool.state_database_path),
+        )
+        exporter.remember_queued_projection(
+            snapshot,
+            retain_base=(
+                (base_hash, base_offset)
+                if is_projection_delta and base_hash
+                else None
+            ),
         )
         queued += 1
     return queued

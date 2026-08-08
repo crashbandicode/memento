@@ -410,11 +410,14 @@ def _logical_document_file_size(
     payload_size: int,
     offset: int,
     existing_size: int = 0,
+    replace_offset: bool = False,
 ) -> int:
     """Return total source size rather than a DELTA payload's tail size."""
     safe_payload = max(0, int(payload_size))
     if mode != "delta":
         return safe_payload
+    if replace_offset:
+        return max(0, int(offset))
     # Collector DELTA offsets are the cumulative source end position. Preserve
     # the existing total as a fallback for legacy senders with a zero offset.
     return max(safe_payload, max(0, int(offset)), max(0, int(existing_size)))
@@ -2427,6 +2430,11 @@ async def ingest_file(
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
     category = normalize_ingest_category(tool_id, category, relative_path)
+    cursor_projection_delta = (
+        mode == "delta"
+        and tool_id == "cursor"
+        and metadata.get("source") == "cursor_state_v1"
+    )
     if conversation_source is not None:
         if category != "conversation" or content_type != "jsonl":
             raise ValueError(
@@ -2583,6 +2591,7 @@ async def ingest_file(
         payload_size=file_size,
         offset=offset,
         existing_size=current_file_size,
+        replace_offset=cursor_projection_delta,
     )
     same_hash_before_write = doc is not None and current_revision == content_hash
     if (
@@ -2601,7 +2610,7 @@ async def ingest_file(
             content_hash,
             incoming_s3_key=content_s3_key,
         )
-        if pointer_is_current:
+        if pointer_is_current or cursor_projection_delta:
             latest_source_modified_at = max(
                 filter(None, (current_source_modified_at, source_modified_at))
             )
@@ -2618,6 +2627,7 @@ async def ingest_file(
 
     if (
         mode == "delta"
+        and not cursor_projection_delta
         and doc is not None
         and sync_row is not None
         and sync_row.last_hash == current_revision
@@ -3179,6 +3189,7 @@ async def ingest_file(
         user_id,
         mode=mode,
         monotonic_offset=same_hash_before_write,
+        replace_offset=cursor_projection_delta,
     )
 
     # Queue only namespaces whose response data changed. The session publishes
@@ -3549,6 +3560,11 @@ async def _extract_messages(
         return "".join(search_parts)
 
     tool_id = doc.tool_id
+    cursor_projection_delta = (
+        mode == "delta"
+        and tool_id == "cursor"
+        and document_metadata(doc).get("source") == "cursor_state_v1"
+    )
     preserve_full_rebase = (
         mode != "delta"
         and tool_id in {"claude_code", "cursor"}
@@ -3705,6 +3721,50 @@ async def _extract_messages(
             incremental=mode == "delta",
         )
     )
+    cursor_projection_rows: dict[str, ConversationMessage] = {}
+    if cursor_projection_delta:
+        # Projection payloads contain only changed/new source records, so parse
+        # the bounded delta once and fetch just those stable identities. The
+        # document/source-id expression index keeps this independent of the
+        # transcript's total row count.
+        incoming_projection = list(stored_messages)
+        incoming_source_ids = [
+            str(meta.get("source_id") or "")
+            for _normalized, _content, meta, _timestamp in incoming_projection
+        ]
+        if (
+            not incoming_source_ids
+            or any(not source_id for source_id in incoming_source_ids)
+            or len(set(incoming_source_ids)) != len(incoming_source_ids)
+        ):
+            raise ValueError(
+                "Cursor projection delta requires unique stable source identities"
+            )
+        existing_projection_rows = (
+            (
+                await db.execute(
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.document_id == doc.id,
+                        ConversationMessage.metadata_["source_id"].astext.in_(
+                            incoming_source_ids
+                        ),
+                    )
+                    .order_by(ConversationMessage.line_number)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for existing_projection_row in existing_projection_rows:
+            source_id = _stored_message_source_id(existing_projection_row)
+            if source_id:
+                cursor_projection_rows.setdefault(
+                    source_id,
+                    existing_projection_row,
+                )
+        stored_messages = iter(incoming_projection)
+
     for normalized, clean_content, meta, ts in stored_messages:
         lifecycle_key = lifecycle_event_identity(normalized.agent_event)
         prior_lifecycle_row = (
@@ -3756,6 +3816,39 @@ async def _extract_messages(
             and not isinstance(normalized.interaction_response, dict)
         ):
             clear_live_interaction_signals = True
+
+        incoming_source_id = str(meta.get("source_id") or "")
+        existing_cursor_projection = (
+            cursor_projection_rows.get(incoming_source_id)
+            if cursor_projection_delta
+            else None
+        )
+        if existing_cursor_projection is not None:
+            message_type = _bounded_message_text(
+                normalized.raw_type or normalized.role,
+                50,
+            )
+            if not _stored_message_matches(
+                existing_cursor_projection,
+                message_type=message_type,
+                role=normalized.role,
+                content=clean_content,
+                metadata=meta,
+                timestamp=ts,
+            ):
+                existing_cursor_projection.message_type = message_type
+                existing_cursor_projection.role = normalized.role
+                existing_cursor_projection.content = clean_content
+                existing_cursor_projection.metadata_ = meta
+                existing_cursor_projection.timestamp = ts
+                dirty_projection_lines.add(
+                    existing_cursor_projection.line_number
+                )
+            add_search_text(normalized.role, clean_content)
+            if delta_tail is existing_cursor_projection:
+                delta_tail = None
+            continue
+
         # Claude persists steers and scheduled instructions as queue enqueues,
         # then may write their canonical row in a later collector delta.
         # Retain the submission-time row and mark it as reconciled instead of
@@ -4223,6 +4316,7 @@ async def _update_sync_state(
     *,
     mode: str = "full",
     monotonic_offset: bool = False,
+    replace_offset: bool = False,
 ) -> None:
     """Update server-side sync state."""
     result = await db.execute(
@@ -4249,8 +4343,12 @@ async def _update_sync_state(
     else:
         state.last_hash = content_hash
         state.last_offset = (
-            max(int(state.last_offset or 0), offset)
-            if mode == "delta" or monotonic_offset
-            else offset
+            offset
+            if replace_offset
+            else (
+                max(int(state.last_offset or 0), offset)
+                if mode == "delta" or monotonic_offset
+                else offset
+            )
         )
         state.last_synced_at = now

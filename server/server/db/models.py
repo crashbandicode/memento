@@ -7,7 +7,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer,
-    LargeBinary, String, Text, UniqueConstraint, func,
+    LargeBinary, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import (
@@ -290,6 +290,11 @@ class ConversationMessage(Base):
         Index("uq_conv_msg_doc_line", "document_id", "line_number", unique=True),
         Index("idx_conv_msg_timestamp", "timestamp"),
         Index("idx_conv_msg_doc_ts", "document_id", "timestamp"),
+        Index(
+            "idx_conv_msg_doc_source_id",
+            "document_id",
+            text("(metadata ->> 'source_id')"),
+        ),
     )
 
 

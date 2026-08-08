@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from uuid import uuid4
@@ -319,6 +320,205 @@ def _claude_tool_row(
             },
         }
     )
+
+
+def _cursor_row(
+    source_id: str,
+    role: str,
+    content: str,
+    *,
+    timestamp: str,
+) -> str:
+    return json.dumps({
+        "type": role,
+        "role": role,
+        "id": source_id,
+        "timestamp": timestamp,
+        "message": {"content": content},
+    })
+
+
+@pytest.mark.asyncio
+async def test_cursor_projection_delta_updates_stable_rows_in_place(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        document.metadata_ = {
+            **document.metadata_,
+            "source": "cursor_state_v1",
+        }
+        user = _cursor_row(
+            "user-1",
+            "user",
+            "Inspect the worker.",
+            timestamp="2026-08-08T04:00:00Z",
+        )
+        assistant = _cursor_row(
+            "assistant-1",
+            "assistant",
+            "The worker is still running.",
+            timestamp="2026-08-08T04:00:01Z",
+        )
+        full_snapshot = f"{user}\n{assistant}"
+        await _extract_messages(
+            session,
+            document,
+            full_snapshot,
+            "full",
+        )
+        base_hash = hashlib.sha256(full_snapshot.encode()).hexdigest()
+        base_offset = len(full_snapshot.encode())
+        document.content = full_snapshot
+        document.content_hash = base_hash
+        document.file_size_bytes = base_offset
+        _set_stored_source_identity(
+            document,
+            full_snapshot,
+            revision_hash=base_hash,
+        )
+        session.add(SyncState(
+            machine_id=document.machine_id,
+            tool_id=document.tool_id,
+            relative_path=document.relative_path,
+            last_hash=base_hash,
+            last_offset=base_offset,
+        ))
+        await session.commit()
+        initial_rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assistant_id = initial_rows[1].id
+
+        updated_assistant = _cursor_row(
+            "assistant-1",
+            "assistant",
+            "The worker completed successfully.",
+            timestamp="2026-08-08T04:00:01Z",
+        )
+        appended = _cursor_row(
+            "assistant-2",
+            "assistant",
+            "No restart is required.",
+            timestamp="2026-08-08T04:00:02Z",
+        )
+        delta = f"{updated_assistant}\n{appended}"
+        final_snapshot = f"{user}\n{delta}"
+        first_delta_hash = hashlib.sha256(final_snapshot.encode()).hexdigest()
+        first_delta_offset = len(final_snapshot.encode())
+        machine = await session.get(Machine, document.machine_id)
+        assert machine is not None
+        await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=delta,
+            content_hash=first_delta_hash,
+            file_size=len(delta.encode()),
+            mode="delta",
+            offset=first_delta_offset,
+            base_hash=base_hash,
+            base_offset=base_offset,
+            metadata={
+                **document.metadata_,
+                "source": "cursor_state_v1",
+            },
+            timestamp=1_786_162_000.0,
+            machine_id=document.machine_id,
+            user_id=str(machine.user_id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        read_model = await session.get(ConversationReadModel, document.id)
+
+        assert len(rows) == 3
+        assert rows[1].id == assistant_id
+        assert rows[1].line_number == 2
+        assert rows[1].content == "The worker completed successfully."
+        assert rows[2].metadata_["source_id"] == "assistant-2"
+        assert read_model is not None
+        assert read_model.message_count == 3
+        assert read_model.latest_assistant_line == 3
+
+        shorter_assistant = _cursor_row(
+            "assistant-1",
+            "assistant",
+            "Done.",
+            timestamp="2026-08-08T04:00:01Z",
+        )
+        shorter_snapshot = f"{user}\n{shorter_assistant}\n{appended}"
+        assert len(shorter_snapshot.encode()) < first_delta_offset
+        await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=shorter_assistant,
+            content_hash=hashlib.sha256(shorter_snapshot.encode()).hexdigest(),
+            file_size=len(shorter_assistant.encode()),
+            mode="delta",
+            offset=len(shorter_snapshot.encode()),
+            base_hash=first_delta_hash,
+            base_offset=first_delta_offset,
+            metadata={
+                **document.metadata_,
+                "source": "cursor_state_v1",
+            },
+            timestamp=1_786_162_001.0,
+            machine_id=document.machine_id,
+            user_id=str(machine.user_id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+        final_rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assert len(final_rows) == 3
+        assert final_rows[1].id == assistant_id
+        assert final_rows[1].content == "Done."
+
+        replayed = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=shorter_assistant,
+            content_hash=hashlib.sha256(shorter_snapshot.encode()).hexdigest(),
+            file_size=len(shorter_assistant.encode()),
+            mode="delta",
+            offset=len(shorter_snapshot.encode()),
+            base_hash=first_delta_hash,
+            base_offset=first_delta_offset,
+            metadata={
+                **document.metadata_,
+                "source": "cursor_state_v1",
+            },
+            timestamp=1_786_162_001.0,
+            machine_id=document.machine_id,
+            user_id=str(machine.user_id),
+            schedule_post_ingest=False,
+        )
+        assert getattr(replayed, "_memento_ingest_disposition") == "idempotent"
 
 
 @pytest.mark.asyncio

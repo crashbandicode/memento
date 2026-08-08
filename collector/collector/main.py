@@ -730,10 +730,28 @@ def main() -> None:
         spool_threshold=config.queue_spool_threshold,
     )
     watcher = FileWatcher(available, queue, config)
+
+    def _request_full_resync(source_path: str) -> None:
+        try:
+            is_cursor_state = (
+                Path(source_path).resolve()
+                == cursor_tool.state_database_path.resolve()
+            )
+        except OSError:
+            is_cursor_state = False
+        if not is_cursor_state:
+            watcher.request_full_resync(source_path)
+            return
+        # state.vscdb is a POLL source rather than a normal watched transcript.
+        # A rejected projection delta must forget its in-memory row baseline and
+        # immediately capture a complete authoritative snapshot.
+        _invalidate_cursor_state(cursor_exporter)
+        _poll_cursor_state(cursor_exporter, queue, logger)
+
     sync_client = SyncClient(
         queue,
         config,
-        full_resync_callback=watcher.request_full_resync,
+        full_resync_callback=_request_full_resync,
         delta_catchup_callback=watcher.request_delta_catchup,
         upload_synced_callback=canvas_schedule.notify_upload,
     )
