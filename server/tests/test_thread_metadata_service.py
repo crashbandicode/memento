@@ -131,6 +131,14 @@ class ThreadMetadataValidationTests(unittest.TestCase):
                 tool="codex",
                 thread_id="not-a-thread",
                 title="Rename",
+                revision=1,
+            )
+        with self.assertRaises(ValidationError):
+            IngestMetadataRequest(
+                metadata_type="codex_thread_title",
+                tool="codex",
+                thread_id=uuid.uuid4(),
+                title="Rename",
                 revision=0,
             )
 
@@ -145,6 +153,61 @@ class ThreadMetadataValidationTests(unittest.TestCase):
                 ),
             ),
             str(session_id),
+        )
+
+    def test_cursor_metadata_accepts_bounded_raw_session_id(self) -> None:
+        session_id = uuid.uuid4()
+        raw_session_id = f"task-{session_id}"
+        relative_path = (
+            "projects/workspace/agent-transcripts/"
+            f"{raw_session_id}/{raw_session_id}.jsonl"
+        )
+
+        request = IngestMetadataRequest(
+            metadata_type="conversation_activity",
+            tool="cursor",
+            relative_path=relative_path,
+            session_id=raw_session_id,
+            activity_id="shell-1",
+            activity_status="running",
+        )
+
+        self.assertEqual(request.session_id, raw_session_id)
+        self.assertEqual(
+            normalized_metadata_session_id(
+                request.tool,
+                relative_path,
+                request.session_id,
+            ),
+            str(session_id),
+        )
+
+    def test_metadata_session_id_is_bounded_and_never_routes_malformed_values(
+        self,
+    ) -> None:
+        request_values = {
+            "metadata_type": "conversation_activity",
+            "tool": "cursor",
+            "relative_path": "projects/workspace/not-a-session.jsonl",
+            "activity_id": "shell-1",
+            "activity_status": "running",
+        }
+        for invalid_session_id in ("", "x" * 513, {"task": "not-a-string"}):
+            with (
+                self.subTest(session_id=invalid_session_id),
+                self.assertRaises(ValidationError),
+            ):
+                IngestMetadataRequest(
+                    **request_values,
+                    session_id=invalid_session_id,
+                )
+
+        self.assertIsNone(
+            normalized_metadata_session_id(
+                "cursor",
+                request_values["relative_path"],
+                "task-not-a-uuid",
+            )
         )
 
     def test_lookup_is_owner_scoped_locked_and_matches_thread_id_only(self) -> None:
@@ -1212,6 +1275,79 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(chunk_exc.exception.status_code, 400)
         self.assertFalse(chunk_upload.read_called)
+
+    async def test_task_cursor_activity_is_normalized_before_defer(self) -> None:
+        user_id = uuid.uuid4()
+        machine = SimpleNamespace(id=uuid.uuid4())
+        session_id = uuid.uuid4()
+        raw_session_id = f"task-{session_id}"
+        relative_path = (
+            "projects/workspace/agent-transcripts/"
+            f"{raw_session_id}/{raw_session_id}.jsonl"
+        )
+        canonical_path = (
+            "projects/workspace/agent-transcripts/"
+            f"{session_id}/{session_id}.jsonl"
+        )
+        request = IngestMetadataRequest(
+            metadata_type="conversation_activity",
+            tool="cursor",
+            relative_path=relative_path,
+            session_id=raw_session_id,
+            activity_id="shell-task-1",
+            activity_status="running",
+            activity_tool="Shell",
+            command="python worker.py",
+            timestamp="2026-08-08T01:00:00Z",
+        )
+        db = _Session()
+
+        with (
+            patch(
+                "server.api.ingest.ensure_device",
+                new=AsyncMock(return_value=machine),
+            ),
+            patch(
+                "server.api.ingest.resolve_metadata_relative_path",
+                new=AsyncMock(return_value=canonical_path),
+            ) as resolve_path,
+            patch(
+                "server.api.ingest.apply_conversation_activity_update",
+                new=AsyncMock(
+                    return_value=ThreadTitleUpdateResult(0, 0, 0)
+                ),
+            ) as apply_activity,
+            patch(
+                "server.api.ingest.defer_conversation_metadata",
+                new=AsyncMock(return_value=True),
+            ) as defer,
+        ):
+            response = await ingest_metadata_endpoint(
+                request,
+                _collector_user=SimpleNamespace(id=user_id),
+                _throttle=None,
+                db=db,
+                x_device_id="device",
+                x_device_name="Device",
+                x_device_platform="Windows",
+            )
+
+        self.assertEqual(response.status, "deferred")
+        resolve_path.assert_awaited_once_with(
+            db,
+            machine_id=machine.id,
+            user_id=user_id,
+            tool_id="cursor",
+            relative_path=relative_path,
+            session_id=str(session_id),
+        )
+        self.assertEqual(
+            apply_activity.await_args.kwargs["relative_path"],
+            canonical_path,
+        )
+        deferred_payload = defer.await_args.kwargs["payload"]
+        self.assertEqual(deferred_payload["relative_path"], relative_path)
+        self.assertEqual(deferred_payload["session_id"], str(session_id))
 
     async def test_missing_transcript_is_durably_deferred_once(self) -> None:
         user_id = uuid.uuid4()

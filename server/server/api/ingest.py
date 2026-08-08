@@ -134,7 +134,10 @@ class IngestMetadataRequest(BaseModel):
     title_kind: Literal["custom", "fallback", "unknown"] = "unknown"
     revision: int | None = Field(default=None, gt=0, le=2**63 - 1)
     relative_path: str | None = Field(default=None, max_length=2000)
-    session_id: UUID | None = None
+    # Cursor can expose opaque composer keys such as ``task-<uuid>``. This is
+    # transport data only; database routing always uses the verified value
+    # produced by ``normalized_metadata_session_id`` below.
+    session_id: str | None = Field(default=None, min_length=1, max_length=512)
     interaction_id: str | None = Field(default=None, min_length=1, max_length=512)
     interaction_status: Literal["pending", "answered", "cancelled"] | None = None
     question_tool: str = Field(default="", max_length=256)
@@ -436,19 +439,19 @@ async def ingest_metadata_endpoint(
         user_id=_collector_user.id,
     )
     relative_path = req.relative_path or ""
+    routing_session_id = normalized_metadata_session_id(
+        req.tool,
+        relative_path,
+        req.session_id,
+    )
     if relative_path:
-        session_id = normalized_metadata_session_id(
-            req.tool,
-            relative_path,
-            req.session_id,
-        )
         relative_path = await resolve_metadata_relative_path(
             db,
             machine_id=machine.id,
             user_id=_collector_user.id,
             tool_id=req.tool,
             relative_path=relative_path,
-            session_id=session_id,
+            session_id=routing_session_id,
         )
     if req.metadata_type == "codex_thread_title":
         if (
@@ -519,6 +522,7 @@ async def ingest_metadata_endpoint(
         # instead of making every collector retry it forever.
         payload = req.model_dump(mode="json")
         payload["relative_path"] = req.relative_path
+        payload["session_id"] = routing_session_id
         deferred = await defer_conversation_metadata(
             db,
             machine_id=machine.id,
