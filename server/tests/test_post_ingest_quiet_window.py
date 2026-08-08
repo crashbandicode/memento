@@ -101,6 +101,11 @@ async def test_multipart_upload_uses_measured_size_when_reported_size_is_zero(
 
     monkeypatch.setattr(ingest_api, "ensure_device", _ensure_device)
     monkeypatch.setattr(ingest_api, "ingest_file", _ingest_file)
+    monkeypatch.setattr(
+        ingest_api,
+        "store_large_content",
+        lambda *_args, **_kwargs: "raw/test/conversation.txt",
+    )
     upload = UploadFile(file=io.BytesIO(payload), filename="conversation.jsonl")
     metadata = json.dumps(
         {

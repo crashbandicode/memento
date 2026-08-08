@@ -13,12 +13,18 @@ from server.db.models import (
     Base,
     CanvasArtifactReference,
     ConversationMessage,
+    ConversationPromptProjection,
+    ConversationReadModel,
     ConversationSearchTerm,
     ConversationTaskState,
+    Document,
+    DocumentDeliveryState,
     Machine,
     Tool,
     User,
 )
+from server.db.session import TransactionalAsyncSession
+from server.services import cache, sse_service
 from server.services.content_sanitizer import sanitize_content_file
 from server.services.conversation_stream import ConversationFileSource
 from server.services.ingest_service import (
@@ -46,7 +52,11 @@ async def session_factory():
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
+    yield async_sessionmaker(
+        engine,
+        class_=TransactionalAsyncSession,
+        expire_on_commit=False,
+    )
     await engine.dispose()
 
 
@@ -68,8 +78,20 @@ def _claude_record(
     }
 
 
+class _Redis:
+    def __init__(self) -> None:
+        self.increments: list[str] = []
+
+    async def incr(self, key: str) -> int:
+        self.increments.append(key)
+        return len(self.increments)
+
+
 @pytest.mark.asyncio
-async def test_streamed_full_preserves_normalized_projections(session_factory) -> None:
+async def test_streamed_ingest_projects_transactionally_and_rebases(
+    session_factory,
+    monkeypatch,
+) -> None:
     canvas_path = (
         "/home/me/.cursor/projects/work/canvases/"
         "streaming-report.canvas.tsx"
@@ -165,25 +187,90 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
         + "\n"
     ).encode("utf-8")
     delta_revision_hash = hashlib.sha256(raw_payload + delta_payload).hexdigest()
+    rollback_payload = (
+        json.dumps(
+            _claude_record(
+                "user",
+                "This rolled-back prompt must never become visible.",
+                source_id="user-rollback",
+                timestamp="2026-08-07T12:00:05Z",
+            ),
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    rollback_revision_hash = hashlib.sha256(
+        raw_payload + delta_payload + rollback_payload
+    ).hexdigest()
+    rebase_tail = (
+        json.dumps(
+            _claude_record(
+                "user",
+                "Ship the committed full rebase.",
+                source_id="user-rebase",
+                timestamp="2026-08-07T12:00:06Z",
+            ),
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    rebase_payload = raw_payload + delta_payload + rebase_tail
+    rebase_revision_hash = hashlib.sha256(rebase_payload).hexdigest()
 
     with tempfile.TemporaryDirectory() as temporary:
         raw_path = Path(temporary) / "raw.jsonl"
         sanitized_path = Path(temporary) / "sanitized.jsonl"
         delta_path = Path(temporary) / "delta.jsonl"
         sanitized_delta_path = Path(temporary) / "sanitized-delta.jsonl"
+        rollback_path = Path(temporary) / "rollback.jsonl"
+        sanitized_rollback_path = Path(temporary) / "sanitized-rollback.jsonl"
+        rebase_path = Path(temporary) / "rebase.jsonl"
+        sanitized_rebase_path = Path(temporary) / "sanitized-rebase.jsonl"
         raw_path.write_bytes(raw_payload)
         delta_path.write_bytes(delta_payload)
+        rollback_path.write_bytes(rollback_payload)
+        rebase_path.write_bytes(rebase_payload)
         sanitized = sanitize_content_file(raw_path, sanitized_path, chunk_size=7)
         sanitized_delta = sanitize_content_file(
             delta_path,
             sanitized_delta_path,
             chunk_size=5,
         )
+        sanitized_rollback = sanitize_content_file(
+            rollback_path,
+            sanitized_rollback_path,
+            chunk_size=5,
+        )
+        sanitized_rebase = sanitize_content_file(
+            rebase_path,
+            sanitized_rebase_path,
+            chunk_size=7,
+        )
         source = ConversationFileSource.inspect(sanitized.path, chunk_size=11)
         delta_source = ConversationFileSource.inspect(
             sanitized_delta.path,
             chunk_size=13,
         )
+        rollback_source = ConversationFileSource.inspect(
+            sanitized_rollback.path,
+            chunk_size=11,
+        )
+        rebase_source = ConversationFileSource.inspect(
+            sanitized_rebase.path,
+            chunk_size=13,
+        )
+        redis = _Redis()
+        published: list[tuple[str, dict, str | None]] = []
+
+        async def publish_event(
+            event_type: str,
+            data: dict,
+            user_id: str | None = None,
+        ) -> None:
+            published.append((event_type, data, user_id))
+
+        monkeypatch.setattr(cache, "_client", redis)
+        monkeypatch.setattr(sse_service, "publish_event", publish_event)
 
         async with session_factory() as session:
             user = User(
@@ -222,6 +309,12 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
                 content_had_sensitive=sanitized.had_sensitive,
                 conversation_source=source,
             )
+            document_id = document.id
+            relative_path = document.relative_path
+            user_id = str(user.id)
+            machine_id = str(machine.id)
+            assert redis.increments == []
+            assert published == []
             await session.commit()
 
             messages = (
@@ -251,6 +344,20 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
                 ConversationSearchTerm,
                 "streamingneedle",
             )
+            delivery_state = await session.get(
+                DocumentDeliveryState,
+                document.id,
+            )
+            read_model = await session.get(ConversationReadModel, document.id)
+            prompts = (
+                await session.execute(
+                    select(ConversationPromptProjection)
+                    .where(
+                        ConversationPromptProjection.document_id == document.id
+                    )
+                    .order_by(ConversationPromptProjection.line_number)
+                )
+            ).scalars().all()
 
             assert document.content is None
             assert document.content_s3_key == "raw/private/streamed.txt"
@@ -276,6 +383,21 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
             assert canvas_references[0].recorded_path == canvas_path
             assert search_term is not None
             assert await session.get(Tool, "claude_code") is not None
+            assert delivery_state is not None
+            assert delivery_state.revision_hash == revision_hash
+            assert read_model is not None
+            assert read_model.message_count == 4
+            assert read_model.projected_through_line == 4
+            assert [(prompt.line_number, prompt.content) for prompt in prompts] == [
+                (1, f"Build streamingneedle report at [{canvas_path}]({canvas_path}).")
+            ]
+            assert redis.increments == [
+                f"cache:generation:daily:{user_id}",
+            ]
+            assert len(published) == 1
+            assert published[0][0] == "file_synced"
+            assert "conversation.prompts" in published[0][1]["changes"]
+            first_message_id = messages[0].id
 
             await ingest_file(
                 session,
@@ -299,16 +421,25 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
                 content_had_sensitive=sanitized_delta.had_sensitive,
                 conversation_source=delta_source,
             )
+            assert len(published) == 1
             await session.commit()
             await session.refresh(document)
             await session.refresh(task_state)
+            await session.refresh(delivery_state)
+            await session.refresh(read_model)
 
             assert document.content is None
             assert document.content_s3_key == "raw/private/streamed.txt"
-            assert document.content_hash == delta_revision_hash
+            assert document.content_hash == revision_hash
+            assert delivery_state.revision_hash == delta_revision_hash
             assert document.metadata_[STORED_SOURCE_REVISION_KEY] == revision_hash
             assert document.metadata_[STORED_SOURCE_HASH_KEY] == source.sha256
             assert task_state.state["tasks"][0]["status"] == "completed"
+            assert read_model.message_count == 5
+            assert len(published) == 2
+            assert redis.increments == [
+                f"cache:generation:daily:{user_id}",
+            ]
 
             with pytest.raises(DeltaBaseMismatch):
                 await ingest_file(
@@ -332,3 +463,118 @@ async def test_streamed_full_preserves_normalized_projections(session_factory) -
                     content_already_sanitized=True,
                     conversation_source=delta_source,
                 )
+            await session.rollback()
+            assert len(published) == 2
+            assert len(redis.increments) == 1
+
+            document = await session.get(Document, document_id)
+            assert document is not None
+            await ingest_file(
+                session,
+                tool_id="claude_code",
+                category="conversation",
+                content_type="jsonl",
+                relative_path=relative_path,
+                content="",
+                content_hash=rollback_revision_hash,
+                file_size=rollback_source.size,
+                mode="delta",
+                offset=len(raw_payload) + len(delta_payload) + len(rollback_payload),
+                base_hash=delta_revision_hash,
+                base_offset=len(raw_payload) + len(delta_payload),
+                metadata={},
+                machine_id=machine_id,
+                user_id=user_id,
+                schedule_post_ingest=False,
+                persist_content=True,
+                content_already_sanitized=True,
+                content_had_sensitive=sanitized_rollback.had_sensitive,
+                conversation_source=rollback_source,
+            )
+            assert len(published) == 2
+            assert len(redis.increments) == 1
+            await session.rollback()
+            assert len(published) == 2
+            assert len(redis.increments) == 1
+
+            delivery_state = await session.get(
+                DocumentDeliveryState,
+                document_id,
+            )
+            read_model = await session.get(ConversationReadModel, document_id)
+            prompts = (
+                await session.execute(
+                    select(ConversationPromptProjection).where(
+                        ConversationPromptProjection.document_id == document_id
+                    )
+                )
+            ).scalars().all()
+            assert delivery_state is not None
+            assert delivery_state.revision_hash == delta_revision_hash
+            assert read_model is not None
+            assert read_model.message_count == 5
+            assert len(prompts) == 1
+
+            document = await session.get(Document, document_id)
+            assert document is not None
+            await ingest_file(
+                session,
+                tool_id="claude_code",
+                category="conversation",
+                content_type="jsonl",
+                relative_path=relative_path,
+                content="",
+                content_hash=rebase_revision_hash,
+                file_size=rebase_source.size,
+                mode="full",
+                offset=len(rebase_payload),
+                metadata={},
+                machine_id=machine_id,
+                user_id=user_id,
+                schedule_post_ingest=False,
+                persist_content=False,
+                content_s3_key="raw/private/rebased.txt",
+                content_already_sanitized=True,
+                content_had_sensitive=sanitized_rebase.had_sensitive,
+                conversation_source=rebase_source,
+                authoritative_rebase=True,
+            )
+            assert len(published) == 2
+            await session.commit()
+
+            messages = (
+                await session.execute(
+                    select(ConversationMessage)
+                    .where(ConversationMessage.document_id == document_id)
+                    .order_by(ConversationMessage.line_number)
+                )
+            ).scalars().all()
+            delivery_state = await session.get(
+                DocumentDeliveryState,
+                document_id,
+            )
+            read_model = await session.get(ConversationReadModel, document_id)
+            prompts = (
+                await session.execute(
+                    select(ConversationPromptProjection)
+                    .where(
+                        ConversationPromptProjection.document_id == document_id
+                    )
+                    .order_by(ConversationPromptProjection.line_number)
+                )
+            ).scalars().all()
+            assert messages[0].id == first_message_id
+            assert len(messages) == 6
+            assert delivery_state is not None
+            assert delivery_state.revision_hash == rebase_revision_hash
+            assert read_model is not None
+            assert read_model.message_count == 6
+            assert [prompt.content for prompt in prompts] == [
+                f"Build streamingneedle report at [{canvas_path}]({canvas_path}).",
+                "Ship the committed full rebase.",
+            ]
+            assert len(published) == 3
+            assert redis.increments == [
+                f"cache:generation:daily:{user_id}",
+                f"cache:generation:daily:{user_id}",
+            ]

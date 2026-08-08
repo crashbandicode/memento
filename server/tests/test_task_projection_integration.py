@@ -262,9 +262,11 @@ async def test_prompt_projection_updates_only_candidate_rows(
         )
         prompts = (
             await session.execute(
-                select(ConversationPromptProjection).order_by(
-                    ConversationPromptProjection.line_number
+                select(ConversationPromptProjection)
+                .where(
+                    ConversationPromptProjection.document_id == document.id
                 )
+                .order_by(ConversationPromptProjection.line_number)
             )
         ).scalars().all()
         assert [(item.line_number, item.content) for item in prompts] == [
@@ -281,9 +283,11 @@ async def test_prompt_projection_updates_only_candidate_rows(
         )
         remaining = (
             await session.execute(
-                select(ConversationPromptProjection).order_by(
-                    ConversationPromptProjection.line_number
+                select(ConversationPromptProjection)
+                .where(
+                    ConversationPromptProjection.document_id == document.id
                 )
+                .order_by(ConversationPromptProjection.line_number)
             )
         ).scalars().all()
         assert [(item.line_number, item.content) for item in remaining] == [

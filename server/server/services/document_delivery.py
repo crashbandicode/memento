@@ -114,7 +114,7 @@ async def ensure_document_delivery_state(
     document: Document,
 ) -> DocumentDeliveryState:
     """Create a lazy projection from legacy columns on first changed ingest."""
-    state = getattr(document, "delivery_state", None)
+    state = document_delivery_state(document)
     if state is not None:
         return state
     state = DocumentDeliveryState(
@@ -150,7 +150,16 @@ def document_delivery_state(document: Document) -> DocumentDeliveryState | None:
     state = getattr(document, "_memento_delivery_state", None)
     if isinstance(state, DocumentDeliveryState):
         return state
-    return getattr(document, "delivery_state", None)
+    # Accessing an unloaded async relationship from ordinary Python code
+    # attempts implicit I/O and raises MissingGreenlet. Joined loads and
+    # explicitly attached states are already present in the instance dict.
+    loaded = getattr(document, "__dict__", {}).get("delivery_state")
+    if isinstance(loaded, DocumentDeliveryState):
+        return loaded
+    if not isinstance(document, Document):
+        candidate = getattr(document, "delivery_state", None)
+        return candidate if isinstance(candidate, DocumentDeliveryState) else None
+    return None
 
 
 def document_metadata(document: Document) -> dict:

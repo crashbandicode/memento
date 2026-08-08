@@ -116,6 +116,7 @@ async def test_api_lifespan_readiness_does_not_wait_for_online_indexes(
     assert schema_engine.connection.sync_calls == [
         server_main._run_migrations,
         server_main.Base.metadata.create_all,
+        server_main._configure_hot_storage,
     ]
     assert schema_engine.disposed is True
 
