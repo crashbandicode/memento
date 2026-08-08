@@ -992,6 +992,97 @@ class SyncQueue:
             return None
         return candidate
 
+    @_rollback_on_error
+    def record_unchanged_legacy_full_source(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        legacy_hash: str,
+        source_size: int,
+        source_mtime_ns: int,
+        identity_version: str,
+    ) -> bool:
+        """Durably prove one inactive acknowledged legacy FULL source.
+
+        This intentionally records only the source observation epoch.  The
+        acknowledged hash remains in its historical identity domain; claiming
+        it is a canonical sanitized-payload hash would let an active transition
+        row bypass reconciliation.  Any same-path active row, unacknowledged
+        state, or divergent observation must take the full parse path instead.
+        """
+
+        if (
+            len(legacy_hash) != 64
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in legacy_hash
+            )
+            or not identity_version
+        ):
+            return False
+
+        source_size = max(0, int(source_size))
+        source_mtime_ns = max(0, int(source_mtime_ns))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            state = self._conn.execute(
+                """SELECT COALESCE(observed_hash, last_hash), synced_hash,
+                          synced_offset, synced_at, identity_version
+                   FROM file_state WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if (
+                state is None
+                or state[0] != legacy_hash
+                or state[1] != legacy_hash
+                or int(state[2] or 0) != source_size
+                or state[3] is None
+                or state[4] not in (None, identity_version)
+            ):
+                self._conn.rollback()
+                return False
+
+            active = self._conn.execute(
+                """SELECT 1 FROM queue
+                   WHERE tool_name=? AND relative_path=?
+                     AND status IN (
+                        'pending','uploading','auth_blocked',
+                        'repair_required','quarantined'
+                     )
+                   LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if active is not None:
+                self._conn.rollback()
+                return False
+
+            cursor = self._conn.execute(
+                """UPDATE file_state
+                   SET source_size=?, source_mtime_ns=?, identity_version=?
+                   WHERE tool_name=? AND relative_path=?
+                     AND COALESCE(observed_hash, last_hash)=?
+                     AND synced_hash=? AND synced_offset=?
+                     AND synced_at IS NOT NULL
+                     AND (identity_version IS NULL OR identity_version=?)""",
+                (
+                    source_size,
+                    source_mtime_ns,
+                    identity_version,
+                    tool_name,
+                    relative_path,
+                    legacy_hash,
+                    legacy_hash,
+                    source_size,
+                    identity_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+
     def adopt_legacy_full_source(
         self,
         tool_name: str,

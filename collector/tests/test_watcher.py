@@ -30,9 +30,11 @@ from collector.tools.base import (
     ContentType,
     FileClassification,
     SyncStrategy,
+    WatchPath,
 )
 from collector.watcher import (
     FULL_IDENTITY_VERSION,
+    LEGACY_FULL_PROOF_VERSION,
     FileWatcher,
     _DebouncedHandler,
     _delta_hash_revision,
@@ -459,6 +461,262 @@ def _legacy_full_watcher(
     watcher._queue = queue
     watcher._parsers = [JsonlParser()]
     return queue, watcher
+
+
+def _insert_acknowledged_legacy_full_state(
+    queue: SyncQueue,
+    path: Path,
+    relative_path: str,
+) -> str:
+    stat = path.stat()
+    legacy_hash = _legacy_full_hash_revision(
+        path,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    with queue._lock:
+        queue._conn.execute(
+            """INSERT INTO file_state (
+                   tool_name, relative_path, last_hash, last_offset,
+                   last_synced_at, observed_hash, observed_offset, observed_at,
+                   synced_hash, synced_offset, synced_at,
+                   source_size, source_mtime_ns, identity_version
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+            (
+                "codex",
+                relative_path,
+                legacy_hash,
+                stat.st_size,
+                100.0,
+                legacy_hash,
+                stat.st_size,
+                100.0,
+                legacy_hash,
+                stat.st_size,
+                100.0,
+                None,
+                None,
+            ),
+        )
+        queue._conn.commit()
+    return legacy_hash
+
+
+def _inactive_legacy_scan_watcher(queue: SyncQueue, root: Path) -> FileWatcher:
+    def classify(path: Path) -> FileClassification:
+        return FileClassification(
+            tool_name="codex",
+            category=Category.CONVERSATION,
+            content_type=ContentType.JSONL,
+            sync_strategy=SyncStrategy.FULL,
+            relative_path=f"archived_sessions/{path.name}",
+        )
+
+    watch_path = WatchPath(
+        path=root,
+        pattern="*.jsonl",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+    )
+    tool = SimpleNamespace(
+        name="codex",
+        root_path=root,
+        is_available=lambda: True,
+        get_watch_paths=lambda: [watch_path],
+        classify_file=classify,
+    )
+    watcher = object.__new__(FileWatcher)
+    watcher._tools = [tool]
+    watcher._tool_map = {str(root): tool}
+    watcher._queue = queue
+    watcher._config = SimpleNamespace(queue_high_water_bytes=0)
+    watcher._parsers = [JsonlParser()]
+    watcher._stop_event = threading.Event()
+    watcher._scan_cancel_event = threading.Event()
+    watcher._scan_lock = threading.Lock()
+    watcher._processing_lock = threading.Lock()
+    return watcher
+
+
+def test_initial_scan_cheaply_proves_many_inactive_legacy_archives_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    archive_dir = tmp_path / "archived_sessions"
+    archive_dir.mkdir()
+    database = tmp_path / "queue" / "sync.db"
+    queue = SyncQueue(database, spool_threshold=64 * 1024)
+    file_count = 32
+    for index in range(file_count):
+        path = archive_dir / f"rollout-{index:03d}.jsonl"
+        path.write_text(
+            json.dumps(
+                {"message": f"{index:03d}-" + "x" * (300 * 1024)},
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _insert_acknowledged_legacy_full_state(
+            queue,
+            path,
+            f"archived_sessions/{path.name}",
+        )
+
+    watcher = _inactive_legacy_scan_watcher(queue, archive_dir)
+
+    def unexpected_full_payload_work(*_args, **_kwargs):
+        raise AssertionError("inactive legacy source was parsed or sanitized")
+
+    monkeypatch.setattr(
+        JsonlParser,
+        "parse_to_writer",
+        unexpected_full_payload_work,
+    )
+    monkeypatch.setattr(
+        "collector.watcher.sanitize_jsonl_line",
+        unexpected_full_payload_work,
+    )
+    monkeypatch.setattr(
+        "collector.watcher.sanitize_jsonl",
+        unexpected_full_payload_work,
+    )
+
+    assert queue.pending_count() == 0
+    assert watcher.initial_scan() == file_count
+    assert queue.pending_count() == 0
+    with queue._lock:
+        proof_count = queue._conn.execute(
+            """SELECT COUNT(*) FROM file_state
+               WHERE identity_version=?
+                 AND source_size IS NOT NULL
+                 AND source_mtime_ns IS NOT NULL""",
+            (LEGACY_FULL_PROOF_VERSION,),
+        ).fetchone()[0]
+    assert proof_count == file_count
+    queue.close()
+
+    queue = SyncQueue(database, spool_threshold=64 * 1024)
+    watcher._queue = queue
+    monkeypatch.setattr(
+        "collector.watcher._legacy_full_hash_revision",
+        unexpected_full_payload_work,
+    )
+    try:
+        assert watcher.initial_scan() == file_count
+        assert queue.pending_count() == 0
+    finally:
+        queue.close()
+
+
+def test_inactive_legacy_proof_fully_ingests_same_size_changes(
+    tmp_path: Path,
+) -> None:
+    before = '{"message":"AAAA"}\n'
+    after = '{"message":"BBBB"}\n'
+    assert len(before.encode("utf-8")) == len(after.encode("utf-8"))
+
+    for preserve_mtime in (False, True):
+        case = tmp_path / f"preserve-mtime-{preserve_mtime}"
+        archive_dir = case / "archived_sessions"
+        archive_dir.mkdir(parents=True)
+        path = archive_dir / "same-size.jsonl"
+        path.write_text(before, encoding="utf-8")
+        original_stat = path.stat()
+        queue = SyncQueue(case / "queue" / "sync.db")
+        legacy_hash = _insert_acknowledged_legacy_full_state(
+            queue,
+            path,
+            "archived_sessions/same-size.jsonl",
+        )
+        watcher = _inactive_legacy_scan_watcher(queue, archive_dir)
+
+        path.write_text(after, encoding="utf-8")
+        target_mtime_ns = (
+            original_stat.st_mtime_ns
+            if preserve_mtime
+            else original_stat.st_mtime_ns + 10_000_000_000
+        )
+        os.utime(
+            path,
+            ns=(original_stat.st_atime_ns, target_mtime_ns),
+        )
+        current_stat = path.stat()
+        assert current_stat.st_size == original_stat.st_size
+        if preserve_mtime:
+            assert current_stat.st_mtime_ns == original_stat.st_mtime_ns
+        assert _legacy_full_hash_revision(
+            path,
+            size=current_stat.st_size,
+            mtime_ns=current_stat.st_mtime_ns,
+        ) != legacy_hash
+
+        try:
+            assert queue.pending_count() == 0
+            watcher._process_file_changed(path, emit_live_signals=False)
+
+            changed = queue.claim_batch()[0]
+            expected = sanitize_jsonl(after).content
+            assert queue.read_payload_text(changed) == expected
+            assert changed.content_hash == hashlib.sha256(
+                expected.encode("utf-8")
+            ).hexdigest()
+            assert queue.get_source_revision(
+                "codex",
+                "archived_sessions/same-size.jsonl",
+                identity_version=FULL_IDENTITY_VERSION,
+            ) == (current_stat.st_size, current_stat.st_mtime_ns)
+        finally:
+            queue.close()
+
+
+def test_restarted_legacy_proof_ingests_later_same_size_change(
+    tmp_path: Path,
+) -> None:
+    archive_dir = tmp_path / "archived_sessions"
+    archive_dir.mkdir()
+    path = archive_dir / "changed-after-proof.jsonl"
+    before = '{"message":"before"}\n'
+    after = '{"message":"after!"}\n'
+    assert len(before.encode("utf-8")) == len(after.encode("utf-8"))
+    path.write_text(before, encoding="utf-8")
+    database = tmp_path / "queue" / "sync.db"
+    queue = SyncQueue(database)
+    _insert_acknowledged_legacy_full_state(
+        queue,
+        path,
+        "archived_sessions/changed-after-proof.jsonl",
+    )
+    watcher = _inactive_legacy_scan_watcher(queue, archive_dir)
+
+    watcher._process_file_changed(path, emit_live_signals=False)
+    assert queue.pending_count() == 0
+    proven_stat = path.stat()
+    assert queue.get_source_revision(
+        "codex",
+        "archived_sessions/changed-after-proof.jsonl",
+        identity_version=LEGACY_FULL_PROOF_VERSION,
+    ) == (proven_stat.st_size, proven_stat.st_mtime_ns)
+    queue.close()
+
+    queue = SyncQueue(database)
+    watcher._queue = queue
+    path.write_text(after, encoding="utf-8")
+    changed_mtime_ns = proven_stat.st_mtime_ns + 10_000_000_000
+    os.utime(path, ns=(proven_stat.st_atime_ns, changed_mtime_ns))
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        changed = queue.claim_batch()[0]
+        assert queue.read_payload_text(changed) == sanitize_jsonl(after).content
+        assert queue.get_source_revision(
+            "codex",
+            "archived_sessions/changed-after-proof.jsonl",
+            identity_version=FULL_IDENTITY_VERSION,
+        ) == (path.stat().st_size, path.stat().st_mtime_ns)
+    finally:
+        queue.close()
 
 
 def _reconciliation_watcher(queue: SyncQueue, root: Path) -> FileWatcher:

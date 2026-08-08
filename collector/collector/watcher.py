@@ -54,6 +54,9 @@ _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
 # Bump this whenever sanitization/parsing can change server-visible FULL
 # content. A matching stat token may skip work only within the same epoch.
 FULL_IDENTITY_VERSION = "sanitized-payload-v1"
+# An acknowledged pre-canonical FULL hash can prove its historical source
+# revision without pretending that hash describes the sanitized payload.
+LEGACY_FULL_PROOF_VERSION = "legacy-full-source-v1"
 LEGACY_RECONCILE_MAX_FILES = 16
 LEGACY_RECONCILE_MAX_SOURCE_BYTES = 1024 * 1024 * 1024
 LEGACY_RECONCILE_MAX_SINGLE_SOURCE_BYTES = 256 * 1024 * 1024
@@ -655,6 +658,15 @@ class FileWatcher:
                     else None
                 ),
             )
+            if (
+                observed_source_revision != source_revision
+                and classification.sync_strategy == SyncStrategy.FULL
+            ):
+                observed_source_revision = get_source_revision(
+                    classification.tool_name,
+                    classification.relative_path,
+                    identity_version=LEGACY_FULL_PROOF_VERSION,
+                )
             if observed_source_revision == source_revision:
                 # Startup/catch-up scans can contain thousands of durable,
                 # unchanged files. Their exact stat token is enough to avoid
@@ -684,6 +696,42 @@ class FileWatcher:
                     size=file_size,
                     mtime_ns=source_stat.st_mtime_ns,
                 )
+                if legacy_source_hash == legacy_adoption_hash:
+                    # Inactive acknowledged legacy rows need no canonical
+                    # payload merely to make their unchanged source revision
+                    # durable.  Keep the identity domains distinct so active
+                    # transition rows still take the canonical reconciliation
+                    # path below.
+                    try:
+                        proof_stat = path.stat()
+                    except OSError:
+                        return
+                    proof_is_stable = (
+                        source_stat.st_dev == proof_stat.st_dev
+                        and source_stat.st_ino == proof_stat.st_ino
+                        and (proof_stat.st_size, proof_stat.st_mtime_ns)
+                        == source_revision
+                    )
+                    if not proof_is_stable:
+                        return
+                    record_legacy_source = getattr(
+                        self._queue,
+                        "record_unchanged_legacy_full_source",
+                        None,
+                    )
+                    if callable(record_legacy_source) and record_legacy_source(
+                        classification.tool_name,
+                        classification.relative_path,
+                        legacy_hash=legacy_adoption_hash,
+                        source_size=file_size,
+                        source_mtime_ns=source_stat.st_mtime_ns,
+                        identity_version=LEGACY_FULL_PROOF_VERSION,
+                    ):
+                        logger.debug(
+                            "Recorded unchanged legacy FULL source proof for %s",
+                            path,
+                        )
+                        return
 
         # DELTA revisions deliberately retain the deterministic append-prefix
         # token introduced by d0d50a6. FULL identity is computed later from
