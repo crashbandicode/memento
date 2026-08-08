@@ -31,6 +31,11 @@ _MAX_PROJECTION_BASELINE_BYTES = 8 * 1024 * 1024
 _MAX_PROJECTION_BASELINES_BYTES = 32 * 1024 * 1024
 _MAX_PROJECTION_DELTA_RECORDS = 10_000
 _MAX_PROJECTION_DELTA_BYTES = 16 * 1024 * 1024
+_MAX_PROJECTION_INSERTION_TAIL_RECORDS = 32
+_MAX_PROJECTION_INSERTION_GROUPS = 16
+_MAX_PROJECTION_INSERTED_RECORDS = 64
+_MAX_PROJECTION_SOURCE_ID_CHARS = 256
+_CURSOR_PROJECTION_ORDER_KEY = "_cursor_projection_order_v1"
 _INTERRUPTED_STATES = {"aborted", "cancelled", "canceled", "interrupted"}
 _TERMINAL_COMPOSER_STATES = _INTERRUPTED_STATES | {
     "complete",
@@ -71,10 +76,15 @@ class CursorStateSnapshot:
 
 
 @dataclass(frozen=True)
+class CursorProjectionDelta:
+    content: str
+    ordering_hint: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
 class _ProjectionBaseline:
     source_order: tuple[str, ...]
     digests: dict[str, str]
-    canvas_source_ids: frozenset[str]
     memory_bytes: int
 
 
@@ -672,8 +682,8 @@ class CursorStateExporter:
         *,
         base_hash: str,
         base_offset: int,
-    ) -> str | None:
-        """Return changed/appended rows, or None when a FULL is required."""
+    ) -> CursorProjectionDelta | None:
+        """Return a bounded stable-row delta, or None when a FULL is required."""
         key = (snapshot.relative_path, base_hash, int(base_offset))
         baseline = self._projection_baselines.get(key)
         if baseline is None or not snapshot.projection_records:
@@ -683,10 +693,63 @@ class CursorStateExporter:
         current_order = tuple(
             record.source_id for record in snapshot.projection_records
         )
-        # A row removal, reorder, or insertion before the committed tail changes
-        # presentation order. Only a complete snapshot can safely express it.
-        if current_order[: len(baseline.source_order)] != baseline.source_order:
+        if any(
+            len(source_id) > _MAX_PROJECTION_SOURCE_ID_CHARS
+            for source_id in current_order
+        ):
             return None
+        baseline_positions = {
+            source_id: index
+            for index, source_id in enumerate(baseline.source_order)
+        }
+        baseline_ids = set(baseline_positions)
+        retained_order = tuple(
+            source_id for source_id in current_order if source_id in baseline_ids
+        )
+        # Removing or relatively reordering a committed identity cannot be
+        # represented by this sparse protocol.
+        if retained_order != baseline.source_order:
+            return None
+
+        insertion_groups: list[dict[str, object]] = []
+        inserted_records = 0
+        current_index = 0
+        while current_index < len(current_order):
+            if current_order[current_index] in baseline_ids:
+                current_index += 1
+                continue
+            group_start = current_index
+            while (
+                current_index < len(current_order)
+                and current_order[current_index] not in baseline_ids
+            ):
+                current_index += 1
+            source_ids = list(current_order[group_start:current_index])
+            inserted_records += len(source_ids)
+            if (
+                len(insertion_groups) >= _MAX_PROJECTION_INSERTION_GROUPS
+                or inserted_records > _MAX_PROJECTION_INSERTED_RECORDS
+                or group_start == 0
+            ):
+                return None
+            after_source_id = current_order[group_start - 1]
+            before_source_id = (
+                current_order[current_index]
+                if current_index < len(current_order)
+                else None
+            )
+            if before_source_id is not None:
+                before_index = baseline_positions[before_source_id]
+                if (
+                    len(baseline.source_order) - before_index
+                    > _MAX_PROJECTION_INSERTION_TAIL_RECORDS
+                ):
+                    return None
+            insertion_groups.append({
+                "after_source_id": after_source_id,
+                "before_source_id": before_source_id,
+                "source_ids": source_ids,
+            })
 
         changed_lines: list[str] = []
         changed_bytes = 0
@@ -694,15 +757,6 @@ class CursorStateExporter:
             if baseline.digests.get(record.source_id) == record.digest:
                 continue
             line = snapshot.content[record.start:record.end]
-            # Canvas references have their own FK-backed projection. Existing
-            # FULL ingest replaces those rows and references transactionally;
-            # a sparse in-place row update cannot safely express removal or
-            # replacement of a referenced Canvas path.
-            if (
-                record.source_id in baseline.canvas_source_ids
-                or ".canvas.tsx" in line.casefold()
-            ):
-                return None
             changed_lines.append(line)
             changed_bytes += len(line.encode("utf-8"))
             if (
@@ -710,7 +764,22 @@ class CursorStateExporter:
                 or changed_bytes > _MAX_PROJECTION_DELTA_BYTES
             ):
                 return None
-        return "\n".join(changed_lines)
+        ordering_hint = (
+            {
+                "version": 1,
+                "base_count": len(baseline.source_order),
+                "groups": insertion_groups,
+            }
+            if any(
+                group["before_source_id"] is not None
+                for group in insertion_groups
+            )
+            else None
+        )
+        return CursorProjectionDelta(
+            content="\n".join(changed_lines),
+            ordering_hint=ordering_hint,
+        )
 
     def remember_queued_projection(
         self,
@@ -758,12 +827,6 @@ class CursorStateExporter:
         baseline = _ProjectionBaseline(
             source_order=tuple(record.source_id for record in records),
             digests={record.source_id: record.digest for record in records},
-            canvas_source_ids=frozenset(
-                record.source_id
-                for record in records
-                if ".canvas.tsx"
-                in snapshot.content[record.start:record.end].casefold()
-            ),
             memory_bytes=memory_bytes,
         )
         self._projection_baselines[key] = baseline
@@ -1160,6 +1223,7 @@ def enqueue_cursor_state_snapshots(
         )
         is_projection_delta = False
         payload = snapshot.content
+        delta_ordering_hint: dict[str, object] | None = None
         if base_is_current:
             payload = ""
         elif base_hash and base_offset > 0:
@@ -1169,7 +1233,8 @@ def enqueue_cursor_state_snapshots(
                 base_offset=base_offset,
             )
             if delta is not None:
-                payload = delta
+                payload = delta.content
+                delta_ordering_hint = delta.ordering_hint
                 is_projection_delta = True
 
         # Activity metadata must observe only changed/new projection rows. Feed
@@ -1195,6 +1260,9 @@ def enqueue_cursor_state_snapshots(
             )
             continue
 
+        queue_metadata = dict(snapshot.metadata)
+        if delta_ordering_hint is not None:
+            queue_metadata[_CURSOR_PROJECTION_ORDER_KEY] = delta_ordering_hint
         queue.enqueue(
             tool_name="cursor",
             category=Category.CONVERSATION.value,
@@ -1206,7 +1274,7 @@ def enqueue_cursor_state_snapshots(
             sync_strategy="delta" if is_projection_delta else "full",
             is_partial=is_projection_delta,
             offset=snapshot.content_size,
-            metadata=snapshot.metadata,
+            metadata=queue_metadata,
             source_modified_at=snapshot.source_modified_at,
             base_hash=base_hash if is_projection_delta else None,
             base_offset=base_offset if is_projection_delta else 0,

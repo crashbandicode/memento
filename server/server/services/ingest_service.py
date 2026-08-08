@@ -102,6 +102,10 @@ MAX_DOCUMENT_METADATA_BYTES = 256 * 1024
 MAX_METADATA_STRING_CHARS = 16 * 1024
 MAX_USER_HISTORY_ENTRIES = 2_000
 MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
+MAX_CURSOR_PROJECTION_INSERTION_TAIL_RECORDS = 32
+MAX_CURSOR_PROJECTION_INSERTION_GROUPS = 16
+MAX_CURSOR_PROJECTION_INSERTED_RECORDS = 64
+CURSOR_PROJECTION_ORDER_KEY = "_cursor_projection_order_v1"
 STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
 STORED_SOURCE_HASH_KEY = "_stored_source_hash"
 STORED_SOURCE_SIZE_KEY = "_stored_source_size"
@@ -402,6 +406,14 @@ class DeltaBaseMismatch(RuntimeError):
         super().__init__("delta base does not match committed source revision")
         self.expected_hash = expected_hash
         self.expected_offset = expected_offset
+
+
+class CursorProjectionOrderMismatch(DeltaBaseMismatch):
+    """A sparse ordering hint cannot be applied to the committed row base."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(expected_hash=None, expected_offset=0)
+        self.args = (reason,)
 
 
 def _logical_document_file_size(
@@ -1370,6 +1382,7 @@ async def _open_conversation_line_range(
     anchor: int,
     count: int,
     current_max: int | None = None,
+    synchronize_session: bool = False,
 ) -> int:
     """Open a collision-free positive line range and return the new maximum."""
     if current_max is None:
@@ -1389,7 +1402,9 @@ async def _open_conversation_line_range(
                 ConversationMessage.line_number >= anchor,
             )
             .values(line_number=-ConversationMessage.line_number)
-            .execution_options(synchronize_session=False)
+            .execution_options(
+                synchronize_session="fetch" if synchronize_session else False
+            )
         )
         await db.execute(
             update(ConversationMessage)
@@ -1399,7 +1414,9 @@ async def _open_conversation_line_range(
                 ConversationMessage.line_number <= -anchor,
             )
             .values(line_number=-ConversationMessage.line_number + count)
-            .execution_options(synchronize_session=False)
+            .execution_options(
+                synchronize_session="fetch" if synchronize_session else False
+            )
         )
     return current_max + count
 
@@ -2435,6 +2452,11 @@ async def ingest_file(
         and tool_id == "cursor"
         and metadata.get("source") == "cursor_state_v1"
     )
+    cursor_projection_order = metadata.pop(CURSOR_PROJECTION_ORDER_KEY, None)
+    if cursor_projection_order is not None and not cursor_projection_delta:
+        raise ValueError(
+            "Cursor projection ordering hints require a Cursor state delta"
+        )
     if conversation_source is not None:
         if category != "conversation" or content_type != "jsonl":
             raise ValueError(
@@ -3088,6 +3110,7 @@ async def ingest_file(
             user_history=user_history,
             first_user_message=first_user_message,
             conversation_source=conversation_source,
+            cursor_projection_order=cursor_projection_order,
         )
         from .conversation_activity import refresh_document_activity_at
 
@@ -3456,6 +3479,244 @@ def _stored_message_source_id(message: ConversationMessage) -> str:
     return str(metadata.get("source_id") or "")
 
 
+def _cursor_projection_hint_source_id(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+    ):
+        raise CursorProjectionOrderMismatch(
+            f"Cursor projection {field} must be a bounded source ID"
+        )
+    return value
+
+
+async def _apply_cursor_projection_order(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    raw_hint: object,
+    incoming_source_ids: list[str],
+    current_max: int,
+) -> tuple[dict[str, int], set[int]]:
+    """Validate anchor hints, open bounded gaps, and return final insert lines."""
+    if not isinstance(raw_hint, dict) or set(raw_hint) != {
+        "version",
+        "base_count",
+        "groups",
+    }:
+        raise CursorProjectionOrderMismatch(
+            "Malformed Cursor projection ordering hint"
+        )
+    version = raw_hint.get("version")
+    base_count = raw_hint.get("base_count")
+    raw_groups = raw_hint.get("groups")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+        or not isinstance(base_count, int)
+        or isinstance(base_count, bool)
+        or base_count != current_max
+        or current_max < 1
+        or current_max > 2_147_483_647 - MAX_CURSOR_PROJECTION_INSERTED_RECORDS
+        or not isinstance(raw_groups, list)
+        or not raw_groups
+        or len(raw_groups) > MAX_CURSOR_PROJECTION_INSERTION_GROUPS
+    ):
+        raise CursorProjectionOrderMismatch(
+            "Invalid Cursor projection ordering bounds"
+        )
+
+    groups: list[dict[str, object]] = []
+    listed_source_ids: list[str] = []
+    anchor_source_ids: set[str] = set()
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict) or set(raw_group) != {
+            "after_source_id",
+            "before_source_id",
+            "source_ids",
+        }:
+            raise CursorProjectionOrderMismatch(
+                "Malformed Cursor projection insertion group"
+            )
+        after_source_id = _cursor_projection_hint_source_id(
+            raw_group.get("after_source_id"),
+            "after anchor",
+        )
+        raw_before = raw_group.get("before_source_id")
+        before_source_id = (
+            None
+            if raw_before is None
+            else _cursor_projection_hint_source_id(raw_before, "before anchor")
+        )
+        raw_source_ids = raw_group.get("source_ids")
+        if not isinstance(raw_source_ids, list) or not raw_source_ids:
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection insertion group is empty"
+            )
+        source_ids = [
+            _cursor_projection_hint_source_id(value, "inserted identity")
+            for value in raw_source_ids
+        ]
+        if len(set(source_ids)) != len(source_ids):
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection insertion identities are duplicated"
+            )
+        listed_source_ids.extend(source_ids)
+        anchor_source_ids.add(after_source_id)
+        if before_source_id is not None:
+            anchor_source_ids.add(before_source_id)
+        groups.append({
+            "after_source_id": after_source_id,
+            "before_source_id": before_source_id,
+            "source_ids": source_ids,
+        })
+
+    if (
+        len(listed_source_ids) > MAX_CURSOR_PROJECTION_INSERTED_RECORDS
+        or len(set(listed_source_ids)) != len(listed_source_ids)
+    ):
+        raise CursorProjectionOrderMismatch(
+            "Cursor projection inserted identities exceed bounds"
+        )
+
+    lookup_source_ids = sorted(set(incoming_source_ids) | anchor_source_ids)
+    located = (
+        await db.execute(
+            select(
+                ConversationMessage.metadata_["source_id"].astext.label("source_id"),
+                ConversationMessage.line_number,
+            ).where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.metadata_["source_id"].astext.in_(
+                    lookup_source_ids
+                ),
+            )
+        )
+    ).all()
+    source_lines: dict[str, int] = {}
+    for source_id, line_number in located:
+        source_id = str(source_id or "")
+        if source_id in source_lines:
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection source anchor is ambiguous"
+            )
+        source_lines[source_id] = int(line_number)
+
+    missing_incoming = [
+        source_id
+        for source_id in incoming_source_ids
+        if source_id not in source_lines
+    ]
+    if listed_source_ids != missing_incoming:
+        raise CursorProjectionOrderMismatch(
+            "Cursor projection ordering hint does not cover new identities"
+        )
+
+    internal_groups: list[tuple[int, list[str]]] = []
+    append_group: list[str] | None = None
+    previous_anchor = 0
+    for group in groups:
+        after_source_id = str(group["after_source_id"])
+        before_source_id = group["before_source_id"]
+        source_ids = list(group["source_ids"])
+        after_line = source_lines.get(after_source_id)
+        if after_line is None or after_line < 1:
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection after anchor is missing"
+            )
+        if before_source_id is None:
+            if append_group is not None or after_line != current_max:
+                raise CursorProjectionOrderMismatch(
+                    "Cursor projection append anchor is ambiguous"
+                )
+            anchor = current_max + 1
+            append_group = source_ids
+        else:
+            before_line = source_lines.get(str(before_source_id))
+            if before_line is None or before_line != after_line + 1:
+                raise CursorProjectionOrderMismatch(
+                    "Cursor projection anchors are not adjacent"
+                )
+            anchor = before_line
+            if (
+                current_max - anchor + 1
+                > MAX_CURSOR_PROJECTION_INSERTION_TAIL_RECORDS
+            ):
+                raise CursorProjectionOrderMismatch(
+                    "Cursor projection insertion is too far from tail"
+                )
+            internal_groups.append((anchor, source_ids))
+        if anchor <= previous_anchor:
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection insertion groups are unordered"
+            )
+        previous_anchor = anchor
+
+    if append_group is not None and groups[-1]["before_source_id"] is not None:
+        raise CursorProjectionOrderMismatch(
+            "Cursor projection append group must be last"
+        )
+
+    dirty_lines: set[int] = set()
+    if internal_groups:
+        first_anchor = internal_groups[0][0]
+        suffix_lines = [
+            int(value)
+            for value in (
+                await db.execute(
+                    select(ConversationMessage.line_number)
+                    .where(
+                        ConversationMessage.document_id == document_id,
+                        ConversationMessage.line_number >= first_anchor,
+                    )
+                    .order_by(ConversationMessage.line_number)
+                    .limit(MAX_CURSOR_PROJECTION_INSERTION_TAIL_RECORDS + 1)
+                )
+            ).scalars()
+        ]
+        if len(suffix_lines) > MAX_CURSOR_PROJECTION_INSERTION_TAIL_RECORDS:
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection suffix exceeds the bounded tail"
+            )
+        for original_line in suffix_lines:
+            dirty_lines.add(
+                original_line
+                + sum(
+                    len(source_ids)
+                    for anchor, source_ids in internal_groups
+                    if anchor <= original_line
+                )
+            )
+
+    current_shifted_max = current_max
+    for anchor, source_ids in reversed(internal_groups):
+        current_shifted_max = await _open_conversation_line_range(
+            db,
+            document_id,
+            anchor=anchor,
+            count=len(source_ids),
+            current_max=current_shifted_max,
+            synchronize_session=True,
+        )
+
+    insert_lines: dict[str, int] = {}
+    inserted_before = 0
+    for anchor, source_ids in internal_groups:
+        final_anchor = anchor + inserted_before
+        for index, source_id in enumerate(source_ids):
+            insert_lines[source_id] = final_anchor + index
+        inserted_before += len(source_ids)
+    if append_group is not None:
+        append_anchor = current_max + inserted_before + 1
+        for index, source_id in enumerate(append_group):
+            insert_lines[source_id] = append_anchor + index
+    dirty_lines.update(insert_lines.values())
+    return insert_lines, dirty_lines
+
+
 async def _extract_messages(
     db: AsyncSession,
     doc: Document,
@@ -3465,6 +3726,7 @@ async def _extract_messages(
     user_history: list[dict] | None = None,
     first_user_message: str = "",
     conversation_source: ConversationFileSource | None = None,
+    cursor_projection_order: object | None = None,
 ) -> str:
     """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
@@ -3478,7 +3740,10 @@ async def _extract_messages(
         extract_search_terms,
         upsert_search_terms,
     )
-    from .canvas_artifact_store import project_message_canvases
+    from .canvas_artifact_store import (
+        project_message_canvases,
+        reconcile_message_canvases,
+    )
 
     search_parts: list[str] = []
     search_bytes = 0
@@ -3722,6 +3987,8 @@ async def _extract_messages(
         )
     )
     cursor_projection_rows: dict[str, ConversationMessage] = {}
+    cursor_projection_insert_lines: dict[str, int] = {}
+    canvas_reconcile_rows: list[ConversationMessage] = []
     if cursor_projection_delta:
         # Projection payloads contain only changed/new source records, so parse
         # the bounded delta once and fetch just those stable identities. The
@@ -3737,9 +4004,21 @@ async def _extract_messages(
             or any(not source_id for source_id in incoming_source_ids)
             or len(set(incoming_source_ids)) != len(incoming_source_ids)
         ):
-            raise ValueError(
+            raise CursorProjectionOrderMismatch(
                 "Cursor projection delta requires unique stable source identities"
             )
+        if cursor_projection_order is not None:
+            (
+                cursor_projection_insert_lines,
+                shifted_projection_lines,
+            ) = await _apply_cursor_projection_order(
+                db,
+                doc.id,
+                raw_hint=cursor_projection_order,
+                incoming_source_ids=incoming_source_ids,
+                current_max=start_line - 1,
+            )
+            dirty_projection_lines.update(shifted_projection_lines)
         existing_projection_rows = (
             (
                 await db.execute(
@@ -3751,6 +4030,7 @@ async def _extract_messages(
                         ),
                     )
                     .order_by(ConversationMessage.line_number)
+                    .execution_options(populate_existing=True)
                 )
             )
             .scalars()
@@ -3844,6 +4124,7 @@ async def _extract_messages(
                 dirty_projection_lines.add(
                     existing_cursor_projection.line_number
                 )
+                canvas_reconcile_rows.append(existing_cursor_projection)
             add_search_text(normalized.role, clean_content)
             if delta_tail is existing_cursor_projection:
                 delta_tail = None
@@ -4007,8 +4288,6 @@ async def _extract_messages(
                 existing_message is not None
                 and incoming_source_id
                 and incoming_source_id == existing_source_id
-                and ".canvas.tsx" not in existing_message.content.casefold()
-                and ".canvas.tsx" not in clean_content.casefold()
             ):
                 # Mutable projections (notably Cursor's current-task row) keep
                 # one stable source identity. Update that row without forcing
@@ -4020,6 +4299,7 @@ async def _extract_messages(
                 existing_message.timestamp = ts
                 add_search_text(normalized.role, clean_content)
                 dirty_projection_lines.add(existing_message.line_number)
+                canvas_reconcile_rows.append(existing_message)
                 line_num += 1
                 continue
             if line_num <= full_existing_max:
@@ -4034,10 +4314,23 @@ async def _extract_messages(
             full_prefix_intact = False
             full_existing_rows.clear()
 
+        target_line = (
+            cursor_projection_insert_lines.get(incoming_source_id, line_num)
+            if cursor_projection_delta
+            else line_num
+        )
+        if (
+            cursor_projection_delta
+            and cursor_projection_order is not None
+            and incoming_source_id not in cursor_projection_insert_lines
+        ):
+            raise CursorProjectionOrderMismatch(
+                "Cursor projection ordering hint omitted a new source identity"
+            )
         batch.append(
             ConversationMessage(
                 document_id=doc.id,
-                line_number=line_num,
+                line_number=target_line,
                 message_type=message_type,
                 role=normalized.role,
                 content=clean_content,
@@ -4085,6 +4378,8 @@ async def _extract_messages(
         db.add_all(batch)
         await db.flush()
         await project_message_canvases(db, doc, batch)
+    if canvas_reconcile_rows:
+        await reconcile_message_canvases(db, doc, canvas_reconcile_rows)
 
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.

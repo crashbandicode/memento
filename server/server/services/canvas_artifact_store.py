@@ -100,20 +100,69 @@ async def project_message_canvases(
     messages: list[ConversationMessage],
 ) -> int:
     """Persist Canvas references with the messages that introduced them."""
+    return await reconcile_message_canvases(db, document, messages)
+
+
+async def reconcile_message_canvases(
+    db: AsyncSession,
+    document: Document,
+    messages: list[ConversationMessage],
+) -> int:
+    """Exactly reconcile references while preserving unchanged outcomes."""
     if (
         document.machine_id is None
         or document.tool_id not in ALLOWED_TOOLS
         or not messages
     ):
         return 0
+    message_by_id = {
+        int(message.id): message
+        for message in messages
+        if message.id is not None
+    }
+    if not message_by_id:
+        return 0
+    existing = (
+        (
+            await db.execute(
+                select(CanvasArtifactReference).where(
+                    CanvasArtifactReference.document_id == document.id,
+                    CanvasArtifactReference.message_id.in_(message_by_id),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_by_message: dict[int, dict[str, CanvasArtifactReference]] = {}
+    for reference in existing:
+        existing_by_message.setdefault(reference.message_id, {}).setdefault(
+            reference.path_hash,
+            reference,
+        )
+
     projected = 0
+    removed = 0
     for message in messages:
-        if message.id is None or ".canvas.tsx" not in message.content.casefold():
+        if message.id is None:
             continue
-        for descriptor in detect_message_canvases(message.content):
-            path = str(descriptor.get("path") or "")
-            if not path:
+        desired: dict[str, dict[str, Any]] = {}
+        if ".canvas.tsx" in message.content.casefold():
+            for descriptor in detect_message_canvases(message.content):
+                path = str(descriptor.get("path") or "")
+                if path:
+                    desired.setdefault(normalized_path_hash(path), descriptor)
+        current = existing_by_message.get(int(message.id), {})
+        for path_hash, reference in current.items():
+            if path_hash not in desired:
+                await db.delete(reference)
+                removed += 1
+        for path_hash, descriptor in desired.items():
+            if path_hash in current:
+                # Preserve the exact row, including terminal status, artifact
+                # identity, reason, attempts, and timestamps.
                 continue
+            path = str(descriptor.get("path") or "")
             eligible = _is_collector_eligible(path)
             db.add(
                 CanvasArtifactReference(
@@ -121,14 +170,14 @@ async def project_message_canvases(
                     message_id=message.id,
                     machine_id=document.machine_id,
                     recorded_path=path,
-                    path_hash=normalized_path_hash(path),
+                    path_hash=path_hash,
                     name=str(descriptor.get("name") or "canvas")[:120],
                     status="discovered" if eligible else "unsupported",
                     reason=None if eligible else "non_local_or_unsupported_path",
                 )
             )
             projected += 1
-    if projected:
+    if projected or removed:
         await db.flush()
     return projected
 

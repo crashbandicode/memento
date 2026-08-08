@@ -10,12 +10,14 @@ import pytest_asyncio
 from server.api.tasks import get_tasks
 from server.db.models import (
     Base,
+    CanvasArtifactReference,
     ConversationMetadataInbox,
     ConversationMessage,
     ConversationPromptProjection,
     ConversationReadModel,
     ConversationTaskState,
     Document,
+    DocumentDeliveryState,
     DocumentVersion,
     Machine,
     SyncState,
@@ -34,6 +36,8 @@ from server.services.conversation_metadata_inbox import (
 )
 from server.services.conversation_read_model import refresh_conversation_read_model
 from server.services.ingest_service import (
+    CURSOR_PROJECTION_ORDER_KEY,
+    CursorProjectionOrderMismatch,
     LIVE_SHELL_ACTIVITIES_KEY,
     _extract_messages,
     _set_stored_source_identity,
@@ -338,6 +342,43 @@ def _cursor_row(
     })
 
 
+def _cursor_tool_row(
+    source_id: str,
+    content: str,
+    *,
+    timestamp: str,
+    status: str = "completed",
+    tool_name: str = "Read",
+    tool_input: dict | None = None,
+) -> str:
+    return json.dumps({
+        "type": "cursor_state_tool",
+        "role": "tool",
+        "id": source_id,
+        "timestamp": timestamp,
+        "tool_name": tool_name,
+        "tool_input": json.dumps(
+            tool_input or {"path": f"{source_id}.py"}
+        ),
+        "content": content,
+        "tool_call_id": f"call-{source_id}",
+        "tool_status": status,
+    })
+
+
+def _cursor_task_row(source_id: str, *, timestamp: str) -> str:
+    tasks = [{"id": "verify", "content": "Verify order", "status": "pending"}]
+    return json.dumps({
+        "type": "cursor_state_task",
+        "role": "tool",
+        "id": source_id,
+        "timestamp": timestamp,
+        "tool_name": "Task progress 0/1",
+        "tool_input": json.dumps({"tasks": tasks, "is_current": True}),
+        "content": "0 of 1 tasks complete\n○ Verify order",
+    })
+
+
 @pytest.mark.asyncio
 async def test_cursor_projection_delta_updates_stable_rows_in_place(
     session_factory,
@@ -519,6 +560,456 @@ async def test_cursor_projection_delta_updates_stable_rows_in_place(
             schedule_post_ingest=False,
         )
         assert getattr(replayed, "_memento_ingest_disposition") == "idempotent"
+
+
+@pytest.mark.asyncio
+async def test_cursor_projection_delta_inserts_before_bounded_mutable_tail(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        document.metadata_ = {
+            **document.metadata_,
+            "source": "cursor_state_v1",
+        }
+        timestamp = "2026-08-08T04:00:00Z"
+        stable_rows = [
+            _cursor_tool_row(
+                f"stable-{index}",
+                f"Stable output {index}",
+                timestamp=timestamp,
+            )
+            for index in range(5)
+        ]
+        mutable_tail = _cursor_tool_row(
+            "mutable-tail",
+            "Status: running",
+            timestamp=timestamp,
+            status="running",
+            tool_name="Shell",
+            tool_input={"command": "python worker.py"},
+        )
+        task_tail = _cursor_task_row("current-task", timestamp=timestamp)
+        full_snapshot = "\n".join([*stable_rows, task_tail, mutable_tail])
+        await _extract_messages(
+            session,
+            document,
+            full_snapshot,
+            "full",
+        )
+        base_hash = hashlib.sha256(full_snapshot.encode()).hexdigest()
+        base_offset = len(full_snapshot.encode())
+        document.content = full_snapshot
+        document.content_hash = base_hash
+        document.file_size_bytes = base_offset
+        _set_stored_source_identity(
+            document,
+            full_snapshot,
+            revision_hash=base_hash,
+        )
+        session.add(SyncState(
+            machine_id=document.machine_id,
+            tool_id=document.tool_id,
+            relative_path=document.relative_path,
+            last_hash=base_hash,
+            last_offset=base_offset,
+        ))
+        await session.commit()
+        initial = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        initial_identity = {
+            row.metadata_["source_id"]: (row.id, row.line_number)
+            for row in initial
+        }
+        initial_read_model = await session.get(
+            ConversationReadModel,
+            document.id,
+        )
+        initial_task_projection = await session.get(
+            ConversationTaskState,
+            document.id,
+        )
+        assert initial_read_model is not None
+        assert len(initial_read_model.live_activities) == 1
+        assert initial_task_projection is not None
+        assert initial_task_projection.source_line_number == 6
+        task_message_id = initial_task_projection.source_message_id
+
+        inserted_rows = [
+            _cursor_tool_row(
+                f"inserted-{index}",
+                f"Inserted output {index}",
+                timestamp=timestamp,
+            )
+            for index in range(1, 4)
+        ]
+        appended_row = _cursor_tool_row(
+            "appended-4",
+            "Appended output 4",
+            timestamp=timestamp,
+        )
+        completed_tail = _cursor_tool_row(
+            "mutable-tail",
+            "Tail completed.",
+            timestamp=timestamp,
+            tool_name="Shell",
+            tool_input={"command": "python worker.py"},
+        )
+        delta = "\n".join([*inserted_rows, completed_tail, appended_row])
+        final_snapshot = "\n".join([
+            *stable_rows[:3],
+            inserted_rows[0],
+            *stable_rows[3:],
+            *inserted_rows[1:],
+            task_tail,
+            completed_tail,
+            appended_row,
+        ])
+        final_hash = hashlib.sha256(final_snapshot.encode()).hexdigest()
+        ordering_hint = {
+            "version": 1,
+            "base_count": 7,
+            "groups": [
+                {
+                    "after_source_id": "stable-2",
+                    "before_source_id": "stable-3",
+                    "source_ids": ["inserted-1"],
+                },
+                {
+                    "after_source_id": "stable-4",
+                    "before_source_id": "current-task",
+                    "source_ids": ["inserted-2", "inserted-3"],
+                },
+                {
+                    "after_source_id": "mutable-tail",
+                    "before_source_id": None,
+                    "source_ids": ["appended-4"],
+                },
+            ],
+        }
+        machine = await session.get(Machine, document.machine_id)
+        assert machine is not None
+
+        await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=delta,
+            content_hash=final_hash,
+            file_size=len(delta.encode()),
+            mode="delta",
+            offset=len(final_snapshot.encode()),
+            base_hash=base_hash,
+            base_offset=base_offset,
+            metadata={
+                **document.metadata_,
+                CURSOR_PROJECTION_ORDER_KEY: ordering_hint,
+            },
+            timestamp=1_786_162_002.0,
+            machine_id=document.machine_id,
+            user_id=str(machine.user_id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        source_order = [row.metadata_["source_id"] for row in rows]
+        refreshed_document = await session.get(
+            Document,
+            document.id,
+            populate_existing=True,
+        )
+        read_model = await session.get(
+            ConversationReadModel,
+            document.id,
+            populate_existing=True,
+        )
+        task_projection = await session.get(
+            ConversationTaskState,
+            document.id,
+            populate_existing=True,
+        )
+        delivery_state = await session.get(
+            DocumentDeliveryState,
+            document.id,
+            populate_existing=True,
+        )
+
+        assert source_order == [
+            "stable-0",
+            "stable-1",
+            "stable-2",
+            "inserted-1",
+            "stable-3",
+            "stable-4",
+            "inserted-2",
+            "inserted-3",
+            "current-task",
+            "mutable-tail",
+            "appended-4",
+        ]
+        assert len({row.line_number for row in rows}) == len(rows)
+        assert [row.line_number for row in rows] == list(range(1, 12))
+        final_by_source = {
+            row.metadata_["source_id"]: row
+            for row in rows
+        }
+        for index in range(3):
+            row = final_by_source[f"stable-{index}"]
+            assert (row.id, row.line_number) == initial_identity[f"stable-{index}"]
+        for index in range(3, 5):
+            row = final_by_source[f"stable-{index}"]
+            assert row.id == initial_identity[f"stable-{index}"][0]
+            assert row.line_number == initial_identity[f"stable-{index}"][1] + 1
+        mutable = final_by_source["mutable-tail"]
+        assert mutable.id == initial_identity["mutable-tail"][0]
+        assert mutable.line_number == 10
+        assert mutable.content == "Tail completed."
+        assert refreshed_document is not None
+        assert refreshed_document.content == full_snapshot
+        assert refreshed_document.content_hash == base_hash
+        assert refreshed_document.file_size_bytes == base_offset
+        assert delivery_state is not None
+        assert delivery_state.revision_hash == final_hash
+        assert delivery_state.file_size_bytes == len(final_snapshot.encode())
+        assert CURSOR_PROJECTION_ORDER_KEY not in delivery_state.delivery_metadata
+        assert read_model is not None
+        assert read_model.message_count == 11
+        assert read_model.projected_through_line == 11
+        assert read_model.live_activities == []
+        assert task_projection is not None
+        assert task_projection.source_message_id == task_message_id
+        assert task_projection.source_line_number == 9
+
+        replayed = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=document.relative_path,
+            content=delta,
+            content_hash=final_hash,
+            file_size=len(delta.encode()),
+            mode="delta",
+            offset=len(final_snapshot.encode()),
+            base_hash=base_hash,
+            base_offset=base_offset,
+            metadata={
+                **document.metadata_,
+                CURSOR_PROJECTION_ORDER_KEY: ordering_hint,
+            },
+            timestamp=1_786_162_002.0,
+            machine_id=document.machine_id,
+            user_id=str(machine.user_id),
+            schedule_post_ingest=False,
+        )
+        assert getattr(replayed, "_memento_ingest_disposition") == "idempotent"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+            )
+        ) == 11
+
+
+@pytest.mark.asyncio
+async def test_cursor_projection_delta_reconciles_canvas_references_exactly(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        document.metadata_ = {
+            **document.metadata_,
+            "source": "cursor_state_v1",
+        }
+        timestamp = "2026-08-08T04:00:00Z"
+        paths = {
+            name: (
+                f"/home/me/.cursor/projects/demo/canvases/{name}.canvas.tsx"
+            )
+            for name in ("removed", "retained", "added", "new-row")
+        }
+
+        def reference(name: str) -> str:
+            return f"[{name}.canvas.tsx]({paths[name]})"
+
+        initial = _cursor_tool_row(
+            "canvas-stable",
+            f"Open {reference('removed')} and {reference('retained')}.",
+            timestamp=timestamp,
+        )
+        await _extract_messages(session, document, initial, "full")
+        await session.flush()
+        initial_message = (
+            await session.execute(
+                select(ConversationMessage).where(
+                    ConversationMessage.document_id == document.id
+                )
+            )
+        ).scalar_one()
+        initial_references = (
+            await session.execute(
+                select(CanvasArtifactReference).where(
+                    CanvasArtifactReference.document_id == document.id
+                )
+            )
+        ).scalars().all()
+        by_path = {
+            item.recorded_path: item
+            for item in initial_references
+        }
+        retained = by_path[paths["retained"]]
+        retained.status = "missing"
+        retained.reason = "source_missing"
+        retained.attempt_count = 3
+        retained_id = retained.id
+        await session.commit()
+
+        changed = _cursor_tool_row(
+            "canvas-stable",
+            f"Open {reference('retained')} and {reference('added')}.",
+            timestamp=timestamp,
+        )
+        appended = _cursor_tool_row(
+            "canvas-new",
+            f"Tool output mentions {reference('new-row')}.",
+            timestamp=timestamp,
+        )
+        delta = f"{changed}\n{appended}"
+        await _extract_messages(session, document, delta, "delta")
+        await session.commit()
+
+        messages = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        references = (
+            await session.execute(
+                select(CanvasArtifactReference)
+                .where(CanvasArtifactReference.document_id == document.id)
+                .order_by(CanvasArtifactReference.recorded_path)
+            )
+        ).scalars().all()
+        final_by_path = {item.recorded_path: item for item in references}
+
+        assert len(messages) == 2
+        assert messages[0].id == initial_message.id
+        assert set(final_by_path) == {
+            paths["retained"],
+            paths["added"],
+            paths["new-row"],
+        }
+        assert final_by_path[paths["retained"]].id == retained_id
+        assert final_by_path[paths["retained"]].status == "missing"
+        assert final_by_path[paths["retained"]].reason == "source_missing"
+        assert final_by_path[paths["retained"]].attempt_count == 3
+        assert final_by_path[paths["added"]].status == "discovered"
+        assert final_by_path[paths["added"]].message_id == messages[0].id
+        assert final_by_path[paths["new-row"]].message_id == messages[1].id
+        assert len({
+            (item.message_id, item.path_hash)
+            for item in references
+        }) == len(references)
+
+        await _extract_messages(session, document, delta, "delta")
+        await session.commit()
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(CanvasArtifactReference)
+                .where(CanvasArtifactReference.document_id == document.id)
+            )
+        ) == 3
+
+
+@pytest.mark.asyncio
+async def test_cursor_projection_delta_rejects_malformed_and_far_tail_hints(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        document.metadata_ = {
+            **document.metadata_,
+            "source": "cursor_state_v1",
+        }
+        timestamp = "2026-08-08T04:00:00Z"
+        full = "\n".join(
+            _cursor_tool_row(
+                f"stable-{index}",
+                f"Stable {index}",
+                timestamp=timestamp,
+            )
+            for index in range(40)
+        )
+        await _extract_messages(session, document, full, "full")
+        await session.flush()
+        inserted = _cursor_tool_row(
+            "inserted",
+            "Unsafe insertion",
+            timestamp=timestamp,
+        )
+
+        with pytest.raises(
+            CursorProjectionOrderMismatch,
+            match="ordering bounds",
+        ) as malformed:
+            await _extract_messages(
+                session,
+                document,
+                inserted,
+                "delta",
+                cursor_projection_order={
+                    "version": 1,
+                    "base_count": 40,
+                    "groups": "malformed",
+                },
+            )
+        assert malformed.value.expected_hash is None
+        assert malformed.value.expected_offset == 0
+        with pytest.raises(
+            CursorProjectionOrderMismatch,
+            match="too far from tail",
+        ):
+            await _extract_messages(
+                session,
+                document,
+                inserted,
+                "delta",
+                cursor_projection_order={
+                    "version": 1,
+                    "base_count": 40,
+                    "groups": [{
+                        "after_source_id": "stable-0",
+                        "before_source_id": "stable-1",
+                        "source_ids": ["inserted"],
+                    }],
+                },
+            )
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+            )
+        ) == 40
+        await session.rollback()
 
 
 @pytest.mark.asyncio

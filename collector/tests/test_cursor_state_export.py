@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -7,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from collector.cursor_state_export import (
+    CursorProjectionRecord,
     CursorStateExporter,
+    CursorStateSnapshot,
     _iso_timestamp,
     _model_selection,
     _tool_record,
@@ -756,6 +759,46 @@ def _recording_queue(
     return queue
 
 
+def _synthetic_projection_snapshot(
+    source_ids: list[str],
+    *,
+    revisions: dict[str, int] | None = None,
+) -> CursorStateSnapshot:
+    revisions = revisions or {}
+    lines: list[str] = []
+    projection_records: list[CursorProjectionRecord] = []
+    position = 0
+    for source_id in source_ids:
+        line = json.dumps(
+            {
+                "type": "cursor_state_tool",
+                "role": "tool",
+                "id": source_id,
+                "content": f"{source_id}-v{revisions.get(source_id, 1)}",
+            },
+            separators=(",", ":"),
+        )
+        lines.append(line)
+        projection_records.append(CursorProjectionRecord(
+            source_id=source_id,
+            digest=hashlib.sha256(line.encode()).hexdigest(),
+            start=position,
+            end=position + len(line),
+        ))
+        position += len(line) + 1
+    content = "\n".join(lines)
+    encoded = content.encode()
+    return CursorStateSnapshot(
+        relative_path="projects/demo/agent-transcripts/session/session.jsonl",
+        content=content,
+        content_hash=hashlib.sha256(encoded).hexdigest(),
+        content_size=len(encoded),
+        projection_records=tuple(projection_records),
+        metadata={"source": "cursor_state_v1", "session_id": "session"},
+        source_modified_at=None,
+    )
+
+
 def test_cold_completed_composer_does_not_replay_historical_activity(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
@@ -1114,6 +1157,215 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
     assert "Free the resources" not in item["content"]
 
 
+def test_enqueue_sends_near_tail_insertions_with_bounded_anchor_hint(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    composer_key = f"composerData:{session_id}"
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["status"] = "generating"
+    composer["todos"] = []
+    composer["fullConversationHeadersOnly"] = [
+        {"bubbleId": "user-1", "type": 1},
+        {"bubbleId": "assistant-1", "type": 2},
+        {"bubbleId": "tool-1", "type": 2},
+    ]
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    connection.execute(
+        "DELETE FROM cursorDiskKV WHERE key IN (?, ?)",
+        (
+            f"bubbleId:{session_id}:thought-1",
+            f"bubbleId:{session_id}:tasks-1",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    exporter = CursorStateExporter(tool)
+    queue = _recording_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    initial = queue.items.pop()
+
+    connection = sqlite3.connect(tool.state_database_path)
+    composer["fullConversationHeadersOnly"][2:2] = [
+        {"bubbleId": f"inserted-tool-{index}", "type": 2}
+        for index in range(1, 4)
+    ]
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
+    for index in range(1, 4):
+        bubble_id = f"inserted-tool-{index}"
+        connection.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                f"bubbleId:{session_id}:{bubble_id}",
+                json.dumps({
+                    "bubbleId": bubble_id,
+                    "type": 2,
+                    "createdAt": f"2026-07-18T14:20:0{index}Z",
+                    "toolFormerData": {
+                        "name": "read_file_v2",
+                        "status": "completed",
+                        "params": {"path": f"file-{index}.py"},
+                        "result": {"bytes": index},
+                        "toolCallId": f"call-inserted-{index}",
+                    },
+                }),
+            ),
+        )
+    tail_key = f"bubbleId:{session_id}:tool-1"
+    tail = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (tail_key,),
+    ).fetchone()[0])
+    tail["toolFormerData"]["status"] = "completed"
+    tail["toolFormerData"]["result"] = {"output": "tail completed"}
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(tail), tail_key),
+    )
+    connection.execute(
+        "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+        ("2026-07-18T14:22:00Z", session_id),
+    )
+    connection.commit()
+    connection.close()
+    queue.base = (initial["content_hash"], initial["offset"])
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    item = queue.items[0]
+    records = [json.loads(line) for line in item["content"].splitlines()]
+    hint = item["metadata"]["_cursor_projection_order_v1"]
+
+    assert item["sync_strategy"] == "delta"
+    assert len(item["content"].encode("utf-8")) < item["offset"]
+    assert [record["id"] for record in records] == [
+        "inserted-tool-1:tool",
+        "inserted-tool-2:tool",
+        "inserted-tool-3:tool",
+        "tool-1:tool",
+    ]
+    assert hint == {
+        "version": 1,
+        "base_count": 3,
+        "groups": [{
+            "after_source_id": "assistant-1",
+            "before_source_id": "tool-1:tool",
+            "source_ids": [
+                "inserted-tool-1:tool",
+                "inserted-tool-2:tool",
+                "inserted-tool-3:tool",
+            ],
+        }],
+    }
+
+
+def test_projection_delta_supports_multiple_bounded_insertion_groups(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    exporter = CursorStateExporter(tool)
+    baseline_ids = [f"stable-{index}" for index in range(40)]
+    baseline = _synthetic_projection_snapshot(baseline_ids)
+    exporter.remember_queued_projection(baseline)
+    current_ids = [
+        *baseline_ids[:36],
+        "inserted-a",
+        *baseline_ids[36:39],
+        "inserted-b",
+        "inserted-c",
+        baseline_ids[39],
+        "appended-d",
+    ]
+    current = _synthetic_projection_snapshot(
+        current_ids,
+        revisions={baseline_ids[39]: 2},
+    )
+
+    delta = exporter.projection_delta(
+        current,
+        base_hash=baseline.content_hash,
+        base_offset=baseline.content_size,
+    )
+
+    assert delta is not None
+    assert [
+        json.loads(line)["id"]
+        for line in delta.content.splitlines()
+    ] == [
+        "inserted-a",
+        "inserted-b",
+        "inserted-c",
+        baseline_ids[39],
+        "appended-d",
+    ]
+    assert delta.ordering_hint == {
+        "version": 1,
+        "base_count": 40,
+        "groups": [
+            {
+                "after_source_id": "stable-35",
+                "before_source_id": "stable-36",
+                "source_ids": ["inserted-a"],
+            },
+            {
+                "after_source_id": "stable-38",
+                "before_source_id": "stable-39",
+                "source_ids": ["inserted-b", "inserted-c"],
+            },
+            {
+                "after_source_id": "stable-39",
+                "before_source_id": None,
+                "source_ids": ["appended-d"],
+            },
+        ],
+    }
+
+
+def test_projection_delta_rejects_far_insert_reorder_and_removal(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    exporter = CursorStateExporter(tool)
+    baseline_ids = [f"stable-{index}" for index in range(40)]
+    baseline = _synthetic_projection_snapshot(baseline_ids)
+    exporter.remember_queued_projection(baseline)
+
+    far_insert = _synthetic_projection_snapshot([
+        baseline_ids[0],
+        "too-far-from-tail",
+        *baseline_ids[1:],
+    ])
+    reordered = _synthetic_projection_snapshot([
+        baseline_ids[0],
+        baseline_ids[2],
+        baseline_ids[1],
+        *baseline_ids[3:],
+    ])
+    removed = _synthetic_projection_snapshot(
+        [source_id for source_id in baseline_ids if source_id != "stable-20"]
+    )
+    oversized_identity = _synthetic_projection_snapshot([
+        *baseline_ids,
+        "x" * 257,
+    ])
+
+    for unsafe_snapshot in (
+        far_insert,
+        reordered,
+        removed,
+        oversized_identity,
+    ):
+        assert exporter.projection_delta(
+            unsafe_snapshot,
+            base_hash=baseline.content_hash,
+            base_offset=baseline.content_size,
+        ) is None
+
+
 def test_enqueue_sends_mutable_last_row_by_stable_source_id(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
@@ -1234,10 +1486,20 @@ def test_enqueue_falls_back_to_full_when_projected_row_is_removed(tmp_path):
     assert queue.items[0]["is_partial"] is False
 
 
-def test_enqueue_falls_back_to_full_when_canvas_row_changes(tmp_path):
+def test_enqueue_reconciles_changed_canvas_row_as_sparse_delta(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     assistant_key = f"bubbleId:{session_id}:assistant-1"
     connection = sqlite3.connect(tool.state_database_path)
+    composer_key = f"composerData:{session_id}"
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (composer_key,),
+    ).fetchone()[0])
+    composer["status"] = "generating"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), composer_key),
+    )
     assistant = json.loads(connection.execute(
         "SELECT value FROM cursorDiskKV WHERE key=?",
         (assistant_key,),
@@ -1273,7 +1535,12 @@ def test_enqueue_falls_back_to_full_when_canvas_row_changes(tmp_path):
     queue.base = (initial["content_hash"], initial["offset"])
 
     assert enqueue_cursor_state_snapshots(exporter, queue) == 1
-    assert queue.items[0]["sync_strategy"] == "full"
+    assert queue.items[0]["sync_strategy"] == "delta"
+    assert [
+        json.loads(line)["id"]
+        for line in queue.items[0]["content"].splitlines()
+    ] == ["assistant-1"]
+    assert ".canvas.tsx" not in queue.items[0]["content"].casefold()
 
 
 def test_restarted_exporter_falls_back_to_full_for_unknown_base(tmp_path):
@@ -1315,6 +1582,44 @@ def test_projection_delta_waits_behind_uploading_base(tmp_path):
         assert base.sync_strategy == "full"
 
         connection = sqlite3.connect(tool.state_database_path)
+        composer_key = f"composerData:{session_id}"
+        composer = json.loads(connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0])
+        tool_header_index = next(
+            index
+            for index, header in enumerate(
+                composer["fullConversationHeadersOnly"]
+            )
+            if header["bubbleId"] == "tool-1"
+        )
+        composer["fullConversationHeadersOnly"].insert(
+            tool_header_index,
+            {"bubbleId": "inserted-while-uploading", "type": 2},
+        )
+        connection.execute(
+            "UPDATE cursorDiskKV SET value=? WHERE key=?",
+            (json.dumps(composer), composer_key),
+        )
+        connection.execute(
+            "INSERT INTO cursorDiskKV VALUES (?,?)",
+            (
+                f"bubbleId:{session_id}:inserted-while-uploading",
+                json.dumps({
+                    "bubbleId": "inserted-while-uploading",
+                    "type": 2,
+                    "createdAt": "2026-07-18T14:20:30Z",
+                    "toolFormerData": {
+                        "name": "read_file_v2",
+                        "status": "completed",
+                        "params": {"path": "coalesced.py"},
+                        "result": {"bytes": 1},
+                        "toolCallId": "call-inserted-uploading",
+                    },
+                }),
+            ),
+        )
         tool_key = f"bubbleId:{session_id}:tool-1"
         tool_row = json.loads(connection.execute(
             "SELECT value FROM cursorDiskKV WHERE key=?",
@@ -1334,11 +1639,31 @@ def test_projection_delta_waits_behind_uploading_base(tmp_path):
 
         assert enqueue_cursor_state_snapshots(exporter, queue) == 1
         assert queue.claim_batch() == []
+
+        connection = sqlite3.connect(tool.state_database_path)
+        tool_row["toolFormerData"]["result"] = {"output": "latest coalesced result"}
+        connection.execute(
+            "UPDATE cursorDiskKV SET value=? WHERE key=?",
+            (json.dumps(tool_row), tool_key),
+        )
+        connection.execute(
+            "UPDATE composerHeaders SET lastUpdatedAt=? WHERE composerId=?",
+            ("2026-07-18T14:23:00Z", session_id),
+        )
+        connection.commit()
+        connection.close()
+
+        assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+        assert queue.claim_batch() == []
         assert queue.mark_synced(base) is True
         delta = queue.claim_batch()[0]
         assert delta.sync_strategy == "delta"
         assert delta.base_hash == base.content_hash
         assert delta.base_offset == base.offset
+        assert "_cursor_projection_order_v1" in delta.metadata
+        payload = queue.read_payload_text(delta)
+        assert "inserted-while-uploading:tool" in payload
+        assert "latest coalesced result" in payload
     finally:
         queue.close()
 
