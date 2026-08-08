@@ -40,6 +40,7 @@ from server.services.dashboard_projection import (
 from server.services.document_delivery import attach_document_delivery
 from server.services.ingest_service import _conversation_event_changes
 from server.services.conversation_read_model import (
+    backfill_conversation_read_models,
     conversation_backfill_documents_statement,
     refresh_conversation_read_model,
     refresh_conversation_read_model_in_batches,
@@ -332,6 +333,12 @@ async def test_conversation_read_backfill_batches_message_rows(
         ]
         assert len(message_reads) == 3
         assert all(" limit " in statement for statement in message_reads)
+        result = await backfill_conversation_read_models(
+            session,
+            [document.id],
+            message_batch_size=2,
+        )
+        assert result == {"documents": 1, "created_or_updated": 1}
         await session.rollback()
 
 

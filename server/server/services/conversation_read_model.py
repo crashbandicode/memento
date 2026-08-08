@@ -690,6 +690,8 @@ def conversation_backfill_documents_statement(
 async def backfill_conversation_read_models(
     db: AsyncSession,
     document_ids: Iterable[object] | None = None,
+    *,
+    message_batch_size: int = READ_MODEL_BACKFILL_MESSAGE_BATCH_SIZE,
 ) -> dict[str, int]:
     """Build historical projections with bounded document and message reads."""
     ids = list(document_ids or [])
@@ -708,14 +710,15 @@ async def backfill_conversation_read_models(
         if not documents:
             break
         for document in documents:
-            before = await db.get(ConversationReadModel, document.id)
-            previous = before.updated_at if before is not None else None
-            projection = await refresh_conversation_read_model_in_batches(
+            await refresh_conversation_read_model_in_batches(
                 db,
                 document,
+                batch_size=message_batch_size,
             )
-            if before is None or projection.updated_at != previous:
-                updated += 1
+            # A full historical rebuild deterministically replaces this row.
+            # Do not inspect server-managed updated_at after a flush: SQLAlchemy
+            # expires on-update columns, and implicit async lazy IO is invalid.
+            updated += 1
             visited += 1
         last_id = documents[-1].id
         await db.flush()
