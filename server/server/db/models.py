@@ -614,7 +614,6 @@ class ConversationReadModel(Base):
         Integer, nullable=False, default=1
     )
 
-    prompts: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     pending_interactions: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list
     )
@@ -665,6 +664,35 @@ class ConversationReadModel(Base):
             "machine_id",
             "tool_id",
             "agent_tool_use_id",
+        ),
+    )
+
+
+# Prompt rows stay normalized so an append updates one bounded row instead of
+# rewriting an ever-growing JSONB outline on every conversation ingest.
+class ConversationPromptProjection(Base):
+    """One materialized human prompt per normalized conversation message."""
+
+    __tablename__ = "conversation_prompt_projections"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("conversation_messages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    line_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index(
+            "idx_conversation_prompt_line",
+            "document_id",
+            "line_number",
+            "message_id",
         ),
     )
 

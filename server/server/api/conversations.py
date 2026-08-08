@@ -56,6 +56,7 @@ from ..services.conversation_parser import (
     normalize_tool_calls,
     parse_conversation,
 )
+from ..services.conversation_read_model import conversation_prompt_rows_statement
 from ..services.document_delivery import (
     delivery_metadata_expression,
     delivery_synced_expression,
@@ -1998,14 +1999,24 @@ async def get_conversation_prompts(
     if read_model is not None:
         reset = generation is not None and generation != read_model.generation
         minimum_line = None if reset else after_line
-        prompts = [
-            item
-            for item in (read_model.prompts or [])
-            if isinstance(item, dict)
-            and (
-                minimum_line is None
-                or int(item.get("line_number") or 0) > minimum_line
+        prompt_rows = (
+            await db.execute(
+                conversation_prompt_rows_statement(
+                    doc_id,
+                    after_line=minimum_line,
+                )
             )
+        ).scalars().all()
+        prompts = [
+            {
+                "id": item.message_id,
+                "line_number": item.line_number,
+                "content": item.content,
+                "timestamp": (
+                    item.timestamp.isoformat() if item.timestamp else None
+                ),
+            }
+            for item in prompt_rows
         ]
         return {
             "prompts": prompts,

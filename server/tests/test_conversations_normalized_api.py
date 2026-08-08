@@ -129,7 +129,6 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             "latest_assistant_line": 4306,
             "generation": 7,
             "projection_version": 1,
-            "prompts": [],
             "pending_interactions": [],
             "inferred_responses": [],
             "live_activities": [],
@@ -1225,23 +1224,21 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prompt_refresh_reads_only_projection_delta(self) -> None:
         projection = self.read_model(
-            prompts=[
-                {
-                    "id": 7,
-                    "line_number": 12,
-                    "content": "Earlier",
-                    "timestamp": self.now.isoformat(),
-                },
-                {
-                    "id": 9,
-                    "line_number": 44,
-                    "content": "New prompt",
-                    "timestamp": self.now.isoformat(),
-                },
-            ],
             projected_through_line=45,
         )
-        db = _Db([_Result(rows=[(self.doc, projection)])])
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(
+                rows=[
+                    SimpleNamespace(
+                        message_id=9,
+                        line_number=44,
+                        content="New prompt",
+                        timestamp=self.now,
+                    )
+                ]
+            ),
+        ])
 
         payload = await get_conversation_prompts(
             self.doc_id,
@@ -1257,10 +1254,14 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(payload["reset"])
         self.assertEqual(payload["projected_through_line"], 45)
-        self.assertEqual(len(db.statements), 1)
-        sql = str(db.statements[0].compile()).upper()
-        self.assertIn("CONVERSATION_READ_MODELS", sql)
-        self.assertNotIn("CONVERSATION_MESSAGES", sql)
+        self.assertEqual(len(db.statements), 2)
+        identity_sql = str(db.statements[0].compile()).upper()
+        prompt_sql = str(db.statements[1].compile()).upper()
+        self.assertIn("CONVERSATION_READ_MODELS", identity_sql)
+        self.assertIn("CONVERSATION_PROMPT_PROJECTIONS", prompt_sql)
+        self.assertIn("LINE_NUMBER >", prompt_sql)
+        self.assertNotIn("CONVERSATION_MESSAGES", prompt_sql)
+        self.assertNotIn("OFFSET", prompt_sql)
 
     async def test_projected_pending_interactions_do_not_replay_messages(
         self,

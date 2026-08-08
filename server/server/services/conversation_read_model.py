@@ -5,10 +5,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, ConversationReadModel, Document
+from ..db.models import (
+    ConversationMessage,
+    ConversationPromptProjection,
+    ConversationReadModel,
+    Document,
+)
 from .conversation_hierarchy import (
     conversation_root_thread_id,
     current_thread_id,
@@ -165,13 +170,27 @@ def _interaction_item(row, interaction: dict) -> dict:
     }
 
 
+def _prompt_projection_value(row) -> dict | None:
+    metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    role = row.role or row.message_type
+    clean = str(row.content or "").strip()
+    if role != "user" or not is_meaningful_human_prompt(
+        clean,
+        metadata,
+        role,
+    ):
+        return None
+    return {
+        "document_id": row.document_id,
+        "message_id": int(row.id),
+        "line_number": int(row.line_number or 0),
+        "content": clean[:500],
+        "timestamp": row.timestamp,
+    }
+
+
 class _Accumulator:
     def __init__(self, projection: ConversationReadModel | None = None) -> None:
-        self.prompts = {
-            int(item.get("id") or 0): dict(item)
-            for item in ((projection.prompts or []) if projection else [])
-            if isinstance(item, dict)
-        }
         self.pending = {
             str((item.get("interaction") or {}).get("id") or ""): dict(item)
             for item in (
@@ -213,19 +232,6 @@ class _Accumulator:
         metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
         role = row.role or row.message_type
         message_id = int(row.id or 0)
-        self.prompts.pop(message_id, None)
-        clean = str(row.content or "").strip()
-        if role == "user" and is_meaningful_human_prompt(
-            clean,
-            metadata,
-            role,
-        ):
-            self.prompts[message_id] = {
-                "id": message_id,
-                "line_number": int(row.line_number or 0),
-                "content": clean[:500],
-                "timestamp": _timestamp(row.timestamp),
-            }
 
         interactions = _question_interactions(metadata)
         for interaction in interactions:
@@ -333,10 +339,6 @@ class _Accumulator:
         self.agent_events[index] = item
 
     def values(self) -> dict:
-        prompts = sorted(
-            self.prompts.values(),
-            key=lambda item: (int(item.get("line_number") or 0), int(item["id"])),
-        )
         pending = sorted(
             self.pending.values(),
             key=lambda item: (
@@ -359,7 +361,6 @@ class _Accumulator:
             ),
         )[-MAX_LIVE_ACTIVITIES:]
         return {
-            "prompts": prompts,
             "pending_interactions": pending,
             "inferred_responses": inferred,
             "live_activities": activities,
@@ -426,6 +427,54 @@ def conversation_read_rows_statement(
     )
 
 
+def conversation_prompt_rows_statement(
+    document_id: object,
+    *,
+    after_line: int | None = None,
+):
+    """Compile the keyset prompt read served to steady-state refreshes."""
+    statement = select(ConversationPromptProjection).where(
+        ConversationPromptProjection.document_id == document_id
+    )
+    if after_line is not None:
+        statement = statement.where(
+            ConversationPromptProjection.line_number > after_line
+        )
+    return statement.order_by(
+        ConversationPromptProjection.line_number,
+        ConversationPromptProjection.message_id,
+    )
+
+
+async def _refresh_prompt_projections(
+    db: AsyncSession,
+    document_id: object,
+    rows: Iterable[ConversationMessage],
+    *,
+    replace: bool,
+) -> None:
+    candidates = list(rows)
+    message_ids = sorted({int(row.id) for row in candidates})
+    if replace:
+        await db.execute(
+            delete(ConversationPromptProjection).where(
+                ConversationPromptProjection.document_id == document_id
+            )
+        )
+    elif message_ids:
+        await db.execute(
+            delete(ConversationPromptProjection).where(
+                ConversationPromptProjection.document_id == document_id,
+                ConversationPromptProjection.message_id.in_(message_ids),
+            )
+        )
+    db.add_all(
+        ConversationPromptProjection(**value)
+        for row in candidates
+        if (value := _prompt_projection_value(row)) is not None
+    )
+
+
 async def refresh_conversation_read_model(
     db: AsyncSession,
     document: Document,
@@ -459,6 +508,12 @@ async def refresh_conversation_read_model(
         .all()
     )
 
+    await _refresh_prompt_projections(
+        db,
+        document.id,
+        rows,
+        replace=not incremental,
+    )
     accumulator = _Accumulator(projection if incremental else None)
     for row in rows:
         accumulator.observe(row)

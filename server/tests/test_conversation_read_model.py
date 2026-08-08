@@ -13,6 +13,8 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.services.conversation_read_model import (
     _Accumulator,
+    _prompt_projection_value,
+    conversation_prompt_rows_statement,
     conversation_read_rows_statement,
 )
 
@@ -55,6 +57,20 @@ def test_incremental_projection_query_is_high_water_bounded() -> None:
     assert "JSONB_EXTRACT_PATH_TEXT" not in sql
 
 
+def test_prompt_projection_query_is_keyset_bounded() -> None:
+    statement = conversation_prompt_rows_statement(
+        uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        after_line=40_000,
+    )
+    sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+
+    assert "CONVERSATION_PROMPT_PROJECTIONS.LINE_NUMBER >" in sql
+    assert "ORDER BY CONVERSATION_PROMPT_PROJECTIONS.LINE_NUMBER" in sql
+    assert "COUNT(" not in sql
+    assert "OFFSET" not in sql
+    assert "JSONB" not in sql
+
+
 def test_accumulator_materializes_prompts_and_interaction_resolution() -> None:
     now = datetime(2026, 8, 7, 16, tzinfo=UTC)
     interaction = {
@@ -83,9 +99,18 @@ def test_accumulator_materializes_prompts_and_interaction_resolution() -> None:
         )
     )
     values = accumulator.values()
+    prompt = _prompt_projection_value(
+        _row(
+            2,
+            role="user",
+            content="Use the first option.",
+            timestamp=now + timedelta(seconds=1),
+        )
+    )
 
     assert values["pending_interactions"] == []
-    assert values["prompts"][0]["line_number"] == 2
+    assert prompt is not None
+    assert prompt["line_number"] == 2
     assert (
         values["inferred_responses"][0]["response"]["interaction_id"]
         == "question-1"

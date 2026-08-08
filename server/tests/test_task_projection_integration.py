@@ -11,6 +11,7 @@ from server.db.models import (
     Base,
     ConversationMetadataInbox,
     ConversationMessage,
+    ConversationPromptProjection,
     ConversationReadModel,
     ConversationTaskState,
     Document,
@@ -30,6 +31,7 @@ from server.services.conversation_metadata_inbox import (
     apply_deferred_conversation_metadata,
     defer_conversation_metadata,
 )
+from server.services.conversation_read_model import refresh_conversation_read_model
 from server.services.ingest_service import (
     LIVE_SHELL_ACTIVITIES_KEY,
     _extract_messages,
@@ -218,6 +220,75 @@ async def test_incremental_projection_updates_mutated_source_row(
         assert projection.revision == 2
         assert projection.completed_count == 1
         assert projection.state["tasks"][0]["status"] == "completed"
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_prompt_projection_updates_only_candidate_rows(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        first = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            message_type="user",
+            role="user",
+            content="First prompt",
+            metadata_={},
+        )
+        session.add(first)
+        await session.flush()
+        await refresh_conversation_read_model(
+            session,
+            document,
+            mode="full",
+        )
+
+        second = ConversationMessage(
+            document_id=document.id,
+            line_number=2,
+            message_type="user",
+            role="user",
+            content="Second prompt",
+            metadata_={},
+        )
+        session.add(second)
+        await session.flush()
+        await refresh_conversation_read_model(
+            session,
+            document,
+            mode="delta",
+        )
+        prompts = (
+            await session.execute(
+                select(ConversationPromptProjection).order_by(
+                    ConversationPromptProjection.line_number
+                )
+            )
+        ).scalars().all()
+        assert [(item.line_number, item.content) for item in prompts] == [
+            (1, "First prompt"),
+            (2, "Second prompt"),
+        ]
+
+        first.content = "[AUTO HEALTH-CHECK — runs every 5 min]\nCheck status."
+        await refresh_conversation_read_model(
+            session,
+            document,
+            mode="delta",
+            dirty_line_numbers=[1],
+        )
+        remaining = (
+            await session.execute(
+                select(ConversationPromptProjection).order_by(
+                    ConversationPromptProjection.line_number
+                )
+            )
+        ).scalars().all()
+        assert [(item.line_number, item.content) for item in remaining] == [
+            (2, "Second prompt"),
+        ]
         await session.rollback()
 
 
@@ -606,6 +677,7 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
 ) -> None:
     bind = session_factory.kw["bind"]
     async with bind.begin() as connection:
+        await connection.execute(text("DROP TABLE conversation_prompt_projections"))
         await connection.execute(text("DROP TABLE conversation_read_models"))
         await connection.execute(text("DROP TABLE conversation_task_states"))
         await connection.run_sync(_run_migrations)
@@ -620,6 +692,11 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         read_exists = (
             await connection.execute(
                 text("SELECT to_regclass('conversation_read_models')")
+            )
+        ).scalar_one()
+        prompt_exists = (
+            await connection.execute(
+                text("SELECT to_regclass('conversation_prompt_projections')")
             )
         ).scalar_one()
         indexes = set(
@@ -644,8 +721,20 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
                 )
             ).scalars()
         )
+        prompt_indexes = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename = 'conversation_prompt_projections'"
+                    )
+                )
+            ).scalars()
+        )
     assert exists == "conversation_task_states"
     assert read_exists == "conversation_read_models"
+    assert prompt_exists == "conversation_prompt_projections"
     assert {
         "conversation_task_states_pkey",
         "idx_task_state_machine",
@@ -669,3 +758,7 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         "idx_conversation_read_agent",
         "idx_conversation_read_tool_use",
     } <= read_indexes
+    assert {
+        "conversation_prompt_projections_pkey",
+        "idx_conversation_prompt_line",
+    } <= prompt_indexes

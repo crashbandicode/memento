@@ -438,7 +438,6 @@ def _run_migrations(conn) -> None:
                 "latest_assistant_line INTEGER, "
                 "generation INTEGER NOT NULL DEFAULT 1, "
                 "projection_version INTEGER NOT NULL DEFAULT 1, "
-                "prompts JSONB NOT NULL DEFAULT '[]'::jsonb, "
                 "pending_interactions JSONB NOT NULL DEFAULT '[]'::jsonb, "
                 "inferred_responses JSONB NOT NULL DEFAULT '[]'::jsonb, "
                 "live_activities JSONB NOT NULL DEFAULT '[]'::jsonb, "
@@ -462,6 +461,24 @@ def _run_migrations(conn) -> None:
             "(machine_id, tool_id, agent_tool_use_id)",
         ):
             conn.execute(text(read_index_sql))
+
+        if "conversation_prompt_projections" not in tables:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS conversation_prompt_projections ("
+                "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+                "message_id BIGINT NOT NULL REFERENCES conversation_messages(id) "
+                "ON DELETE CASCADE, "
+                "line_number INTEGER NOT NULL, "
+                "content TEXT NOT NULL, "
+                "timestamp TIMESTAMPTZ, "
+                "PRIMARY KEY (document_id, message_id)"
+                ")"
+            ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_prompt_line "
+            "ON conversation_prompt_projections "
+            "(document_id, line_number, message_id)"
+        ))
 
     # Data migration: assign owner token + bind existing machines to owner
     result = conn.execute(text(
