@@ -1,6 +1,6 @@
 [project]
 name = "memento-brain"
-version = "0.0.33"
+version = "0.0.34"
 description = "Memento — a shared brain for your AI coding tools (umbrella/meta package)"
 readme = "README.md"
 license = {text = "AGPL-3.0-only"}
@@ -15,8 +15,8 @@ classifiers = [
 ]
 # Meta-package: pulls in both the collector daemon and the MCP memory server.
 dependencies = [
-    "memento-brain-collector>=0.0.33",
-    "memento-brain-memory>=0.0.33",
+    "memento-brain-collector>=0.0.34",
+    "memento-brain-memory>=0.0.34",
 ]
 
 [project.urls]
