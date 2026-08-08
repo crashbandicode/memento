@@ -6,6 +6,7 @@ namespace: memento
 resources:
 - api.yaml
 - celery.yaml
+- online-index-migrations.yaml
 - web.yaml
 - ingress.yaml
 

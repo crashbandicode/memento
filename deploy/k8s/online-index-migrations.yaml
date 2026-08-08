@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: online-index-migrations
+  labels:
+    app: online-index-migrations
+spec:
+  # Daily reconciliation is a bounded, non-tight safety net. For a rollout,
+  # operators create an immediate Job from this mutable template (see README).
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    metadata:
+      labels:
+        app: online-index-migrations
+    spec:
+      # One controller retry, with Kubernetes backoff. The next automatic
+      # attempt is the following day rather than an API restart loop.
+      backoffLimit: 1
+      activeDeadlineSeconds: 86400
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app: online-index-migrations
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 120
+          containers:
+            - name: online-index-migrations
+              image: ghcr.io/ddong8/memento-server:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - server.scripts.online_index_migrations
+                - --apply
+              envFrom:
+                - configMapRef: { name: memento-config }
+                - secretRef: { name: memento-secret }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }

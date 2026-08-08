@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from .api import admin, auth, canvas_artifacts, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
-from .db.online_migrations import run_online_index_migrations
 from .db.session import engine
 from .logging_filters import install_sensitive_query_filter
 from .services.conversation_identity import (
@@ -688,9 +687,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await conn.run_sync(_run_migrations)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_configure_hot_storage)
-    # PostgreSQL rejects CREATE/DROP INDEX CONCURRENTLY in a transaction block.
-    # Apply the explicit idempotent plan only after the schema transaction ends.
-    await run_online_index_migrations(engine)
+    # Large CREATE INDEX CONCURRENTLY operations are owned by the deployment
+    # migration controller. API readiness must not wait for them.
     await _require_fast_embedding_server()
     # Start daily compaction in background
     compaction_task = asyncio.create_task(_schedule_daily_compaction())

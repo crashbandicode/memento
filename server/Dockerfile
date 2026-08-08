@@ -42,6 +42,7 @@ CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
 # below remains free of pytest and test sources.
 FROM base AS test
 COPY server/tests/ tests/
+COPY deploy/k8s/ deploy/k8s/
 RUN pip install --no-cache-dir ".[dev]"
 ENTRYPOINT ["python", "-m", "pytest"]
 CMD ["-q"]
