@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -22,7 +23,33 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
-from .outcomes import UploadOutcome, UploadOutcomeState
+from .outcomes import (
+    EDGE_AVAILABILITY_HTTP_STATUSES,
+    UploadOutcome,
+    UploadOutcomeState,
+)
+
+
+RETRY_DELAY_MIN_SECONDS = 1.0
+RETRY_DELAY_MAX_SECONDS = 300.0
+RETRY_JITTER_MIN = 0.75
+RETRY_JITTER_MAX = 1.25
+DEFAULT_TERMINAL_SPOOL_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_TERMINAL_SPOOL_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _retry_delay_seconds(retry_count: int) -> float:
+    """Return capped exponential backoff with per-attempt storm jitter."""
+
+    exponent = min(max(1, int(retry_count)), 8)
+    base = min(float(2**exponent), RETRY_DELAY_MAX_SECONDS)
+    return min(
+        RETRY_DELAY_MAX_SECONDS,
+        max(
+            RETRY_DELAY_MIN_SECONDS,
+            base * random.uniform(RETRY_JITTER_MIN, RETRY_JITTER_MAX),
+        ),
+    )
 
 
 def _rollback_on_error(method):
@@ -205,11 +232,25 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
-    def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        spool_threshold: int = 4 * 1024 * 1024,
+        *,
+        terminal_spool_max_age_seconds: int = (
+            DEFAULT_TERMINAL_SPOOL_MAX_AGE_SECONDS
+        ),
+        terminal_spool_max_bytes: int = DEFAULT_TERMINAL_SPOOL_MAX_BYTES,
+    ) -> None:
         self._db_path = db_path
         self._spool_threshold = max(64 * 1024, spool_threshold)
+        self._terminal_spool_max_age_seconds = max(
+            0,
+            int(terminal_spool_max_age_seconds),
+        )
+        self._terminal_spool_max_bytes = max(0, int(terminal_spool_max_bytes))
         self._spool_dir = db_path.parent / "spool"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._spool_dir.mkdir(parents=True, exist_ok=True)
@@ -222,6 +263,7 @@ class SyncQueue:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
         self._remove_orphaned_spool_files()
+        self.cleanup_terminal_spool()
 
     def _signal_change(self) -> None:
         """Wake consumers without requiring them to poll SQLite."""
@@ -290,7 +332,8 @@ class SyncQueue:
                 diagnostic_code TEXT,
                 http_status INTEGER,
                 terminal_at REAL,
-                blocked_config_fingerprint TEXT
+                blocked_config_fingerprint TEXT,
+                payload_discarded_at REAL
             );
             CREATE TABLE IF NOT EXISTS file_state (
                 tool_name TEXT NOT NULL,
@@ -306,6 +349,7 @@ class SyncQueue:
                 synced_at REAL,
                 source_size INTEGER,
                 source_mtime_ns INTEGER,
+                identity_version TEXT,
                 PRIMARY KEY (tool_name, relative_path)
             );
             CREATE TABLE IF NOT EXISTS metadata_state (
@@ -344,6 +388,7 @@ class SyncQueue:
             "http_status": "INTEGER",
             "terminal_at": "REAL",
             "blocked_config_fingerprint": "TEXT",
+            "payload_discarded_at": "REAL",
         }
         for name, definition in queue_additions.items():
             if name not in queue_columns:
@@ -359,6 +404,7 @@ class SyncQueue:
             "synced_at": "REAL",
             "source_size": "INTEGER",
             "source_mtime_ns": "INTEGER",
+            "identity_version": "TEXT",
         }
         for name, definition in state_additions.items():
             if name not in state_columns:
@@ -410,6 +456,47 @@ class SyncQueue:
                    observed_at=COALESCE(observed_at, last_synced_at)
                WHERE observed_hash IS NULL"""
         )
+        # Rows with a durable stat token were observed by the canonical
+        # sanitized-identity collector. Rows without one may still contain the
+        # older size/mtime/prefix identity and require filesystem proof before
+        # adoption; do not guess their identity here.
+        self._conn.execute(
+            """UPDATE file_state
+               SET identity_version='sanitized-payload-v1'
+               WHERE identity_version IS NULL
+                 AND source_size IS NOT NULL
+                 AND source_mtime_ns IS NOT NULL
+                 AND (
+                    synced_hash IS NULL
+                    OR observed_hash=synced_hash
+                 )"""
+        )
+        # Releases before the typed status policy quarantined Cloudflare
+        # origin/edge availability failures after one attempt. Resume those
+        # payloads with staggered durable backoff instead of leaving them
+        # terminal forever.
+        edge_rows = self._conn.execute(
+            f"""SELECT id, retry_count FROM queue
+                WHERE status='quarantined'
+                  AND http_status IN ({
+                      ",".join("?" for _ in EDGE_AVAILABILITY_HTTP_STATUSES)
+                  })""",
+            tuple(sorted(EDGE_AVAILABILITY_HTTP_STATUSES)),
+        ).fetchall()
+        migration_now = time.time()
+        for item_id, retry_count in edge_rows:
+            self._conn.execute(
+                """UPDATE queue
+                   SET status='pending', available_at=?, lease_token=NULL,
+                       lease_until=NULL, outcome_state='transient_retry',
+                       diagnostic_code='edge_availability', terminal_at=NULL,
+                       blocked_config_fingerprint=NULL
+                   WHERE id=? AND status='quarantined'""",
+                (
+                    migration_now + _retry_delay_seconds(int(retry_count or 0) + 1),
+                    int(item_id),
+                ),
+            )
         self._conn.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -835,21 +922,162 @@ class SyncQueue:
         ).fetchone()
         return row[0] if row else None
 
+    def get_legacy_full_adoption_hash(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        identity_version: str,
+    ) -> str | None:
+        """Return an acknowledged pre-canonical FULL identity, if provable."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT synced_hash, synced_offset, synced_at, identity_version
+                   FROM file_state WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+        if (
+            row is None
+            or not row[0]
+            or row[2] is None
+            or row[3] == identity_version
+        ):
+            return None
+        candidate = str(row[0])
+        if candidate.startswith("d2:") or len(candidate) != 64:
+            return None
+        return candidate
+
+    @_rollback_on_error
+    def adopt_legacy_full_source(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        legacy_hash: str,
+        canonical_hash: str,
+        source_size: int,
+        source_mtime_ns: int,
+        identity_version: str,
+    ) -> bool:
+        """Adopt one unchanged acknowledged legacy FULL revision.
+
+        The caller must reproduce the historical source hash from the current
+        file. This transaction independently requires an acknowledged legacy
+        receipt and refuses partial or live leased work. Complete rows created
+        solely by the identity transition are retired with their spool files.
+        """
+
+        payload_paths: list[str] = []
+        changed_queue = False
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            state = self._conn.execute(
+                """SELECT COALESCE(observed_hash, last_hash), synced_hash,
+                          synced_offset, synced_at, identity_version
+                   FROM file_state WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if (
+                state is None
+                or state[1] != legacy_hash
+                or int(state[2] or 0) != max(0, int(source_size))
+                or state[3] is None
+                or state[4] is not None
+                or state[0] not in {legacy_hash, canonical_hash}
+            ):
+                self._conn.rollback()
+                return False
+
+            active = self._conn.execute(
+                """SELECT id, status, content_hash, sync_strategy, is_partial,
+                          payload_path
+                   FROM queue
+                   WHERE tool_name=? AND relative_path=?
+                     AND status IN (
+                        'pending','uploading','auth_blocked',
+                        'repair_required','quarantined'
+                     )""",
+                (tool_name, relative_path),
+            ).fetchall()
+            if any(
+                row[1] == "uploading"
+                or row[3] != "full"
+                or bool(row[4])
+                or row[2] not in {legacy_hash, canonical_hash}
+                for row in active
+            ):
+                self._conn.rollback()
+                return False
+
+            payload_paths.extend(str(row[5]) for row in active if row[5])
+            if active:
+                changed_queue = True
+                self._conn.execute(
+                    """UPDATE queue
+                       SET status='superseded', payload_path=NULL, content='',
+                           lease_token=NULL, lease_until=NULL, available_at=0
+                       WHERE tool_name=? AND relative_path=?
+                         AND status IN (
+                            'pending','auth_blocked',
+                            'repair_required','quarantined'
+                         )""",
+                    (tool_name, relative_path),
+                )
+
+            now = time.time()
+            self._conn.execute(
+                """UPDATE file_state
+                   SET last_hash=?, last_offset=?, observed_hash=?,
+                       observed_offset=?, observed_at=?, synced_hash=?,
+                       synced_offset=?, source_size=?, source_mtime_ns=?,
+                       identity_version=?
+                   WHERE tool_name=? AND relative_path=?
+                     AND synced_hash=? AND identity_version IS NULL""",
+                (
+                    canonical_hash,
+                    max(0, int(source_size)),
+                    canonical_hash,
+                    max(0, int(source_size)),
+                    now,
+                    canonical_hash,
+                    max(0, int(source_size)),
+                    max(0, int(source_size)),
+                    max(0, int(source_mtime_ns)),
+                    identity_version,
+                    tool_name,
+                    relative_path,
+                    legacy_hash,
+                ),
+            )
+            self._conn.commit()
+
+        for payload_path in payload_paths:
+            self._discard_payload(payload_path)
+        if changed_queue:
+            self._signal_change()
+        return True
+
     def _record_source_revision_locked(
         self,
         tool_name: str,
         relative_path: str,
         source_size: int | None,
         source_mtime_ns: int | None,
+        identity_version: str | None = None,
     ) -> None:
         if source_size is None or source_mtime_ns is None:
             return
         self._conn.execute(
-            """UPDATE file_state SET source_size=?, source_mtime_ns=?
+            """UPDATE file_state
+               SET source_size=?, source_mtime_ns=?,
+                   identity_version=COALESCE(?, identity_version)
                WHERE tool_name=? AND relative_path=?""",
             (
                 max(0, int(source_size)),
                 max(0, int(source_mtime_ns)),
+                identity_version,
                 tool_name,
                 relative_path,
             ),
@@ -951,6 +1179,7 @@ class SyncQueue:
         source_path: str | None = None,
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
+        identity_version: str | None = None,
         prepared_payload: PreparedPayload | None = None,
     ) -> int:
         del file_size  # payload byte size is measured after sanitization below
@@ -981,6 +1210,7 @@ class SyncQueue:
                         relative_path,
                         source_size,
                         source_mtime_ns,
+                        identity_version,
                     )
                     self._conn.commit()
                     if prepared_payload is not None:
@@ -1024,6 +1254,7 @@ class SyncQueue:
                         relative_path,
                         source_size,
                         source_mtime_ns,
+                        identity_version,
                     )
                     self._conn.commit()
                     self._discard_payload(payload_path)
@@ -1072,7 +1303,7 @@ class SyncQueue:
                            base_hash=?, base_offset=?, source_path=?,
                            status=?, payload_path=?, payload_bytes=?,
                            lease_token=NULL, lease_until=NULL, available_at=0,
-                           last_attempt_at=NULL,
+                           last_attempt_at=NULL, payload_discarded_at=NULL,
                            last_error=CASE WHEN ?='pending' THEN NULL
                                            ELSE 'credentials rejected by server' END,
                            outcome_state=CASE WHEN ?='pending' THEN NULL
@@ -1190,8 +1421,8 @@ class SyncQueue:
                     """INSERT INTO file_state (
                            tool_name, relative_path, last_hash, last_offset,
                            observed_hash, observed_offset, observed_at,
-                           source_size, source_mtime_ns
-                       ) VALUES (?,?,?,?,?,?,?,?,?)
+                           source_size, source_mtime_ns, identity_version
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(tool_name, relative_path) DO UPDATE SET
                            last_hash=excluded.last_hash,
                            last_offset=excluded.last_offset,
@@ -1203,6 +1434,9 @@ class SyncQueue:
                            ),
                            source_mtime_ns=COALESCE(
                                excluded.source_mtime_ns, file_state.source_mtime_ns
+                           ),
+                           identity_version=COALESCE(
+                               excluded.identity_version, file_state.identity_version
                            )""",
                     (
                         tool_name,
@@ -1214,6 +1448,7 @@ class SyncQueue:
                         now,
                         source_size,
                         source_mtime_ns,
+                        identity_version,
                     ),
                 )
                 self._conn.commit()
@@ -1622,7 +1857,7 @@ class SyncQueue:
                 payload_path = row[5]
             elif outcome.state is UploadOutcomeState.TRANSIENT_RETRY:
                 status = "pending"
-                available_at = now + min(2 ** min(next_retry, 8), 300)
+                available_at = now + _retry_delay_seconds(next_retry)
             elif outcome.state is UploadOutcomeState.AUTHENTICATION_BLOCKED:
                 status = "auth_blocked"
                 available_at = 0.0
@@ -1696,6 +1931,8 @@ class SyncQueue:
                 )
             self._conn.commit()
         self._discard_payload(payload_path)
+        if status in {"repair_required", "quarantined"}:
+            self.cleanup_terminal_spool()
         self._signal_change()
         return True
 
@@ -1866,15 +2103,20 @@ class SyncQueue:
         self,
         tool_name: str,
         relative_path: str,
+        *,
+        identity_version: str | None = None,
     ) -> tuple[int | None, int | None]:
         """Return the last fully observed filesystem revision."""
         with self._lock:
             row = self._conn.execute(
-                """SELECT source_size, source_mtime_ns FROM file_state
+                """SELECT source_size, source_mtime_ns, identity_version
+                   FROM file_state
                    WHERE tool_name=? AND relative_path=?""",
                 (tool_name, relative_path),
             ).fetchone()
-        if row is None:
+        if row is None or (
+            identity_version is not None and row[2] != identity_version
+        ):
             return None, None
         return (
             int(row[0]) if row[0] is not None else None,
@@ -1890,18 +2132,21 @@ class SyncQueue:
         *,
         source_size: int,
         source_mtime_ns: int,
+        identity_version: str | None = None,
     ) -> bool:
         """Advance only the cheap observation token for identical content."""
 
         with self._lock:
             cursor = self._conn.execute(
                 """UPDATE file_state
-                   SET source_size=?, source_mtime_ns=?
+                   SET source_size=?, source_mtime_ns=?,
+                       identity_version=COALESCE(?, identity_version)
                    WHERE tool_name=? AND relative_path=?
                      AND COALESCE(observed_hash, last_hash)=?""",
                 (
                     max(0, int(source_size)),
                     max(0, int(source_mtime_ns)),
+                    identity_version,
                     tool_name,
                     relative_path,
                     content_hash,
@@ -1939,6 +2184,96 @@ class SyncQueue:
                 ),
             )
             self._conn.commit()
+
+    @_rollback_on_error
+    def cleanup_terminal_spool(self) -> int:
+        """Bound regenerable terminal payloads while retaining diagnostics.
+
+        A payload is disposable only while its source still has the exact
+        size/mtime revision recorded at capture time. Synthetic or missing
+        sources remain byte-for-byte intact because they cannot be rebuilt.
+        """
+
+        cutoff = time.time() - self._terminal_spool_max_age_seconds
+        discarded_paths: list[str] = []
+        discarded = 0
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT q.id, q.payload_path, q.payload_bytes, q.source_path,
+                          q.tool_name, q.relative_path, q.sync_strategy,
+                          COALESCE(q.terminal_at, q.created_at),
+                          fs.source_size, fs.source_mtime_ns
+                   FROM queue AS q
+                   LEFT JOIN file_state AS fs
+                     ON fs.tool_name=q.tool_name
+                    AND fs.relative_path=q.relative_path
+                   WHERE q.status IN ('repair_required','quarantined')
+                     AND q.payload_path IS NOT NULL
+                   ORDER BY COALESCE(q.terminal_at, q.created_at), q.id"""
+            ).fetchall()
+            retained_bytes = 0
+            row_bytes: dict[int, int] = {}
+            for row in rows:
+                try:
+                    size = Path(str(row[1])).stat().st_size
+                except OSError:
+                    size = max(0, int(row[2] or 0))
+                row_bytes[int(row[0])] = size
+                retained_bytes += size
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                (
+                    item_id,
+                    payload_path,
+                    _payload_bytes,
+                    source_path,
+                    _tool_name,
+                    _relative_path,
+                    sync_strategy,
+                    terminal_at,
+                    source_size,
+                    source_mtime_ns,
+                ) = row
+                if (
+                    sync_strategy == "metadata"
+                    or not source_path
+                    or source_size is None
+                    or source_mtime_ns is None
+                ):
+                    continue
+                try:
+                    source_stat = Path(str(source_path)).stat()
+                except OSError:
+                    continue
+                if (
+                    source_stat.st_size != int(source_size)
+                    or source_stat.st_mtime_ns != int(source_mtime_ns)
+                ):
+                    continue
+
+                payload_size = row_bytes[int(item_id)]
+                age_due = float(terminal_at) <= cutoff
+                size_due = retained_bytes > self._terminal_spool_max_bytes
+                if not age_due and not size_due:
+                    continue
+                cursor = self._conn.execute(
+                    """UPDATE queue
+                       SET payload_path=NULL, content='', payload_discarded_at=?
+                       WHERE id=? AND payload_path=?
+                         AND status IN ('repair_required','quarantined')""",
+                    (time.time(), int(item_id), str(payload_path)),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                retained_bytes = max(0, retained_bytes - payload_size)
+                discarded_paths.append(str(payload_path))
+                discarded += 1
+            self._conn.commit()
+
+        for payload_path in discarded_paths:
+            self._discard_payload(payload_path)
+        return discarded
 
     @_rollback_on_error
     def cleanup_synced(self, older_than_seconds: int = 3600) -> int:
@@ -1982,7 +2317,9 @@ class SyncQueue:
             }
             rows = self._conn.execute(
                 """SELECT id, tool_name, relative_path, status, outcome_state,
-                          diagnostic_code, http_status, last_error, terminal_at
+                          diagnostic_code, http_status, last_error, terminal_at,
+                          payload_path, payload_bytes, length(content),
+                          source_path, payload_discarded_at
                    FROM queue
                    WHERE status IN (?,?,?)
                    ORDER BY COALESCE(terminal_at, created_at) DESC, id DESC
@@ -2008,6 +2345,11 @@ class SyncQueue:
                     "terminal_at": (
                         float(row[8]) if row[8] is not None else None
                     ),
+                    "payload_retained": bool(
+                        row[9] or int(row[11] or 0) > 0 or int(row[10] or 0) == 0
+                    ),
+                    "payload_bytes": int(row[10] or 0),
+                    "source_rebuildable": bool(row[12] and row[13] is not None),
                 }
                 for row in rows
             ],
@@ -2019,7 +2361,7 @@ class SyncQueue:
 
         with self._lock:
             row = self._conn.execute(
-                """SELECT payload_path FROM queue
+                """SELECT payload_path, payload_bytes, length(content) FROM queue
                    WHERE id=? AND status IN (
                        'auth_blocked','repair_required','quarantined'
                    )""",
@@ -2028,6 +2370,8 @@ class SyncQueue:
             if row is None:
                 return False
             if row[0] and not Path(str(row[0])).is_file():
+                return False
+            if not row[0] and int(row[1] or 0) > 0 and int(row[2] or 0) == 0:
                 return False
             cursor = self._conn.execute(
                 """UPDATE queue
@@ -2046,6 +2390,36 @@ class SyncQueue:
         if changed:
             self._signal_change()
         return changed
+
+    def terminal_rebuild_source(
+        self,
+        item_id: int,
+    ) -> tuple[str, str, str] | None:
+        """Return an exact retained source for an explicitly requested rebuild."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT q.source_path, q.tool_name, q.relative_path,
+                          fs.source_size, fs.source_mtime_ns
+                   FROM queue AS q
+                   LEFT JOIN file_state AS fs
+                     ON fs.tool_name=q.tool_name
+                    AND fs.relative_path=q.relative_path
+                   WHERE q.id=? AND q.status IN (
+                       'repair_required','quarantined'
+                   ) AND q.payload_path IS NULL
+                     AND q.payload_discarded_at IS NOT NULL""",
+                (int(item_id),),
+            ).fetchone()
+        if row is None or not row[0] or row[3] is None or row[4] is None:
+            return None
+        try:
+            stat = Path(str(row[0])).stat()
+        except OSError:
+            return None
+        if stat.st_size != int(row[3]) or stat.st_mtime_ns != int(row[4]):
+            return None
+        return str(row[0]), str(row[1]), str(row[2])
 
     def outstanding_bytes(self) -> int:
         with self._lock:

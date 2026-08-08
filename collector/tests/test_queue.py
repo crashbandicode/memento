@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -563,6 +564,96 @@ class SyncQueueTests(unittest.TestCase):
             quarantine_id,
         )
         self.assertEqual(self.queue.claim_batch()[0].content_hash, "hash-repaired")
+
+    def test_terminal_spool_is_bounded_only_when_source_is_rebuildable(
+        self,
+    ) -> None:
+        self.queue.close()
+        self.queue = SyncQueue(
+            self.db_path,
+            spool_threshold=64 * 1024,
+            terminal_spool_max_age_seconds=7 * 24 * 60 * 60,
+            terminal_spool_max_bytes=1,
+        )
+        source = self.root / "archived_sessions" / "large.jsonl"
+        source.parent.mkdir()
+        source.write_text("x" * 70_000, encoding="utf-8")
+        stat = source.stat()
+        item_id = self.queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path="archived_sessions/large.jsonl",
+            content="x" * 70_000,
+            content_hash="hash-large",
+            file_size=70_000,
+            sync_strategy="full",
+            offset=stat.st_size,
+            source_path=str(source),
+            source_size=stat.st_size,
+            source_mtime_ns=stat.st_mtime_ns,
+        )
+        item = self.queue.claim_batch(max_bytes=100_000)[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                item,
+                UploadOutcome.quarantine(
+                    "HTTP 418 malformed payload",
+                    diagnostic_code="http_418",
+                    http_status=418,
+                ),
+            )
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            row = connection.execute(
+                """SELECT status, payload_path, payload_bytes, diagnostic_code,
+                          payload_discarded_at
+                   FROM queue WHERE id=?""",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(row[:4], ("quarantined", None, 70_000, "http_418"))
+        self.assertIsNotNone(row[4])
+        self.assertEqual(
+            self.queue.terminal_rebuild_source(item_id),
+            (
+                str(source),
+                "codex",
+                "archived_sessions/large.jsonl",
+            ),
+        )
+        health = self.queue.health_status()
+        self.assertFalse(health["diagnostics"][0]["payload_retained"])
+        self.assertTrue(health["diagnostics"][0]["source_rebuildable"])
+        self.assertFalse(self.queue.requeue_terminal(item_id))
+
+        synthetic_id = self.queue.enqueue(
+            tool_name="collector",
+            category="metadata",
+            content_type="json",
+            relative_path="__synthetic__/large.json",
+            content="y" * 70_000,
+            content_hash="hash-synthetic",
+            file_size=70_000,
+            sync_strategy="metadata",
+        )
+        synthetic = self.queue.claim_batch(max_bytes=100_000)[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                synthetic,
+                UploadOutcome.quarantine(
+                    "unsupported synthetic metadata",
+                    diagnostic_code="unsupported_metadata",
+                ),
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            synthetic_spool = connection.execute(
+                "SELECT payload_path FROM queue WHERE id=?",
+                (synthetic_id,),
+            ).fetchone()[0]
+        self.assertIsNotNone(synthetic_spool)
+        self.assertTrue(Path(synthetic_spool).is_file())
 
     def test_metadata_transition_is_durable_and_acknowledged_separately(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
@@ -1276,6 +1367,77 @@ class SyncQueueMigrationTests(unittest.TestCase):
                 )
             finally:
                 queue.close()
+
+    def test_edge_quarantine_migrates_to_staggered_transient_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db_path = Path(temporary) / "sync_queue.db"
+            queue = SyncQueue(db_path, spool_threshold=64 * 1024)
+            edge_id = queue.enqueue(
+                tool_name="codex",
+                category="conversation",
+                content_type="jsonl",
+                relative_path="archived_sessions/edge.jsonl",
+                content="x" * 70_000,
+                content_hash="edge-hash",
+                file_size=70_000,
+                sync_strategy="full",
+            )
+            edge = queue.claim_batch(max_bytes=100_000)[0]
+            self.assertTrue(
+                queue.mark_upload_outcome(
+                    edge,
+                    UploadOutcome.quarantine(
+                        "Cloudflare origin unreachable",
+                        diagnostic_code="http_523",
+                        http_status=523,
+                    ),
+                )
+            )
+            permanent_id = queue.enqueue(
+                tool_name="codex",
+                category="conversation",
+                content_type="jsonl",
+                relative_path="archived_sessions/permanent.jsonl",
+                content="bad",
+                content_hash="permanent-hash",
+                file_size=3,
+                sync_strategy="full",
+            )
+            permanent = queue.claim_batch()[0]
+            self.assertTrue(
+                queue.mark_upload_outcome(
+                    permanent,
+                    UploadOutcome.quarantine(
+                        "unsupported payload",
+                        diagnostic_code="http_418",
+                        http_status=418,
+                    ),
+                )
+            )
+            queue.close()
+
+            before = time.time()
+            migrated = SyncQueue(db_path, spool_threshold=64 * 1024)
+            try:
+                with closing(sqlite3.connect(db_path)) as connection:
+                    edge_row = connection.execute(
+                        """SELECT status, outcome_state, terminal_at, available_at,
+                                  payload_path
+                           FROM queue WHERE id=?""",
+                        (edge_id,),
+                    ).fetchone()
+                    permanent_row = connection.execute(
+                        "SELECT status FROM queue WHERE id=?",
+                        (permanent_id,),
+                    ).fetchone()
+                self.assertEqual(edge_row[0:3], ("pending", "transient_retry", None))
+                self.assertGreaterEqual(edge_row[3], before + 1)
+                self.assertLessEqual(edge_row[3], time.time() + 300)
+                self.assertTrue(Path(edge_row[4]).is_file())
+                self.assertEqual(permanent_row, ("quarantined",))
+                self.assertEqual(migrated.claim_batch(), [])
+            finally:
+                migrated.close()
 
 
 if __name__ == "__main__":

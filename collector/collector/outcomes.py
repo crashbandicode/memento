@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+EDGE_AVAILABILITY_HTTP_STATUSES = frozenset(range(520, 528))
+
+
 class UploadOutcomeState(str, Enum):
     """Disposition of one upload attempt."""
 

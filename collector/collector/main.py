@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 from .canvas_sync import sync_pending_canvases
 from .claude_pending_hook import install_claude_pending_hooks
@@ -36,6 +37,7 @@ from .watcher import FileWatcher
 HEARTBEAT_INTERVAL = 30       # Log heartbeat every 30s
 COMMAND_POLL_INTERVAL = 10    # Check server commands every 10s
 AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
+QUEUE_MAINTENANCE_INTERVAL = 3600
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
 SOURCE_CHANGE_CHECK_INTERVAL = 1  # Cheap stat tokens; expensive work is change-driven
@@ -728,6 +730,8 @@ def main() -> None:
     queue = SyncQueue(
         config.queue_db_path,
         spool_threshold=config.queue_spool_threshold,
+        terminal_spool_max_age_seconds=config.terminal_spool_max_age_seconds,
+        terminal_spool_max_bytes=config.terminal_spool_max_bytes,
     )
     watcher = FileWatcher(available, queue, config)
 
@@ -829,6 +833,7 @@ def main() -> None:
     last_heartbeat_token = -1
     last_command_poll = time.monotonic()
     last_update_check = time.monotonic()
+    last_queue_maintenance = time.monotonic()
     last_codex_metadata_poll = time.monotonic()
     last_source_change_check = time.monotonic()
 
@@ -875,6 +880,15 @@ def main() -> None:
             if config.auto_update_enabled and now - last_update_check > AUTO_UPDATE_INTERVAL:
                 last_update_check = now
                 threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+
+            if now - last_queue_maintenance > QUEUE_MAINTENANCE_INTERVAL:
+                last_queue_maintenance = now
+                discarded = queue.cleanup_terminal_spool()
+                if discarded:
+                    logger.info(
+                        "Released %d rebuildable terminal spool payload(s)",
+                        discarded,
+                    )
 
             if (
                 codex_tool in available

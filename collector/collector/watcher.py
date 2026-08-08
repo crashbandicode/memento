@@ -51,6 +51,9 @@ _NO_CONTENT_CHANGE_EVENT_TYPES = frozenset(
 
 
 _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
+# Bump this whenever sanitization/parsing can change server-visible FULL
+# content. A matching stat token may skip work only within the same epoch.
+FULL_IDENTITY_VERSION = "sanitized-payload-v1"
 
 
 def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
@@ -69,6 +72,19 @@ def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
                 remaining -= len(chunk)
         if remaining:
             return ""
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _legacy_full_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
+    """Reproduce the pre-canonical FULL identity for one-time adoption."""
+
+    try:
+        h = hashlib.sha256()
+        h.update(f"{size}:{mtime_ns}".encode())
+        with open(path, "rb") as stream:
+            h.update(stream.read(min(_FAST_HASH_READ, max(0, int(size)))))
         return h.hexdigest()
     except OSError:
         return ""
@@ -370,6 +386,32 @@ class FileWatcher:
             daemon=True,
         ).start()
 
+    def rebuild_terminal_source(
+        self,
+        source_path: str,
+        *,
+        tool_name: str,
+        relative_path: str,
+    ) -> bool:
+        """Synchronously rebuild one explicitly selected pruned terminal row."""
+
+        path = Path(source_path)
+        if not path.is_file():
+            return False
+        tool = self._find_tool(path)
+        if tool is None:
+            return False
+        classification = tool.classify_file(path)
+        if (
+            classification is None
+            or classification.tool_name != tool_name
+            or classification.relative_path != relative_path
+        ):
+            return False
+        self._on_file_changed(path, force_full=True, emit_live_signals=False)
+        self._queue.prioritize_file(tool_name, relative_path)
+        return True
+
     def request_delta_catchup(self, source_path: str) -> None:
         """Queue the next bounded tail after the previous one is acknowledged.
 
@@ -601,12 +643,41 @@ class FileWatcher:
             observed_source_revision = get_source_revision(
                 classification.tool_name,
                 classification.relative_path,
+                identity_version=(
+                    FULL_IDENTITY_VERSION
+                    if classification.sync_strategy == SyncStrategy.FULL
+                    else None
+                ),
             )
             if observed_source_revision == source_revision:
                 # Startup/catch-up scans can contain thousands of durable,
                 # unchanged files. Their exact stat token is enough to avoid
                 # rereading the first 256 KiB and reparsing the full payload.
                 return
+
+        legacy_adoption_hash = None
+        legacy_source_hash = ""
+        get_legacy_adoption = getattr(
+            self._queue,
+            "get_legacy_full_adoption_hash",
+            None,
+        )
+        if (
+            not force_full
+            and classification.sync_strategy == SyncStrategy.FULL
+            and callable(get_legacy_adoption)
+        ):
+            legacy_adoption_hash = get_legacy_adoption(
+                classification.tool_name,
+                classification.relative_path,
+                identity_version=FULL_IDENTITY_VERSION,
+            )
+            if legacy_adoption_hash:
+                legacy_source_hash = _legacy_full_hash_revision(
+                    path,
+                    size=file_size,
+                    mtime_ns=source_stat.st_mtime_ns,
+                )
 
         # DELTA revisions deliberately retain the deterministic append-prefix
         # token introduced by d0d50a6. FULL identity is computed later from
@@ -817,6 +888,30 @@ class FileWatcher:
         source_modified_at = source_stat.st_mtime
 
         if (
+            legacy_adoption_hash
+            and legacy_source_hash == legacy_adoption_hash
+            and classification.sync_strategy == SyncStrategy.FULL
+        ):
+            adopt_legacy = getattr(
+                self._queue,
+                "adopt_legacy_full_source",
+                None,
+            )
+            if callable(adopt_legacy) and adopt_legacy(
+                classification.tool_name,
+                classification.relative_path,
+                legacy_hash=legacy_adoption_hash,
+                canonical_hash=current_hash,
+                source_size=new_offset,
+                source_mtime_ns=source_stat.st_mtime_ns,
+                identity_version=FULL_IDENTITY_VERSION,
+            ):
+                if prepared_payload is not None:
+                    self._queue.discard_prepared_payload(prepared_payload)
+                logger.info("Adopted unchanged legacy FULL state for %s", path)
+                return
+
+        if (
             not force_full
             and classification.sync_strategy == SyncStrategy.FULL
             and current_hash == last_hash
@@ -833,6 +928,7 @@ class FileWatcher:
                     current_hash,
                     source_size=new_offset,
                     source_mtime_ns=source_stat.st_mtime_ns,
+                    identity_version=FULL_IDENTITY_VERSION,
                 )
             if prepared_payload is not None:
                 self._queue.discard_prepared_payload(prepared_payload)
@@ -865,6 +961,11 @@ class FileWatcher:
             source_path=str(path),
             source_size=new_offset,
             source_mtime_ns=source_stat.st_mtime_ns,
+            identity_version=(
+                FULL_IDENTITY_VERSION
+                if classification.sync_strategy == SyncStrategy.FULL
+                else None
+            ),
             prepared_payload=prepared_payload,
         )
 

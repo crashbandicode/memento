@@ -13,7 +13,12 @@ from typing import BinaryIO, Callable
 import httpx
 
 from .config import CollectorConfig
-from .outcomes import SourceRepairAction, UploadOutcome, UploadOutcomeState
+from .outcomes import (
+    EDGE_AVAILABILITY_HTTP_STATUSES,
+    SourceRepairAction,
+    UploadOutcome,
+    UploadOutcomeState,
+)
 from .queue import QueueItem, SyncQueue
 
 logger = logging.getLogger("collector.sync")
@@ -25,7 +30,9 @@ CHUNK_RETRY_BASE_SECONDS = 0.5
 CHUNK_RETRY_MAX_SECONDS = 4.0
 CHUNK_COMMIT_POLL_SECONDS = 2.0
 CHUNK_COMMIT_TIMEOUT_SECONDS = 30 * 60
-TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+TRANSIENT_HTTP_STATUSES = frozenset(
+    {408, 425, 429, 500, 502, 503, 504}
+) | EDGE_AVAILABILITY_HTTP_STATUSES
 SOURCE_REPAIR_HTTP_STATUSES = frozenset({400, 413, 422})
 
 

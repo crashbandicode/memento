@@ -678,6 +678,34 @@ class SyncClientStreamingTests(unittest.TestCase):
         )
         self.assertEqual(delays, [CHUNK_RETRY_BASE_SECONDS])
 
+    def test_cloudflare_edge_failures_retry_current_chunk(self) -> None:
+        for status in (520, 523):
+            total_size = CHUNK_SIZE + 1
+            queue = _FakeQueue(total_size)
+            http_client = _ScriptedHttpClient(
+                [
+                    _Response(status),
+                    _Response(200),
+                    _Response(200),
+                ]
+            )
+            client = self._client(queue, http_client)
+            delays: list[float] = []
+            client._sleep_interruptibly = delays.append
+
+            with self.subTest(status=status):
+                self.assertTrue(
+                    client._upload_chunked(
+                        self._payload(),
+                        self._item(total_size),
+                    )
+                )
+                self.assertEqual(
+                    [call["metadata"]["chunk_index"] for call in http_client.calls],
+                    [0, 0, 1],
+                )
+                self.assertEqual(delays, [CHUNK_RETRY_BASE_SECONDS])
+
     def test_permanent_4xx_fails_without_retrying(self) -> None:
         total_size = CHUNK_SIZE + 1
         queue = _FakeQueue(total_size)
@@ -786,6 +814,14 @@ class SyncClientStreamingTests(unittest.TestCase):
                 502,
                 503,
                 504,
+                520,
+                521,
+                522,
+                523,
+                524,
+                525,
+                526,
+                527,
             ),
             UploadOutcomeState.AUTHENTICATION_BLOCKED: (401, 403),
             UploadOutcomeState.SOURCE_REPAIR_REQUIRED: (400, 413, 422),

@@ -790,6 +790,8 @@ def status() -> None:
         queue = SyncQueue(
             config.queue_db_path,
             spool_threshold=config.queue_spool_threshold,
+            terminal_spool_max_age_seconds=config.terminal_spool_max_age_seconds,
+            terminal_spool_max_bytes=config.terminal_spool_max_bytes,
         )
         try:
             health = queue.health_status()
@@ -829,13 +831,48 @@ def requeue() -> None:
     queue = SyncQueue(
         config.queue_db_path,
         spool_threshold=config.queue_spool_threshold,
+        terminal_spool_max_age_seconds=config.terminal_spool_max_age_seconds,
+        terminal_spool_max_bytes=config.terminal_spool_max_bytes,
     )
     try:
-        changed = queue.requeue_terminal(int(sys.argv[2]))
+        item_id = int(sys.argv[2])
+        changed = queue.requeue_terminal(item_id)
+        if not changed:
+            rebuild = queue.terminal_rebuild_source(item_id)
+            if rebuild is not None:
+                from .tools.antigravity import AntigravityTool
+                from .tools.claude_code import ClaudeCodeTool
+                from .tools.codex import CodexTool
+                from .tools.cursor import CursorTool
+                from .tools.hermes import HermesTool
+                from .tools.obsidian import ObsidianTool
+                from .tools.openclaw import OpenClawTool
+                from .watcher import FileWatcher
+
+                tools = [
+                    ClaudeCodeTool(),
+                    OpenClawTool(),
+                    CodexTool(),
+                    AntigravityTool(),
+                    ObsidianTool(vault_path=config.obsidian_vault_path),
+                    CursorTool(),
+                    HermesTool(),
+                ]
+                watcher = FileWatcher(
+                    [tool for tool in tools if tool.is_available()],
+                    queue,
+                    config,
+                )
+                source_path, tool_name, relative_path = rebuild
+                changed = watcher.rebuild_terminal_source(
+                    source_path,
+                    tool_name=tool_name,
+                    relative_path=relative_path,
+                )
     finally:
         queue.close()
     if not changed:
-        print("Queue item is not terminal or its spooled payload is unavailable.")
+        print("Queue item is not terminal or its source/payload is unavailable.")
         raise SystemExit(1)
     print(f"Requeued queue item {sys.argv[2]}.")
 

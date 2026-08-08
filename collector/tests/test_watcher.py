@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,16 +20,24 @@ from watchdog.events import (
     FileOpenedEvent,
 )
 
+from collector.outcomes import UploadOutcome
 from collector.parsers.base import ParseResult
 from collector.parsers.jsonl import JsonlParser
 from collector.queue import SyncQueue
+from collector.sanitizer import sanitize_jsonl
 from collector.tools.base import (
     Category,
     ContentType,
     FileClassification,
     SyncStrategy,
 )
-from collector.watcher import FileWatcher, _DebouncedHandler, _delta_hash_revision
+from collector.watcher import (
+    FULL_IDENTITY_VERSION,
+    FileWatcher,
+    _DebouncedHandler,
+    _delta_hash_revision,
+    _legacy_full_hash_revision,
+)
 
 
 def _modified(path: Path) -> FileModifiedEvent:
@@ -383,6 +394,338 @@ def test_restarted_scan_skips_durable_unchanged_source(
     )
     try:
         watcher._process_file_changed(path, emit_live_signals=False)
+    finally:
+        queue.close()
+
+
+def _legacy_full_watcher(
+    tmp_path: Path,
+    path: Path,
+    *,
+    legacy_hash: str,
+    synced: bool = True,
+) -> tuple[SyncQueue, FileWatcher]:
+    database = tmp_path / "queue" / "sync.db"
+    created = SyncQueue(database)
+    created.close()
+    with closing(sqlite3.connect(database)) as connection:
+        # Exact v7 shape: the old database had neither the identity epoch nor
+        # terminal payload-retention marker.
+        connection.execute("ALTER TABLE file_state DROP COLUMN identity_version")
+        connection.execute("ALTER TABLE queue DROP COLUMN payload_discarded_at")
+        connection.execute("PRAGMA user_version=7")
+        connection.execute(
+            """INSERT INTO file_state (
+                   tool_name, relative_path, last_hash, last_offset,
+                   last_synced_at, observed_hash, observed_offset, observed_at,
+                   synced_hash, synced_offset, synced_at,
+                   source_size, source_mtime_ns
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "codex",
+                "archived_sessions/rollout-2026-07-19.jsonl",
+                legacy_hash,
+                path.stat().st_size,
+                100.0,
+                legacy_hash,
+                path.stat().st_size,
+                100.0,
+                legacy_hash if synced else None,
+                path.stat().st_size if synced else 0,
+                100.0 if synced else None,
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="archived_sessions/rollout-2026-07-19.jsonl",
+    )
+    queue = SyncQueue(database, spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(path.parent): SimpleNamespace(
+            classify_file=lambda _path: classification,
+        )
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    return queue, watcher
+
+
+def test_legacy_archived_full_adopts_only_acknowledged_unchanged_source(
+    tmp_path: Path,
+) -> None:
+    archive_dir = tmp_path / "archived_sessions"
+    archive_dir.mkdir()
+    path = archive_dir / "rollout-2026-07-19.jsonl"
+    path.write_text(
+        json.dumps({"message": "x" * 70_000}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    stat = path.stat()
+    legacy_hash = _legacy_full_hash_revision(
+        path,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    queue, watcher = _legacy_full_watcher(
+        tmp_path,
+        path,
+        legacy_hash=legacy_hash,
+    )
+
+    try:
+        canonical_content = sanitize_jsonl(
+            path.read_text(encoding="utf-8")
+        ).content
+        canonical_hash = hashlib.sha256(
+            canonical_content.encode("utf-8")
+        ).hexdigest()
+        queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path="archived_sessions/rollout-2026-07-19.jsonl",
+            content=canonical_content,
+            content_hash=canonical_hash,
+            file_size=len(canonical_content.encode("utf-8")),
+            sync_strategy="full",
+            offset=path.stat().st_size,
+            source_path=str(path),
+            source_size=path.stat().st_size,
+            source_mtime_ns=path.stat().st_mtime_ns,
+        )
+        assert queue.pending_count() == 1
+        assert len(list((tmp_path / "queue" / "spool").glob("*.payload"))) == 1
+
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        assert queue.pending_count() == 0
+        assert queue.get_file_state(
+            "codex",
+            "archived_sessions/rollout-2026-07-19.jsonl",
+        ) == (canonical_hash, path.stat().st_size)
+        assert queue.get_source_revision(
+            "codex",
+            "archived_sessions/rollout-2026-07-19.jsonl",
+            identity_version=FULL_IDENTITY_VERSION,
+        ) == (path.stat().st_size, path.stat().st_mtime_ns)
+        assert list((tmp_path / "queue" / "spool").glob("*.payload")) == []
+        with queue._lock:
+            assert queue._conn.execute(
+                "SELECT status FROM queue ORDER BY id DESC LIMIT 1"
+            ).fetchone() == ("superseded",)
+    finally:
+        queue.close()
+
+
+def test_changed_or_unacknowledged_legacy_full_is_not_adopted(
+    tmp_path: Path,
+) -> None:
+    for synced, changed in ((True, True), (False, False)):
+        case = tmp_path / f"{synced}-{changed}"
+        archive_dir = case / "archived_sessions"
+        archive_dir.mkdir(parents=True)
+        path = archive_dir / "rollout-2026-07-19.jsonl"
+        path.write_text('{"message":"original"}\n', encoding="utf-8")
+        stat = path.stat()
+        legacy_hash = _legacy_full_hash_revision(
+            path,
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+        )
+        queue, watcher = _legacy_full_watcher(
+            case,
+            path,
+            legacy_hash=legacy_hash,
+            synced=synced,
+        )
+        try:
+            if changed:
+                path.write_text('{"message":"changed"}\n', encoding="utf-8")
+                changed_at = path.stat().st_mtime + 10
+                os.utime(path, (changed_at, changed_at))
+            watcher._process_file_changed(path, emit_live_signals=False)
+
+            item = queue.claim_batch()[0]
+            assert item.content_hash != legacy_hash
+            assert queue.read_payload_text(item) == sanitize_jsonl(
+                path.read_text(encoding="utf-8")
+            ).content
+        finally:
+            queue.close()
+
+
+def test_unacknowledged_interrupted_full_row_recovers_after_migration(
+    tmp_path: Path,
+) -> None:
+    archive_dir = tmp_path / "archived_sessions"
+    archive_dir.mkdir()
+    path = archive_dir / "rollout-2026-07-19.jsonl"
+    path.write_text('{"message":"not-yet-acknowledged"}\n', encoding="utf-8")
+    stat = path.stat()
+    legacy_hash = _legacy_full_hash_revision(
+        path,
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )
+    queue, watcher = _legacy_full_watcher(
+        tmp_path,
+        path,
+        legacy_hash=legacy_hash,
+        synced=False,
+    )
+    canonical = sanitize_jsonl(path.read_text(encoding="utf-8")).content
+    canonical_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    item_id = queue.enqueue(
+        tool_name="codex",
+        category="conversation",
+        content_type="jsonl",
+        relative_path="archived_sessions/rollout-2026-07-19.jsonl",
+        content=canonical,
+        content_hash=canonical_hash,
+        file_size=len(canonical.encode("utf-8")),
+        sync_strategy="full",
+        offset=stat.st_size,
+        source_path=str(path),
+        source_size=stat.st_size,
+        source_mtime_ns=stat.st_mtime_ns,
+    )
+    interrupted = queue.claim_batch(lease_seconds=0)[0]
+    assert interrupted.id == item_id
+    queue.close()
+
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher._queue = queue
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        recovered = queue.claim_batch()[0]
+        assert recovered.id == item_id
+        assert recovered.content_hash == canonical_hash
+        assert queue.read_payload_text(recovered) == canonical
+    finally:
+        queue.close()
+
+
+def test_pruned_terminal_payload_rebuilds_from_exact_source(tmp_path: Path) -> None:
+    archive_dir = tmp_path / "archived_sessions"
+    archive_dir.mkdir()
+    path = archive_dir / "large.jsonl"
+    path.write_text(
+        json.dumps({"message": "x" * 70_000}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    stat = path.stat()
+    queue = SyncQueue(
+        tmp_path / "queue" / "sync.db",
+        spool_threshold=64 * 1024,
+        terminal_spool_max_bytes=1,
+    )
+    item_id = queue.enqueue(
+        tool_name="codex",
+        category="conversation",
+        content_type="jsonl",
+        relative_path="archived_sessions/large.jsonl",
+        content=sanitize_jsonl(path.read_text(encoding="utf-8")).content,
+        content_hash="terminal-hash",
+        file_size=70_000,
+        sync_strategy="full",
+        offset=stat.st_size,
+        source_path=str(path),
+        source_size=stat.st_size,
+        source_mtime_ns=stat.st_mtime_ns,
+        identity_version=FULL_IDENTITY_VERSION,
+    )
+    terminal = queue.claim_batch(max_bytes=100_000)[0]
+    assert queue.mark_upload_outcome(
+        terminal,
+        UploadOutcome.quarantine(
+            "unsupported payload",
+            diagnostic_code="unsupported_payload",
+        ),
+    )
+    rebuild = queue.terminal_rebuild_source(item_id)
+    assert rebuild is not None
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="archived_sessions/large.jsonl",
+    )
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(archive_dir): SimpleNamespace(
+            classify_file=lambda _path: classification,
+        )
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._stop_event = threading.Event()
+    watcher._processing_lock = threading.Lock()
+    try:
+        source_path, tool_name, relative_path = rebuild
+        assert watcher.rebuild_terminal_source(
+            source_path,
+            tool_name=tool_name,
+            relative_path=relative_path,
+        )
+
+        rebuilt = queue.claim_batch(max_bytes=100_000)[0]
+        assert rebuilt.id == item_id
+        assert rebuilt.metadata["_queue_force_reprocess_nonce"]
+        assert queue.read_payload_text(rebuilt) == sanitize_jsonl(
+            path.read_text(encoding="utf-8")
+        ).content
+    finally:
+        queue.close()
+
+
+def test_full_identity_epoch_rechecks_sanitizer_visible_content(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"message":"visible"}\n', encoding="utf-8")
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        assert queue.mark_synced(queue.claim_batch()[0])
+        with queue._lock:
+            queue._conn.execute(
+                """UPDATE file_state
+                   SET last_hash=?, observed_hash=?, synced_hash=?,
+                       identity_version='sanitized-payload-v0'
+                   WHERE tool_name='cursor' AND relative_path='projects/session.jsonl'""",
+                ("f" * 64, "f" * 64, "f" * 64),
+            )
+            queue._conn.commit()
+
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        repaired = queue.claim_batch()[0]
+        assert repaired.content_hash != "f" * 64
+        assert queue.read_payload_text(repaired) == '{"message":"visible"}'
     finally:
         queue.close()
 
