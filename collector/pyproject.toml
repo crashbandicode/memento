@@ -1,6 +1,6 @@
 [project]
 name = "memento-brain-collector"
-version = "0.0.31"
+version = "0.0.32"
 description = "Cross-platform agent that collects AI coding tool memory files and syncs to a central server"
 readme = "README.md"
 license = {text = "AGPL-3.0-only"}
@@ -40,7 +40,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     "packaging>=23.0",
     "cryptography>=41.0",
-    "memento-brain-memory>=0.0.31",
+    "memento-brain-memory>=0.0.32",
 ]
 
 [project.optional-dependencies]
