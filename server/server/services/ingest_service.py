@@ -102,6 +102,7 @@ MAX_DOCUMENT_METADATA_BYTES = 256 * 1024
 MAX_METADATA_STRING_CHARS = 16 * 1024
 MAX_USER_HISTORY_ENTRIES = 2_000
 MAX_USER_HISTORY_BYTES = 4 * 1024 * 1024
+MAX_CURSOR_PROJECTION_BASELINE_RECORDS = 100_000
 MAX_CURSOR_PROJECTION_INSERTION_TAIL_RECORDS = 32
 MAX_CURSOR_PROJECTION_INSERTION_GROUPS = 16
 MAX_CURSOR_PROJECTION_INSERTED_RECORDS = 64
@@ -3518,7 +3519,15 @@ async def _apply_cursor_projection_order(
         or version != 1
         or not isinstance(base_count, int)
         or isinstance(base_count, bool)
-        or base_count != current_max
+        # ``base_count`` is in the collector's projected-source domain while
+        # ``current_max`` is in the normalized read-model domain. Cursor can
+        # project records that normalize to no stored content, so equality is
+        # not a valid invariant. Each projected record produces at most one
+        # stored row, so a smaller source count is still impossible.
+        # The committed base-hash guard and the exact adjacent source-ID
+        # anchors below provide the stale/race protection for this insertion.
+        or base_count < current_max
+        or base_count > MAX_CURSOR_PROJECTION_BASELINE_RECORDS
         or current_max < 1
         or current_max > 2_147_483_647 - MAX_CURSOR_PROJECTION_INSERTED_RECORDS
         or not isinstance(raw_groups, list)

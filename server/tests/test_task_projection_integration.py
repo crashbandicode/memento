@@ -38,6 +38,7 @@ from server.services.conversation_read_model import refresh_conversation_read_mo
 from server.services.ingest_service import (
     CURSOR_PROJECTION_ORDER_KEY,
     CursorProjectionOrderMismatch,
+    DeltaBaseMismatch,
     LIVE_SHELL_ACTIVITIES_KEY,
     _extract_messages,
     _set_stored_source_identity,
@@ -827,6 +828,297 @@ async def test_cursor_projection_delta_inserts_before_bounded_mutable_tail(
 
 
 @pytest.mark.asyncio
+async def test_cursor_projection_full_then_sparse_deltas_with_filtered_rows(
+    session_factory,
+) -> None:
+    """Projection counts may exceed normalized rows without changing hash safety."""
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="cursor-projection-count-test",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="cursor"))
+        session.add_all([user, machine])
+        await session.flush()
+
+        timestamp = "2026-08-08T04:00:00Z"
+        session_id = str(uuid4())
+        relative_path = (
+            "projects/empty-window/agent-transcripts/"
+            f"{session_id}/{session_id}.jsonl"
+        )
+        metadata = {
+            "source": "cursor_state_v1",
+            "session_id": session_id,
+        }
+        stable_0 = _cursor_row(
+            "stable-0",
+            "user",
+            "Inspect the projection.",
+            timestamp=timestamp,
+        )
+        # Cursor's projection can retain source records with no normalized
+        # content. They remain part of the collector's source-order baseline
+        # and content hash, but intentionally produce no read-model row.
+        filtered = _cursor_row(
+            "filtered-empty",
+            "assistant",
+            "",
+            timestamp=timestamp,
+        )
+        stable_1 = _cursor_tool_row(
+            "stable-1",
+            "First result",
+            timestamp=timestamp,
+        )
+        stable_2 = _cursor_tool_row(
+            "stable-2",
+            "Mutable tail",
+            timestamp=timestamp,
+            status="running",
+            tool_name="Shell",
+            tool_input={"command": "python worker.py"},
+        )
+        full_rows = [stable_0, filtered, stable_1, stable_2]
+        full_snapshot = "\n".join(full_rows)
+        full_hash = hashlib.sha256(full_snapshot.encode()).hexdigest()
+        full_size = len(full_snapshot.encode())
+
+        document = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content=full_snapshot,
+            content_hash=full_hash,
+            file_size=full_size,
+            mode="full",
+            offset=full_size,
+            metadata=metadata,
+            timestamp=1_786_162_000.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        initial_rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assert [row.metadata_["source_id"] for row in initial_rows] == [
+            "stable-0",
+            "stable-1",
+            "stable-2",
+        ]
+        initial_sync = (
+            await session.execute(
+                select(SyncState).where(
+                    SyncState.machine_id == machine.id,
+                    SyncState.tool_id == "cursor",
+                    SyncState.relative_path == relative_path,
+                )
+            )
+        ).scalar_one()
+        assert (initial_sync.last_hash, initial_sync.last_offset) == (
+            full_hash,
+            full_size,
+        )
+
+        inserted_1 = _cursor_tool_row(
+            "inserted-1",
+            "Late first result",
+            timestamp=timestamp,
+        )
+        first_rows = [stable_0, filtered, stable_1, inserted_1, stable_2]
+        first_snapshot = "\n".join(first_rows)
+        first_hash = hashlib.sha256(first_snapshot.encode()).hexdigest()
+        first_size = len(first_snapshot.encode())
+        first_hint = {
+            "version": 1,
+            "base_count": len(full_rows),
+            "groups": [{
+                "after_source_id": "stable-1",
+                "before_source_id": "stable-2",
+                "source_ids": ["inserted-1"],
+            }],
+        }
+        await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content=inserted_1,
+            content_hash=first_hash,
+            file_size=len(inserted_1.encode()),
+            mode="delta",
+            offset=first_size,
+            base_hash=full_hash,
+            base_offset=full_size,
+            metadata={
+                **metadata,
+                CURSOR_PROJECTION_ORDER_KEY: first_hint,
+            },
+            timestamp=1_786_162_001.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        inserted_2 = _cursor_tool_row(
+            "inserted-2",
+            "Late second result",
+            timestamp=timestamp,
+        )
+        second_rows = [
+            stable_0,
+            filtered,
+            stable_1,
+            inserted_1,
+            inserted_2,
+            stable_2,
+        ]
+        second_snapshot = "\n".join(second_rows)
+        second_hash = hashlib.sha256(second_snapshot.encode()).hexdigest()
+        second_size = len(second_snapshot.encode())
+        second_hint = {
+            "version": 1,
+            "base_count": len(first_rows),
+            "groups": [{
+                "after_source_id": "inserted-1",
+                "before_source_id": "stable-2",
+                "source_ids": ["inserted-2"],
+            }],
+        }
+        await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content=inserted_2,
+            content_hash=second_hash,
+            file_size=len(inserted_2.encode()),
+            mode="delta",
+            offset=second_size,
+            base_hash=first_hash,
+            base_offset=first_size,
+            metadata={
+                **metadata,
+                CURSOR_PROJECTION_ORDER_KEY: second_hint,
+            },
+            timestamp=1_786_162_002.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+        )
+        await session.commit()
+
+        final_rows = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(ConversationMessage.document_id == document.id)
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assert [row.metadata_["source_id"] for row in final_rows] == [
+            "stable-0",
+            "stable-1",
+            "inserted-1",
+            "inserted-2",
+            "stable-2",
+        ]
+        final_sync = (
+            await session.execute(
+                select(SyncState).where(
+                    SyncState.machine_id == machine.id,
+                    SyncState.tool_id == "cursor",
+                    SyncState.relative_path == relative_path,
+                )
+            )
+        ).scalar_one()
+        final_delivery = await session.get(
+            DocumentDeliveryState,
+            document.id,
+            populate_existing=True,
+        )
+        assert final_delivery is not None
+        assert (final_sync.last_hash, final_sync.last_offset) == (
+            second_hash,
+            second_size,
+        )
+        assert (
+            final_delivery.revision_hash,
+            final_delivery.file_size_bytes,
+        ) == (second_hash, second_size)
+
+        replayed = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content=inserted_2,
+            content_hash=second_hash,
+            file_size=len(inserted_2.encode()),
+            mode="delta",
+            offset=second_size,
+            base_hash=first_hash,
+            base_offset=first_size,
+            metadata={
+                **metadata,
+                CURSOR_PROJECTION_ORDER_KEY: second_hint,
+            },
+            timestamp=1_786_162_002.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+        )
+        assert getattr(replayed, "_memento_ingest_disposition") == "idempotent"
+
+        with pytest.raises(DeltaBaseMismatch) as stale:
+            await ingest_file(
+                session,
+                tool_id="cursor",
+                category="conversation",
+                content_type="jsonl",
+                relative_path=relative_path,
+                content=inserted_1,
+                content_hash=first_hash,
+                file_size=len(inserted_1.encode()),
+                mode="delta",
+                offset=first_size,
+                base_hash=full_hash,
+                base_offset=full_size,
+                metadata={
+                    **metadata,
+                    CURSOR_PROJECTION_ORDER_KEY: first_hint,
+                },
+                timestamp=1_786_162_001.0,
+                machine_id=machine.id,
+                user_id=str(user.id),
+                schedule_post_ingest=False,
+            )
+        assert stale.value.expected_hash == second_hash
+        assert stale.value.expected_offset == second_size
+
+
+@pytest.mark.asyncio
 async def test_cursor_projection_delta_reconciles_canvas_references_exactly(
     session_factory,
 ) -> None:
@@ -983,6 +1275,25 @@ async def test_cursor_projection_delta_rejects_malformed_and_far_tail_hints(
             )
         assert malformed.value.expected_hash is None
         assert malformed.value.expected_offset == 0
+        with pytest.raises(
+            CursorProjectionOrderMismatch,
+            match="ordering bounds",
+        ):
+            await _extract_messages(
+                session,
+                document,
+                inserted,
+                "delta",
+                cursor_projection_order={
+                    "version": 1,
+                    "base_count": 39,
+                    "groups": [{
+                        "after_source_id": "stable-38",
+                        "before_source_id": "stable-39",
+                        "source_ids": ["inserted"],
+                    }],
+                },
+            )
         with pytest.raises(
             CursorProjectionOrderMismatch,
             match="too far from tail",
