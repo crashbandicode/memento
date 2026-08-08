@@ -36,6 +36,11 @@ class _Result:
     def scalar(self):
         return self._scalar_value
 
+    def first(self):
+        if self._rows:
+            return self._rows[0]
+        return self._scalar_value
+
     def scalars(self):
         return self
 
@@ -106,6 +111,97 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             },
             timestamp=self.now,
         )
+
+    def read_model(self, **overrides):
+        values = {
+            "document_id": self.doc_id,
+            "machine_id": self.doc.machine_id,
+            "tool_id": self.doc.tool_id,
+            "thread_id": self.doc.metadata_["session_id"],
+            "root_thread_id": self.doc.metadata_["session_id"],
+            "parent_thread_id": None,
+            "agent_id": None,
+            "agent_tool_use_id": None,
+            "agent_depth": 0,
+            "is_subagent": False,
+            "message_count": 4306,
+            "projected_through_line": 4306,
+            "latest_assistant_line": 4306,
+            "generation": 7,
+            "projection_version": 1,
+            "prompts": [],
+            "pending_interactions": [],
+            "inferred_responses": [],
+            "live_activities": [],
+            "agent_events": [],
+            "runtime": {},
+            "lifecycle": {},
+            "latest_human_at": "",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    async def test_projected_tail_is_count_and_offset_free(self) -> None:
+        projection = self.read_model()
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[self.message(4306), self.message(4305)]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=2,
+            tail=True,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["total"], 4306)
+        self.assertEqual(payload["offset"], 4304)
+        self.assertTrue(payload["has_earlier"])
+        self.assertFalse(payload["has_more"])
+        self.assertEqual(len(db.statements), 2)
+        sql = str(db.statements[1].compile()).upper()
+        self.assertNotIn("COUNT(", sql)
+        self.assertNotIn("OFFSET", sql)
+        self.assertIn("DESC", sql)
+
+    async def test_projected_keyset_page_uses_limit_plus_one(self) -> None:
+        projection = self.read_model()
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[
+                self.message(101),
+                self.message(102),
+                self.message(103),
+            ]),
+        ])
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=2,
+            tail=False,
+            line_number=None,
+            context_before=0,
+            after_line=100,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            [item["line_number"] for item in payload["messages"]],
+            [101, 102],
+        )
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["next_after_line"], 102)
+        sql = str(db.statements[1].compile()).upper()
+        self.assertIn("LINE_NUMBER >", sql)
+        self.assertNotIn("OFFSET", sql)
+        self.assertNotIn("COUNT(", sql)
 
     async def test_messages_prefer_indexed_normalized_rows(self) -> None:
         db = _Db(
@@ -436,7 +532,6 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             [
                 _Result(scalar_value=self.doc),
                 _Result(scalar_value=4306),
-                _Result(scalar_value=4281),
                 _Result(rows=[self.message(4282), self.message(4283)]),
             ]
         )
@@ -453,7 +548,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["total"], 4306)
         self.assertEqual(payload["offset"], 4281)
-        message_sql = str(db.statements[3].compile())
+        message_sql = str(db.statements[2].compile())
         self.assertIn("conversation_messages.line_number >=", message_sql)
         self.assertNotIn("documents.content", message_sql)
 
@@ -462,7 +557,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             [
                 _Result(scalar_value=self.doc),
                 _Result(scalar_value=4306),
-                _Result(rows=[self.message(4305), self.message(4306)]),
+                _Result(rows=[self.message(4306), self.message(4305)]),
             ]
         )
 
@@ -484,7 +579,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             [4305, 4306],
         )
         message_sql = str(db.statements[2].compile())
-        self.assertIn("OFFSET", message_sql.upper())
+        self.assertNotIn("OFFSET", message_sql.upper())
+        self.assertIn("DESC", message_sql.upper())
         self.assertNotIn("documents.content", message_sql)
 
     async def test_pending_interactions_include_out_of_window_subagent_questions(
@@ -1127,6 +1223,86 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         prompt_sql = str(db.statements[2].compile()).upper()
         self.assertNotIn(" LIMIT ", prompt_sql)
 
+    async def test_prompt_refresh_reads_only_projection_delta(self) -> None:
+        projection = self.read_model(
+            prompts=[
+                {
+                    "id": 7,
+                    "line_number": 12,
+                    "content": "Earlier",
+                    "timestamp": self.now.isoformat(),
+                },
+                {
+                    "id": 9,
+                    "line_number": 44,
+                    "content": "New prompt",
+                    "timestamp": self.now.isoformat(),
+                },
+            ],
+            projected_through_line=45,
+        )
+        db = _Db([_Result(rows=[(self.doc, projection)])])
+
+        payload = await get_conversation_prompts(
+            self.doc_id,
+            after_line=12,
+            generation=7,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            [item["line_number"] for item in payload["prompts"]],
+            [44],
+        )
+        self.assertFalse(payload["reset"])
+        self.assertEqual(payload["projected_through_line"], 45)
+        self.assertEqual(len(db.statements), 1)
+        sql = str(db.statements[0].compile()).upper()
+        self.assertIn("CONVERSATION_READ_MODELS", sql)
+        self.assertNotIn("CONVERSATION_MESSAGES", sql)
+
+    async def test_projected_pending_interactions_do_not_replay_messages(
+        self,
+    ) -> None:
+        interaction = {
+            "id": "projected-question",
+            "kind": "question",
+            "source": "codex",
+            "tool_name": "request_user_input",
+            "questions": [],
+        }
+        projection = self.read_model(
+            pending_interactions=[{
+                "document_id": str(self.doc_id),
+                "message_id": 88,
+                "line_number": 88,
+                "interaction": interaction,
+                "timestamp": self.now.isoformat(),
+            }]
+        )
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[(self.doc, projection)]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(
+            payload["interactions"][0]["interaction"]["id"],
+            "projected-question",
+        )
+        self.assertEqual(len(db.statements), 2)
+        for statement in db.statements:
+            sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+            self.assertNotIn("CONVERSATION_MESSAGES", sql)
+            self.assertNotIn("METADATA ?", sql)
+
     async def test_claude_child_parent_messages_are_not_prompt_navigation(self) -> None:
         self.doc.tool_id = "claude_code"
         self.doc.relative_path = (
@@ -1311,6 +1487,36 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("coalesce", hierarchy_sql)
         self.assertTrue(any(value == "root_session_id" for value in hierarchy_params))
         self.assertTrue(any(value == "session_id" for value in hierarchy_params))
+
+    async def test_metadata_refresh_uses_materialized_hierarchy_and_events(
+        self,
+    ) -> None:
+        projection = self.read_model(message_count=4306)
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(scalar_value=None),
+            _Result(rows=[(self.doc, projection)]),
+        ])
+
+        payload = await get_conversation(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["message_count"], 4306)
+        self.assertEqual(payload["subagent_count"], 0)
+        self.assertEqual(len(db.statements), 3)
+        for statement in db.statements:
+            sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+            self.assertNotIn("COUNT(", sql)
+            self.assertNotIn("CONVERSATION_MESSAGES", sql)
+            self.assertNotIn("JSONB_EXTRACT_PATH_TEXT", sql)
+        hierarchy_sql = str(
+            db.statements[2].compile(dialect=postgresql.dialect())
+        ).upper()
+        self.assertIn("CONVERSATION_READ_MODELS.ROOT_THREAD_ID", hierarchy_sql)
+        self.assertIn(" LIMIT ", hierarchy_sql)
 
     async def test_direct_claude_child_api_uses_launch_description_title(self) -> None:
         root_thread_id = "root-thread"

@@ -3465,6 +3465,7 @@ async def _extract_messages(
     # Always full-replace (file is rewritten on each turn).
     if doc.tool_id == "hermes":
         from .conversation_parser import parse_conversation
+        from .conversation_read_model import refresh_conversation_read_model
 
         await db.execute(
             delete(ConversationMessage).where(ConversationMessage.document_id == doc.id)
@@ -3511,6 +3512,12 @@ async def _extract_messages(
             db.add_all(batch)
             await db.flush()
             await project_message_canvases(db, doc, batch)
+        await refresh_conversation_read_model(
+            db,
+            doc,
+            mode="full",
+            force_full=True,
+        )
         await upsert_search_terms(db, search_terms)
         return "".join(search_parts)
 
@@ -3524,6 +3531,8 @@ async def _extract_messages(
     full_existing_rows: dict[int, ConversationMessage] = {}
     full_loaded_through = 0
     full_prefix_intact = preserve_full_rebase
+    projection_requires_rebuild = False
+    dirty_projection_lines: set[int] = set()
 
     # DELTA appends after the committed tail. A FULL/rebase keeps the exact
     # normalized prefix and only replaces the first changed suffix.
@@ -3555,14 +3564,17 @@ async def _extract_messages(
         start_line = 1
 
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
-    from .conversation_tasks import (
-        current_projected_task_state,
-        refresh_task_projection,
-    )
+    from .conversation_tasks import canonical_task_state
+    from ..db.models import ConversationTaskState
 
-    initial_task_state = (
-        await current_projected_task_state(db, doc.id)
+    existing_task_projection = (
+        await db.get(ConversationTaskState, doc.id)
         if mode == "delta"
+        else None
+    )
+    initial_task_state = canonical_task_state(
+        existing_task_projection.state
+        if existing_task_projection is not None
         else None
     )
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
@@ -3693,6 +3705,7 @@ async def _extract_messages(
                 )
                 if delta_tail is prior_lifecycle_row:
                     delta_tail = None
+                dirty_projection_lines.add(prior_lifecycle_row.line_number)
                 continue
 
         pending_before = bool(pending_question_ids)
@@ -3796,6 +3809,7 @@ async def _extract_messages(
             delta_tail.metadata_ = meta
             delta_tail.timestamp = ts
             add_search_text(normalized.role, clean_content)
+            dirty_projection_lines.add(delta_tail.line_number)
             delta_tail = None
             continue
         if (
@@ -3823,6 +3837,7 @@ async def _extract_messages(
                 delta_tail.metadata_ = meta
                 delta_tail.timestamp = ts
             add_search_text(normalized.role, clean_content)
+            dirty_projection_lines.add(delta_tail.line_number)
             delta_tail = None
             continue
         message_type = _bounded_message_text(
@@ -3884,8 +3899,11 @@ async def _extract_messages(
                 existing_message.metadata_ = meta
                 existing_message.timestamp = ts
                 add_search_text(normalized.role, clean_content)
+                dirty_projection_lines.add(existing_message.line_number)
                 line_num += 1
                 continue
+            if line_num <= full_existing_max:
+                projection_requires_rebuild = True
             await db.execute(
                 delete(ConversationMessage).where(
                     ConversationMessage.document_id == doc.id,
@@ -3924,6 +3942,7 @@ async def _extract_messages(
             batch_bytes = 0
 
     if full_prefix_intact and line_num <= full_existing_max:
+        projection_requires_rebuild = True
         await db.execute(
             delete(ConversationMessage).where(
                 ConversationMessage.document_id == doc.id,
@@ -4138,10 +4157,29 @@ async def _extract_messages(
                 add_search_text("user", clean_first_user)
                 await db.flush()
 
-    # The projection and normalized message history commit in the same ingest
-    # transaction. FULL replacement therefore cannot expose stale task state,
-    # and DELTA updates are seeded from the previously committed projection.
-    await refresh_task_projection(db, doc)
+    # Read projections commit with normalized history. Ordinary DELTAs inspect
+    # only rows beyond the prior high-water mark plus explicitly mutated rows.
+    # A FULL upload whose normalized prefix stayed intact has the same safe
+    # shape: it is either unchanged or append-only, so replaying all prior rows
+    # would merely duplicate work.
+    from .conversation_read_model import refresh_conversation_read_model
+
+    projection_mode = (
+        "delta"
+        if mode == "delta"
+        or (
+            preserve_full_rebase
+            and not projection_requires_rebuild
+        )
+        else "full"
+    )
+    await refresh_conversation_read_model(
+        db,
+        doc,
+        mode=projection_mode,
+        dirty_line_numbers=dirty_projection_lines,
+        force_full=bool(user_history or first_user_message),
+    )
     await upsert_search_terms(db, search_terms)
     setattr(doc, "_memento_interactions_changed", interactions_changed)
     return "".join(search_parts)

@@ -467,6 +467,10 @@ export interface MessagesResponse {
   total: number;
   offset: number;
   limit: number;
+  has_more?: boolean;
+  has_earlier?: boolean;
+  next_after_line?: number | null;
+  previous_before_line?: number | null;
   messages: ConversationMessage[];
 }
 
@@ -528,6 +532,9 @@ export interface ConversationPrompt {
 
 export interface ConversationPromptsResponse {
   prompts: ConversationPrompt[];
+  generation?: number;
+  projected_through_line?: number;
+  reset?: boolean;
 }
 
 export interface DailyDate {
@@ -809,6 +816,15 @@ export const api = {
     }),
   getMessages: (id: string, offset = 0, limit = 50) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?offset=${offset}&limit=${limit}`),
+  getMessagesAfter: (id: string, afterLine: number | null, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (afterLine !== null) params.set("after_line", String(afterLine));
+    return apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?${params}`);
+  },
+  getMessagesBefore: (id: string, beforeLine: number, limit = 50) =>
+    apiFetch<MessagesResponse>(
+      `/api/conversations/${id}/messages?before_line=${beforeLine}&limit=${limit}`,
+    ),
   getLatestMessages: (id: string, limit = 200) =>
     apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?tail=true&limit=${limit}`),
   getPendingInteractions: (id: string) =>
@@ -829,8 +845,15 @@ export const api = {
     });
     return apiFetch<MessagesResponse>(`/api/conversations/${id}/messages?${params}`);
   },
-  getPrompts: (id: string) =>
-    apiFetch<ConversationPromptsResponse>(`/api/conversations/${id}/prompts`),
+  getPrompts: (id: string, afterLine?: number, generation?: number) => {
+    const params = new URLSearchParams();
+    if (typeof afterLine === "number") params.set("after_line", String(afterLine));
+    if (typeof generation === "number") params.set("generation", String(generation));
+    const query = params.size > 0 ? `?${params}` : "";
+    return apiFetch<ConversationPromptsResponse>(
+      `/api/conversations/${id}/prompts${query}`,
+    );
+  },
   searchConversation: (
     id: string,
     q: string,

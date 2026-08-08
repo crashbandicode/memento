@@ -581,6 +581,95 @@ class ConversationTaskState(Base):
 
 
 # ---------------------------------------------------------------------------
+# Materialized conversation read state
+# ---------------------------------------------------------------------------
+class ConversationReadModel(Base):
+    """One ingest-owned read projection per normalized conversation."""
+
+    __tablename__ = "conversation_read_models"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    machine_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE")
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String(512))
+    root_thread_id: Mapped[str | None] = mapped_column(String(512))
+    parent_thread_id: Mapped[str | None] = mapped_column(String(512))
+    agent_id: Mapped[str | None] = mapped_column(String(512))
+    agent_tool_use_id: Mapped[str | None] = mapped_column(String(512))
+    agent_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_subagent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    projected_through_line: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    latest_assistant_line: Mapped[int | None] = mapped_column(Integer)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    projection_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+
+    prompts: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    pending_interactions: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    inferred_responses: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    live_activities: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    agent_events: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    runtime: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    lifecycle: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    latest_human_at: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_conversation_read_root",
+            "machine_id",
+            "tool_id",
+            "root_thread_id",
+        ),
+        Index(
+            "idx_conversation_read_thread",
+            "machine_id",
+            "tool_id",
+            "thread_id",
+        ),
+        Index(
+            "idx_conversation_read_agent",
+            "machine_id",
+            "tool_id",
+            "agent_id",
+        ),
+        Index(
+            "idx_conversation_read_tool_use",
+            "machine_id",
+            "tool_id",
+            "agent_tool_use_id",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Conversation search spelling lexicon
 # ---------------------------------------------------------------------------
 class ConversationSearchTerm(Base):

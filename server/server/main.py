@@ -416,6 +416,53 @@ def _run_migrations(conn) -> None:
         ):
             conn.execute(text(task_index_sql))
 
+        # Conversation viewer projection. Read endpoints join this compact row
+        # instead of replaying message history and JSON metadata on each SSE
+        # refresh. Historical rows remain compatible through API fallbacks and
+        # can be populated with the dedicated backfill script.
+        if "conversation_read_models" not in tables:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS conversation_read_models ("
+                "document_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, "
+                "machine_id UUID REFERENCES machines(id) ON DELETE CASCADE, "
+                "tool_id VARCHAR(50) NOT NULL, "
+                "thread_id VARCHAR(512), "
+                "root_thread_id VARCHAR(512), "
+                "parent_thread_id VARCHAR(512), "
+                "agent_id VARCHAR(512), "
+                "agent_tool_use_id VARCHAR(512), "
+                "agent_depth INTEGER NOT NULL DEFAULT 0, "
+                "is_subagent BOOLEAN NOT NULL DEFAULT FALSE, "
+                "message_count INTEGER NOT NULL DEFAULT 0, "
+                "projected_through_line INTEGER NOT NULL DEFAULT 0, "
+                "latest_assistant_line INTEGER, "
+                "generation INTEGER NOT NULL DEFAULT 1, "
+                "projection_version INTEGER NOT NULL DEFAULT 1, "
+                "prompts JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "pending_interactions JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "inferred_responses JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "live_activities JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "agent_events JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "runtime JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "lifecycle JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "latest_human_at VARCHAR(128) NOT NULL DEFAULT '', "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ))
+        for read_index_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_conversation_read_root "
+            "ON conversation_read_models (machine_id, tool_id, root_thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conversation_read_thread "
+            "ON conversation_read_models (machine_id, tool_id, thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conversation_read_agent "
+            "ON conversation_read_models (machine_id, tool_id, agent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conversation_read_tool_use "
+            "ON conversation_read_models "
+            "(machine_id, tool_id, agent_tool_use_id)",
+        ):
+            conn.execute(text(read_index_sql))
+
     # Data migration: assign owner token + bind existing machines to owner
     result = conn.execute(text(
         "SELECT id, collector_token FROM users WHERE role = 'owner' AND status = 'active' LIMIT 1"

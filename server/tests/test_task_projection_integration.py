@@ -11,6 +11,7 @@ from server.db.models import (
     Base,
     ConversationMetadataInbox,
     ConversationMessage,
+    ConversationReadModel,
     ConversationTaskState,
     Document,
     DocumentVersion,
@@ -178,6 +179,48 @@ async def test_projection_prefers_latest_explicit_snapshot_and_dedupes(
         await session.rollback()
 
 
+@pytest.mark.asyncio
+async def test_incremental_projection_updates_mutated_source_row(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="cursor")
+        row = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            message_type="tool",
+            role="tool",
+            content="",
+            metadata_={
+                "task_state": _snapshot(
+                    "1", "Mutable", "pending", revision=1, current=True
+                )
+            },
+        )
+        session.add(row)
+        await session.flush()
+        projection = await refresh_task_projection(session, document)
+        assert projection is not None
+
+        row.metadata_ = {
+            "task_state": _snapshot(
+                "1", "Mutable", "completed", revision=2, current=True
+            )
+        }
+        await refresh_task_projection(
+            session,
+            document,
+            candidate_rows=[row],
+            replace=False,
+        )
+
+        assert projection.source_message_id == row.id
+        assert projection.revision == 2
+        assert projection.completed_count == 1
+        assert projection.state["tasks"][0]["status"] == "completed"
+        await session.rollback()
+
+
 def _claude_tool_row(
     name: str,
     payload: dict,
@@ -225,6 +268,9 @@ async def test_full_rebase_preserves_unchanged_message_prefix(
         ).scalars().all()
         assert len(original) == 1
         original_id = original[0].id
+        initial_read_model = await session.get(ConversationReadModel, document.id)
+        assert initial_read_model is not None
+        initial_generation = initial_read_model.generation
 
         second = _claude_tool_row(
             "Read",
@@ -244,6 +290,31 @@ async def test_full_rebase_preserves_unchanged_message_prefix(
         assert len(rebased) == 2
         assert rebased[0].id == original_id
         assert rebased[1].id != original_id
+        read_model = await session.get(ConversationReadModel, document.id)
+        assert read_model is not None
+        assert read_model.generation == initial_generation
+        assert read_model.message_count == 2
+        assert read_model.projected_through_line == 2
+
+        changed_first = _claude_tool_row(
+            "Read",
+            {"file_path": "updated.py"},
+            source_id="stable-first",
+        )
+        await _extract_messages(
+            session,
+            document,
+            f"{changed_first}\n{second}",
+            "full",
+        )
+        await session.commit()
+        changed_read_model = await session.get(
+            ConversationReadModel,
+            document.id,
+        )
+        assert changed_read_model is not None
+        assert changed_read_model.generation == initial_generation + 1
+        assert changed_read_model.message_count == 2
 
 
 @pytest.mark.asyncio
@@ -421,8 +492,13 @@ async def test_full_and_delta_ingest_keep_authoritative_current_state(
         await _extract_messages(session, document, delta, "delta")
         await session.commit()
         state = await current_projected_task_state(session, document.id)
+        read_model = await session.get(ConversationReadModel, document.id)
 
         assert state is not None
+        assert read_model is not None
+        assert read_model.message_count == 2
+        assert read_model.projected_through_line == 2
+        assert read_model.projection_version == 1
         assert state["revision"] == 2
         assert state["quality"] == "explicit_current"
         assert [(task["id"], task["status"]) for task in state["tasks"]] == [
@@ -530,6 +606,7 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
 ) -> None:
     bind = session_factory.kw["bind"]
     async with bind.begin() as connection:
+        await connection.execute(text("DROP TABLE conversation_read_models"))
         await connection.execute(text("DROP TABLE conversation_task_states"))
         await connection.run_sync(_run_migrations)
         # Production invokes this on every API restart. A second pass must
@@ -538,6 +615,11 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         exists = (
             await connection.execute(
                 text("SELECT to_regclass('conversation_task_states')")
+            )
+        ).scalar_one()
+        read_exists = (
+            await connection.execute(
+                text("SELECT to_regclass('conversation_read_models')")
             )
         ).scalar_one()
         indexes = set(
@@ -551,7 +633,19 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
                 )
             ).scalars()
         )
+        read_indexes = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename = 'conversation_read_models'"
+                    )
+                )
+            ).scalars()
+        )
     assert exists == "conversation_task_states"
+    assert read_exists == "conversation_read_models"
     assert {
         "conversation_task_states_pkey",
         "idx_task_state_machine",
@@ -568,3 +662,10 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         "idx_task_state_completed",
         "idx_task_state_cancelled",
     } <= indexes
+    assert {
+        "conversation_read_models_pkey",
+        "idx_conversation_read_root",
+        "idx_conversation_read_thread",
+        "idx_conversation_read_agent",
+        "idx_conversation_read_tool_use",
+    } <= read_indexes

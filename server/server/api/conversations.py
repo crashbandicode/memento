@@ -16,6 +16,7 @@ from ..db.models import (
     CanvasArtifact,
     CanvasArtifactReference,
     ConversationMessage,
+    ConversationReadModel,
     ConversationTaskState,
     Document,
     Machine,
@@ -310,6 +311,8 @@ async def _subagent_event_runtime_overrides(
     db: AsyncSession,
     document: Document,
     messages: list[ConversationMessage],
+    *,
+    read_model: ConversationReadModel | None = None,
 ) -> dict[int, dict]:
     """Resolve actual child runtime identity for lifecycle rows on one page."""
     event_rows: list[tuple[int, dict]] = []
@@ -330,63 +333,110 @@ async def _subagent_event_runtime_overrides(
     if not event_rows:
         return {}
 
-    effective_metadata = delivery_metadata_expression()
-    child_filters = []
-    if tool_use_ids:
-        child_filters.append(
-            effective_metadata["agent_tool_use_id"].astext.in_(tool_use_ids)
-        )
-    if thread_ids:
-        child_filters.extend([
-            effective_metadata["agent_id"].astext.in_(thread_ids),
-            effective_metadata["session_id"].astext.in_(thread_ids),
-            effective_metadata["thread_id"].astext.in_(thread_ids),
-        ])
-    if not child_filters:
-        return {}
-
-    child_query = select(effective_metadata).where(
-        Document.id != document.id,
-        Document.machine_id == document.machine_id,
-        Document.tool_id == document.tool_id,
-        Document.category == "conversation",
-        or_(*child_filters),
-    )
-    parent_root = conversation_root_thread_id(
-        document.tool_id,
-        document.relative_path,
-        document.metadata_,
-    )
-    if parent_root:
-        child_query = child_query.where(
-            build_conversation_companion_filter(
-                Document.tool_id,
-                effective_metadata,
-                Document.relative_path,
-                {document.tool_id: {parent_root}},
+    if read_model is not None and read_model.root_thread_id:
+        projected_filters = []
+        if tool_use_ids:
+            projected_filters.append(
+                ConversationReadModel.agent_tool_use_id.in_(tool_use_ids)
             )
-        )
-    child_rows = (await db.execute(child_query)).scalars().all()
+        if thread_ids:
+            projected_filters.extend([
+                ConversationReadModel.agent_id.in_(thread_ids),
+                ConversationReadModel.thread_id.in_(thread_ids),
+            ])
+        child_rows = (
+            await db.execute(
+                select(
+                    ConversationReadModel.agent_tool_use_id,
+                    ConversationReadModel.agent_id,
+                    ConversationReadModel.thread_id,
+                    ConversationReadModel.runtime,
+                    ConversationReadModel.lifecycle,
+                ).where(
+                    ConversationReadModel.document_id != document.id,
+                    ConversationReadModel.machine_id == document.machine_id,
+                    ConversationReadModel.tool_id == document.tool_id,
+                    ConversationReadModel.root_thread_id
+                    == read_model.root_thread_id,
+                    or_(*projected_filters),
+                )
+            )
+        ).all()
+        by_tool_use: dict[str, dict[str, str]] = {}
+        by_thread: dict[str, dict[str, str]] = {}
+        lifecycle_by_tool_use: dict[str, dict[str, str]] = {}
+        lifecycle_by_thread: dict[str, dict[str, str]] = {}
+        for tool_use_id, agent_id, thread_id, runtime, lifecycle in child_rows:
+            safe_runtime = runtime if isinstance(runtime, dict) else {}
+            safe_lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+            if tool_use_id and safe_runtime:
+                by_tool_use[str(tool_use_id)] = safe_runtime
+            if tool_use_id and safe_lifecycle:
+                lifecycle_by_tool_use[str(tool_use_id)] = safe_lifecycle
+            for value in (agent_id, thread_id):
+                for alias in _agent_id_aliases(value):
+                    if safe_runtime:
+                        by_thread[alias] = safe_runtime
+                    if safe_lifecycle:
+                        lifecycle_by_thread[alias] = safe_lifecycle
+    else:
+        effective_metadata = delivery_metadata_expression()
+        child_filters = []
+        if tool_use_ids:
+            child_filters.append(
+                effective_metadata["agent_tool_use_id"].astext.in_(tool_use_ids)
+            )
+        if thread_ids:
+            child_filters.extend([
+                effective_metadata["agent_id"].astext.in_(thread_ids),
+                effective_metadata["session_id"].astext.in_(thread_ids),
+                effective_metadata["thread_id"].astext.in_(thread_ids),
+            ])
+        if not child_filters:
+            return {}
 
-    by_tool_use: dict[str, dict[str, str]] = {}
-    by_thread: dict[str, dict[str, str]] = {}
-    lifecycle_by_tool_use: dict[str, dict[str, str]] = {}
-    lifecycle_by_thread: dict[str, dict[str, str]] = {}
-    for raw_metadata in child_rows:
-        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-        runtime = subagent_runtime_from_metadata(metadata)
-        lifecycle = persisted_child_lifecycle(metadata)
-        tool_use_id = str(metadata.get("agent_tool_use_id") or "").strip()
-        if tool_use_id and runtime:
-            by_tool_use[tool_use_id] = runtime
-        if tool_use_id and lifecycle:
-            lifecycle_by_tool_use[tool_use_id] = lifecycle
-        for key in ("agent_id", "session_id", "thread_id"):
-            for alias in _agent_id_aliases(metadata.get(key)):
-                if runtime:
-                    by_thread[alias] = runtime
-                if lifecycle:
-                    lifecycle_by_thread[alias] = lifecycle
+        child_query = select(effective_metadata).where(
+            Document.id != document.id,
+            Document.machine_id == document.machine_id,
+            Document.tool_id == document.tool_id,
+            Document.category == "conversation",
+            or_(*child_filters),
+        )
+        parent_root = conversation_root_thread_id(
+            document.tool_id,
+            document.relative_path,
+            document.metadata_,
+        )
+        if parent_root:
+            child_query = child_query.where(
+                build_conversation_companion_filter(
+                    Document.tool_id,
+                    effective_metadata,
+                    Document.relative_path,
+                    {document.tool_id: {parent_root}},
+                )
+            )
+        child_rows = (await db.execute(child_query)).scalars().all()
+
+        by_tool_use = {}
+        by_thread = {}
+        lifecycle_by_tool_use = {}
+        lifecycle_by_thread = {}
+        for raw_metadata in child_rows:
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+            runtime = subagent_runtime_from_metadata(metadata)
+            lifecycle = persisted_child_lifecycle(metadata)
+            tool_use_id = str(metadata.get("agent_tool_use_id") or "").strip()
+            if tool_use_id and runtime:
+                by_tool_use[tool_use_id] = runtime
+            if tool_use_id and lifecycle:
+                lifecycle_by_tool_use[tool_use_id] = lifecycle
+            for key in ("agent_id", "session_id", "thread_id"):
+                for alias in _agent_id_aliases(metadata.get(key)):
+                    if runtime:
+                        by_thread[alias] = runtime
+                    if lifecycle:
+                        lifecycle_by_thread[alias] = lifecycle
 
     overrides: dict[int, dict] = {}
     for message_id, event in event_rows:
@@ -426,28 +476,39 @@ async def _get_conversation_identity(
     db: AsyncSession,
     user: User,
     doc_id: uuid.UUID,
-) -> Document:
-    """Return the minimal authorized document shape used by message APIs."""
-    mids = await user_machine_ids(db, user)
-    doc = (
-        await db.execute(
-            select(Document)
-            .options(
-                load_only(
-                    Document.id,
-                    Document.machine_id,
-                    Document.tool_id,
-                    Document.title,
-                    Document.relative_path,
-                    Document.metadata_,
-                )
-            )
-            .where(Document.id == doc_id)
+) -> tuple[Document, ConversationReadModel | None]:
+    """Return one authorized document and its compact read projection."""
+    statement = (
+        select(Document, ConversationReadModel)
+        .outerjoin(
+            ConversationReadModel,
+            ConversationReadModel.document_id == Document.id,
         )
-    ).scalar_one_or_none()
-    if not doc or (mids is not None and doc.machine_id not in mids):
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(Document.id == doc_id)
+    )
+    if user.role not in ("admin", "owner"):
+        statement = statement.where(
+            Document.machine_id.in_(
+                select(Machine.id).where(Machine.user_id == user.id)
+            )
+        )
+    row = (await db.execute(statement)).first()
+    if row is None:
         raise HTTPException(status_code=404)
-    return doc
+    if hasattr(row, "_mapping") or isinstance(row, (tuple, list)):
+        return row[0], row[1]
+    # Lightweight unit doubles historically returned the scalar document.
+    return row, None
 
 
 def _message_question_interactions(metadata: object) -> list[dict]:
@@ -475,7 +536,11 @@ async def get_conversation(
     mids = await user_machine_ids(db, _user)
 
     result = await db.execute(
-        select(Document)
+        select(Document, ConversationReadModel)
+        .outerjoin(
+            ConversationReadModel,
+            ConversationReadModel.document_id == Document.id,
+        )
         .options(
             load_only(
                 Document.id,
@@ -495,7 +560,13 @@ async def get_conversation(
         )
         .where(Document.id == doc_id)
     )
-    doc = result.scalar_one_or_none()
+    row = result.first()
+    if row is not None and (
+        hasattr(row, "_mapping") or isinstance(row, (tuple, list))
+    ):
+        doc, read_model = row[0], row[1]
+    else:
+        doc, read_model = row, None
     if not doc:
         raise HTTPException(status_code=404)
     if mids is not None and doc.machine_id not in mids:
@@ -504,10 +575,13 @@ async def get_conversation(
     # Normalized rows are written transactionally during ingest and are the
     # viewer's indexed representation.  Prefer their cheap indexed count over
     # hydrating and reparsing a potentially hundreds-of-megabytes JSONL blob.
-    count_result = await db.execute(
-        select(func.count()).where(ConversationMessage.document_id == doc_id)
-    )
-    message_count = count_result.scalar() or 0
+    if read_model is not None:
+        message_count = int(read_model.message_count or 0)
+    else:
+        count_result = await db.execute(
+            select(func.count()).where(ConversationMessage.document_id == doc_id)
+        )
+        message_count = count_result.scalar() or 0
     active_task_state = (
         await db.execute(
             select(ConversationTaskState.state).where(
@@ -525,6 +599,7 @@ async def get_conversation(
     subagents: list[dict] = []
     is_subagent_orphan = False
     logical_activity: dict = {}
+    subagents_truncated = False
     if doc.tool_id in FOLDABLE_CONVERSATION_TOOLS:
         current_ref = ConversationRef(
             document_id=doc.id,
@@ -547,31 +622,70 @@ async def get_conversation(
                 roots_by_tool,
             ),
         )
-        hierarchy_q = (
-            select(Document)
-            .options(
-                load_only(
-                    Document.id,
-                    Document.machine_id,
-                    Document.tool_id,
-                    Document.title,
-                    Document.relative_path,
-                    Document.metadata_,
-                    Document.source_modified_at,
-                    Document.activity_at,
-                    Document.synced_at,
-                    Document.file_size_bytes,
+        hierarchy_states_by_id: dict[uuid.UUID, ConversationReadModel] = {}
+        if read_model is not None and read_model.root_thread_id:
+            hierarchy_q = (
+                select(Document, ConversationReadModel)
+                .join(
+                    ConversationReadModel,
+                    ConversationReadModel.document_id == Document.id,
+                )
+                .options(
+                    load_only(
+                        Document.id,
+                        Document.machine_id,
+                        Document.tool_id,
+                        Document.title,
+                        Document.relative_path,
+                        Document.metadata_,
+                        Document.source_modified_at,
+                        Document.activity_at,
+                        Document.synced_at,
+                        Document.file_size_bytes,
+                    )
+                )
+                .where(
+                    Document.machine_id == doc.machine_id,
+                    ConversationReadModel.tool_id == doc.tool_id,
+                    ConversationReadModel.root_thread_id
+                    == read_model.root_thread_id,
+                )
+                .order_by(Document.id)
+                .limit(257)
+            )
+            hierarchy_rows = (await db.execute(hierarchy_q)).all()
+            subagents_truncated = len(hierarchy_rows) > 256
+            hierarchy_rows = hierarchy_rows[:256]
+            hierarchy_docs = [item[0] for item in hierarchy_rows]
+            hierarchy_states_by_id = {
+                item[0].id: item[1] for item in hierarchy_rows
+            }
+        else:
+            hierarchy_q = (
+                select(Document)
+                .options(
+                    load_only(
+                        Document.id,
+                        Document.machine_id,
+                        Document.tool_id,
+                        Document.title,
+                        Document.relative_path,
+                        Document.metadata_,
+                        Document.source_modified_at,
+                        Document.activity_at,
+                        Document.synced_at,
+                        Document.file_size_bytes,
+                    )
+                )
+                .where(
+                    Document.tool_id == doc.tool_id,
+                    Document.category == "conversation",
+                    hierarchy_scope,
                 )
             )
-            .where(
-                Document.tool_id == doc.tool_id,
-                Document.category == "conversation",
-                hierarchy_scope,
-            )
-        )
-        if mids is not None:
-            hierarchy_q = hierarchy_q.where(Document.machine_id.in_(mids))
-        hierarchy_docs = (await db.execute(hierarchy_q)).scalars().all()
+            if mids is not None:
+                hierarchy_q = hierarchy_q.where(Document.machine_id.in_(mids))
+            hierarchy_docs = (await db.execute(hierarchy_q)).scalars().all()
         hierarchy_refs = [
             ConversationRef(
                 document_id=item.id,
@@ -607,44 +721,60 @@ async def get_conversation(
             if current_is_subagent
             else [item.id for item in hierarchy_docs]
         )
-        lifecycle_rows = (
-            await db.execute(
-                select(
-                    ConversationMessage.document_id,
-                    ConversationMessage.metadata_,
-                    ConversationMessage.timestamp,
+        if hierarchy_states_by_id:
+            lifecycle_rows = [
+                (
+                    source_document_id,
+                    {"agent_event": item["event"]},
+                    item.get("timestamp"),
                 )
-                .where(
-                    ConversationMessage.document_id.in_(lifecycle_document_ids),
-                    ConversationMessage.metadata_.op("?")("agent_event"),
-                    or_(
-                        func.coalesce(
-                            func.jsonb_extract_path_text(
-                                ConversationMessage.metadata_,
-                                "agent_event",
-                                "agent_thread_id",
-                            ),
-                            "",
-                        )
-                        != "",
-                        func.coalesce(
-                            func.jsonb_extract_path_text(
-                                ConversationMessage.metadata_,
-                                "agent_event",
-                                "agent_tool_use_id",
-                            ),
-                            "",
-                        )
-                        != "",
-                    ),
+                for source_document_id in lifecycle_document_ids
+                for item in (
+                    hierarchy_states_by_id.get(source_document_id).agent_events
+                    if hierarchy_states_by_id.get(source_document_id) is not None
+                    else []
                 )
-                .order_by(
-                    ConversationMessage.timestamp,
-                    ConversationMessage.document_id,
-                    ConversationMessage.line_number,
+                if isinstance(item, dict) and isinstance(item.get("event"), dict)
+            ]
+        else:
+            lifecycle_rows = (
+                await db.execute(
+                    select(
+                        ConversationMessage.document_id,
+                        ConversationMessage.metadata_,
+                        ConversationMessage.timestamp,
+                    )
+                    .where(
+                        ConversationMessage.document_id.in_(lifecycle_document_ids),
+                        ConversationMessage.metadata_.op("?")("agent_event"),
+                        or_(
+                            func.coalesce(
+                                func.jsonb_extract_path_text(
+                                    ConversationMessage.metadata_,
+                                    "agent_event",
+                                    "agent_thread_id",
+                                ),
+                                "",
+                            )
+                            != "",
+                            func.coalesce(
+                                func.jsonb_extract_path_text(
+                                    ConversationMessage.metadata_,
+                                    "agent_event",
+                                    "agent_tool_use_id",
+                                ),
+                                "",
+                            )
+                            != "",
+                        ),
+                    )
+                    .order_by(
+                        ConversationMessage.timestamp,
+                        ConversationMessage.document_id,
+                        ConversationMessage.line_number,
+                    )
                 )
-            )
-        ).all()
+            ).all()
         refs_by_id = {item.document_id: item for item in hierarchy_refs}
         lifecycle_events: list[dict] = []
         for source_document_id, metadata, timestamp in lifecycle_rows:
@@ -667,7 +797,11 @@ async def get_conversation(
                         if doc.tool_id == "claude_code"
                         else None
                     ),
-                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "timestamp": (
+                        timestamp.isoformat()
+                        if isinstance(timestamp, datetime)
+                        else timestamp
+                    ),
                 }
             )
         subagents = merge_subagent_event_summaries(
@@ -756,6 +890,7 @@ async def get_conversation(
         ),
         "message_count": message_count,
         "subagent_count": len(subagents),
+        "subagents_truncated": subagents_truncated,
         "is_subagent_orphan": is_subagent_orphan,
         "subagents": subagents,
         "activity_at": activity_at.isoformat() if activity_at else None,
@@ -772,11 +907,13 @@ async def get_conversation_messages(
     tail: bool = Query(False),
     line_number: int | None = Query(None, ge=1),
     context_before: int = Query(0, ge=0, le=200),
+    after_line: int | None = None,
+    before_line: int | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Get paginated, human-readable conversation messages."""
-    doc = await _get_conversation_identity(db, _user, doc_id)
+    doc, read_model = await _get_conversation_identity(db, _user, doc_id)
     user_role_origin = conversation_user_role_origin(
         doc.tool_id,
         doc.relative_path,
@@ -787,38 +924,75 @@ async def get_conversation_messages(
     # preserve the viewer fields, and avoid reparsing the raw transcript for
     # every initial page, prompt jump, and scroll page.
     base_filter = [ConversationMessage.document_id == doc_id]
-    count_result = await db.execute(select(func.count()).where(*base_filter))
-    total = count_result.scalar() or 0
+    if read_model is not None:
+        total = int(read_model.message_count or 0)
+    else:
+        count_result = await db.execute(select(func.count()).where(*base_filter))
+        total = count_result.scalar() or 0
     if total > 0:
-        if tail is True and line_number is None:
-            offset = max(0, total - limit)
         message_query = (
             select(ConversationMessage)
             .where(*base_filter)
             .order_by(ConversationMessage.line_number)
-            .limit(limit)
+            .limit(limit + 1)
         )
+        descending = False
         if line_number is not None:
             start_line = max(1, line_number - context_before)
-            start_count = await db.execute(
-                select(func.count()).where(
-                    *base_filter,
-                    ConversationMessage.line_number < start_line,
-                )
-            )
-            offset = start_count.scalar() or 0
+            offset = max(0, start_line - 1)
             message_query = message_query.where(
                 ConversationMessage.line_number >= start_line
             )
+        elif tail is True:
+            descending = True
+            message_query = message_query.order_by(
+                None
+            ).order_by(
+                ConversationMessage.line_number.desc(),
+                ConversationMessage.id.desc(),
+            )
+        elif before_line is not None:
+            descending = True
+            message_query = (
+                message_query.where(
+                    ConversationMessage.line_number < before_line
+                )
+                .order_by(None)
+                .order_by(
+                    ConversationMessage.line_number.desc(),
+                    ConversationMessage.id.desc(),
+                )
+            )
+        elif after_line is not None:
+            message_query = message_query.where(
+                ConversationMessage.line_number > after_line
+            )
         else:
-            message_query = message_query.offset(offset)
+            if offset:
+                message_query = message_query.offset(offset)
 
         msgs_result = await db.execute(message_query)
-        messages = msgs_result.scalars().all()
+        fetched = msgs_result.scalars().all()
+        page_has_extra = len(fetched) > limit
+        messages = fetched[:limit]
+        if descending:
+            messages.reverse()
+        if messages:
+            offset = max(0, int(messages[0].line_number or 1) - 1)
+        has_earlier = bool(messages) and (
+            page_has_extra if before_line is not None else offset > 0
+        )
+        if tail is True:
+            has_more = False
+        elif before_line is not None:
+            has_more = True
+        else:
+            has_more = page_has_extra
         agent_event_overrides = await _subagent_event_runtime_overrides(
             db,
             doc,
             messages,
+            read_model=read_model,
         )
         canvas_links = await _canvas_links_for_messages(
             db,
@@ -832,6 +1006,14 @@ async def get_conversation_messages(
             "total": total,
             "offset": offset,
             "limit": limit,
+            "has_more": has_more,
+            "has_earlier": has_earlier,
+            "next_after_line": (
+                messages[-1].line_number if has_more and messages else None
+            ),
+            "previous_before_line": (
+                messages[0].line_number if has_earlier and messages else None
+            ),
             "messages": [
                 {
                     "id": m.id,
@@ -924,6 +1106,220 @@ async def get_conversation_messages(
     return {"total": 0, "offset": offset, "limit": limit, "messages": []}
 
 
+async def _projected_pending_interactions(
+    db: AsyncSession,
+    document: Document,
+    projection: ConversationReadModel,
+) -> dict:
+    """Assemble bounded interaction state without replaying message history."""
+    statement = (
+        select(Document, ConversationReadModel)
+        .join(
+            ConversationReadModel,
+            ConversationReadModel.document_id == Document.id,
+        )
+        .where(Document.machine_id == document.machine_id)
+        .order_by(Document.id)
+        .limit(257)
+    )
+    if projection.root_thread_id:
+        statement = statement.where(
+            ConversationReadModel.tool_id == document.tool_id,
+            ConversationReadModel.root_thread_id == projection.root_thread_id,
+        )
+    else:
+        statement = statement.where(Document.id == document.id)
+    rows = (await db.execute(statement)).all()
+    rows = rows[:256]
+    if not rows:
+        rows = [(document, projection)]
+
+    interactions: list[dict] = []
+    inline_by_id: dict[str, dict] = {}
+    inferred: list[dict] = []
+    activities_by_id: dict[tuple[str, str], dict] = {}
+    seen_interaction_ids: set[str] = set()
+    for source_document, state in rows:
+        title = conversation_display_title(
+            source_document.tool_id,
+            source_document.relative_path,
+            source_document.metadata_,
+            source_document.title,
+        )
+        for raw_item in state.pending_interactions or []:
+            if not isinstance(raw_item, dict):
+                continue
+            item = {**raw_item, "source_title": title}
+            interaction = item.get("interaction")
+            interaction_id = (
+                str(interaction.get("id") or "").strip()
+                if isinstance(interaction, dict)
+                else ""
+            )
+            if not interaction_id or interaction_id in seen_interaction_ids:
+                continue
+            seen_interaction_ids.add(interaction_id)
+            interactions.append(item)
+        for item in state.inferred_responses or []:
+            if isinstance(item, dict):
+                inferred.append(dict(item))
+        for raw_activity in state.live_activities or []:
+            if not isinstance(raw_activity, dict):
+                continue
+            activity_id = str(raw_activity.get("activity_id") or "").strip()
+            if activity_id:
+                activities_by_id[(str(source_document.id), activity_id)] = {
+                    **raw_activity,
+                    "source_title": title,
+                }
+
+        metadata = (
+            source_document.metadata_
+            if isinstance(source_document.metadata_, dict)
+            else {}
+        )
+        signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+        if isinstance(signals, dict):
+            for interaction_id, signal in signals.items():
+                if (
+                    interaction_id in seen_interaction_ids
+                    or not isinstance(signal, dict)
+                ):
+                    continue
+                interaction = coerce_claude_live_interaction(
+                    signal.get("interaction")
+                )
+                if not isinstance(interaction, dict):
+                    continue
+                canonical_id = str(
+                    interaction.get("id") or interaction_id
+                ).strip()
+                if not canonical_id or canonical_id in seen_interaction_ids:
+                    continue
+                seen_interaction_ids.add(canonical_id)
+                item = {
+                    "document_id": str(source_document.id),
+                    "source_title": title,
+                    "message_id": 0,
+                    "line_number": 0,
+                    "interaction": interaction,
+                    "model": signal.get("model", ""),
+                    "reasoning_effort": signal.get("reasoning_effort", ""),
+                    "service_tier": signal.get("service_tier", ""),
+                    "agent_mode": signal.get("agent_mode", ""),
+                    "timestamp": signal.get("timestamp") or None,
+                }
+                interactions.append(item)
+                if interaction.get("interaction_type") == "permission_request":
+                    inline_by_id[canonical_id] = {**item, "status": "pending"}
+
+        for entry in _stored_interaction_history(metadata):
+            interaction = coerce_claude_live_interaction(entry.get("interaction"))
+            if (
+                not isinstance(interaction, dict)
+                or interaction.get("interaction_type") != "permission_request"
+            ):
+                continue
+            interaction_id = str(interaction.get("id") or "").strip()
+            status = str(entry.get("status") or "").strip().lower()
+            if not interaction_id or status not in {
+                "pending",
+                "answered",
+                "cancelled",
+            }:
+                continue
+            response = entry.get("response")
+            inline_by_id[interaction_id] = {
+                "document_id": str(source_document.id),
+                "source_title": title,
+                "message_id": 0,
+                "line_number": max(0, int(entry.get("anchor_line_number") or 0)),
+                "interaction": interaction,
+                **({"response": response} if isinstance(response, dict) else {}),
+                "model": entry.get("model", ""),
+                "reasoning_effort": entry.get("reasoning_effort", ""),
+                "service_tier": entry.get("service_tier", ""),
+                "agent_mode": entry.get("agent_mode", ""),
+                "timestamp": entry.get("timestamp") or None,
+                "status": status,
+            }
+
+        raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
+        if isinstance(raw_activities, dict):
+            for activity_id, raw_activity in raw_activities.items():
+                if not isinstance(raw_activity, dict):
+                    continue
+                canonical_id = str(
+                    raw_activity.get("id") or activity_id
+                ).strip()
+                command = str(raw_activity.get("command") or "").strip()
+                status = str(raw_activity.get("status") or "").strip().lower()
+                if (
+                    not canonical_id
+                    or not command
+                    or status not in {
+                        "running",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                    }
+                ):
+                    continue
+                activities_by_id[(str(source_document.id), canonical_id)] = {
+                    "document_id": str(source_document.id),
+                    "source_title": title,
+                    "message_id": 0,
+                    "line_number": max(
+                        0,
+                        int(raw_activity.get("anchor_line_number") or 0),
+                    ),
+                    "activity_id": canonical_id,
+                    "activity_type": "shell",
+                    "status": status,
+                    "tool_name": str(raw_activity.get("tool_name") or "Shell"),
+                    "command": command,
+                    "started_at": raw_activity.get("started_at") or None,
+                    "updated_at": raw_activity.get("updated_at") or None,
+                }
+
+    interactions.sort(
+        key=lambda item: (
+            str(item.get("timestamp") or ""),
+            str(item.get("document_id") or ""),
+            int(item.get("line_number") or 0),
+        )
+    )
+    inferred.sort(
+        key=lambda item: (
+            str(item.get("timestamp") or ""),
+            int(item.get("line_number") or 0),
+        )
+    )
+    inline = sorted(
+        inline_by_id.values(),
+        key=lambda item: (
+            int(item.get("line_number") or 0) <= 0,
+            int(item.get("line_number") or 0),
+            str(item.get("timestamp") or ""),
+        ),
+    )
+    activities = sorted(
+        activities_by_id.values(),
+        key=lambda item: (
+            int(item.get("line_number") or 0) <= 0,
+            int(item.get("line_number") or 0),
+            str(item.get("started_at") or ""),
+        ),
+    )
+    return {
+        "count": len(interactions[-64:]),
+        "interactions": interactions[-64:],
+        "inline_interactions": inline[-64:],
+        "live_activities": activities[-64:],
+        "inferred_responses": inferred[-64:],
+    }
+
+
 @router.get("/{doc_id}/pending-interactions")
 async def get_pending_conversation_interactions(
     doc_id: uuid.UUID,
@@ -931,7 +1327,9 @@ async def get_pending_conversation_interactions(
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Return unresolved questions independently of transcript pagination."""
-    doc = await _get_conversation_identity(db, _user, doc_id)
+    doc, read_model = await _get_conversation_identity(db, _user, doc_id)
+    if read_model is not None:
+        return await _projected_pending_interactions(db, doc, read_model)
     source_documents = {
         doc.id: conversation_display_title(
             doc.tool_id,
@@ -1405,7 +1803,9 @@ async def get_latest_agent_message(
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Return the latest assistant line without loading a transcript window."""
-    doc = await _get_conversation_identity(db, _user, doc_id)
+    doc, read_model = await _get_conversation_identity(db, _user, doc_id)
+    if read_model is not None:
+        return {"line_number": read_model.latest_assistant_line}
     latest_line = (
         await db.execute(
             select(ConversationMessage.line_number)
@@ -1427,12 +1827,14 @@ async def get_latest_agent_message(
     if latest_line is not None:
         return {"line_number": latest_line}
 
-    normalized_count = (
+    normalized_exists = (
         await db.execute(
-            select(func.count()).where(ConversationMessage.document_id == doc_id)
+            select(ConversationMessage.id)
+            .where(ConversationMessage.document_id == doc_id)
+            .limit(1)
         )
-    ).scalar() or 0
-    if normalized_count > 0:
+    ).scalar_one_or_none()
+    if normalized_exists is not None:
         return {"line_number": None}
 
     raw_content = (
@@ -1467,7 +1869,7 @@ async def search_conversation_messages(
     editor search. The existing ``messages?line_number=`` endpoint loads the
     bounded rendering window when a hit is selected.
     """
-    doc = await _get_conversation_identity(db, _user, doc_id)
+    doc, _read_model = await _get_conversation_identity(db, _user, doc_id)
     user_role_origin = conversation_user_role_origin(
         doc.tool_id,
         doc.relative_path,
@@ -1566,25 +1968,61 @@ async def search_conversation_messages(
 @router.get("/{doc_id}/prompts")
 async def get_conversation_prompts(
     doc_id: uuid.UUID,
+    after_line: int | None = None,
+    generation: int | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Return a lightweight outline of every meaningful human prompt."""
-    doc = await _get_conversation_identity(db, _user, doc_id)
+    doc, read_model = await _get_conversation_identity(db, _user, doc_id)
     if conversation_user_role_origin(
         doc.tool_id,
         doc.relative_path,
         doc.metadata_,
     ) == "parent_agent":
-        return {"prompts": []}
+        return {
+            "prompts": [],
+            **(
+                {
+                    "generation": read_model.generation,
+                    "projected_through_line": read_model.projected_through_line,
+                    "reset": generation != read_model.generation
+                    if generation is not None
+                    else False,
+                }
+                if read_model is not None
+                else {}
+            ),
+        }
 
-    normalized_count = (
+    if read_model is not None:
+        reset = generation is not None and generation != read_model.generation
+        minimum_line = None if reset else after_line
+        prompts = [
+            item
+            for item in (read_model.prompts or [])
+            if isinstance(item, dict)
+            and (
+                minimum_line is None
+                or int(item.get("line_number") or 0) > minimum_line
+            )
+        ]
+        return {
+            "prompts": prompts,
+            "generation": read_model.generation,
+            "projected_through_line": read_model.projected_through_line,
+            "reset": reset,
+        }
+
+    normalized_exists = (
         await db.execute(
-            select(func.count()).where(ConversationMessage.document_id == doc_id)
+            select(ConversationMessage.id)
+            .where(ConversationMessage.document_id == doc_id)
+            .limit(1)
         )
-    ).scalar() or 0
+    ).scalar_one_or_none()
     prompts = []
-    if normalized_count > 0:
+    if normalized_exists is not None:
         prompt_rows = await db.execute(
             select(
                 ConversationMessage.id,

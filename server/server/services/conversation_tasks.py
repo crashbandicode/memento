@@ -263,65 +263,89 @@ def _candidate_key(row: Any) -> tuple[int, int, int]:
 async def refresh_task_projection(
     db: AsyncSession,
     document: Document,
+    *,
+    candidate_rows: Iterable[Any] | None = None,
+    replace: bool = True,
 ) -> ConversationTaskState | None:
-    """Recompute one projection from normalized task-state history."""
-    rows = (
-        (
-            await db.execute(
-                select(
-                    ConversationMessage.id,
-                    ConversationMessage.line_number,
-                    ConversationMessage.metadata_.label("metadata_"),
-                    ConversationMessage.timestamp,
-                )
-                .where(
-                    ConversationMessage.document_id == document.id,
-                    ConversationMessage.metadata_.op("?")("task_state"),
-                )
-                .order_by(
-                    (
+    """Refresh one projection from supplied ingest rows or legacy history."""
+    if candidate_rows is None:
+        rows = (
+            (
+                await db.execute(
+                    select(
+                        ConversationMessage.id,
+                        ConversationMessage.line_number,
+                        ConversationMessage.metadata_.label("metadata_"),
+                        ConversationMessage.timestamp,
+                    )
+                    .where(
+                        ConversationMessage.document_id == document.id,
+                        ConversationMessage.metadata_.op("?")("task_state"),
+                    )
+                    .order_by(
                         (
-                            func.jsonb_extract_path_text(
-                                ConversationMessage.metadata_,
-                                "task_state",
-                                "is_current",
-                            )
-                            == "true"
-                        )
-                        & (
-                            func.coalesce(
+                            (
                                 func.jsonb_extract_path_text(
                                     ConversationMessage.metadata_,
                                     "task_state",
-                                    "quality",
-                                ),
-                                "",
+                                    "is_current",
+                                )
+                                == "true"
                             )
-                            != "partial"
-                        )
-                    ).desc(),
-                    ConversationMessage.line_number.desc(),
-                    ConversationMessage.id.desc(),
+                            & (
+                                func.coalesce(
+                                    func.jsonb_extract_path_text(
+                                        ConversationMessage.metadata_,
+                                        "task_state",
+                                        "quality",
+                                    ),
+                                    "",
+                                )
+                                != "partial"
+                            )
+                        ).desc(),
+                        ConversationMessage.line_number.desc(),
+                        ConversationMessage.id.desc(),
+                    )
+                    .limit(20)
                 )
-                .limit(20)
             )
+            .all()
         )
-        .all()
-    )
+    else:
+        rows = list(candidate_rows)
     candidates = [
         row
         for row in rows
         if _state_from_metadata(row.metadata_) is not None
     ]
+    existing = await db.get(ConversationTaskState, document.id)
     if not candidates:
-        await db.execute(
-            delete(ConversationTaskState).where(
-                ConversationTaskState.document_id == document.id
+        if not replace:
+            return existing
+        if existing is not None:
+            await db.delete(existing)
+        elif candidate_rows is None:
+            await db.execute(
+                delete(ConversationTaskState).where(
+                    ConversationTaskState.document_id == document.id
+                )
             )
-        )
         return None
 
     source = max(candidates, key=_candidate_key)
+    if existing is not None and not replace:
+        existing_key = (
+            int(existing.explicit_current),
+            int(existing.source_line_number or 0),
+            int(existing.source_message_id or 0),
+        )
+        # Mutable ingest rows (for example Cursor's current-task snapshot)
+        # keep the same source row while their semantic state advances. An
+        # equal source key must therefore flow through the hash comparison
+        # below; only an older candidate is safe to ignore.
+        if _candidate_key(source) < existing_key:
+            return existing
     metadata = source.metadata_ if isinstance(source.metadata_, dict) else {}
     state = _state_from_metadata(metadata)
     assert state is not None
@@ -342,7 +366,6 @@ async def refresh_task_projection(
             select(Machine.user_id).where(Machine.id == document.machine_id)
         )
     ).scalar_one_or_none()
-    existing = await db.get(ConversationTaskState, document.id)
     observed_at = source.timestamp or datetime.now(timezone.utc)
     explicit_current = bool(
         state["is_current"] and state["quality"] != "partial"
