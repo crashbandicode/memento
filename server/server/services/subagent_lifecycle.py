@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
@@ -108,9 +108,11 @@ def _jsonl_objects(content: object) -> list[dict[str, Any]]:
     return records
 
 
-def _claude_child_lifecycle(content: object) -> dict[str, str] | None:
+def _claude_child_lifecycle(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, str] | None:
     terminal: dict[str, str] | None = None
-    for record in _jsonl_objects(content):
+    for record in records:
         timestamp = record.get("timestamp")
         record_type = str(record.get("type") or "").strip().casefold()
         message = record.get("message")
@@ -155,9 +157,11 @@ def _claude_child_lifecycle(content: object) -> dict[str, str] | None:
     return terminal
 
 
-def _codex_child_lifecycle(content: object) -> dict[str, str] | None:
+def _codex_child_lifecycle(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, str] | None:
     latest: dict[str, str] | None = None
-    for record in _jsonl_objects(content):
+    for record in records:
         if str(record.get("type") or "").strip().casefold() != "event_msg":
             continue
         payload = record.get("payload")
@@ -238,9 +242,56 @@ def child_lifecycle_evidence(
                 evidence=f"composer_status={values.get('composer_status')}",
             )
     if tool == "claude_code":
-        return _claude_child_lifecycle(content)
+        return _claude_child_lifecycle(_jsonl_objects(content))
     if tool == "codex":
-        return _codex_child_lifecycle(content)
+        return _codex_child_lifecycle(_jsonl_objects(content))
+    return None
+
+
+def child_lifecycle_evidence_from_objects(
+    tool_id: object,
+    metadata: Mapping[str, Any] | None,
+    records: Iterable[object],
+    *,
+    source_timestamp: object = None,
+) -> dict[str, str] | None:
+    """Stream authoritative child-state evidence from decoded JSONL records."""
+    values = metadata or {}
+    missing_state = normalized_subagent_status(
+        values.get("subagent_source_state")
+    )
+    if (
+        missing_state == "disconnected"
+        and values.get("subagent_source_state_authoritative") is True
+    ):
+        return _lifecycle_evidence(
+            "disconnected",
+            source="collector_source_inventory",
+            timestamp=(
+                values.get("subagent_source_state_at") or source_timestamp
+            ),
+            evidence="authoritative child source missing",
+        )
+
+    tool = str(tool_id or "").strip().casefold()
+    if tool == "cursor":
+        status = normalized_subagent_status(values.get("composer_status"))
+        if status:
+            return _lifecycle_evidence(
+                status,
+                source="cursor_composer_state",
+                timestamp=values.get("last_timestamp") or source_timestamp,
+                evidence=f"composer_status={values.get('composer_status')}",
+            )
+        return None
+
+    mappings = (
+        record for record in records if isinstance(record, Mapping)
+    )
+    if tool == "claude_code":
+        return _claude_child_lifecycle(mappings)
+    if tool == "codex":
+        return _codex_child_lifecycle(mappings)
     return None
 
 

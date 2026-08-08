@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
@@ -18,6 +21,8 @@ from ..db.models import Document, User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
 from ..services.device_service import ensure_device
+from ..services.content_sanitizer import sanitize_content_file
+from ..services.conversation_stream import ConversationFileSource
 from ..services.conversation_metadata_inbox import (
     defer_conversation_metadata,
     normalized_metadata_session_id,
@@ -37,6 +42,11 @@ from ..services.ingest_spool import (
     pending_source_revision_job_id,
     stage_chunk,
 )
+from ..services.large_content_store import (
+    DATABASE_CONTENT_MAX_BYTES,
+    multipart_content_job_id,
+    store_large_content,
+)
 from ..services.thread_metadata_service import (
     apply_codex_thread_title_update,
     apply_conversation_activity_update,
@@ -45,6 +55,19 @@ from ..services.thread_metadata_service import (
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 logger = logging.getLogger("ingest")
+_UPLOAD_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+async def _stream_upload_to_path(content: UploadFile, target: Path) -> int:
+    """Copy one multipart body with fixed-size reads and durable local writes."""
+    total = 0
+    with target.open("wb", buffering=0) as output:
+        while chunk := await content.read(_UPLOAD_STREAM_CHUNK_BYTES):
+            output.write(chunk)
+            total += len(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    return total
 
 
 async def throttle_ingest():
@@ -247,7 +270,8 @@ async def _enqueue_spool_job(job_id: str) -> None:
 async def _stage_delta_behind_pending_revision(
     *,
     meta: dict,
-    content_bytes: bytes,
+    content_bytes: bytes | None = None,
+    content_path: Path | None = None,
     user_id: str,
     device_id: str,
     device_name: str,
@@ -260,6 +284,13 @@ async def _stage_delta_behind_pending_revision(
     keeps the fast synchronous path unchanged while preventing an active large
     transcript from repeatedly uploading complete snapshots.
     """
+    if (content_bytes is None) == (content_path is None):
+        raise ValueError("exactly one delta payload source is required")
+    payload_size = (
+        len(content_bytes)
+        if content_bytes is not None
+        else content_path.stat().st_size
+    )
     base_hash = meta.get("base_hash")
     base_offset = meta.get("base_offset")
     if (
@@ -268,7 +299,7 @@ async def _stage_delta_behind_pending_revision(
         or not base_hash
         or not isinstance(base_offset, int)
         or isinstance(base_offset, bool)
-        or not content_bytes
+        or payload_size <= 0
     ):
         return None
 
@@ -288,28 +319,41 @@ async def _stage_delta_behind_pending_revision(
     spool_meta = {
         **meta,
         "mode": "delta",
-        "file_size": len(content_bytes),
+        "file_size": payload_size,
         "upload_id": f"deferred-delta/{base_hash}/{content_hash}",
     }
-    total_chunks = (len(content_bytes) + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES
+    total_chunks = (payload_size + MAX_CHUNK_BYTES - 1) // MAX_CHUNK_BYTES
     staged = None
-    for chunk_index in range(total_chunks):
-        start = chunk_index * MAX_CHUNK_BYTES
-        staged = await asyncio.to_thread(
-            stage_chunk,
-            meta={
-                **spool_meta,
-                "chunk_index": chunk_index,
-                "total_chunks": total_chunks,
-            },
-            chunk_data=content_bytes[start : start + MAX_CHUNK_BYTES],
-            user_id=user_id,
-            device_id=device_id,
-            device_name=device_name,
-            device_platform=device_platform,
-        )
-        if staged.complete and not staged.should_enqueue:
-            break
+    source = content_path.open("rb", buffering=0) if content_path is not None else None
+    try:
+        for chunk_index in range(total_chunks):
+            if content_bytes is not None:
+                start = chunk_index * MAX_CHUNK_BYTES
+                chunk_data = content_bytes[start : start + MAX_CHUNK_BYTES]
+            else:
+                assert source is not None
+                chunk_data = await asyncio.to_thread(
+                    source.read,
+                    MAX_CHUNK_BYTES,
+                )
+            staged = await asyncio.to_thread(
+                stage_chunk,
+                meta={
+                    **spool_meta,
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                },
+                chunk_data=chunk_data,
+                user_id=user_id,
+                device_id=device_id,
+                device_name=device_name,
+                device_platform=device_platform,
+            )
+            if staged.complete and not staged.should_enqueue:
+                break
+    finally:
+        if source is not None:
+            source.close()
 
     if staged is None or not staged.complete:
         raise RuntimeError("dependent delta was not durably staged")
@@ -331,7 +375,8 @@ async def _ingest_or_stage_dependent_delta(
     db: AsyncSession,
     ingest_kwargs: dict,
     spool_meta: dict,
-    content_bytes: bytes,
+    content_bytes: bytes | None = None,
+    content_path: Path | None = None,
     user_id: str,
     device_id: str,
     device_name: str,
@@ -347,6 +392,7 @@ async def _ingest_or_stage_dependent_delta(
         queued = await _stage_delta_behind_pending_revision(
             meta=spool_meta,
             content_bytes=content_bytes,
+            content_path=content_path,
             user_id=user_id,
             device_id=device_id,
             device_name=device_name,
@@ -563,9 +609,125 @@ async def ingest_file_upload(
         sync_strategy=meta.get("sync_strategy"),
         relative_path=meta.get("relative_path"),
     )
+    reported_size = max(0, int(meta.get("file_size") or 0))
+    upload_size = getattr(content, "size", None)
+    known_size = max(
+        reported_size,
+        upload_size if isinstance(upload_size, int) else 0,
+    )
+    stream_conversation = (
+        meta.get("category") == "conversation"
+        and meta.get("content_type") == "jsonl"
+        and meta.get("mode", "full") in {"full", "delta"}
+    )
+    if stream_conversation:
+        machine = await ensure_device(
+            db,
+            x_device_id,
+            x_device_name,
+            x_device_platform,
+            user_id=_collector_user.id,
+        )
+        with tempfile.TemporaryDirectory(prefix="memento-multipart-") as temporary:
+            temporary_root = Path(temporary)
+            raw_path = temporary_root / "payload.bin"
+            measured_size = await _stream_upload_to_path(content, raw_path)
+            if max(known_size, measured_size) <= DATABASE_CONTENT_MAX_BYTES:
+                file_content = raw_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                return await _ingest_or_stage_dependent_delta(
+                    db=db,
+                    ingest_kwargs={
+                        "db": db,
+                        "tool_id": meta["tool"],
+                        "category": meta["category"],
+                        "content_type": meta["content_type"],
+                        "relative_path": meta["relative_path"],
+                        "content": file_content,
+                        "content_hash": meta["hash"],
+                        "file_size": max(reported_size, measured_size),
+                        "mode": meta.get("mode", "full"),
+                        "offset": meta.get("offset", 0),
+                        "metadata": meta.get("metadata", {}),
+                        "timestamp": meta.get("timestamp"),
+                        "machine_id": str(machine.id),
+                        "user_id": str(_collector_user.id),
+                        "base_hash": meta.get("base_hash"),
+                        "base_offset": meta.get("base_offset"),
+                        "authoritative_rebase": _validated_authoritative_rebase(meta),
+                    },
+                    spool_meta=meta,
+                    content_bytes=file_content.encode("utf-8"),
+                    user_id=str(_collector_user.id),
+                    device_id=x_device_id,
+                    device_name=x_device_name,
+                    device_platform=x_device_platform,
+                    success_message="Uploaded successfully",
+                )
+            sanitized = await asyncio.to_thread(
+                sanitize_content_file,
+                raw_path,
+                temporary_root / "sanitized.bin",
+            )
+            conversation_source = await asyncio.to_thread(
+                ConversationFileSource.inspect,
+                sanitized.path,
+            )
+            mode = meta.get("mode", "full")
+            content_s3_key = None
+            if mode == "full":
+                job_id = multipart_content_job_id(
+                    user_id=str(_collector_user.id),
+                    device_id=x_device_id,
+                    relative_path=str(meta["relative_path"]),
+                    content_hash=str(meta["hash"]),
+                )
+                content_s3_key = await asyncio.to_thread(
+                    store_large_content,
+                    sanitized.path,
+                    user_id=str(_collector_user.id),
+                    device_id=x_device_id,
+                    job_id=job_id,
+                )
+            return await _ingest_or_stage_dependent_delta(
+                db=db,
+                ingest_kwargs={
+                    "db": db,
+                    "tool_id": meta["tool"],
+                    "category": meta["category"],
+                    "content_type": meta["content_type"],
+                    "relative_path": meta["relative_path"],
+                    "content": "",
+                    "content_hash": meta["hash"],
+                    "file_size": conversation_source.size,
+                    "mode": mode,
+                    "offset": meta.get("offset", 0),
+                    "metadata": meta.get("metadata", {}),
+                    "timestamp": meta.get("timestamp"),
+                    "machine_id": str(machine.id),
+                    "user_id": str(_collector_user.id),
+                    "base_hash": meta.get("base_hash"),
+                    "base_offset": meta.get("base_offset"),
+                    "authoritative_rebase": _validated_authoritative_rebase(meta),
+                    "persist_content": mode != "full",
+                    "content_s3_key": content_s3_key,
+                    "content_already_sanitized": True,
+                    "content_had_sensitive": sanitized.had_sensitive,
+                    "conversation_source": conversation_source,
+                },
+                spool_meta={**meta, "file_size": measured_size},
+                content_path=raw_path,
+                user_id=str(_collector_user.id),
+                device_id=x_device_id,
+                device_name=x_device_name,
+                device_platform=x_device_platform,
+                success_message="Uploaded successfully",
+            )
+
     file_content = (await content.read()).decode("utf-8", errors="replace")
     measured_size = len(file_content.encode("utf-8"))
-    reported_size = max(0, int(meta.get("file_size") or 0))
     machine = await ensure_device(
         db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
     )

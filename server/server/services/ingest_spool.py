@@ -19,7 +19,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from uuid import UUID
 
 from .ingest_revision import (
@@ -171,8 +171,11 @@ def _spool_usage_bytes(root: Path) -> int:
         if not job_dir.is_dir() or not _JOB_ID_RE.fullmatch(job_dir.name):
             continue
         for path in job_dir.iterdir():
-            if path.name in {"payload.bin", "sanitized.bin"} or path.name.startswith(
-                "chunk-"
+            if (
+                path.name in {"payload.bin", "sanitized.bin"}
+                or path.name.startswith("payload-chain-")
+                or path.name.startswith("sanitized-chain-")
+                or path.name.startswith("chunk-")
             ):
                 try:
                     total += path.stat().st_size
@@ -1042,6 +1045,61 @@ def assemble_job(
     if payload_path.stat().st_size != expected_size:
         raise ChunkValidationError("assembled payload size does not match file_size")
     return manifest, payload_path
+
+
+def assemble_job_chain(
+    jobs: Sequence[tuple[str, dict[str, Any]]],
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> Path:
+    """Assemble a bounded contiguous job chain without joining bytes in memory."""
+    if not jobs:
+        raise ValueError("at least one spool job is required")
+    if len(jobs) == 1:
+        return assemble_job(jobs[0][0], root, manifest=jobs[0][1])[1]
+
+    identity = hashlib.sha256(
+        "\0".join(job_id for job_id, _ in jobs).encode("ascii")
+    ).hexdigest()
+    first_job_id = jobs[0][0]
+    target = _job_dir(first_job_id, root) / f"payload-chain-{identity}.bin"
+    expected_size = sum(int(manifest["meta"]["file_size"]) for _, manifest in jobs)
+    if target.exists():
+        if target.stat().st_size != expected_size:
+            raise ChunkValidationError("assembled chain size does not match file_size")
+        return target
+
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with _filesystem_lock(root / ".quota.lock"):
+            _assert_spool_capacity(root, expected_size)
+            with temporary.open("wb") as output:
+                for job_id, manifest in jobs:
+                    validated = ready_manifest(job_id, root)
+                    if validated != manifest:
+                        raise ChunkValidationError(
+                            "spool manifest changed during chain assembly"
+                        )
+                    job_dir = _job_dir(job_id, root)
+                    for index in range(int(manifest["total_chunks"])):
+                        chunk_path = job_dir / f"chunk-{index:06d}.bin"
+                        if not chunk_path.is_file() or chunk_path.is_symlink():
+                            raise FileNotFoundError(
+                                f"spool job {job_id} lost chunk {index}"
+                            )
+                        with chunk_path.open("rb") as source:
+                            shutil.copyfileobj(source, output, length=1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+            if temporary.stat().st_size != expected_size:
+                raise ChunkValidationError(
+                    "assembled chain size does not match file_size"
+                )
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+            _fsync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
 
 def read_ready_job_bytes(

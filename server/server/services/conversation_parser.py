@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Protocol, TypeVar
@@ -4228,7 +4228,7 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
 
 
 def _iter_claude_conversation_messages(
-    raw_content: str,
+    source_objects: Iterable[object],
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity: AssistantIdentityState | None = None,
@@ -4298,9 +4298,7 @@ def _iter_claude_conversation_messages(
             emitted.append(message)
         return emitted
 
-    for record_index, source_object in enumerate(
-        _iter_decoded_json_objects(raw_content)
-    ):
+    for record_index, source_object in enumerate(source_objects):
         _update_assistant_identity(identity, source_object, "claude_code")
         for message in _parse_claude_record_messages(source_object):
             _attach_assistant_identity(message, identity)
@@ -4510,7 +4508,7 @@ def _parse_cursor_record_messages(obj: object) -> list[NormalizedMessage]:
 
 
 def _iter_cursor_conversation_messages(
-    raw_content: str,
+    source_objects: Iterable[object],
     *,
     initial_question_interactions: list[dict[str, object]] | None = None,
     assistant_identity: AssistantIdentityState | None = None,
@@ -4533,9 +4531,7 @@ def _iter_cursor_conversation_messages(
             pending_question = (-1, interaction)
             break
 
-    for record_index, source_object in enumerate(
-        _iter_decoded_json_objects(raw_content)
-    ):
+    for record_index, source_object in enumerate(source_objects):
         _update_assistant_identity(identity, source_object, "cursor")
         if (
             pending_question is not None
@@ -4957,13 +4953,7 @@ def iter_conversation_messages(
     initial_task_state: dict[str, object] | None = None,
     incremental: bool = False,
 ) -> Iterator[NormalizedMessage]:
-    """Yield semantic messages once, using identities supplied by each tool.
-
-    Claude UUIDs and Codex client IDs are authoritative identities. Cursor's
-    exported JSONL currently has neither mirrored transport rows nor stable
-    IDs, so each source item is preserved.  This intentionally avoids any
-    role/content/second heuristic: two identical prompts are still two turns.
-    """
+    """Compatibility wrapper for callers that already hold a complete string."""
     identity = assistant_identity or AssistantIdentityState()
     if tool_id == "hermes":
         yield from _parse_hermes_session(
@@ -4973,9 +4963,36 @@ def iter_conversation_messages(
             assistant_identity=identity,
         )
         return
+    yield from iter_conversation_messages_from_objects(
+        _iter_decoded_json_objects(raw_content),
+        tool_id,
+        initial_question_interactions=initial_question_interactions,
+        assistant_identity=identity,
+        initial_task_state=initial_task_state,
+        incremental=incremental,
+    )
+
+
+def iter_conversation_messages_from_objects(
+    source_objects: Iterable[object],
+    tool_id: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity: AssistantIdentityState | None = None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
+) -> Iterator[NormalizedMessage]:
+    """Yield semantic messages once, using identities supplied by each tool.
+
+    Claude UUIDs and Codex client IDs are authoritative identities. Cursor's
+    exported JSONL currently has neither mirrored transport rows nor stable
+    IDs, so each source item is preserved.  This intentionally avoids any
+    role/content/second heuristic: two identical prompts are still two turns.
+    """
+    identity = assistant_identity or AssistantIdentityState()
     if tool_id == "cursor":
         yield from _iter_cursor_conversation_messages(
-            raw_content,
+            source_objects,
             initial_question_interactions=initial_question_interactions,
             assistant_identity=identity,
             initial_task_state=initial_task_state,
@@ -4984,7 +5001,7 @@ def iter_conversation_messages(
         return
     if tool_id == "claude_code":
         yield from _iter_claude_conversation_messages(
-            raw_content,
+            source_objects,
             initial_question_interactions=initial_question_interactions,
             assistant_identity=identity,
             initial_task_state=initial_task_state,
@@ -5020,9 +5037,7 @@ def iter_conversation_messages(
         task_tracker.apply(message)
         return True
 
-    for record_index, source_object in enumerate(
-        _iter_decoded_json_objects(raw_content)
-    ):
+    for record_index, source_object in enumerate(source_objects):
         _update_assistant_identity(identity, source_object, tool_id)
         if tool_id == "codex":
             source_payload = _as_mapping(source_object.get("payload"))

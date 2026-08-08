@@ -15,14 +15,19 @@ from sqlalchemy import select, text
 from ..db.models import Document, SyncState
 from ..db.session import async_session_factory
 from ..services.content_sanitizer import sanitize_content_file
+from ..services.conversation_stream import ConversationFileSource
 from ..services.device_service import DeviceOwnershipError, ensure_device
 from ..services.ingest_revision import committed_full_supersedes
 from ..services.ingest_service import DeltaBaseMismatch, ingest_file
-from ..services.large_content_store import store_large_content
+from ..services.large_content_store import (
+    DATABASE_CONTENT_MAX_BYTES,
+    store_large_content,
+)
 from ..services.ingest_spool import (
     DEFAULT_SPOOL_ROOT,
     ChunkValidationError,
     assemble_job,
+    assemble_job_chain,
     blocked_job_ids,
     cleanup_completion_receipts,
     cleanup_stale_incomplete_jobs,
@@ -35,7 +40,6 @@ from ..services.ingest_spool import (
     ready_manifest,
     ready_job_ids,
     ready_delta_chain_job_ids,
-    read_ready_job_bytes,
     record_job_attempt,
     select_ready_source_head,
     source_identity,
@@ -48,12 +52,6 @@ from .celery_app import INGEST_RECOVERY_EXPIRES_SECONDS, celery_app
 logger = logging.getLogger("ingest_spool")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_FINALIZE_RETRIES = 12
-# Conversation source blobs are immutable archival inputs, not the live query
-# model. Keep large TEXT values out of the update-heavy documents row early;
-# normalized ConversationMessage rows remain the authoritative live history.
-DATABASE_CONTENT_MAX_BYTES = 1024 * 1024
-
-
 class RetryLimitExceeded(RuntimeError):
     """Raised when a durable job exhausted its persisted attempt budget."""
 
@@ -160,36 +158,49 @@ async def _ingest_ready_job(
 
     content_s3_key = None
     content_had_sensitive = False
+    conversation_source = None
     if len(payload_jobs) > 1:
-        payload = await asyncio.to_thread(
-            lambda: b"".join(
-                read_ready_job_bytes(
-                    candidate_id,
-                    manifest=candidate_manifest,
-                )[1]
-                for candidate_id, candidate_manifest in payload_jobs
-            )
+        payload_path = await asyncio.to_thread(
+            assemble_job_chain,
+            payload_jobs,
         )
-        file_content = payload.decode("utf-8", errors="replace")
-        ingested_payload_bytes = len(payload)
     else:
         manifest, payload_path = assemble_job(job_id, manifest=manifest)
-        ingest_path = payload_path
-        if externalize_content:
-            sanitized = await asyncio.to_thread(
-                sanitize_content_file,
-                payload_path,
-                payload_path.with_name("sanitized.bin"),
-            )
-            ingest_path = sanitized.path
-            content_had_sensitive = sanitized.had_sensitive
-            content_s3_key = await asyncio.to_thread(
-                store_large_content,
-                ingest_path,
-                user_id=str(user_id),
-                device_id=str(manifest["device_id"]),
-                job_id=job_id,
-            )
+    ingest_path = payload_path
+    stream_conversation = (
+        meta.get("category") == "conversation"
+        and meta.get("content_type") == "jsonl"
+        and (externalize_content or meta.get("mode", "full") == "delta")
+    )
+    if externalize_content or stream_conversation:
+        sanitized_name = (
+            "sanitized.bin"
+            if len(payload_jobs) == 1
+            else f"sanitized-chain-{payload_path.name.removeprefix('payload-chain-')}"
+        )
+        sanitized = await asyncio.to_thread(
+            sanitize_content_file,
+            payload_path,
+            payload_path.with_name(sanitized_name),
+        )
+        ingest_path = sanitized.path
+        content_had_sensitive = sanitized.had_sensitive
+    if externalize_content:
+        content_s3_key = await asyncio.to_thread(
+            store_large_content,
+            ingest_path,
+            user_id=str(user_id),
+            device_id=str(manifest["device_id"]),
+            job_id=job_id,
+        )
+    if stream_conversation:
+        conversation_source = await asyncio.to_thread(
+            ConversationFileSource.inspect,
+            ingest_path,
+        )
+        file_content = ""
+        ingested_payload_bytes = conversation_source.size
+    else:
         file_content = await asyncio.to_thread(
             ingest_path.read_text,
             encoding="utf-8",
@@ -224,8 +235,9 @@ async def _ingest_ready_job(
             schedule_post_ingest=False,
             persist_content=not externalize_content,
             content_s3_key=content_s3_key,
-            content_already_sanitized=externalize_content,
+            content_already_sanitized=externalize_content or stream_conversation,
             content_had_sensitive=content_had_sensitive,
+            conversation_source=conversation_source,
         )
         await db.commit()
 

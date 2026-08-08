@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -11,6 +12,9 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from ..config import settings
+
+
+DATABASE_CONTENT_MAX_BYTES = 1024 * 1024
 
 
 def _client():
@@ -28,6 +32,22 @@ def large_content_key(*, user_id: str, device_id: str, job_id: str) -> str:
     """Return the immutable private object key for one durable upload."""
     device_key = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
     return f"raw/{user_id}/{device_key}/{job_id}.txt"
+
+
+def multipart_content_job_id(
+    *,
+    user_id: str,
+    device_id: str,
+    relative_path: str,
+    content_hash: str,
+) -> str:
+    """Address a retryable multipart source without exposing owned paths."""
+    identity = json.dumps(
+        [user_id, device_id, relative_path, content_hash],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(b"memento:multipart-content:v1\0" + identity).hexdigest()
 
 
 def store_large_content(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, select, text, update
@@ -27,6 +28,7 @@ from .conversation_identity import (
     select_canonical_conversation_document,
     should_relocate_conversation_document,
 )
+from .conversation_stream import ConversationFileSource
 from .history_recovery import (
     UserOccurrence,
     partition_recovered_occurrences,
@@ -39,6 +41,7 @@ from .subagent_lifecycle import (
     SUBAGENT_LIFECYCLE_SOURCE_KEY,
     SUBAGENT_LIFECYCLE_STATUS_KEY,
     child_lifecycle_evidence,
+    child_lifecycle_evidence_from_objects,
     lifecycle_event_identity,
     merge_duplicate_lifecycle_events,
     reconcile_child_lifecycle_metadata,
@@ -420,6 +423,28 @@ def _set_stored_source_identity(
     doc.metadata_ = metadata
 
 
+def _set_stored_source_proof(
+    doc: Document,
+    *,
+    source_hash: str,
+    source_size: int,
+    revision_hash: str | None,
+) -> None:
+    """Record a preverified sanitized blob without rebuilding it in memory."""
+    if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+        raise ValueError("stored source hash must be a SHA-256 hex digest")
+    if source_size < 0:
+        raise ValueError("stored source size must be non-negative")
+    metadata = dict(doc.metadata_ or {})
+    metadata[STORED_SOURCE_HASH_KEY] = source_hash
+    metadata[STORED_SOURCE_SIZE_KEY] = int(source_size)
+    if revision_hash:
+        metadata[STORED_SOURCE_REVISION_KEY] = revision_hash
+    else:
+        metadata.pop(STORED_SOURCE_REVISION_KEY, None)
+    doc.metadata_ = metadata
+
+
 def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
     """Accumulate parser statistics while preserving first-source metadata."""
     merged = {**existing, **incoming}
@@ -597,19 +622,50 @@ def iter_stored_conversation_messages(
     here prevents a historical repair from creating rows that a subsequent
     collector update would immediately rewrite differently.
     """
-    from .conversation_parser import (
-        iter_conversation_messages,
-        strip_terminal_sequences,
+    from .conversation_parser import iter_conversation_messages
+
+    yield from _iter_stored_normalized_messages(
+        iter_conversation_messages(
+            content,
+            tool_id,
+            initial_question_interactions=initial_question_interactions,
+            assistant_identity=assistant_identity,
+            initial_task_state=initial_task_state,
+            incremental=incremental,
+        )
     )
 
-    for normalized in iter_conversation_messages(
-        content,
-        tool_id,
-        initial_question_interactions=initial_question_interactions,
-        assistant_identity=assistant_identity,
-        initial_task_state=initial_task_state,
-        incremental=incremental,
-    ):
+
+def iter_stored_conversation_objects(
+    source_objects: Iterable[object],
+    tool_id: str,
+    *,
+    initial_question_interactions: list[dict[str, object]] | None = None,
+    assistant_identity=None,
+    initial_task_state: dict[str, object] | None = None,
+    incremental: bool = False,
+):
+    """Normalize a streamed decoded-object sequence at the storage boundary."""
+    from .conversation_parser import iter_conversation_messages_from_objects
+
+    yield from _iter_stored_normalized_messages(
+        iter_conversation_messages_from_objects(
+            source_objects,
+            tool_id,
+            initial_question_interactions=initial_question_interactions,
+            assistant_identity=assistant_identity,
+            initial_task_state=initial_task_state,
+            incremental=incremental,
+        )
+    )
+
+
+def _iter_stored_normalized_messages(
+    messages: Iterable[object],
+) -> Iterator[tuple[object, str, dict, datetime | None]]:
+    from .conversation_parser import strip_terminal_sequences
+
+    for normalized in messages:
         if normalized.role not in ("user", "assistant", "tool", "system"):
             continue
         full_clean_content = strip_terminal_sequences(normalized.content).replace(
@@ -2019,6 +2075,7 @@ def _reconcile_subagent_document_lifecycle(
     content: str | None,
     *,
     source_timestamp: object = None,
+    source_objects: Iterable[object] | None = None,
 ) -> bool:
     """Persist source-backed child state without treating silence as completion."""
     if document.category != "conversation":
@@ -2031,11 +2088,20 @@ def _reconcile_subagent_document_lifecycle(
         document.metadata_,
     ):
         return False
-    evidence = child_lifecycle_evidence(
-        document.tool_id,
-        document.metadata_,
-        content,
-        source_timestamp=source_timestamp or document.source_modified_at,
+    evidence = (
+        child_lifecycle_evidence_from_objects(
+            document.tool_id,
+            document.metadata_,
+            source_objects,
+            source_timestamp=source_timestamp or document.source_modified_at,
+        )
+        if source_objects is not None
+        else child_lifecycle_evidence(
+            document.tool_id,
+            document.metadata_,
+            content,
+            source_timestamp=source_timestamp or document.source_modified_at,
+        )
     )
     metadata, changed = reconcile_child_lifecycle_metadata(
         document.metadata_,
@@ -2227,6 +2293,7 @@ async def ingest_file(
     content_s3_key: str | None = None,
     content_already_sanitized: bool = False,
     content_had_sensitive: bool = False,
+    conversation_source: ConversationFileSource | None = None,
     base_hash: str | None = None,
     base_offset: int | None = None,
     authoritative_rebase: bool = False,
@@ -2234,6 +2301,23 @@ async def ingest_file(
     """Process and store an ingested file."""
     metadata = dict(metadata or {})
     category = normalize_ingest_category(tool_id, category, relative_path)
+    if conversation_source is not None:
+        if category != "conversation" or content_type != "jsonl":
+            raise ValueError(
+                "streamed sources are supported only for conversation JSONL"
+            )
+        if content:
+            raise ValueError("streamed conversation ingest must not include inline content")
+        if not content_already_sanitized:
+            raise ValueError("streamed conversation source must already be sanitized")
+        if mode == "full" and (persist_content or not content_s3_key):
+            raise ValueError(
+                "streamed full conversation must retain only its object-store key"
+            )
+        file_size = conversation_source.size
+    content_preview = (
+        conversation_source.prefix if conversation_source is not None else content
+    )
     received_at = datetime.now(timezone.utc)
     source_modified_at = bounded_source_timestamp(timestamp, received_at) or received_at
     stable_source_identity = conversation_session_id(tool_id, category, metadata)
@@ -2470,7 +2554,9 @@ async def ingest_file(
 
     # Re-sanitize
     content = content.replace("\x00", "")  # PostgreSQL TEXT rejects null bytes
-    if content_already_sanitized:
+    if conversation_source is not None:
+        had_sensitive = content_had_sensitive
+    elif content_already_sanitized:
         had_sensitive = content_had_sensitive
     else:
         content, had_sensitive = _resanitize(content)
@@ -2478,10 +2564,10 @@ async def ingest_file(
     # Collector metadata is advisory and older clients omitted Codex thread
     # identity entirely.  The first session_meta object is authoritative and
     # cheap to parse even for an externalized multi-hundred-megabyte FULL.
-    if tool_id == "codex" and category == "conversation" and content:
+    if tool_id == "codex" and category == "conversation" and content_preview:
         from .conversation_parser import extract_codex_session_metadata
 
-        metadata.update(extract_codex_session_metadata(content))
+        metadata.update(extract_codex_session_metadata(content_preview))
 
     if tool_id in {"cursor", "claude_code"} and category == "conversation":
         from .conversation_hierarchy import path_linked_subagent_identity
@@ -2511,9 +2597,9 @@ async def ingest_file(
     _needs_extract = not project_hash or _looks_like_hash
     project_path: str | None = metadata.get("project_path")
 
-    if _needs_extract and content and category == "conversation":
+    if _needs_extract and content_preview and category == "conversation":
         # Universal: extract cwd from first occurrence in content (Claude Code, Codex, Cursor all have it)
-        cwd_match = re.search(r'"cwd"\s*:\s*"([^"]+)"', content[:10000])
+        cwd_match = re.search(r'"cwd"\s*:\s*"([^"]+)"', content_preview[:10000])
         if cwd_match:
             raw_cwd = cwd_match.group(1)
             raw_cwd = re.sub(r"^\\\\?\?\\", "", raw_cwd)
@@ -2526,12 +2612,14 @@ async def ingest_file(
 
     if (
         _needs_extract
-        and content
+        and content_preview
         and tool_id == "antigravity"
         and "brain" in relative_path
     ):
         # Antigravity: extract workspace from file:// URIs in brain content
-        extracted_name, extracted_path = _extract_workspace_from_content(content)
+        extracted_name, extracted_path = _extract_workspace_from_content(
+            content_preview
+        )
         if extracted_name:
             project_hash = extracted_name
             if extracted_path and not project_path:
@@ -2624,7 +2712,11 @@ async def ingest_file(
             category=category,
             content_type=content_type,
             title=title,
-            content=content if persist_content else None,
+            content=(
+                content
+                if persist_content and conversation_source is None
+                else None
+            ),
             content_s3_key=content_s3_key,
             content_hash=content_hash,
             file_size_bytes=logical_file_size,
@@ -2656,14 +2748,18 @@ async def ingest_file(
             # snapshot (inline or in object storage) and append only normalized
             # messages until another FULL source snapshot arrives.
             preserve_stored_source_identity = True
-        elif mode == "delta" and doc.content:
+        elif (
+            mode == "delta"
+            and doc.content
+            and conversation_source is None
+        ):
             doc.content = doc.content + "\n" + content
             if previous_stored_revision == base_hash:
                 stored_revision_hash = content_hash
             else:
                 stored_revision_hash = None
             stored_blob_content = doc.content
-        else:
+        elif conversation_source is None:
             doc.content = content
         if persist_content and not preserve_externalized_delta:
             doc.content_s3_key = None
@@ -2719,11 +2815,19 @@ async def ingest_file(
             db.add(version)
 
     if category == "conversation" and not preserve_stored_source_identity:
-        _set_stored_source_identity(
-            doc,
-            stored_blob_content,
-            revision_hash=stored_revision_hash,
-        )
+        if conversation_source is not None:
+            _set_stored_source_proof(
+                doc,
+                source_hash=conversation_source.sha256,
+                source_size=conversation_source.size,
+                revision_hash=stored_revision_hash,
+            )
+        else:
+            _set_stored_source_identity(
+                doc,
+                stored_blob_content,
+                revision_hash=stored_revision_hash,
+            )
 
     from sqlalchemy import func as _func
     from sqlalchemy import update as _update
@@ -2751,8 +2855,13 @@ async def ingest_file(
     )
     lifecycle_changed = _reconcile_subagent_document_lifecycle(
         doc,
-        content,
+        content if conversation_source is None else None,
         source_timestamp=source_modified_at,
+        source_objects=(
+            conversation_source.iter_objects()
+            if conversation_source is not None
+            else None
+        ),
     )
     enriched_lifecycle_changed = False
     if enriched_claude_child is not None and enriched_claude_child.id != doc.id:
@@ -2817,6 +2926,7 @@ async def ingest_file(
             mode,
             user_history=user_history,
             first_user_message=first_user_message,
+            conversation_source=conversation_source,
         )
         from .conversation_activity import refresh_document_activity_at
 
@@ -3110,6 +3220,7 @@ async def _extract_messages(
     *,
     user_history: list[dict] | None = None,
     first_user_message: str = "",
+    conversation_source: ConversationFileSource | None = None,
 ) -> str:
     """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
@@ -3329,14 +3440,26 @@ async def _extract_messages(
     # The shared iterator is the single source of truth for semantic identity,
     # pagination, counting, and ingestion.  In particular, it preserves valid
     # repeated prompts and collapses only Codex's observed cross-transport pair.
-    for normalized, clean_content, meta, ts in iter_stored_conversation_messages(
-        content,
-        tool_id,
-        initial_question_interactions=initial_question_interactions,
-        assistant_identity=assistant_identity,
-        initial_task_state=initial_task_state,
-        incremental=mode == "delta",
-    ):
+    stored_messages = (
+        iter_stored_conversation_objects(
+            conversation_source.iter_objects(),
+            tool_id,
+            initial_question_interactions=initial_question_interactions,
+            assistant_identity=assistant_identity,
+            initial_task_state=initial_task_state,
+            incremental=mode == "delta",
+        )
+        if conversation_source is not None
+        else iter_stored_conversation_messages(
+            content,
+            tool_id,
+            initial_question_interactions=initial_question_interactions,
+            assistant_identity=assistant_identity,
+            initial_task_state=initial_task_state,
+            incremental=mode == "delta",
+        )
+    )
+    for normalized, clean_content, meta, ts in stored_messages:
         lifecycle_key = lifecycle_event_identity(normalized.agent_event)
         prior_lifecycle_row = (
             recent_lifecycle_rows.get(lifecycle_key)
