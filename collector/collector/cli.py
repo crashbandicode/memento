@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .config import CollectorConfig, SYSTEM, _default_data_dir
+from .queue import SyncQueue
 
 PLIST_NAME = "com.memento.collector"
 SYSTEMD_UNIT = "memento-collector"
@@ -785,12 +786,58 @@ def status() -> None:
     except Exception:
         print("Server:  unreachable")
 
+    if config.queue_db_path.exists():
+        queue = SyncQueue(
+            config.queue_db_path,
+            spool_threshold=config.queue_spool_threshold,
+        )
+        try:
+            health = queue.health_status()
+        finally:
+            queue.close()
+        print(
+            f"Queue:   {health['actionable']} actionable, "
+            f"{health['terminal']} blocked/quarantined"
+        )
+        for diagnostic in health["diagnostics"]:
+            http_status = (
+                f" HTTP {diagnostic['http_status']}"
+                if diagnostic["http_status"] is not None
+                else ""
+            )
+            print(
+                f"  [{diagnostic['id']}] {diagnostic['status']}{http_status} "
+                f"{diagnostic['tool']}/{diagnostic['relative_path']}: "
+                f"{diagnostic['code']} {diagnostic['diagnostic']}".rstrip()
+            )
+
     # Recent log
     log_file = config.log_dir / "collector.log"
     if log_file.exists():
         lines = log_file.read_text().splitlines()
         if lines:
             print(f"\nLast log: {lines[-1]}")
+
+
+def requeue() -> None:
+    """Explicitly requeue one terminal item shown by the status command."""
+
+    if len(sys.argv) != 3 or not sys.argv[2].isdigit():
+        print("Usage: memento-collector requeue <queue-item-id>")
+        raise SystemExit(2)
+    config = CollectorConfig()
+    queue = SyncQueue(
+        config.queue_db_path,
+        spool_threshold=config.queue_spool_threshold,
+    )
+    try:
+        changed = queue.requeue_terminal(int(sys.argv[2]))
+    finally:
+        queue.close()
+    if not changed:
+        print("Queue item is not terminal or its spooled payload is unavailable.")
+        raise SystemExit(1)
+    print(f"Requeued queue item {sys.argv[2]}.")
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +860,7 @@ def cli_main() -> None:
         "start": start,
         "stop": stop,
         "status": status,
+        "requeue": requeue,
         "run": lambda: __import__("collector.main", fromlist=["main"]).main(),
     }
 
@@ -828,6 +876,7 @@ def cli_main() -> None:
         print("  start      Start the service")
         print("  stop       Stop the service")
         print("  status     Show collector status")
+        print("  requeue ID Explicitly retry one terminal queue item")
         print("  run        Run in foreground (default)")
         print("  help       Show this help")
     else:

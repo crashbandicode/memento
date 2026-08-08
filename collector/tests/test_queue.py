@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from collector.outcomes import UploadOutcome  # noqa: E402
 from collector.queue import SyncQueue  # noqa: E402
 
 
@@ -472,6 +473,96 @@ class SyncQueueTests(unittest.TestCase):
             self._make_retries_available()
 
         self.assertEqual(self._status_rows()[0][2], "pending")
+
+    def test_auth_block_persists_until_auth_context_changes(self) -> None:
+        self.queue.configure_auth("credentials-a")
+        self._enqueue("auth.jsonl", "payload", "hash-auth")
+        item = self.queue.claim_batch()[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                item,
+                UploadOutcome.authentication_blocked(
+                    "HTTP 401 invalid token",
+                    http_status=401,
+                ),
+                auth_fingerprint="credentials-a",
+            )
+        )
+        self.assertEqual(self.queue.claim_batch(), [])
+        health = self.queue.health_status()
+        self.assertEqual(health["counts"]["auth_blocked"], 1)
+        self.assertEqual(health["diagnostics"][0]["http_status"], 401)
+        self.assertIn("invalid token", health["diagnostics"][0]["diagnostic"])
+
+        self.queue.close()
+        self.queue = SyncQueue(self.db_path, spool_threshold=64 * 1024)
+        self.assertEqual(self.queue.configure_auth("credentials-a"), 0)
+        self.assertEqual(self.queue.claim_batch(), [])
+
+        self.assertEqual(self.queue.configure_auth("credentials-b"), 1)
+        resumed = self.queue.claim_batch()[0]
+        self.assertEqual(resumed.content_hash, "hash-auth")
+
+    def test_source_repair_and_quarantine_require_explicit_or_new_input(
+        self,
+    ) -> None:
+        repair_id = self._enqueue("repair.jsonl", "repair", "hash-repair")
+        repair = self.queue.claim_batch()[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                repair,
+                UploadOutcome.source_repair(
+                    "HTTP 422 invalid metadata",
+                    diagnostic_code="http_422",
+                    http_status=422,
+                ),
+            )
+        )
+        quarantine_id = self._enqueue(
+            "quarantine.jsonl",
+            "quarantine",
+            "hash-quarantine",
+        )
+        quarantined = self.queue.claim_batch()[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                quarantined,
+                UploadOutcome.quarantine(
+                    "server commit failed",
+                    diagnostic_code="commit_failed",
+                ),
+            )
+        )
+
+        self.assertEqual(self.queue.pending_count(), 0)
+        health = self.queue.health_status()
+        self.assertEqual(health["counts"]["repair_required"], 1)
+        self.assertEqual(health["counts"]["quarantined"], 1)
+        self.assertEqual(health["terminal"], 2)
+
+        self.assertTrue(self.queue.requeue_terminal(repair_id))
+        self.assertEqual(self.queue.claim_batch()[0].id, repair_id)
+
+        # A genuinely new source revision replaces the quarantined payload;
+        # the identical terminal revision itself is never retransmitted.
+        self.assertEqual(
+            self._enqueue(
+                "quarantine.jsonl",
+                "quarantine",
+                "hash-quarantine",
+            ),
+            quarantine_id,
+        )
+        self.assertEqual(self.queue.claim_batch(), [])
+        self.assertEqual(
+            self._enqueue(
+                "quarantine.jsonl",
+                "repaired source",
+                "hash-repaired",
+            ),
+            quarantine_id,
+        )
+        self.assertEqual(self.queue.claim_batch()[0].content_hash, "hash-repaired")
 
     def test_metadata_transition_is_durable_and_acknowledged_separately(self) -> None:
         thread_id = "019f144c-82d6-70d0-95e8-e01e7b813e98"
@@ -1157,6 +1248,10 @@ class SyncQueueMigrationTests(unittest.TestCase):
                         "SELECT source_modified_at FROM queue ORDER BY id"
                     ).fetchall()
                     version = connection.execute("PRAGMA user_version").fetchone()[0]
+                    queue_columns = {
+                        row[1]
+                        for row in connection.execute("PRAGMA table_info(queue)")
+                    }
                 self.assertEqual(full_statuses, [("superseded",), ("pending",)])
                 self.assertEqual(delta_statuses, [("pending",), ("pending",)])
                 self.assertEqual(state, ("new", 42, None))
@@ -1164,6 +1259,15 @@ class SyncQueueMigrationTests(unittest.TestCase):
                     source_timestamps, [(None,), (None,), (None,), (None,)]
                 )
                 self.assertEqual(version, SyncQueue.SCHEMA_VERSION)
+                self.assertTrue(
+                    {
+                        "outcome_state",
+                        "diagnostic_code",
+                        "http_status",
+                        "terminal_at",
+                        "blocked_config_fingerprint",
+                    }.issubset(queue_columns)
+                )
                 self.assertTrue(
                     all(
                         item.source_modified_at is None

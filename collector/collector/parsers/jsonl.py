@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 from .base import BaseParser, ParseResult
 
@@ -25,6 +26,42 @@ class JsonlParser(BaseParser):
         *,
         end_offset: int | None = None,
     ) -> ParseResult:
+        return self._parse(
+            path,
+            offset=offset,
+            end_offset=end_offset,
+            write=None,
+            transform_line=None,
+        )
+
+    def parse_to_writer(
+        self,
+        path: Path,
+        write: Callable[[str], None],
+        *,
+        offset: int = 0,
+        end_offset: int | None = None,
+        transform_line: Callable[[str], str] | None = None,
+    ) -> ParseResult:
+        """Parse, sanitize, hash, and spool without building one large string."""
+
+        return self._parse(
+            path,
+            offset=offset,
+            end_offset=end_offset,
+            write=write,
+            transform_line=transform_line,
+        )
+
+    def _parse(
+        self,
+        path: Path,
+        *,
+        offset: int,
+        end_offset: int | None,
+        write: Callable[[str], None] | None,
+        transform_line: Callable[[str], str] | None,
+    ) -> ParseResult:
         """Parse a byte-bounded JSONL revision.
 
         ``end_offset`` lets the watcher capture an immutable prefix of an
@@ -39,6 +76,7 @@ class JsonlParser(BaseParser):
         message_types: dict[str, int] = {}
         content_parts: list[str] = []
         content_size = 0
+        emitted_content = False
 
         file_size = path.stat().st_size
         bounded_end = file_size if end_offset is None else min(file_size, end_offset)
@@ -90,10 +128,18 @@ class JsonlParser(BaseParser):
                 if not line:
                     continue
 
-                # Accumulate all content (no size limit)
+                output_line = transform_line(line) if transform_line else line
+                # Accumulate all content (no size limit), or stream the exact
+                # same newline-normalized payload into the queue-owned writer.
                 if MAX_CONTENT_SIZE == 0 or content_size < MAX_CONTENT_SIZE:
-                    content_parts.append(line)
-                    content_size += len(line) + 1
+                    if write is None:
+                        content_parts.append(output_line)
+                    else:
+                        if emitted_content:
+                            write("\n")
+                        write(output_line)
+                        emitted_content = True
+                    content_size += len(output_line) + 1
                 line_count += 1
 
                 # Lightweight metadata extraction (only parse first 100 chars for type/timestamp)
@@ -122,7 +168,7 @@ class JsonlParser(BaseParser):
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-        content = "\n".join(content_parts)
+        content = "\n".join(content_parts) if write is None else ""
 
         metadata: dict = {
             "message_types": message_types,

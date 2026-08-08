@@ -22,6 +22,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
+from .outcomes import UploadOutcome, UploadOutcomeState
+
 
 def _rollback_on_error(method):
     """Keep the shared connection usable if any SQLite write/commit fails."""
@@ -66,6 +68,105 @@ class QueueItem:
     lease_token: str | None = None
 
 
+@dataclass(frozen=True)
+class PreparedPayload:
+    """A sanitized payload already hashed and optionally spooled to disk."""
+
+    content: str
+    content_hash: str
+    payload_path: str | None
+    payload_bytes: int
+    has_non_whitespace: bool
+
+
+class PayloadWriter:
+    """Hash sanitized UTF-8 while spilling large payloads exactly once."""
+
+    def __init__(self, spool_dir: Path, threshold: int) -> None:
+        self._spool_dir = spool_dir
+        self._threshold = threshold
+        self._buffer = bytearray()
+        self._hash = hashlib.sha256()
+        self._has_non_whitespace = False
+        self._temporary: Path | None = None
+        self._final: Path | None = None
+        self._stream: BinaryIO | None = None
+        self._bytes = 0
+        self._finished = False
+
+    def _spill(self) -> None:
+        if self._stream is not None:
+            return
+        stem = uuid.uuid4().hex
+        self._temporary = self._spool_dir / f".{stem}.tmp"
+        self._final = self._spool_dir / f"{stem}.payload"
+        self._stream = self._temporary.open("wb")
+        if self._buffer:
+            self._stream.write(self._buffer)
+            self._buffer.clear()
+
+    def write(self, text: str) -> None:
+        if self._finished:
+            raise RuntimeError("payload writer is already finished")
+        if not text:
+            return
+        encoded = text.encode("utf-8")
+        self._hash.update(encoded)
+        self._bytes += len(encoded)
+        self._has_non_whitespace = self._has_non_whitespace or bool(text.strip())
+        if self._stream is None and len(self._buffer) + len(encoded) <= self._threshold:
+            self._buffer.extend(encoded)
+            return
+        self._spill()
+        assert self._stream is not None
+        self._stream.write(encoded)
+
+    def finish(self) -> PreparedPayload:
+        if self._finished:
+            raise RuntimeError("payload writer is already finished")
+        self._finished = True
+        if self._stream is None:
+            return PreparedPayload(
+                content=bytes(self._buffer).decode("utf-8"),
+                content_hash=self._hash.hexdigest(),
+                payload_path=None,
+                payload_bytes=self._bytes,
+                has_non_whitespace=self._has_non_whitespace,
+            )
+        assert self._temporary is not None and self._final is not None
+        try:
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+            self._stream.close()
+            self._stream = None
+            os.replace(self._temporary, self._final)
+            return PreparedPayload(
+                content="",
+                content_hash=self._hash.hexdigest(),
+                payload_path=str(self._final),
+                payload_bytes=self._bytes,
+                has_non_whitespace=self._has_non_whitespace,
+            )
+        except Exception:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except OSError:
+                pass
+            self._stream = None
+        for path in (self._temporary, self._final):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        self._finished = True
+
+
 def _metadata_state_value(record: dict[str, Any], title: str = "") -> str:
     if str(record.get("metadata_type") or "") != "codex_thread_title":
         return json.dumps(
@@ -104,7 +205,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path: Path, spool_threshold: int = 4 * 1024 * 1024) -> None:
         self._db_path = db_path
@@ -184,7 +285,12 @@ class SyncQueue:
                 lease_until REAL,
                 available_at REAL NOT NULL DEFAULT 0,
                 last_attempt_at REAL,
-                last_error TEXT
+                last_error TEXT,
+                outcome_state TEXT,
+                diagnostic_code TEXT,
+                http_status INTEGER,
+                terminal_at REAL,
+                blocked_config_fingerprint TEXT
             );
             CREATE TABLE IF NOT EXISTS file_state (
                 tool_name TEXT NOT NULL,
@@ -210,6 +316,10 @@ class SyncQueue:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (namespace, item_key)
             );
+            CREATE TABLE IF NOT EXISTS queue_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
 
         # ALTER is intentionally additive so a v1 database remains readable by
@@ -229,6 +339,11 @@ class SyncQueue:
             "base_hash": "TEXT",
             "base_offset": "INTEGER NOT NULL DEFAULT 0",
             "source_path": "TEXT",
+            "outcome_state": "TEXT",
+            "diagnostic_code": "TEXT",
+            "http_status": "INTEGER",
+            "terminal_at": "REAL",
+            "blocked_config_fingerprint": "TEXT",
         }
         for name, definition in queue_additions.items():
             if name not in queue_columns:
@@ -361,6 +476,13 @@ class SyncQueue:
         queue_changed = False
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
+            auth_blocked = self._auth_gate_active_locked()
+            target_status = "auth_blocked" if auth_blocked else "pending"
+            auth_fingerprint = (
+                self._meta_value_locked("current_auth_fingerprint")
+                if auth_blocked
+                else None
+            )
             for item_key, source_record in records.items():
                 record = dict(source_record)
                 metadata_type = str(record.get("metadata_type") or "").strip()
@@ -439,7 +561,10 @@ class SyncQueue:
                 pending = self._conn.execute(
                     """SELECT id, metadata FROM queue
                        WHERE tool_name=? AND relative_path=?
-                         AND status='pending'
+                         AND status IN (
+                             'pending','auth_blocked',
+                             'repair_required','quarantined'
+                         )
                        ORDER BY id DESC LIMIT 1""",
                     (tool_name, relative_path),
                 ).fetchone()
@@ -480,9 +605,35 @@ class SyncQueue:
                     self._conn.execute(
                         """UPDATE queue SET metadata=?, content_hash=?,
                                   created_at=?, retry_count=0, available_at=0,
-                                  last_attempt_at=NULL, last_error=NULL
-                           WHERE id=? AND status='pending'""",
-                        (metadata_json, content_hash, now, int(pending[0])),
+                                  last_attempt_at=NULL, status=?,
+                                  last_error=CASE WHEN ?='pending' THEN NULL
+                                      ELSE 'credentials rejected by server' END,
+                                  outcome_state=CASE WHEN ?='pending' THEN NULL
+                                      ELSE 'authentication_blocked' END,
+                                  diagnostic_code=CASE WHEN ?='pending' THEN NULL
+                                      ELSE 'authentication_rejected' END,
+                                  http_status=CASE WHEN ?='pending' THEN NULL
+                                      ELSE http_status END,
+                                  terminal_at=CASE WHEN ?='pending' THEN NULL ELSE ? END,
+                                  blocked_config_fingerprint=?
+                           WHERE id=? AND status IN (
+                               'pending','auth_blocked',
+                               'repair_required','quarantined'
+                           )""",
+                        (
+                            metadata_json,
+                            content_hash,
+                            now,
+                            target_status,
+                            target_status,
+                            target_status,
+                            target_status,
+                            target_status,
+                            target_status,
+                            now,
+                            auth_fingerprint,
+                            int(pending[0]),
+                        ),
                     )
                 else:
                     self._conn.execute(
@@ -490,8 +641,10 @@ class SyncQueue:
                                tool_name, category, content_type, relative_path,
                                content, content_hash, file_size, sync_strategy,
                                is_partial, offset, metadata, created_at,
-                               payload_bytes, available_at
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+                               payload_bytes, available_at, status,
+                               outcome_state, diagnostic_code, terminal_at,
+                               blocked_config_fingerprint, last_error
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)""",
                         (
                             tool_name,
                             "metadata",
@@ -506,6 +659,20 @@ class SyncQueue:
                             metadata_json,
                             now,
                             0,
+                            target_status,
+                            (
+                                UploadOutcomeState.AUTHENTICATION_BLOCKED.value
+                                if auth_blocked
+                                else None
+                            ),
+                            "authentication_rejected" if auth_blocked else None,
+                            now if auth_blocked else None,
+                            auth_fingerprint,
+                            (
+                                "credentials rejected by server"
+                                if auth_blocked
+                                else None
+                            ),
                         ),
                     )
                 queue_changed = True
@@ -520,6 +687,64 @@ class SyncQueue:
         return {
             str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")
         }
+
+    def payload_writer(self) -> PayloadWriter:
+        """Create a one-pass sanitized payload writer owned by this queue."""
+
+        return PayloadWriter(self._spool_dir, self._spool_threshold)
+
+    def discard_prepared_payload(self, payload: PreparedPayload) -> None:
+        self._discard_payload(payload.payload_path)
+
+    def _meta_value_locked(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM queue_meta WHERE key=?",
+            (key,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def _set_meta_value_locked(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """INSERT INTO queue_meta (key, value) VALUES (?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, value),
+        )
+
+    def _auth_gate_active_locked(self) -> bool:
+        current = self._meta_value_locked("current_auth_fingerprint")
+        blocked = self._meta_value_locked("blocked_auth_fingerprint")
+        return bool(current and blocked and current == blocked)
+
+    @_rollback_on_error
+    def configure_auth(self, fingerprint: str) -> int:
+        """Resume auth-blocked rows only after endpoint/token identity changes."""
+
+        if not fingerprint:
+            raise ValueError("auth fingerprint must not be empty")
+        resumed = 0
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            previous = self._meta_value_locked("current_auth_fingerprint")
+            blocked = self._meta_value_locked("blocked_auth_fingerprint")
+            changed = previous is not None and previous != fingerprint
+            if changed or (blocked is not None and blocked != fingerprint):
+                cursor = self._conn.execute(
+                    """UPDATE queue
+                       SET status='pending', available_at=0, retry_count=0,
+                           outcome_state=NULL, diagnostic_code=NULL,
+                           http_status=NULL, terminal_at=NULL,
+                           blocked_config_fingerprint=NULL, last_error=NULL
+                       WHERE status='auth_blocked'"""
+                )
+                resumed = int(cursor.rowcount)
+                self._conn.execute(
+                    "DELETE FROM queue_meta WHERE key='blocked_auth_fingerprint'"
+                )
+            self._set_meta_value_locked("current_auth_fingerprint", fingerprint)
+            self._conn.commit()
+        if resumed:
+            self._signal_change()
+        return resumed
 
     def _remove_orphaned_spool_files(self) -> None:
         with self._lock:
@@ -700,7 +925,7 @@ class SyncQueue:
             row = self._conn.execute(
                 """SELECT 1 FROM queue
                    WHERE tool_name=? AND relative_path=?
-                     AND status IN ('pending','uploading')
+                     AND status IN ('pending','uploading','auth_blocked')
                      AND sync_strategy='delta'
                    LIMIT 1""",
                 (tool_name, relative_path),
@@ -726,6 +951,7 @@ class SyncQueue:
         source_path: str | None = None,
         source_size: int | None = None,
         source_mtime_ns: int | None = None,
+        prepared_payload: PreparedPayload | None = None,
     ) -> int:
         del file_size  # payload byte size is measured after sanitization below
         is_complete_snapshot = sync_strategy in {"full", "delta"} and not is_partial
@@ -743,7 +969,10 @@ class SyncQueue:
                     row = self._conn.execute(
                         """SELECT id FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status IN ('pending','uploading')
+                             AND status IN (
+                                 'pending','uploading','auth_blocked',
+                                 'repair_required','quarantined'
+                             )
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
                     ).fetchone()
@@ -754,9 +983,16 @@ class SyncQueue:
                         source_mtime_ns,
                     )
                     self._conn.commit()
+                    if prepared_payload is not None:
+                        self.discard_prepared_payload(prepared_payload)
                     return int(row[0]) if row else 0
 
-        inline_content, payload_path, payload_bytes = self._store_payload(content)
+        if prepared_payload is None:
+            inline_content, payload_path, payload_bytes = self._store_payload(content)
+        else:
+            inline_content = prepared_payload.content
+            payload_path = prepared_payload.payload_path
+            payload_bytes = prepared_payload.payload_bytes
         old_payload_path: str | None = None
         superseded_payload_paths: list[str] = []
         now = time.time()
@@ -776,7 +1012,10 @@ class SyncQueue:
                     row = self._conn.execute(
                         """SELECT id FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status IN ('pending','uploading')
+                             AND status IN (
+                                 'pending','uploading','auth_blocked',
+                                 'repair_required','quarantined'
+                             )
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
                     ).fetchone()
@@ -790,12 +1029,22 @@ class SyncQueue:
                     self._discard_payload(payload_path)
                     return int(row[0]) if row else 0
 
+                auth_blocked = self._auth_gate_active_locked()
+                target_status = "auth_blocked" if auth_blocked else "pending"
+                auth_fingerprint = (
+                    self._meta_value_locked("current_auth_fingerprint")
+                    if auth_blocked
+                    else None
+                )
                 existing = None
                 if is_complete_snapshot:
                     existing = self._conn.execute(
                         """SELECT id, payload_path FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status='pending' AND is_partial=0
+                             AND status IN (
+                                 'pending','auth_blocked',
+                                 'repair_required','quarantined'
+                             ) AND is_partial=0
                              AND sync_strategy IN ('full','delta')
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path),
@@ -804,7 +1053,10 @@ class SyncQueue:
                     existing = self._conn.execute(
                         """SELECT id, payload_path FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status='pending' AND sync_strategy='delta'
+                             AND status IN (
+                                 'pending','auth_blocked',
+                                 'repair_required','quarantined'
+                             ) AND sync_strategy='delta'
                              AND is_partial=1 AND base_hash=? AND base_offset=?
                            ORDER BY id DESC LIMIT 1""",
                         (tool_name, relative_path, base_hash, int(base_offset)),
@@ -818,10 +1070,22 @@ class SyncQueue:
                            content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
                            offset=?, metadata=?, source_modified_at=?, retry_count=0,
                            base_hash=?, base_offset=?, source_path=?,
-                           status='pending', payload_path=?, payload_bytes=?,
+                           status=?, payload_path=?, payload_bytes=?,
                            lease_token=NULL, lease_until=NULL, available_at=0,
-                           last_attempt_at=NULL, last_error=NULL
-                           WHERE id=? AND status='pending'""",
+                           last_attempt_at=NULL,
+                           last_error=CASE WHEN ?='pending' THEN NULL
+                                           ELSE 'credentials rejected by server' END,
+                           outcome_state=CASE WHEN ?='pending' THEN NULL
+                                              ELSE 'authentication_blocked' END,
+                           diagnostic_code=CASE WHEN ?='pending' THEN NULL
+                                                ELSE 'authentication_rejected' END,
+                           http_status=CASE WHEN ?='pending' THEN NULL ELSE http_status END,
+                           terminal_at=CASE WHEN ?='pending' THEN NULL ELSE ? END,
+                           blocked_config_fingerprint=?
+                           WHERE id=? AND status IN (
+                               'pending','auth_blocked',
+                               'repair_required','quarantined'
+                           )""",
                         (
                             category,
                             content_type,
@@ -836,8 +1100,16 @@ class SyncQueue:
                             base_hash,
                             int(base_offset),
                             source_path,
+                            target_status,
                             payload_path,
                             payload_bytes,
+                            target_status,
+                            target_status,
+                            target_status,
+                            target_status,
+                            target_status,
+                            now,
+                            auth_fingerprint,
                             item_id,
                         ),
                     )
@@ -848,8 +1120,9 @@ class SyncQueue:
                            content_hash, file_size, sync_strategy, is_partial, offset,
                            metadata, created_at, source_modified_at, payload_path,
                            payload_bytes, available_at, base_hash, base_offset,
-                           source_path
-                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)""",
+                           source_path, status, outcome_state, diagnostic_code,
+                           terminal_at, blocked_config_fingerprint, last_error
+                           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
                         (
                             tool_name,
                             category,
@@ -869,6 +1142,20 @@ class SyncQueue:
                             base_hash,
                             int(base_offset),
                             source_path,
+                            target_status,
+                            (
+                                UploadOutcomeState.AUTHENTICATION_BLOCKED.value
+                                if auth_blocked
+                                else None
+                            ),
+                            "authentication_rejected" if auth_blocked else None,
+                            now if auth_blocked else None,
+                            auth_fingerprint,
+                            (
+                                "credentials rejected by server"
+                                if auth_blocked
+                                else None
+                            ),
                         ),
                     )
                     item_id = int(cursor.lastrowid)
@@ -876,7 +1163,11 @@ class SyncQueue:
                 if is_complete_snapshot:
                     superseded = self._conn.execute(
                         """SELECT id, payload_path FROM queue
-                           WHERE tool_name=? AND relative_path=? AND status='pending'
+                           WHERE tool_name=? AND relative_path=?
+                             AND status IN (
+                                 'pending','auth_blocked',
+                                 'repair_required','quarantined'
+                             )
                              AND sync_strategy IN ('full','delta') AND id<>?""",
                         (tool_name, relative_path, item_id),
                     ).fetchall()
@@ -886,7 +1177,11 @@ class SyncQueue:
                     self._conn.execute(
                         """UPDATE queue SET status='superseded', payload_path=NULL,
                                   content='', lease_token=NULL, lease_until=NULL
-                           WHERE tool_name=? AND relative_path=? AND status='pending'
+                           WHERE tool_name=? AND relative_path=?
+                             AND status IN (
+                                 'pending','auth_blocked',
+                                 'repair_required','quarantined'
+                             )
                              AND sync_strategy IN ('full','delta') AND id<>?""",
                         (tool_name, relative_path, item_id),
                     )
@@ -1212,7 +1507,10 @@ class SyncQueue:
             payload_path = row[4]
             self._conn.execute(
                 """UPDATE queue SET status='synced', lease_token=NULL,
-                          lease_until=NULL, payload_path=NULL, content=''
+                          lease_until=NULL, payload_path=NULL, content='',
+                          outcome_state='success', diagnostic_code=NULL,
+                          http_status=NULL, terminal_at=NULL, last_error=NULL,
+                          blocked_config_fingerprint=NULL
                    WHERE id=? AND status='uploading' AND lease_token=?""",
                 (item.id, item.lease_token),
             )
@@ -1267,12 +1565,30 @@ class SyncQueue:
         self._signal_change()
         return True
 
-    @_rollback_on_error
     def mark_failed(self, item: QueueItem, error: str | None = None) -> bool:
-        """Release a failed lease with backoff, or supersede an obsolete FULL."""
+        """Compatibility wrapper for an explicitly transient failure."""
+
+        return self.mark_upload_outcome(
+            item,
+            UploadOutcome.transient(error or "upload failed"),
+        )
+
+    @_rollback_on_error
+    def mark_upload_outcome(
+        self,
+        item: QueueItem,
+        outcome: UploadOutcome,
+        *,
+        auth_fingerprint: str | None = None,
+    ) -> bool:
+        """Persist a typed failure without retrying terminal dispositions."""
+
+        if outcome.state is UploadOutcomeState.SUCCESS:
+            return self.mark_synced(item)
         if not item.lease_token:
             return False
         payload_path: str | None = None
+        now = time.time()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             row = self._conn.execute(
@@ -1304,19 +1620,44 @@ class SyncQueue:
                 status = "superseded"
                 available_at = 0.0
                 payload_path = row[5]
-            else:
+            elif outcome.state is UploadOutcomeState.TRANSIENT_RETRY:
                 status = "pending"
-                available_at = time.time() + min(2 ** min(next_retry, 8), 300)
+                available_at = now + min(2 ** min(next_retry, 8), 300)
+            elif outcome.state is UploadOutcomeState.AUTHENTICATION_BLOCKED:
+                status = "auth_blocked"
+                available_at = 0.0
+            elif outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED:
+                status = "repair_required"
+                available_at = 0.0
+            else:
+                status = "quarantined"
+                available_at = 0.0
 
             self._conn.execute(
                 """UPDATE queue SET retry_count=?, status=?, lease_token=NULL,
-                          lease_until=NULL, available_at=?, last_error=?
+                          lease_until=NULL, available_at=?, last_error=?,
+                          outcome_state=?, diagnostic_code=?, http_status=?,
+                          terminal_at=?, blocked_config_fingerprint=?
                    WHERE id=? AND status='uploading' AND lease_token=?""",
                 (
                     next_retry,
                     status,
                     available_at,
-                    (error or "")[:1000],
+                    outcome.diagnostic[:1000],
+                    outcome.state.value,
+                    outcome.diagnostic_code[:128],
+                    outcome.http_status,
+                    (
+                        None
+                        if outcome.state is UploadOutcomeState.TRANSIENT_RETRY
+                        else now
+                    ),
+                    (
+                        auth_fingerprint
+                        if outcome.state
+                        is UploadOutcomeState.AUTHENTICATION_BLOCKED
+                        else None
+                    ),
                     item.id,
                     item.lease_token,
                 ),
@@ -1326,6 +1667,77 @@ class SyncQueue:
                     "UPDATE queue SET payload_path=NULL, content='' WHERE id=?",
                     (item.id,),
                 )
+            if (
+                auth_fingerprint
+                and outcome.state is UploadOutcomeState.AUTHENTICATION_BLOCKED
+            ):
+                self._set_meta_value_locked(
+                    "current_auth_fingerprint",
+                    auth_fingerprint,
+                )
+                self._set_meta_value_locked(
+                    "blocked_auth_fingerprint",
+                    auth_fingerprint,
+                )
+                self._conn.execute(
+                    """UPDATE queue
+                       SET status='auth_blocked', available_at=0,
+                           outcome_state='authentication_blocked',
+                           diagnostic_code='authentication_rejected',
+                           http_status=?, terminal_at=?,
+                           blocked_config_fingerprint=?, last_error=?
+                       WHERE status='pending'""",
+                    (
+                        outcome.http_status,
+                        now,
+                        auth_fingerprint,
+                        outcome.diagnostic[:1000],
+                    ),
+                )
+            self._conn.commit()
+        self._discard_payload(payload_path)
+        self._signal_change()
+        return True
+
+    @_rollback_on_error
+    def mark_repair_scheduled(
+        self,
+        item: QueueItem,
+        outcome: UploadOutcome,
+    ) -> bool:
+        """Retire a revision that an automatic bounded repair will replace."""
+
+        if not item.lease_token:
+            return False
+        payload_path: str | None = None
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                """SELECT payload_path FROM queue
+                   WHERE id=? AND status='uploading' AND lease_token=?""",
+                (item.id, item.lease_token),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return False
+            payload_path = row[0]
+            self._conn.execute(
+                """UPDATE queue
+                   SET status='superseded', payload_path=NULL, content='',
+                       lease_token=NULL, lease_until=NULL, available_at=0,
+                       outcome_state=?, diagnostic_code=?, http_status=?,
+                       terminal_at=?, last_error=?
+                   WHERE id=? AND status='uploading' AND lease_token=?""",
+                (
+                    outcome.state.value,
+                    outcome.diagnostic_code[:128],
+                    outcome.http_status,
+                    time.time(),
+                    outcome.diagnostic[:1000],
+                    item.id,
+                    item.lease_token,
+                ),
+            )
             self._conn.commit()
         self._discard_payload(payload_path)
         self._signal_change()
@@ -1370,17 +1782,23 @@ class SyncQueue:
             self._conn.execute(
                 """UPDATE queue SET status='superseded', payload_path=NULL,
                           content='', lease_token=NULL, lease_until=NULL,
-                          last_error='delta base mismatch'
+                          last_error='delta base mismatch',
+                          outcome_state='source_repair_required',
+                          diagnostic_code='delta_base_mismatch',
+                          terminal_at=?
                    WHERE id=? AND status='uploading' AND lease_token=?""",
-                (item.id, item.lease_token),
+                (time.time(), item.id, item.lease_token),
             )
             self._conn.execute(
                 """UPDATE queue SET status='superseded', payload_path=NULL,
                           content='', lease_token=NULL, lease_until=NULL,
-                          last_error='delta base mismatch'
+                          last_error='delta base mismatch',
+                          outcome_state='source_repair_required',
+                          diagnostic_code='delta_base_mismatch',
+                          terminal_at=?
                    WHERE tool_name=? AND relative_path=? AND status='pending'
                      AND sync_strategy='delta' AND is_partial=1""",
-                (row[0], row[1]),
+                (time.time(), row[0], row[1]),
             )
             if expected_hash:
                 now = time.time()
@@ -1464,6 +1882,35 @@ class SyncQueue:
         )
 
     @_rollback_on_error
+    def record_unchanged_source(
+        self,
+        tool_name: str,
+        relative_path: str,
+        content_hash: str,
+        *,
+        source_size: int,
+        source_mtime_ns: int,
+    ) -> bool:
+        """Advance only the cheap observation token for identical content."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE file_state
+                   SET source_size=?, source_mtime_ns=?
+                   WHERE tool_name=? AND relative_path=?
+                     AND COALESCE(observed_hash, last_hash)=?""",
+                (
+                    max(0, int(source_size)),
+                    max(0, int(source_mtime_ns)),
+                    tool_name,
+                    relative_path,
+                    content_hash,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    @_rollback_on_error
     def update_file_state(
         self, tool_name: str, relative_path: str, content_hash: str, offset: int
     ) -> None:
@@ -1520,6 +1967,85 @@ class SyncQueue:
                     "SELECT COUNT(*) FROM queue WHERE status IN ('pending','uploading')"
                 ).fetchone()[0]
             )
+
+    def health_status(self, diagnostic_limit: int = 10) -> dict[str, Any]:
+        """Return queue counts and safe terminal diagnostics for CLI health."""
+
+        terminal_statuses = ("auth_blocked", "repair_required", "quarantined")
+        with self._lock:
+            counts = {
+                str(status): int(count)
+                for status, count in self._conn.execute(
+                    """SELECT status, COUNT(*) FROM queue
+                       GROUP BY status ORDER BY status"""
+                ).fetchall()
+            }
+            rows = self._conn.execute(
+                """SELECT id, tool_name, relative_path, status, outcome_state,
+                          diagnostic_code, http_status, last_error, terminal_at
+                   FROM queue
+                   WHERE status IN (?,?,?)
+                   ORDER BY COALESCE(terminal_at, created_at) DESC, id DESC
+                   LIMIT ?""",
+                (*terminal_statuses, max(0, int(diagnostic_limit))),
+            ).fetchall()
+        return {
+            "counts": counts,
+            "actionable": counts.get("pending", 0) + counts.get("uploading", 0),
+            "terminal": sum(counts.get(status, 0) for status in terminal_statuses),
+            "diagnostics": [
+                {
+                    "id": int(row[0]),
+                    "tool": str(row[1]),
+                    "relative_path": str(row[2]),
+                    "status": str(row[3]),
+                    "outcome": str(row[4] or ""),
+                    "code": str(row[5] or ""),
+                    "http_status": (
+                        int(row[6]) if row[6] is not None else None
+                    ),
+                    "diagnostic": str(row[7] or ""),
+                    "terminal_at": (
+                        float(row[8]) if row[8] is not None else None
+                    ),
+                }
+                for row in rows
+            ],
+        }
+
+    @_rollback_on_error
+    def requeue_terminal(self, item_id: int) -> bool:
+        """Explicitly retry one inspected terminal row if its payload is intact."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT payload_path FROM queue
+                   WHERE id=? AND status IN (
+                       'auth_blocked','repair_required','quarantined'
+                   )""",
+                (int(item_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            if row[0] and not Path(str(row[0])).is_file():
+                return False
+            cursor = self._conn.execute(
+                """UPDATE queue
+                   SET status='pending', retry_count=0, available_at=0,
+                       lease_token=NULL, lease_until=NULL, last_attempt_at=NULL,
+                       last_error=NULL, outcome_state=NULL, diagnostic_code=NULL,
+                       http_status=NULL, terminal_at=NULL,
+                       blocked_config_fingerprint=NULL
+                   WHERE id=? AND status IN (
+                       'auth_blocked','repair_required','quarantined'
+                   )""",
+                (int(item_id),),
+            )
+            self._conn.commit()
+            changed = cursor.rowcount == 1
+        if changed:
+            self._signal_change()
+        return changed
 
     def outstanding_bytes(self) -> int:
         with self._lock:

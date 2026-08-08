@@ -144,6 +144,34 @@ def sanitize_jsonl(
     )
 
 
+def sanitize_jsonl_line(
+    line: str,
+    extra_sensitive_keys: frozenset[str] | None = None,
+) -> SanitizeResult:
+    """Sanitize one logical JSONL record without buffering sibling records."""
+
+    if not line.strip():
+        return SanitizeResult("", 0, False)
+    sensitive_keys = DEFAULT_SENSITIVE_KEYS
+    if extra_sensitive_keys:
+        sensitive_keys = sensitive_keys | extra_sensitive_keys
+
+    count = 0
+    try:
+        data = json.loads(line)
+        data, count = _strip_keys(data, sensitive_keys)
+        line = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    result = sanitize_text(line)
+    total = count + result.redaction_count
+    return SanitizeResult(
+        content=result.content,
+        redaction_count=total,
+        has_sensitive_content=total > 0,
+    )
+
+
 def _strip_keys(obj: object, keys: frozenset[str]) -> tuple[object, int]:
     """Recursively strip sensitive keys from a JSON-like object."""
     count = 0

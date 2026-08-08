@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from collector.queue import QueueItem  # noqa: E402
+from collector.outcomes import (  # noqa: E402
+    SourceRepairAction,
+    UploadOutcome,
+    UploadOutcomeState,
+)
 from collector.sync_client import (  # noqa: E402
     CHUNK_RETRY_BASE_SECONDS,
     CHUNK_UPLOAD_MAX_ATTEMPTS,
@@ -23,6 +28,7 @@ from collector.sync_client import (  # noqa: E402
     MAX_CHUNKED_UPLOAD_BYTES,
     DeltaBaseConflict,
     SyncClient,
+    _classify_http_response,
 )
 
 
@@ -413,14 +419,20 @@ class SyncClientStreamingTests(unittest.TestCase):
         size = MAX_CHUNKED_UPLOAD_BYTES + 1
         queue = _FakeQueue(size)
         client = self._client(queue, _ScriptedHttpClient([]))
-        requested: list[str] = []
-        client._full_resync_callback = requested.append
+        client._full_resync_callback = lambda _path: None
         item = self._item(size)
         item.sync_strategy = "delta"
         item.source_path = "/tmp/thread.jsonl"
 
-        self.assertFalse(client._upload(item))
-        self.assertEqual(requested, [item.source_path])
+        outcome = client._upload(item)
+        self.assertEqual(
+            outcome.state,
+            UploadOutcomeState.SOURCE_REPAIR_REQUIRED,
+        )
+        self.assertEqual(
+            outcome.repair_action,
+            SourceRepairAction.REBUILD_BOUNDED_DELTA,
+        )
         self.assertEqual(queue.stream.largest_read, 0)
 
     def test_chunked_upload_reads_only_one_chunk_at_a_time(self) -> None:
@@ -541,7 +553,14 @@ class SyncClientStreamingTests(unittest.TestCase):
         item.base_offset = 100
         item.source_path = "/tmp/thread.jsonl"
 
-        self.assertTrue(client._upload(item))
+        outcome = client._upload(item)
+        self.assertEqual(
+            outcome.repair_action,
+            SourceRepairAction.DELTA_BASE_CONFLICT,
+        )
+        completed: Future[UploadOutcome] = Future()
+        completed.set_result(outcome)
+        client._reap_completed({completed: item})
         self.assertEqual(captured[0]["base_hash"], "base-hash")
         self.assertEqual(queue.delta_conflicts, [item])
         self.assertEqual(requested, ["/tmp/thread.jsonl"])
@@ -591,7 +610,10 @@ class SyncClientStreamingTests(unittest.TestCase):
         item.base_offset = 100
         item.source_path = "/tmp/thread.jsonl"
 
-        self.assertTrue(client._upload(item))
+        outcome = client._upload(item)
+        completed: Future[UploadOutcome] = Future()
+        completed.set_result(outcome)
+        client._reap_completed({completed: item})
         self.assertEqual(
             queue.delta_conflict_bases,
             [("d2:" + ("a" * 61), 150)],
@@ -745,6 +767,128 @@ class SyncClientStreamingTests(unittest.TestCase):
         }
 
         self.assertFalse(client._upload(item))
+
+    def test_every_upload_endpoint_uses_the_same_typed_status_policy(self) -> None:
+        endpoints = (
+            "/api/ingest/metadata",
+            "/api/ingest/file",
+            "/api/ingest/file/upload",
+            "/api/ingest/file/chunk",
+            "/api/ingest/file/chunk/status",
+        )
+        cases = {
+            UploadOutcomeState.SUCCESS: (200, 201, 202, 204),
+            UploadOutcomeState.TRANSIENT_RETRY: (
+                408,
+                425,
+                429,
+                500,
+                502,
+                503,
+                504,
+            ),
+            UploadOutcomeState.AUTHENTICATION_BLOCKED: (401, 403),
+            UploadOutcomeState.SOURCE_REPAIR_REQUIRED: (400, 413, 422),
+            UploadOutcomeState.PERMANENT_QUARANTINE: (
+                301,
+                404,
+                409,
+                410,
+                418,
+                501,
+                505,
+            ),
+        }
+        for endpoint in endpoints:
+            for expected, statuses in cases.items():
+                for status in statuses:
+                    with self.subTest(
+                        endpoint=endpoint,
+                        status=status,
+                        expected=expected.value,
+                    ):
+                        outcome = _classify_http_response(
+                            _Response(status),
+                            endpoint=endpoint,
+                        )
+                        self.assertEqual(outcome.state, expected)
+                        if status >= 300:
+                            self.assertEqual(outcome.http_status, status)
+
+        metadata_404 = _classify_http_response(
+            _Response(404),
+            endpoint="/api/ingest/metadata",
+            retry_not_found=True,
+        )
+        self.assertEqual(
+            metadata_404.state,
+            UploadOutcomeState.TRANSIENT_RETRY,
+        )
+
+    def test_chunk_authentication_failure_is_not_retried(self) -> None:
+        total_size = CHUNK_SIZE + 1
+        queue = _FakeQueue(total_size)
+        http_client = _ScriptedHttpClient([_Response(401)])
+        client = self._client(queue, http_client)
+        delays: list[float] = []
+        client._sleep_interruptibly = delays.append
+
+        outcome = client._upload_chunked(self._payload(), self._item(total_size))
+
+        self.assertEqual(
+            outcome.state,
+            UploadOutcomeState.AUTHENTICATION_BLOCKED,
+        )
+        self.assertEqual(len(http_client.calls), 1)
+        self.assertEqual(delays, [])
+
+    def test_invalid_local_metadata_requires_source_repair(self) -> None:
+        size = CHUNK_SIZE
+        queue = _FakeQueue(size)
+        client = self._client(queue, _ScriptedHttpClient([]))
+        item = self._item(size)
+        item.metadata = {"invalid": object()}
+
+        outcome = client._upload(item)
+
+        self.assertEqual(
+            outcome.state,
+            UploadOutcomeState.SOURCE_REPAIR_REQUIRED,
+        )
+        self.assertEqual(outcome.diagnostic_code, "invalid_metadata")
+
+    def test_terminal_chunk_commit_states_are_typed(self) -> None:
+        total_size = CHUNK_SIZE + 1
+        cases = (
+            (
+                {"status": "failed", "error_type": "ValueError"},
+                UploadOutcomeState.PERMANENT_QUARANTINE,
+                "commit_failed",
+            ),
+            (
+                {"status": "blocked"},
+                UploadOutcomeState.PERMANENT_QUARANTINE,
+                "commit_blocked",
+            ),
+            (
+                {"status": "missing"},
+                UploadOutcomeState.SOURCE_REPAIR_REQUIRED,
+                "commit_missing",
+            ),
+        )
+        for status_payload, expected_state, expected_code in cases:
+            with self.subTest(status=status_payload["status"]):
+                queue = _FakeQueue(total_size)
+                client = self._client(
+                    queue,
+                    _CommitHttpClient([status_payload]),
+                )
+                outcome = client._upload_chunked(
+                    self._payload(),
+                    self._item(total_size),
+                )
+                self.assertEqual(outcome.state, expected_state)
+                self.assertEqual(outcome.diagnostic_code, expected_code)
 
 
 if __name__ == "__main__":

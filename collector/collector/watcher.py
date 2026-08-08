@@ -27,7 +27,12 @@ from .parsers.markdown import MarkdownParser
 from .parsers.sqlite_parser import SqliteParser
 from .parsers.toml_parser import TomlParser
 from .queue import SyncQueue
-from .sanitizer import sanitize_json, sanitize_jsonl, sanitize_text
+from .sanitizer import (
+    sanitize_json,
+    sanitize_jsonl,
+    sanitize_jsonl_line,
+    sanitize_text,
+)
 from .tools.base import BaseTool, ContentType, SyncStrategy
 
 logger = logging.getLogger("collector.watcher")
@@ -49,12 +54,21 @@ _FAST_HASH_READ = 256 * 1024  # Read first 256KB for fast hashing
 
 
 def _file_hash_revision(path: Path, *, size: int, mtime_ns: int) -> str:
-    """Hash one observed source revision without restatting a growing file."""
+    """Hash exact source bytes; size/mtime are observation tokens, not identity."""
+
+    del mtime_ns
     try:
         h = hashlib.sha256()
-        h.update(f"{size}:{mtime_ns}".encode())
-        with open(path, "rb") as f:
-            h.update(f.read(min(_FAST_HASH_READ, size)))
+        remaining = max(0, int(size))
+        with open(path, "rb") as stream:
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        if remaining:
+            return ""
         return h.hexdigest()
     except OSError:
         return ""
@@ -79,11 +93,7 @@ def _delta_hash_revision(path: Path, *, size: int) -> str:
 
 
 def _file_hash(path: Path) -> str:
-    """Fast file change detection: size + mtime + hash of first 256KB.
-
-    Full SHA-256 is too slow for frequent file changes on large JSONL files.
-    The first 256KB + file size + mtime catches virtually all real changes.
-    """
+    """Compatibility helper returning exact source-byte identity."""
     try:
         stat = path.stat()
         return _file_hash_revision(
@@ -598,31 +608,19 @@ class FileWatcher:
                 # rereading the first 256 KiB and reparsing the full payload.
                 return
 
-        # Check if file content actually changed
-        current_hash = (
-            _delta_hash_revision(path, size=file_size)
-            if classification.sync_strategy == SyncStrategy.DELTA
-            else _file_hash_revision(
-                path,
-                size=file_size,
-                mtime_ns=source_stat.st_mtime_ns,
-            )
-        )
-        if not current_hash:
-            return
+        # DELTA revisions deliberately retain the deterministic append-prefix
+        # token introduced by d0d50a6. FULL identity is computed later from
+        # the exact sanitized bytes while they are already being spooled.
+        current_hash = ""
+        if classification.sync_strategy == SyncStrategy.DELTA:
+            current_hash = _delta_hash_revision(path, size=file_size)
+            if not current_hash:
+                return
 
         last_hash, _ = self._queue.get_file_state(
             classification.tool_name,
             classification.relative_path,
         )
-
-        # For FULL sync, skip if hash unchanged
-        if (
-            not force_full
-            and classification.sync_strategy == SyncStrategy.FULL
-            and current_hash == last_hash
-        ):
-            return
 
         # Determine the byte-bounded capture window for delta sync.
         read_offset = 0
@@ -671,7 +669,12 @@ class FileWatcher:
                     path,
                 )
 
-        # Parse (with error protection)
+        # Parse and sanitize (with error protection). Production JSONL parsing
+        # writes directly into the queue's thresholded spool writer, which
+        # computes canonical identity without a second source read or a
+        # payload-sized Python string.
+        prepared_payload = None
+        payload_writer = None
         try:
             parser = self._get_parser(classification.content_type)
             append_only_snapshot = (
@@ -685,12 +688,31 @@ class FileWatcher:
                 and isinstance(parser, JsonlParser)
                 and read_end_offset < file_size
             )
-            if parser is None:
+            can_stream_jsonl = (
+                type(parser) is JsonlParser
+                and callable(getattr(self._queue, "payload_writer", None))
+            )
+            if can_stream_jsonl:
+                payload_writer = self._queue.payload_writer()
+                result = parser.parse_to_writer(
+                    path,
+                    payload_writer.write,
+                    offset=0 if append_only_snapshot else read_offset,
+                    end_offset=read_end_offset,
+                    transform_line=lambda line: sanitize_jsonl_line(line).content,
+                )
+                prepared_payload = payload_writer.finish()
+                parsed_content = ""
+                payload_has_content = prepared_payload.has_non_whitespace
+                payload_bytes = prepared_payload.payload_bytes
+            elif parser is None:
                 try:
                     content = path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     return
                 parsed_content = content
+                payload_has_content = bool(parsed_content.strip())
+                payload_bytes = len(parsed_content.encode("utf-8"))
                 new_offset = path.stat().st_size
                 is_partial = read_offset > 0
             else:
@@ -709,46 +731,53 @@ class FileWatcher:
                 else:
                     result = parser.parse(path, offset=read_offset)
                 parsed_content = result.content
+                payload_has_content = bool(parsed_content.strip())
+                payload_bytes = len(parsed_content.encode("utf-8"))
+            if parser is not None:
                 new_offset = result.offset if result.offset else path.stat().st_size
                 is_partial = result.is_partial
                 classification.metadata.update(result.metadata)
                 if result.title:
                     classification.metadata["title"] = result.title
         except Exception:
+            if payload_writer is not None:
+                payload_writer.abort()
+            if prepared_payload is not None:
+                self._queue.discard_prepared_payload(prepared_payload)
             logger.debug("Parse error for %s, skipping", path)
             return
 
         if append_only_snapshot or read_end_offset < file_size:
-            current_hash = (
-                _delta_hash_revision(path, size=new_offset)
-                if classification.sync_strategy == SyncStrategy.DELTA
-                else _file_hash_revision(
-                    path,
-                    size=new_offset,
-                    mtime_ns=source_stat.st_mtime_ns,
-                )
-            )
+            current_hash = _delta_hash_revision(path, size=new_offset)
             if not current_hash:
+                if prepared_payload is not None:
+                    self._queue.discard_prepared_payload(prepared_payload)
                 return
 
-        if not parsed_content.strip():
+        if not payload_has_content:
+            if prepared_payload is not None:
+                self._queue.discard_prepared_payload(prepared_payload)
             return
 
-        # Sanitize before enqueue (defense-in-depth vs local SQLite leak)
-        if classification.content_type == ContentType.JSONL:
-            san = sanitize_jsonl(parsed_content)
-        elif classification.content_type == ContentType.JSON:
-            san = sanitize_json(parsed_content)
-        else:
-            san = sanitize_text(parsed_content)
-        parsed_content = san.content
+        if prepared_payload is None:
+            # Sanitize before enqueue (defense-in-depth vs local SQLite leak).
+            if classification.content_type == ContentType.JSONL:
+                san = sanitize_jsonl(parsed_content)
+            elif classification.content_type == ContentType.JSON:
+                san = sanitize_json(parsed_content)
+            else:
+                san = sanitize_text(parsed_content)
+            parsed_content = san.content
+            payload_has_content = bool(parsed_content.strip())
+            payload_bytes = len(parsed_content.encode("utf-8"))
+            if not payload_has_content:
+                return
         if classification.sync_strategy == SyncStrategy.FULL:
-            # Filesystem mtimes are observation tokens, not document identity.
-            # Hash the sanitized payload so a touch cannot create a duplicate
-            # canonical upload after the one necessary verification read.
-            current_hash = hashlib.sha256(
-                parsed_content.encode("utf-8")
-            ).hexdigest()
+            current_hash = (
+                prepared_payload.content_hash
+                if prepared_payload is not None
+                else hashlib.sha256(parsed_content.encode("utf-8")).hexdigest()
+            )
 
         # Hash, parse, and timestamp must describe one stable source revision.
         # A concurrent append generates another watcher event; returning here
@@ -758,6 +787,8 @@ class FileWatcher:
         try:
             final_stat = path.stat()
         except OSError:
+            if prepared_payload is not None:
+                self._queue.discard_prepared_payload(prepared_payload)
             return
         if append_only_snapshot or bounded_append_window:
             same_file = (
@@ -775,11 +806,37 @@ class FileWatcher:
                 or not (same_revision or appended_after_capture)
             ):
                 logger.debug("Source was replaced while processing %s; deferring", path)
+                if prepared_payload is not None:
+                    self._queue.discard_prepared_payload(prepared_payload)
                 return
         elif (final_stat.st_size, final_stat.st_mtime_ns) != source_revision:
             logger.debug("Source changed while processing %s; deferring", path)
+            if prepared_payload is not None:
+                self._queue.discard_prepared_payload(prepared_payload)
             return
         source_modified_at = source_stat.st_mtime
+
+        if (
+            not force_full
+            and classification.sync_strategy == SyncStrategy.FULL
+            and current_hash == last_hash
+        ):
+            record_unchanged = getattr(
+                self._queue,
+                "record_unchanged_source",
+                None,
+            )
+            if callable(record_unchanged):
+                record_unchanged(
+                    classification.tool_name,
+                    classification.relative_path,
+                    current_hash,
+                    source_size=new_offset,
+                    source_mtime_ns=source_stat.st_mtime_ns,
+                )
+            if prepared_payload is not None:
+                self._queue.discard_prepared_payload(prepared_payload)
+            return
 
         queue_metadata = dict(classification.metadata)
         if force_full:
@@ -797,7 +854,7 @@ class FileWatcher:
             relative_path=classification.relative_path,
             content=parsed_content,
             content_hash=current_hash,
-            file_size=len(parsed_content),
+            file_size=payload_bytes,
             sync_strategy=classification.sync_strategy.value,
             is_partial=is_partial,
             offset=new_offset,
@@ -808,6 +865,7 @@ class FileWatcher:
             source_path=str(path),
             source_size=new_offset,
             source_mtime_ns=source_stat.st_mtime_ns,
+            prepared_payload=prepared_payload,
         )
 
         logger.info(

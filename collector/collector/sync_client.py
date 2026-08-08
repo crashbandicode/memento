@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -12,6 +13,7 @@ from typing import BinaryIO, Callable
 import httpx
 
 from .config import CollectorConfig
+from .outcomes import SourceRepairAction, UploadOutcome, UploadOutcomeState
 from .queue import QueueItem, SyncQueue
 
 logger = logging.getLogger("collector.sync")
@@ -23,6 +25,8 @@ CHUNK_RETRY_BASE_SECONDS = 0.5
 CHUNK_RETRY_MAX_SECONDS = 4.0
 CHUNK_COMMIT_POLL_SECONDS = 2.0
 CHUNK_COMMIT_TIMEOUT_SECONDS = 30 * 60
+TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+SOURCE_REPAIR_HTTP_STATUSES = frozenset({400, 413, 422})
 
 
 class DeltaBaseConflict(RuntimeError):
@@ -39,6 +43,54 @@ class DeltaBaseConflict(RuntimeError):
         self.relative_path = relative_path
         self.expected_hash = expected_hash
         self.expected_offset = max(0, int(expected_offset or 0))
+
+
+def _response_diagnostic(response, endpoint: str) -> str:
+    text = str(getattr(response, "text", "") or "").strip()
+    detail = f": {text[:500]}" if text else ""
+    return f"{endpoint} returned HTTP {int(response.status_code)}{detail}"
+
+
+def _classify_http_response(
+    response,
+    *,
+    endpoint: str,
+    retry_not_found: bool = False,
+) -> UploadOutcome:
+    """Map an endpoint response to one exhaustive durable disposition."""
+
+    status = int(response.status_code)
+    diagnostic = _response_diagnostic(response, endpoint)
+    if 200 <= status < 300:
+        return UploadOutcome.success(diagnostic)
+    if status in (401, 403):
+        return UploadOutcome.authentication_blocked(
+            diagnostic,
+            http_status=status,
+        )
+    if status == 404 and retry_not_found:
+        return UploadOutcome.transient(
+            diagnostic,
+            diagnostic_code="dependency_not_ready",
+            http_status=status,
+        )
+    if status in TRANSIENT_HTTP_STATUSES:
+        return UploadOutcome.transient(
+            diagnostic,
+            diagnostic_code=f"http_{status}",
+            http_status=status,
+        )
+    if status in SOURCE_REPAIR_HTTP_STATUSES:
+        return UploadOutcome.source_repair(
+            diagnostic,
+            diagnostic_code=f"http_{status}",
+            http_status=status,
+        )
+    return UploadOutcome.quarantine(
+        diagnostic,
+        diagnostic_code=f"http_{status}",
+        http_status=status,
+    )
 
 
 class SyncClient:
@@ -62,6 +114,25 @@ class SyncClient:
         self._full_resync_callback = full_resync_callback
         self._delta_catchup_callback = delta_catchup_callback
         self._upload_synced_callback = upload_synced_callback
+        auth_identity = json.dumps(
+            {
+                "server_url": config.server.url.rstrip("/"),
+                "server_token": config.server.token,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._auth_fingerprint = hashlib.sha256(
+            auth_identity.encode("utf-8")
+        ).hexdigest()
+        configure_auth = getattr(queue, "configure_auth", None)
+        if callable(configure_auth):
+            resumed = configure_auth(self._auth_fingerprint)
+            if resumed:
+                logger.info(
+                    "Credentials changed; resumed %d authentication-blocked upload(s)",
+                    resumed,
+                )
         try:
             from importlib.metadata import version
 
@@ -137,7 +208,7 @@ class SyncClient:
             time.sleep(min(remaining, 0.2))
 
     def _run(self) -> None:
-        futures: dict[Future[bool], QueueItem] = {}
+        futures: dict[Future[UploadOutcome | bool], QueueItem] = {}
         poll_interval = max(0.05, self._config.sync_interval)
         queue_token = getattr(self._queue, "change_token", None)
         wait_for_change = getattr(self._queue, "wait_for_change", None)
@@ -239,7 +310,7 @@ class SyncClient:
 
     def _reap_completed(
         self,
-        futures: dict[Future[bool], QueueItem],
+        futures: dict[Future[UploadOutcome | bool], QueueItem],
     ) -> None:
         """Acknowledge completed uploads without blocking queue polling."""
         completed = [future for future in futures if future.done()]
@@ -247,7 +318,17 @@ class SyncClient:
         for future in completed:
             item = futures.pop(future)
             try:
-                if future.result():
+                result = future.result()
+                outcome = (
+                    result
+                    if isinstance(result, UploadOutcome)
+                    else (
+                        UploadOutcome.success()
+                        if result
+                        else UploadOutcome.transient("upload returned false")
+                    )
+                )
+                if outcome.state is UploadOutcomeState.SUCCESS:
                     if self._queue.mark_synced(item):
                         synced = True
                         upload_synced_callback = getattr(
@@ -263,8 +344,44 @@ class SyncClient:
                             and self._delta_catchup_callback
                         ):
                             self._delta_catchup_callback(item.source_path)
+                elif (
+                    outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED
+                    and outcome.repair_action
+                    is SourceRepairAction.DELTA_BASE_CONFLICT
+                ):
+                    if self._queue.mark_delta_conflict(
+                        item,
+                        expected_hash=outcome.expected_hash,
+                        expected_offset=outcome.expected_offset,
+                    ):
+                        self._schedule_delta_repair(item, outcome)
+                elif (
+                    outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED
+                    and outcome.repair_action
+                    is SourceRepairAction.REBUILD_BOUNDED_DELTA
+                ):
+                    marker = getattr(self._queue, "mark_repair_scheduled", None)
+                    marked = (
+                        marker(item, outcome)
+                        if callable(marker)
+                        else self._queue.mark_failed(item, outcome.diagnostic)
+                    )
+                    if marked and self._full_resync_callback and item.source_path:
+                        self._full_resync_callback(item.source_path)
                 else:
-                    self._queue.mark_failed(item, "upload returned false")
+                    marker = getattr(self._queue, "mark_upload_outcome", None)
+                    if callable(marker):
+                        marker(
+                            item,
+                            outcome,
+                            auth_fingerprint=getattr(
+                                self,
+                                "_auth_fingerprint",
+                                None,
+                            ),
+                        )
+                    else:
+                        self._queue.mark_failed(item, outcome.diagnostic)
             except Exception as exc:
                 logger.exception(
                     "Upload worker failed for %s/%s",
@@ -275,10 +392,41 @@ class SyncClient:
         if synced:
             self._queue.cleanup_synced()
 
-    def _upload(self, item: QueueItem) -> bool:
+    def _schedule_delta_repair(
+        self,
+        item: QueueItem,
+        outcome: UploadOutcome,
+    ) -> None:
+        resumable = (
+            bool(outcome.expected_hash)
+            and outcome.expected_hash.startswith("d2:")
+            and outcome.expected_offset > 0
+            and getattr(self, "_delta_catchup_callback", None)
+        )
+        if resumable and item.source_path:
+            logger.warning(
+                "Delta base advanced for %s/%s; resuming from server offset %d",
+                item.tool_name,
+                item.relative_path,
+                outcome.expected_offset,
+            )
+            self._delta_catchup_callback(item.source_path)
+            return
+        logger.warning(
+            "Delta base changed for %s/%s; scheduling a complete snapshot",
+            item.tool_name,
+            item.relative_path,
+        )
+        if self._full_resync_callback and item.source_path:
+            self._full_resync_callback(item.source_path)
+
+    def _upload(self, item: QueueItem) -> UploadOutcome:
         """Upload one leased item without materializing large payloads."""
         if not self._running or self._pause_requested.is_set():
-            return False
+            return UploadOutcome.transient(
+                "upload paused before transmission",
+                diagnostic_code="upload_paused",
+            )
         item_metadata = dict(item.metadata)
         force_reprocess_nonce = item_metadata.pop(
             "_queue_force_reprocess_nonce",
@@ -330,15 +478,25 @@ class SyncClient:
                         MAX_CHUNKED_UPLOAD_BYTES,
                         item.relative_path,
                     )
-                    self._full_resync_callback(item.source_path)
-                else:
-                    logger.warning(
-                        "Payload exceeds the server's %d-byte upload cap: %s (%d bytes)",
-                        MAX_CHUNKED_UPLOAD_BYTES,
-                        item.relative_path,
-                        size,
+                    return UploadOutcome.source_repair(
+                        (
+                            f"payload exceeds {MAX_CHUNKED_UPLOAD_BYTES} bytes; "
+                            "rebuilding a bounded delta base"
+                        ),
+                        diagnostic_code="payload_too_large",
+                        repair_action=SourceRepairAction.REBUILD_BOUNDED_DELTA,
                     )
-                return False
+                logger.warning(
+                    "Payload exceeds the server's %d-byte upload cap: %s (%d bytes)",
+                    MAX_CHUNKED_UPLOAD_BYTES,
+                    item.relative_path,
+                    size,
+                )
+                return UploadOutcome.source_repair(
+                    f"payload is {size} bytes; server limit is "
+                    f"{MAX_CHUNKED_UPLOAD_BYTES}",
+                    diagnostic_code="payload_too_large",
+                )
             if force_reprocess_nonce:
                 return self._upload_chunked(
                     payload,
@@ -362,58 +520,52 @@ class SyncClient:
             return self._upload_chunked(payload, item)
 
         except DeltaBaseConflict as conflict:
-            if not self._queue.mark_delta_conflict(
-                item,
+            return UploadOutcome.source_repair(
+                "server rejected the guarded delta base",
+                diagnostic_code="delta_base_mismatch",
+                http_status=409,
+                repair_action=SourceRepairAction.DELTA_BASE_CONFLICT,
                 expected_hash=conflict.expected_hash,
                 expected_offset=conflict.expected_offset,
-            ):
-                logger.warning(
-                    "Delta base conflict could not retire queue item %s/%s",
-                    item.tool_name,
-                    item.relative_path,
-                )
-                return False
-            resumable = (
-                bool(conflict.expected_hash)
-                and conflict.expected_hash.startswith("d2:")
-                and conflict.expected_offset > 0
-                and getattr(self, "_delta_catchup_callback", None)
             )
-            if resumable and item.source_path:
-                logger.warning(
-                    "Delta base advanced for %s/%s; resuming from server offset %d",
-                    item.tool_name,
-                    item.relative_path,
-                    conflict.expected_offset,
-                )
-                self._delta_catchup_callback(item.source_path)
-            else:
-                logger.warning(
-                    "Delta base changed for %s/%s; scheduling a complete snapshot",
-                    item.tool_name,
-                    item.relative_path,
-                )
-                if self._full_resync_callback and item.source_path:
-                    self._full_resync_callback(item.source_path)
-            return True
-        except httpx.ConnectError:
+        except httpx.TransportError as exc:
             logger.warning("Server unreachable, will retry later")
-            return False
-        except httpx.TimeoutException:
-            logger.warning(
-                "Upload timeout for %s/%s (%d bytes)",
+            return UploadOutcome.transient(
+                f"{type(exc).__name__}: {exc}",
+                diagnostic_code="network_error",
+            )
+        except (OSError, UnicodeError) as exc:
+            logger.error(
+                "Local payload unavailable for %s/%s: %s",
                 item.tool_name,
                 item.relative_path,
-                item.payload_bytes,
+                exc,
             )
-            return False
-        except Exception:
+            return UploadOutcome.source_repair(
+                f"{type(exc).__name__}: {exc}",
+                diagnostic_code="local_payload_unavailable",
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.error(
+                "Invalid upload metadata for %s/%s: %s",
+                item.tool_name,
+                item.relative_path,
+                exc,
+            )
+            return UploadOutcome.source_repair(
+                f"{type(exc).__name__}: {exc}",
+                diagnostic_code="invalid_metadata",
+            )
+        except Exception as exc:
             logger.exception(
                 "Upload error for %s/%s", item.tool_name, item.relative_path
             )
-            return False
+            return UploadOutcome.quarantine(
+                f"{type(exc).__name__}: {exc}",
+                diagnostic_code="unexpected_client_error",
+            )
 
-    def _upload_metadata(self, item: QueueItem) -> bool:
+    def _upload_metadata(self, item: QueueItem) -> UploadOutcome:
         """Send a durable metadata-only update without reading file content."""
         payload = {
             key: value
@@ -421,47 +573,37 @@ class SyncClient:
             if not key.startswith("_queue_")
         }
         resp = self._client.post("/api/ingest/metadata", json=payload)
-        if resp.status_code in (200, 201):
-            return True
-        logger.warning(
-            "Server %s for metadata %s/%s: %s",
-            resp.status_code,
-            item.tool_name,
-            item.relative_path,
-            resp.text[:200],
+        return _classify_http_response(
+            resp,
+            endpoint="/api/ingest/metadata",
+            # A collector may be upgraded before the endpoint, and older
+            # servers used 404 while the referenced transcript was not ready.
+            retry_not_found=True,
         )
-        return False
 
-    def _upload_json(self, payload: dict) -> bool:
+    def _upload_json(self, payload: dict) -> UploadOutcome:
         resp = self._client.post("/api/ingest/file", json=payload)
         self._raise_delta_conflict(resp, payload)
-        if resp.status_code in (200, 201):
-            return True
-        logger.warning(
-            "Server %s for %s/%s: %s",
-            resp.status_code,
-            payload["tool"],
-            payload["relative_path"],
-            resp.text[:200],
+        return _classify_http_response(
+            resp,
+            endpoint="/api/ingest/file",
         )
-        return False
 
-    def _upload_multipart(self, payload: dict, content_stream: BinaryIO) -> bool:
+    def _upload_multipart(
+        self,
+        payload: dict,
+        content_stream: BinaryIO,
+    ) -> UploadOutcome:
         resp = self._client.post(
             "/api/ingest/file/upload",
             data={"metadata": json.dumps(payload)},
             files={"content": ("content.txt", content_stream, "text/plain")},
         )
         self._raise_delta_conflict(resp, payload)
-        if resp.status_code in (200, 201):
-            return True
-        logger.warning(
-            "Server %s for multipart %s/%s",
-            resp.status_code,
-            payload["tool"],
-            payload["relative_path"],
+        return _classify_http_response(
+            resp,
+            endpoint="/api/ingest/file/upload",
         )
-        return False
 
     def _upload_chunked(
         self,
@@ -469,7 +611,7 @@ class SyncClient:
         item: QueueItem,
         *,
         force_reprocess_nonce: str | None = None,
-    ) -> bool:
+    ) -> UploadOutcome:
         """Stream a large spool file in fixed-size chunks."""
         total_size = item.payload_bytes
         total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -490,12 +632,18 @@ class SyncClient:
         with self._queue.open_payload(item) as stream:
             for index in range(total_chunks):
                 if not self._running or self._pause_requested.is_set():
-                    return False
+                    return UploadOutcome.transient(
+                        "chunk upload paused",
+                        diagnostic_code="upload_paused",
+                    )
 
                 chunk = stream.read(CHUNK_SIZE)
                 if not chunk:
                     logger.warning("Payload ended early: %s", payload["relative_path"])
-                    return False
+                    return UploadOutcome.source_repair(
+                        "spooled payload ended before its recorded byte length",
+                        diagnostic_code="payload_truncated",
+                    )
                 chunk_meta = {
                     **payload,
                     "chunk_index": index,
@@ -506,7 +654,10 @@ class SyncClient:
 
                 for attempt in range(1, CHUNK_UPLOAD_MAX_ATTEMPTS + 1):
                     if not self._running or self._pause_requested.is_set():
-                        return False
+                        return UploadOutcome.transient(
+                            "chunk upload paused",
+                            diagnostic_code="upload_paused",
+                        )
                     if not self._queue.renew_lease(
                         item,
                         lease_seconds=self._config.queue_lease_seconds,
@@ -515,9 +666,12 @@ class SyncClient:
                             "Lease lost during upload: %s",
                             payload["relative_path"],
                         )
-                        return False
+                        return UploadOutcome.transient(
+                            "queue lease was lost during chunk upload",
+                            diagnostic_code="lease_lost",
+                        )
 
-                    retry_reason: str | None = None
+                    retry_outcome: UploadOutcome | None = None
                     try:
                         resp = self._client.post(
                             "/api/ingest/file/chunk",
@@ -531,9 +685,18 @@ class SyncClient:
                             },
                         )
                     except httpx.TransportError as exc:
-                        retry_reason = f"{type(exc).__name__}: {exc}"
+                        retry_outcome = UploadOutcome.transient(
+                            f"{type(exc).__name__}: {exc}",
+                            diagnostic_code="network_error",
+                        )
                     else:
-                        if resp.status_code in (200, 201):
+                        if resp.status_code == 409 and payload.get("mode") == "delta":
+                            raise DeltaBaseConflict(payload["relative_path"])
+                        response_outcome = _classify_http_response(
+                            resp,
+                            endpoint="/api/ingest/file/chunk",
+                        )
+                        if response_outcome.succeeded:
                             if index == total_chunks - 1:
                                 try:
                                     document_id = resp.json().get("document_id", "")
@@ -544,20 +707,20 @@ class SyncClient:
                                 ) and document_id.startswith("queued:"):
                                     commit_job_id = document_id.removeprefix("queued:")
                             break
-                        if resp.status_code == 409 and payload.get("mode") == "delta":
-                            raise DeltaBaseConflict(payload["relative_path"])
-                        if resp.status_code == 429 or 500 <= resp.status_code < 600:
-                            retry_reason = f"HTTP {resp.status_code}"
+                        if (
+                            response_outcome.state
+                            is UploadOutcomeState.TRANSIENT_RETRY
+                        ):
+                            retry_outcome = response_outcome
                         else:
                             logger.warning(
-                                "Chunk %d/%d failed permanently (%s: %.200s) for %s",
+                                "Chunk %d/%d stopped (%s) for %s",
                                 index + 1,
                                 total_chunks,
-                                resp.status_code,
-                                resp.text,
+                                response_outcome.state.value,
                                 payload["relative_path"],
                             )
-                            return False
+                            return response_outcome
 
                     if attempt >= CHUNK_UPLOAD_MAX_ATTEMPTS:
                         logger.warning(
@@ -565,10 +728,17 @@ class SyncClient:
                             index + 1,
                             total_chunks,
                             CHUNK_UPLOAD_MAX_ATTEMPTS,
-                            retry_reason,
+                            (
+                                retry_outcome.diagnostic
+                                if retry_outcome is not None
+                                else "transient failure"
+                            ),
                             payload["relative_path"],
                         )
-                        return False
+                        return retry_outcome or UploadOutcome.transient(
+                            "chunk attempts exhausted",
+                            diagnostic_code="chunk_attempts_exhausted",
+                        )
 
                     delay = min(
                         CHUNK_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
@@ -581,12 +751,19 @@ class SyncClient:
                         attempt + 1,
                         CHUNK_UPLOAD_MAX_ATTEMPTS,
                         delay,
-                        retry_reason,
+                        (
+                            retry_outcome.diagnostic
+                            if retry_outcome is not None
+                            else "transient failure"
+                        ),
                         payload["relative_path"],
                     )
                     self._sleep_interruptibly(delay)
                     if not self._running or self._pause_requested.is_set():
-                        return False
+                        return UploadOutcome.transient(
+                            "chunk upload paused during retry backoff",
+                            diagnostic_code="upload_paused",
+                        )
 
         if commit_job_id is not None:
             return self._wait_for_chunk_commit(
@@ -600,7 +777,7 @@ class SyncClient:
         # final response has no queued job identifier, so retain the historical
         # durable-acceptance behavior until the server is upgraded.
         logger.info("Chunked upload accepted: %s", payload["relative_path"])
-        return True
+        return UploadOutcome.success("legacy server durably accepted all chunks")
 
     def _wait_for_chunk_commit(
         self,
@@ -609,7 +786,7 @@ class SyncClient:
         *,
         upload_id: str,
         job_id: str,
-    ) -> bool:
+    ) -> UploadOutcome:
         """Poll a durably accepted upload until its database commit is known."""
         deadline = time.monotonic() + CHUNK_COMMIT_TIMEOUT_SECONDS
         while self._running and not self._pause_requested.is_set():
@@ -621,7 +798,10 @@ class SyncClient:
                     "Lease lost while awaiting commit: %s",
                     payload["relative_path"],
                 )
-                return False
+                return UploadOutcome.transient(
+                    "queue lease was lost while awaiting chunk commit",
+                    diagnostic_code="lease_lost",
+                )
             try:
                 response = self._client.post(
                     "/api/ingest/file/chunk/status",
@@ -638,7 +818,15 @@ class SyncClient:
                     try:
                         status_payload = response.json()
                     except (AttributeError, TypeError, ValueError):
-                        status_payload = {}
+                        return UploadOutcome.quarantine(
+                            "chunk status endpoint returned invalid JSON",
+                            diagnostic_code="invalid_commit_status",
+                        )
+                    if not isinstance(status_payload, dict):
+                        return UploadOutcome.quarantine(
+                            "chunk status endpoint returned a non-object payload",
+                            diagnostic_code="invalid_commit_status",
+                        )
                     status = status_payload.get("status")
                     returned_job_id = status_payload.get("job_id")
                     if returned_job_id not in (None, job_id):
@@ -646,46 +834,84 @@ class SyncClient:
                             "Commit status identity changed for %s",
                             payload["relative_path"],
                         )
-                        return False
+                        return UploadOutcome.quarantine(
+                            "chunk commit job identity changed",
+                            diagnostic_code="commit_identity_mismatch",
+                        )
                     if status == "completed":
                         logger.info(
                             "Chunked upload committed: %s",
                             payload["relative_path"],
                         )
-                        return True
+                        return UploadOutcome.success("chunk upload committed")
                     if status in {"failed", "blocked"}:
+                        error_type = str(
+                            status_payload.get("error_type") or "unknown"
+                        )
                         logger.warning(
                             "Chunked upload %s on the server (%s): %s",
                             status,
-                            status_payload.get("error_type") or "unknown",
+                            error_type,
                             payload["relative_path"],
                         )
-                        if payload.get("mode") == "delta":
+                        if (
+                            payload.get("mode") == "delta"
+                            and error_type == "DeltaBaseMismatch"
+                        ):
                             raise DeltaBaseConflict(payload["relative_path"])
-                        return False
+                        return UploadOutcome.quarantine(
+                            f"server chunk commit is {status} ({error_type})",
+                            diagnostic_code=f"commit_{status}",
+                        )
                     if status == "missing":
                         logger.warning(
                             "Server lost accepted chunk upload %s: %s",
                             job_id,
                             payload["relative_path"],
                         )
-                        return False
-                elif response.status_code in (401, 403, 404):
-                    logger.warning(
-                        "Commit status endpoint rejected %s (%s)",
-                        payload["relative_path"],
-                        response.status_code,
+                        return UploadOutcome.source_repair(
+                            "server lost the durably accepted chunk upload",
+                            diagnostic_code="commit_missing",
+                        )
+                    if status not in {"pending", "receiving"}:
+                        return UploadOutcome.quarantine(
+                            f"unknown chunk commit status: {status!r}",
+                            diagnostic_code="invalid_commit_status",
+                        )
+                else:
+                    if response.status_code == 404:
+                        return UploadOutcome.source_repair(
+                            _response_diagnostic(
+                                response,
+                                "/api/ingest/file/chunk/status",
+                            ),
+                            diagnostic_code="commit_status_missing",
+                            http_status=404,
+                        )
+                    response_outcome = _classify_http_response(
+                        response,
+                        endpoint="/api/ingest/file/chunk/status",
                     )
-                    return False
+                    if (
+                        response_outcome.state
+                        is not UploadOutcomeState.TRANSIENT_RETRY
+                    ):
+                        return response_outcome
 
             if time.monotonic() >= deadline:
                 logger.warning(
                     "Timed out awaiting database commit for %s",
                     payload["relative_path"],
                 )
-                return False
+                return UploadOutcome.transient(
+                    "timed out awaiting server chunk commit",
+                    diagnostic_code="commit_timeout",
+                )
             self._sleep_interruptibly(CHUNK_COMMIT_POLL_SECONDS)
-        return False
+        return UploadOutcome.transient(
+            "chunk commit polling paused",
+            diagnostic_code="upload_paused",
+        )
 
     @staticmethod
     def _raise_delta_conflict(response, payload: dict) -> None:

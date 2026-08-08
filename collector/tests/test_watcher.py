@@ -375,13 +375,136 @@ def test_restarted_scan_skips_durable_unchanged_source(
     queue = SyncQueue(database)
     watcher._queue = queue
     monkeypatch.setattr(
-        "collector.watcher._file_hash_revision",
+        JsonlParser,
+        "parse_to_writer",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unchanged source was reread")
+            AssertionError("durably unchanged source was reparsed")
         ),
     )
     try:
         watcher._process_file_changed(path, emit_live_signals=False)
+    finally:
+        queue.close()
+
+
+def test_unchanged_touch_updates_observation_without_requeue(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"message":"unchanged"}\n', encoding="utf-8")
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch()[0]
+        assert queue.mark_synced(original)
+
+        touched_at = path.stat().st_mtime + 10
+        os.utime(path, (touched_at, touched_at))
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        assert queue.pending_count() == 0
+        assert queue.get_file_state("cursor", "projects/session.jsonl")[0] == (
+            original.content_hash
+        )
+        assert queue.get_source_revision(
+            "cursor", "projects/session.jsonl"
+        ) == (path.stat().st_size, path.stat().st_mtime_ns)
+        with queue._lock:
+            assert queue._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0] == 1
+    finally:
+        queue.close()
+
+
+def test_same_size_same_prefix_tail_change_gets_new_canonical_hash(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    prefix = "x" * (256 * 1024 + 32)
+    first = json.dumps({"prefix": prefix, "tail": "AAAA"}, separators=(",", ":"))
+    second = json.dumps({"prefix": prefix, "tail": "BBBB"}, separators=(",", ":"))
+    assert len(first) == len(second)
+    path.write_text(first + "\n", encoding="utf-8")
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db", spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert queue.mark_synced(original)
+
+        path.write_text(second + "\n", encoding="utf-8")
+        changed_at = path.stat().st_mtime + 10
+        os.utime(path, (changed_at, changed_at))
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        changed = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert changed.content_hash != original.content_hash
+        assert '"tail":"BBBB"' in queue.read_payload_text(changed)
+    finally:
+        queue.close()
+
+
+def test_redacted_secret_changes_keep_sanitized_identity(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    first_key = "sk-" + ("a" * 32)
+    second_key = "sk-" + ("b" * 32)
+    path.write_text(json.dumps({"message": first_key}) + "\n", encoding="utf-8")
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/session.jsonl",
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch()[0]
+        sanitized = queue.read_payload_text(original)
+        assert first_key not in sanitized
+        assert "[API_KEY_REDACTED]" in sanitized
+        assert queue.mark_synced(original)
+
+        path.write_text(json.dumps({"message": second_key}) + "\n", encoding="utf-8")
+        changed_at = path.stat().st_mtime + 10
+        os.utime(path, (changed_at, changed_at))
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        assert queue.pending_count() == 0
+        assert queue.get_file_state("cursor", "projects/session.jsonl")[0] == (
+            original.content_hash
+        )
     finally:
         queue.close()
 
