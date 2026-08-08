@@ -27,6 +27,11 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
 )
 from ..services.device_grouping import resolve_device_scope_ids
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
@@ -289,9 +294,9 @@ async def list_tool_files(
     else:
         display_timestamp = conversation_list_timestamp_expression(
             Document.category,
-            Document.activity_at,
-            Document.source_modified_at,
-            Document.synced_at,
+            delivery_activity_expression(),
+            delivery_source_modified_expression(),
+            delivery_synced_expression(),
         )
         query = query.order_by(
             display_timestamp.desc(),

@@ -27,6 +27,10 @@ from ..db.models import (
     DocumentEmbedding,
     DocumentEmbeddingFast,
 )
+from .document_delivery import (
+    current_revision_predicate,
+    delivery_synced_expression,
+)
 
 logger = logging.getLogger("embedding_service")
 
@@ -783,7 +787,7 @@ async def generate_document_embeddings(db: AsyncSession, doc: Document) -> int:
             update(Document)
             .where(
                 Document.id == doc.id,
-                Document.content_hash == revision_hash,
+                current_revision_predicate(Document.id, revision_hash),
                 or_(
                     Document.embedding_status.in_(("pending", "failed")),
                     and_(
@@ -1108,7 +1112,7 @@ async def tiers_with_searchable_rows(
             q = q.where(Document.tool_id == tool_filter)
         if days:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            q = q.where(Document.synced_at >= cutoff)
+            q = q.where(delivery_synced_expression() >= cutoff)
         if machine_ids is not None:
             q = q.where(Document.machine_id.in_(machine_ids))
         if (await db.execute(q)).first() is not None:

@@ -30,6 +30,12 @@ from .conversation_hierarchy import (
     current_thread_id,
     is_conversation_subagent,
 )
+from .document_delivery import (
+    delivery_activity_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from .user_filter import user_machine_ids
 
 TASK_PROJECTION_VERSION = 1
@@ -495,7 +501,7 @@ def _status_clause(status: str):
 
 
 def _selector_clause(name: str, value: str):
-    metadata = Document.metadata_
+    metadata = delivery_metadata_expression()
     if name == "thread_id":
         return or_(
             ConversationTaskState.thread_id == value,
@@ -971,9 +977,9 @@ async def query_conversation_tasks(
             .where(*criteria)
             .order_by(
                 func.coalesce(
-                    Document.activity_at,
-                    Document.source_modified_at,
-                    Document.synced_at,
+                    delivery_activity_expression(),
+                    delivery_source_modified_expression(),
+                    delivery_synced_expression(),
                 ).desc(),
                 Document.id.desc(),
             )
@@ -1015,7 +1021,7 @@ async def query_conversation_tasks(
             seed_ids.extend(document.id for document, _projection in groups[key])
         companion = build_conversation_companion_filter(
             Document.tool_id,
-            Document.metadata_,
+            delivery_metadata_expression(),
             Document.relative_path,
             roots_by_tool,
         )

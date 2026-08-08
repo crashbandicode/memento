@@ -23,6 +23,12 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
     is_conversation_subagent,
 )
+from ..services.document_delivery import (
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
@@ -427,10 +433,10 @@ async def _semantic_rank_for_tier(
             Document.title.label("title"),
             Document.relative_path.label("relative_path"),
             Document.category.label("category"),
-            Document.synced_at.label("synced_at"),
-            Document.source_modified_at.label("source_modified_at"),
-            Document.metadata_.label("metadata"),
-            Document.file_size_bytes.label("file_size_bytes"),
+            delivery_synced_expression().label("synced_at"),
+            delivery_source_modified_expression().label("source_modified_at"),
+            delivery_metadata_expression().label("metadata"),
+            delivery_file_size_expression().label("file_size_bytes"),
             dist_col,
             func.row_number().over(
                 partition_by=Document.id,
@@ -452,7 +458,9 @@ async def _semantic_rank_for_tier(
     if days:
         from datetime import datetime, timedelta, timezone
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        ranked_chunks_q = ranked_chunks_q.where(Document.synced_at >= cutoff)
+        ranked_chunks_q = ranked_chunks_q.where(
+            delivery_synced_expression() >= cutoff
+        )
     if mids is not None:
         ranked_chunks_q = ranked_chunks_q.where(Document.machine_id.in_(mids))
 
@@ -640,15 +648,15 @@ async def semantic_search(
             Document.title,
             Document.relative_path,
             Document.category,
-            Document.synced_at,
-            Document.source_modified_at,
-            Document.metadata_,
-            Document.file_size_bytes,
+            delivery_synced_expression(),
+            delivery_source_modified_expression(),
+            delivery_metadata_expression(),
+            delivery_file_size_expression(),
         ).where(
             Document.category == "conversation",
             build_conversation_companion_filter(
                 Document.tool_id,
-                Document.metadata_,
+                delivery_metadata_expression(),
                 Document.relative_path,
                 companion_roots_by_tool,
             ),

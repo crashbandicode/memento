@@ -35,6 +35,14 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
 )
 from ..services.device_grouping import resolve_device_scope_ids
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+    outerjoin_document_delivery,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -282,7 +290,7 @@ async def get_project(
             else_=None,
         )
         if logical_activity_by_document
-        else Document.activity_at
+        else delivery_activity_expression()
     )
 
     docs_q = (
@@ -300,12 +308,12 @@ async def get_project(
                     Document.category == "conversation",
                     func.coalesce(
                         logical_activity_order,
-                        Document.activity_at,
-                        Document.source_modified_at,
-                        Document.synced_at,
+                        delivery_activity_expression(),
+                        delivery_source_modified_expression(),
+                        delivery_synced_expression(),
                     ),
                 ),
-                else_=Document.synced_at,
+                else_=delivery_synced_expression(),
             ).desc(),
             Document.id.desc(),
         )
@@ -419,10 +427,10 @@ async def get_project_timeline(
     # content can be up to 1MB per doc; loading every doc's content is the main cost.
     meta_cols = (
         Document.id, Document.tool_id, Document.category, Document.content_type,
-        Document.relative_path, Document.title, Document.file_size_bytes,
-        Document.ai_summary, Document.metadata_,
-        Document.source_modified_at, Document.synced_at, Document.machine_id,
-        Document.activity_at,
+        Document.relative_path, Document.title, delivery_file_size_expression(),
+        Document.ai_summary, delivery_metadata_expression(),
+        delivery_source_modified_expression(), delivery_synced_expression(),
+        Document.machine_id, delivery_activity_expression(),
     )
     q = (
         select(*meta_cols)
@@ -432,14 +440,14 @@ async def get_project_timeline(
                 (
                     Document.category == "conversation",
                     func.coalesce(
-                        Document.activity_at,
-                        Document.source_modified_at,
-                        Document.synced_at,
+                        delivery_activity_expression(),
+                        delivery_source_modified_expression(),
+                        delivery_synced_expression(),
                     ),
                 ),
                 else_=func.coalesce(
-                    Document.source_modified_at,
-                    Document.synced_at,
+                    delivery_source_modified_expression(),
+                    delivery_synced_expression(),
                 ),
             ).desc(),
             Document.id.desc(),
@@ -753,16 +761,25 @@ async def get_project_conversations(
     docs to those synced and messages to those timestamped on or
     before that instant. Share-link snapshot semantics.
     """
-    from ..services.cache import cache_get, cache_set
+    from ..services.cache import (
+        cache_get,
+        cache_set,
+        namespaced_cache_key,
+        project_conversations_cache_namespace,
+    )
     # Cache by full query shape — different pages / orderings / preview
     # caps all need separate entries. 30s TTL: short enough that fresh
     # ingest shows up quickly, long enough to hide back/forward
     # navigation hits. ``as_of`` participates in the key so share
     # traffic doesn't poison the owner-UI cache.
     as_of_key = as_of.isoformat() if as_of else "live"
-    cache_key = (
-        f"project:conv:{_user.id}:{project_id}:v5:"
-        f"{session_offset}:{session_limit}:{max_messages_per_session}:{order}:{as_of_key}"
+    cache_key = await namespaced_cache_key(
+        project_conversations_cache_namespace(_user.id, project_id),
+        (
+            "v5:"
+            f"{session_offset}:{session_limit}:"
+            f"{max_messages_per_session}:{order}:{as_of_key}"
+        ),
     )
     cached = await cache_get(cache_key)
     if cached is not None:
@@ -797,16 +814,19 @@ async def get_project_conversations(
         )
         .order_by(
             func.coalesce(
-                Document.activity_at,
-                Document.source_modified_at,
-                Document.synced_at,
+                delivery_activity_expression(joined=True),
+                delivery_source_modified_expression(joined=True),
+                delivery_synced_expression(joined=True),
             ).desc(),
             Document.id.desc(),
         )
     )
+    conv_q = outerjoin_document_delivery(conv_q)
     conv_q = apply_user_filter(conv_q, mids, Document.machine_id)
     if as_of is not None:
-        conv_q = conv_q.where(Document.synced_at <= as_of)
+        conv_q = conv_q.where(
+            delivery_synced_expression(joined=True) <= as_of
+        )
     all_convs = (await db.execute(conv_q)).scalars().all()
 
     activity_at_by_document = {d.id: d.activity_at for d in all_convs}
@@ -944,7 +964,7 @@ async def get_project_conversations(
     plans_q = (
         select(Document)
         .where(Document.project_id == project_id, Document.category == "plan")
-        .order_by(Document.synced_at, Document.id)
+        .order_by(delivery_synced_expression(), Document.id)
     )
     plans_q = apply_user_filter(plans_q, mids, Document.machine_id)
     plans_result = await db.execute(plans_q)
@@ -1194,7 +1214,7 @@ async def export_project_markdown(
     docs_q = (
         select(Document)
         .where(Document.project_id == project_id)
-        .order_by(Document.synced_at.desc())
+        .order_by(delivery_synced_expression().desc())
     )
     docs_q = apply_user_filter(docs_q, mids, Document.machine_id)
     docs = [d for d in (await db.execute(docs_q)).scalars().all()
@@ -1385,7 +1405,7 @@ async def get_project_blueprint(
             Document.project_id == project_id,
             Document.category.in_(CURATED),
         )
-        .order_by(Document.synced_at.desc())
+        .order_by(delivery_synced_expression().desc())
         .limit(100)
     )
     curated_q = apply_user_filter(curated_q, mids, Document.machine_id)
@@ -1402,7 +1422,7 @@ async def get_project_blueprint(
                 Document.project_id == project_id,
                 Document.category == "conversation",
             )
-            .order_by(Document.synced_at.desc())
+            .order_by(delivery_synced_expression().desc())
             .limit(recent_convs)
         )
         conv_q = apply_user_filter(conv_q, mids, Document.machine_id)

@@ -8,6 +8,28 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ..config import settings
 
+
+class TransactionalAsyncSession(AsyncSession):
+    """Async session with rollback-safe, post-commit side-effect delivery."""
+
+    async def commit(self) -> None:
+        await super().commit()
+        try:
+            from ..services.cache import publish_staged_cache_invalidations
+
+            await publish_staged_cache_invalidations(self)
+        except Exception:
+            # A committed transaction must not look failed because an optional
+            # cache backend is unavailable.
+            pass
+
+    async def rollback(self) -> None:
+        await super().rollback()
+        from ..services.cache import discard_staged_cache_invalidations
+
+        discard_staged_cache_invalidations(self)
+
+
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
@@ -61,7 +83,7 @@ post_ingest_engine = create_async_engine(
 
 async_session_factory = async_sessionmaker(
     engine,
-    class_=AsyncSession,
+    class_=TransactionalAsyncSession,
     expire_on_commit=False,
 )
 
@@ -70,14 +92,14 @@ search_session_factory = (
     if search_engine is engine
     else async_sessionmaker(
         search_engine,
-        class_=AsyncSession,
+        class_=TransactionalAsyncSession,
         expire_on_commit=False,
     )
 )
 
 post_ingest_session_factory = async_sessionmaker(
     post_ingest_engine,
-    class_=AsyncSession,
+    class_=TransactionalAsyncSession,
     expire_on_commit=False,
 )
 

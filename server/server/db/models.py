@@ -10,7 +10,13 @@ from sqlalchemy import (
     LargeBinary, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    reconstructor,
+    relationship,
+)
 
 try:
     from pgvector.sqlalchemy import Vector
@@ -167,21 +173,96 @@ class Document(Base):
     machine: Mapped[Machine | None] = relationship(back_populates="documents")
     messages: Mapped[list[ConversationMessage]] = relationship(back_populates="document", cascade="all, delete-orphan")
     versions: Mapped[list[DocumentVersion]] = relationship(back_populates="document", cascade="all, delete-orphan")
+    delivery_state: Mapped[DocumentDeliveryState | None] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy="joined",
+        innerjoin=False,
+    )
 
     __table_args__ = (
         Index("idx_documents_tool", "tool_id"),
         Index("idx_documents_project", "project_id"),
         Index("idx_documents_category", "category"),
-        Index("idx_documents_activity_at", activity_at.desc()),
-        Index("idx_documents_synced_at", synced_at.desc()),
         Index("idx_documents_machine", "machine_id"),
         Index("idx_documents_machine_tool", "machine_id", "tool_id"),
-        Index("idx_documents_tool_synced", "tool_id", synced_at.desc()),
-        Index("idx_documents_project_synced", "project_id", synced_at.desc()),
-        Index("idx_documents_project_activity", "project_id", activity_at.desc()),
         Index("idx_documents_project_category", "project_id", "category"),
         # Unique per machine+tool+path
         Index("uq_documents_machine_tool_path", "machine_id", "tool_id", "relative_path", unique=True),
+    )
+
+    @reconstructor
+    def _apply_delivery_projection(self) -> None:
+        """Expose latest delivery values to legacy instance-level readers.
+
+        Query predicates use explicit projection expressions (see
+        ``services.document_delivery``). Instance consumers historically read
+        these attributes directly, so hydrate them without marking the
+        canonical row dirty.
+        """
+        state = self.delivery_state
+        if state is None:
+            return
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        set_committed_value(self, "content_hash", state.revision_hash)
+        set_committed_value(self, "file_size_bytes", state.file_size_bytes)
+        set_committed_value(self, "metadata_", state.delivery_metadata)
+        set_committed_value(self, "source_modified_at", state.source_modified_at)
+        set_committed_value(self, "activity_at", state.activity_at)
+        set_committed_value(self, "synced_at", state.synced_at)
+
+
+# ---------------------------------------------------------------------------
+# Hot conversation delivery state
+# ---------------------------------------------------------------------------
+class DocumentDeliveryState(Base):
+    """Narrow latest-delivery projection for append-heavy documents.
+
+    The canonical ``documents`` row remains the last durable full snapshot.
+    Conversation DELTAs update this row instead. Only meaningful activity is
+    indexed, so revision/sync/metadata-only updates remain HOT-eligible.
+    """
+
+    __tablename__ = "document_delivery_state"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    delivery_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    source_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    document: Mapped[Document] = relationship(back_populates="delivery_state")
+
+    __table_args__ = (
+        Index("idx_document_delivery_activity", activity_at.desc()),
+        Index(
+            "idx_document_delivery_project_activity",
+            "project_id",
+            activity_at.desc(),
+        ),
     )
 
 

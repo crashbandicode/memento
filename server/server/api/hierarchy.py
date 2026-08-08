@@ -28,6 +28,13 @@ from ..services.device_grouping import (
     build_host_groups,
     resolve_device_scope_ids,
 )
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 
 router = APIRouter(prefix="/api/hierarchy", tags=["hierarchy"])
 
@@ -38,15 +45,15 @@ _DEVICE_FILE_COLUMNS = (
     Document.relative_path,
     Document.category,
     Document.content_type,
-    Document.file_size_bytes,
-    Document.activity_at,
-    Document.source_modified_at,
-    Document.synced_at,
+    delivery_file_size_expression().label("file_size_bytes"),
+    delivery_activity_expression().label("activity_at"),
+    delivery_source_modified_expression().label("source_modified_at"),
+    delivery_synced_expression().label("synced_at"),
 )
 
 _CODEX_DEVICE_FILE_COLUMNS = (
     *_DEVICE_FILE_COLUMNS,
-    Document.metadata_,
+    delivery_metadata_expression().label("metadata"),
 )
 
 
@@ -271,7 +278,7 @@ async def list_device_tool_projects(
         select(
             Document.project_id,
             func.count(func.distinct(Document.relative_path)).label("cnt"),
-            func.max(Document.synced_at).label("last"),
+            func.max(delivery_synced_expression()).label("last"),
         )
         .where(
             Document.machine_id.in_(machine_ids),
@@ -421,9 +428,9 @@ async def list_device_tool_files(
 
     display_timestamp = conversation_list_timestamp_expression(
         Document.category,
-        Document.activity_at,
-        Document.source_modified_at,
-        Document.synced_at,
+        delivery_activity_expression(),
+        delivery_source_modified_expression(),
+        delivery_synced_expression(),
     )
     result = await db.execute(
         select(*_DEVICE_FILE_COLUMNS)

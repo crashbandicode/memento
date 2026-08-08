@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING
 from sqlalchemy import case, func, select
 
 from ..db.models import ConversationMessage
+from .document_delivery import (
+    advance_document_activity,
+    document_delivery_state,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -125,12 +129,13 @@ async def refresh_document_activity_at(
     db: "AsyncSession",
     document: "Document",
 ):
-    """Persist conversation time independently from collector sync time."""
+    """Advance conversation time from normalized human/assistant rows only."""
     activity_at = (
         await db.execute(conversation_activity_at_query(document.id))
     ).scalar_one_or_none()
-    document.activity_at = activity_at
-    return activity_at
+    advance_document_activity(document, activity_at)
+    state = document_delivery_state(document)
+    return state.activity_at if state is not None else document.activity_at
 
 
 async def conversation_activity_summaries(

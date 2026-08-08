@@ -21,6 +21,10 @@ from ..services.embedding_service import (
     EMBEDDING_PROCESSING_STALE_AFTER,
     generate_document_embeddings,
 )
+from ..services.document_delivery import (
+    delivery_file_size_expression,
+    delivery_synced_expression,
+)
 from .celery_app import celery_app
 from .post_ingest import (
     CONVERSATION_QUIET_WINDOW_MIN_BYTES,
@@ -67,10 +71,10 @@ async def _run_locked() -> dict:
                     # same quiet window, preserving eventual recovery.
                     or_(
                         Document.category != "conversation",
-                        Document.file_size_bytes
+                        delivery_file_size_expression()
                         < CONVERSATION_QUIET_WINDOW_MIN_BYTES,
-                        Document.synced_at.is_(None),
-                        Document.synced_at <= quiet_before,
+                        delivery_synced_expression().is_(None),
+                        delivery_synced_expression() <= quiet_before,
                     ),
                 )
                 .order_by(Document.updated_at, Document.id)

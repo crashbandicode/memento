@@ -16,6 +16,7 @@ from server.services.ingest_service import (  # noqa: E402
     _scoped_sync_state_select,
     _update_sync_state,
 )
+from server.db.models import Document  # noqa: E402
 from server.services.device_service import (  # noqa: E402
     DeviceOwnershipError,
     ensure_device,
@@ -79,10 +80,10 @@ class DeviceScopedSelectTests(unittest.TestCase):
                 "sessions/shared.jsonl",
                 str(uuid.uuid4()),
                 str(uuid.uuid4()),
-            ).with_for_update()
+            ).with_for_update(of=Document)
         )
 
-        self.assertIn("FOR UPDATE", str(compiled))
+        self.assertIn("FOR UPDATE OF documents", str(compiled))
 
     def test_sync_state_identity_includes_device_and_owner(self) -> None:
         machine_id = str(uuid.uuid4())

@@ -17,6 +17,12 @@ from ..db.session import async_session_factory
 from ..services.content_sanitizer import sanitize_content_file
 from ..services.conversation_stream import ConversationFileSource
 from ..services.device_service import DeviceOwnershipError, ensure_device
+from ..services.document_delivery import (
+    delivery_file_size_expression,
+    delivery_revision_expression,
+    delivery_source_modified_expression,
+    outerjoin_document_delivery,
+)
 from ..services.ingest_revision import committed_full_supersedes
 from ..services.ingest_service import DeltaBaseMismatch, ingest_file
 from ..services.large_content_store import (
@@ -108,18 +114,21 @@ async def _ingest_ready_job(
         "authoritative_rebase", False
     ):
         async with async_session_factory() as preflight_db:
+            statement = select(
+                Document.id,
+                delivery_revision_expression(joined=True).label("content_hash"),
+                delivery_source_modified_expression(joined=True).label(
+                    "source_modified_at"
+                ),
+                delivery_file_size_expression(joined=True).label("file_size_bytes"),
+            ).where(
+                Document.tool_id == meta["tool"],
+                Document.relative_path == meta["relative_path"],
+                Document.machine_id == machine_id,
+            )
             existing = (
                 await preflight_db.execute(
-                    select(
-                        Document.id,
-                        Document.content_hash,
-                        Document.source_modified_at,
-                        Document.file_size_bytes,
-                    ).where(
-                        Document.tool_id == meta["tool"],
-                        Document.relative_path == meta["relative_path"],
-                        Document.machine_id == machine_id,
-                    )
+                    outerjoin_document_delivery(statement)
                 )
             ).one_or_none()
             sync_state = (

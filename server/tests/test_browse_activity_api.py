@@ -190,7 +190,8 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(payload["project"])
         sql = str(db.statements[2].compile())
         self.assertIn("ORDER BY CASE WHEN", sql)
-        self.assertIn("coalesce(documents.activity_at", sql)
+        self.assertIn("document_delivery_state.activity_at", sql)
+        self.assertIn("documents.activity_at", sql)
 
     async def test_device_files_project_summary_pagination_and_lean_queries(self) -> None:
         machine = SimpleNamespace(id=uuid.uuid4(), user_id=None)

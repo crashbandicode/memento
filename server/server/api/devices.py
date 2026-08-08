@@ -16,6 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import AccessLog, ConversationMessage, Document, DocumentVersion, Machine, Project, SyncState, User
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
+from ..services.document_delivery import (
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_revision_expression,
+    delivery_synced_expression,
+)
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
 
@@ -124,7 +130,7 @@ async def get_device_discovery(
             Document.tool_id == "system",
             Document.category == "discovery",
             Document.machine_id == device_db_id,
-        ).order_by(Document.synced_at.desc()).limit(1)
+        ).order_by(delivery_synced_expression().desc()).limit(1)
     )
     doc = doc_result.scalar_one_or_none()
 
@@ -394,11 +400,13 @@ async def get_commands(
                 Document.category == "conversation",
                 Document.tool_id.in_(("codex", "claude_code", "cursor")),
                 func.coalesce(
-                    Document.metadata_[_STORED_SOURCE_REVISION_KEY].as_string(),
+                    delivery_metadata_expression()[
+                        _STORED_SOURCE_REVISION_KEY
+                    ].as_string(),
                     "",
-                ) != Document.content_hash,
+                ) != delivery_revision_expression(),
             )
-            .order_by(Document.file_size_bytes, Document.id)
+            .order_by(delivery_file_size_expression(), Document.id)
             .limit(_REPAIR_BATCH_SIZE)
         )
         repair_paths = [

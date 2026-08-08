@@ -73,6 +73,7 @@ class _Session:
     def __init__(self, *results: list[object]) -> None:
         self._results = list(results)
         self.statements: list[object] = []
+        self.info: dict[str, object] = {}
 
     async def execute(self, statement):
         self.statements.append(statement)
@@ -821,7 +822,9 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.embedding_status, "ok")
         self.assertEqual(document.synced_at, "unchanged")
         self.assertEqual(document.activity_at, "unchanged")
-        self.assertEqual(invalidate.await_count, 2)
+        self.assertEqual(invalidate.await_count, 0)
+        pending_namespaces = next(iter(db.info.values()))
+        self.assertEqual(len(pending_namespaces), 2)
         compiled_statements = [
             statement.compile(dialect=postgresql.dialect())
             for statement in db.statements

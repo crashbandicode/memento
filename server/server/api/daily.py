@@ -32,12 +32,20 @@ async def list_daily_dates(
     _user: User = Depends(get_current_user),
 ) -> list[dict]:
     """List dates with conversation activity in the last N days."""
-    from ..services.cache import cache_get, cache_set
+    from ..services.cache import (
+        cache_get,
+        cache_set,
+        daily_cache_namespace,
+        namespaced_cache_key,
+    )
     # Cache by (user, days, tz). The underlying GROUP BY on
     # conversation_messages does a 33K-row seq scan + 65MB block read on cold
     # cache (2-3s). The answer itself is small and stable across a minute,
     # so even a short TTL hides the cold path for repeat visits / tab loads.
-    cache_key = f"daily:dates:{_user.id}:{days}:{tz_offset}"
+    cache_key = await namespaced_cache_key(
+        daily_cache_namespace(_user.id),
+        f"dates:{days}:{tz_offset}",
+    )
     cached = await cache_get(cache_key)
     if cached is not None:
         return cached
@@ -100,11 +108,19 @@ async def get_daily(
     how a share link's "snapshot" semantics work: viewers see what the
     owner saw at link-creation time, not what the owner is editing now.
     """
-    from ..services.cache import cache_get, cache_set
+    from ..services.cache import (
+        cache_get,
+        cache_set,
+        daily_cache_namespace,
+        namespaced_cache_key,
+    )
     # as_of in the cache key so share traffic doesn't poison the
     # owner-UI's cache (and vice versa).
     as_of_key = as_of.isoformat() if as_of else "live"
-    cache_key = f"daily:detail:{_user.id}:{date_str}:{tz_offset}:{as_of_key}"
+    cache_key = await namespaced_cache_key(
+        daily_cache_namespace(_user.id),
+        f"detail:{date_str}:{tz_offset}:{as_of_key}",
+    )
     cached = await cache_get(cache_key)
     if cached is not None:
         return cached

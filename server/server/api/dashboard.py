@@ -24,6 +24,13 @@ from ..services.conversation_hierarchy import (
     group_conversation_root_thread_ids,
 )
 from ..services.device_grouping import resolve_device_scope_ids
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -73,7 +80,7 @@ async def get_dashboard(
 
     today_q = (
         select(Document.tool_id, func.count().label("n"))
-        .where(Document.synced_at >= today_start)
+        .where(delivery_synced_expression() >= today_start)
     )
     today_q = _apply_device_filter(today_q, selected_machine_ids)
     today_q = apply_user_filter(today_q, mids, Document.machine_id)
@@ -100,16 +107,18 @@ async def get_dashboard(
     # child transcript, pull its logical companions so the visible root still
     # absorbs the child in dashboard presentation for every supported tool.
     activity_expr = effective_conversation_activity_expression(
-        Document.activity_at,
-        Document.source_modified_at,
-        Document.synced_at,
+        delivery_activity_expression(),
+        delivery_source_modified_expression(),
+        delivery_synced_expression(),
     )
     recent_convos_q = (
         select(Document.id, Document.tool_id, Document.title,
-               Document.synced_at, Document.project_id, Document.file_size_bytes,
+               delivery_synced_expression(), Document.project_id,
+               delivery_file_size_expression(),
                Project.title.label("project_title"), Document.relative_path,
-               Document.metadata_, Document.source_modified_at,
-               Document.activity_at)
+               delivery_metadata_expression(),
+               delivery_source_modified_expression(),
+               delivery_activity_expression())
         .outerjoin(Project, Document.project_id == Project.id)
         .where(Document.category == "conversation")
         .order_by(activity_expr.desc(), Document.id.desc())
@@ -126,20 +135,20 @@ async def get_dashboard(
             Document.id,
             Document.tool_id,
             Document.title,
-            Document.synced_at,
+            delivery_synced_expression(),
             Document.project_id,
-            Document.file_size_bytes,
+            delivery_file_size_expression(),
             Project.title.label("project_title"),
             Document.relative_path,
-            Document.metadata_,
-            Document.source_modified_at,
-            Document.activity_at,
+            delivery_metadata_expression(),
+            delivery_source_modified_expression(),
+            delivery_activity_expression(),
         )
         .outerjoin(Project, Document.project_id == Project.id)
         .where(
             Document.category == "conversation",
-            Document.metadata_.op("?")("pending_question_count"),
-            Document.metadata_["pending_question_count"].astext != "0",
+            delivery_metadata_expression().op("?")("pending_question_count"),
+            delivery_metadata_expression()["pending_question_count"].astext != "0",
         )
     )
     attention_convos_q = _apply_device_filter(
@@ -179,16 +188,18 @@ async def get_dashboard(
     if roots_by_tool:
         companions_q = (
             select(Document.id, Document.tool_id, Document.title,
-                   Document.synced_at, Document.project_id, Document.file_size_bytes,
+                   delivery_synced_expression(), Document.project_id,
+                   delivery_file_size_expression(),
                    Project.title.label("project_title"), Document.relative_path,
-                   Document.metadata_, Document.source_modified_at,
-                   Document.activity_at)
+                   delivery_metadata_expression(),
+                   delivery_source_modified_expression(),
+                   delivery_activity_expression())
             .outerjoin(Project, Document.project_id == Project.id)
             .where(
                 Document.category == "conversation",
                 build_conversation_companion_filter(
                     Document.tool_id,
-                    Document.metadata_,
+                    delivery_metadata_expression(),
                     Document.relative_path,
                     roots_by_tool,
                 ),
@@ -325,10 +336,12 @@ async def get_dashboard(
 
     # Recent activity (last 7 days by date, timezone-adjusted)
     cutoff = now - timedelta(days=7)
-    tz_adjusted_synced = Document.synced_at + timedelta(minutes=-tz_offset)
+    tz_adjusted_synced = (
+        delivery_synced_expression() + timedelta(minutes=-tz_offset)
+    )
     daily_q = (
         select(cast(tz_adjusted_synced, Date).label("day"), func.count().label("count"))
-        .where(Document.synced_at >= cutoff)
+        .where(delivery_synced_expression() >= cutoff)
     )
     daily_q = _apply_device_filter(daily_q, selected_machine_ids)
     daily_q = apply_user_filter(daily_q, mids, Document.machine_id)
@@ -340,7 +353,7 @@ async def get_dashboard(
         select(Document.tool_id,
                cast(tz_adjusted_synced, Date).label("day"),
                func.count().label("count"))
-        .where(Document.synced_at >= cutoff)
+        .where(delivery_synced_expression() >= cutoff)
     )
     tool_daily_q = _apply_device_filter(tool_daily_q, selected_machine_ids)
     tool_daily_q = apply_user_filter(tool_daily_q, mids, Document.machine_id)
@@ -379,13 +392,16 @@ async def get_dashboard(
         })
 
     # Today's stats
-    today_total_q = select(func.count()).where(Document.synced_at >= today_start)
+    today_total_q = select(func.count()).where(
+        delivery_synced_expression() >= today_start
+    )
     today_total_q = _apply_device_filter(today_total_q, selected_machine_ids)
     today_total_q = apply_user_filter(today_total_q, mids, Document.machine_id)
     today_total = (await db.execute(today_total_q)).scalar() or 0
 
     today_conv_q = select(func.count()).where(
-        Document.synced_at >= today_start, Document.category == "conversation",
+        delivery_synced_expression() >= today_start,
+        Document.category == "conversation",
     )
     today_conv_q = _apply_device_filter(today_conv_q, selected_machine_ids)
     today_conv_q = apply_user_filter(today_conv_q, mids, Document.machine_id)

@@ -33,6 +33,12 @@ from ..db.models import (
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import is_low_activity_summary
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from ..services.conversation_hierarchy import (
     ConversationRef,
     build_logical_activity_map,
@@ -470,10 +476,10 @@ async def _load_document(
             Document.tool_id,
             Document.title,
             Document.relative_path,
-            Document.metadata_,
-            Document.activity_at,
-            Document.source_modified_at,
-            Document.synced_at,
+            delivery_metadata_expression(),
+            delivery_activity_expression(),
+            delivery_source_modified_expression(),
+            delivery_synced_expression(),
             Document.project_id,
             Project.title.label("project_title"),
             Machine.name.label("machine_name"),
@@ -529,10 +535,10 @@ async def _all_documents(
             Document.tool_id,
             Document.title,
             Document.relative_path,
-            Document.metadata_,
-            Document.activity_at,
-            Document.source_modified_at,
-            Document.synced_at,
+            delivery_metadata_expression(),
+            delivery_activity_expression(),
+            delivery_source_modified_expression(),
+            delivery_synced_expression(),
             Document.project_id,
             Project.title.label("project_title"),
             Machine.name.label("machine_name"),

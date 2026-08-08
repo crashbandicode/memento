@@ -32,6 +32,13 @@ from ..services.message_search import (
     suggest_corrected_query,
 )
 from ..services.device_grouping import resolve_device_scope_ids
+from ..services.document_delivery import (
+    delivery_activity_expression,
+    delivery_file_size_expression,
+    delivery_metadata_expression,
+    delivery_source_modified_expression,
+    delivery_synced_expression,
+)
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -57,11 +64,11 @@ def _conversation_document_columns():
         Document.tool_id.label("tool_id"),
         Document.relative_path.label("relative_path"),
         Document.title.label("title"),
-        Document.file_size_bytes.label("file_size_bytes"),
-        Document.synced_at.label("synced_at"),
-        Document.source_modified_at.label("source_modified_at"),
-        Document.activity_at.label("activity_at"),
-        Document.metadata_.label("metadata"),
+        delivery_file_size_expression().label("file_size_bytes"),
+        delivery_synced_expression().label("synced_at"),
+        delivery_source_modified_expression().label("source_modified_at"),
+        delivery_activity_expression().label("activity_at"),
+        delivery_metadata_expression().label("metadata"),
     )
 
 
@@ -101,9 +108,9 @@ async def search_messages(
     decoded_cursor = decode_search_cursor(cursor)
     sort_timestamp = func.coalesce(
         ConversationMessage.timestamp,
-        Document.activity_at,
-        Document.source_modified_at,
-        Document.synced_at,
+        delivery_activity_expression(),
+        delivery_source_modified_expression(),
+        delivery_synced_expression(),
     )
 
     # Logical folding can collapse copies and subagents. Over-fetch only a
@@ -217,7 +224,7 @@ async def search_messages(
             Document.category == "conversation",
             build_conversation_companion_filter(
                 Document.tool_id,
-                Document.metadata_,
+                delivery_metadata_expression(),
                 Document.relative_path,
                 roots_by_tool,
             ),
@@ -397,11 +404,11 @@ async def search(
         Document.relative_path.label("relative_path"),
         Document.category.label("category"),
         Document.title.label("title"),
-        Document.file_size_bytes.label("file_size_bytes"),
-        Document.synced_at.label("synced_at"),
-        Document.source_modified_at.label("source_modified_at"),
-        Document.activity_at.label("activity_at"),
-        Document.metadata_.label("metadata"),
+        delivery_file_size_expression().label("file_size_bytes"),
+        delivery_synced_expression().label("synced_at"),
+        delivery_source_modified_expression().label("source_modified_at"),
+        delivery_activity_expression().label("activity_at"),
+        delivery_metadata_expression().label("metadata"),
     ).where(or_(*conds))
 
     if tool:
@@ -416,7 +423,7 @@ async def search(
         from datetime import datetime, timedelta, timezone
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        query = query.where(Document.synced_at >= cutoff)
+        query = query.where(delivery_synced_expression() >= cutoff)
     query = apply_user_filter(query, mids, Document.machine_id)
 
     # Fetch lightweight matching metadata first, fold logical agent threads,
@@ -431,12 +438,12 @@ async def search(
                     (
                         Document.category == "conversation",
                         func.coalesce(
-                            Document.activity_at,
-                            Document.source_modified_at,
-                            Document.synced_at,
+                            delivery_activity_expression(),
+                            delivery_source_modified_expression(),
+                            delivery_synced_expression(),
                         ),
                     ),
-                    else_=Document.synced_at,
+                    else_=delivery_synced_expression(),
                 ).desc(),
                 Document.id.desc(),
             )
@@ -470,16 +477,16 @@ async def search(
             Document.relative_path.label("relative_path"),
             Document.category.label("category"),
             Document.title.label("title"),
-            Document.file_size_bytes.label("file_size_bytes"),
-            Document.synced_at.label("synced_at"),
-            Document.source_modified_at.label("source_modified_at"),
-            Document.activity_at.label("activity_at"),
-            Document.metadata_.label("metadata"),
+            delivery_file_size_expression().label("file_size_bytes"),
+            delivery_synced_expression().label("synced_at"),
+            delivery_source_modified_expression().label("source_modified_at"),
+            delivery_activity_expression().label("activity_at"),
+            delivery_metadata_expression().label("metadata"),
         ).where(
             Document.category == "conversation",
             build_conversation_companion_filter(
                 Document.tool_id,
-                Document.metadata_,
+                delivery_metadata_expression(),
                 Document.relative_path,
                 roots_by_tool,
             ),

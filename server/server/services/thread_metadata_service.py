@@ -10,13 +10,24 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine
-from .cache import cache_delete_prefix
+from .cache import (
+    daily_cache_namespace,
+    project_conversations_cache_namespace,
+    stage_cache_invalidation,
+)
 from .conversation_parser import (
     coerce_claude_live_interaction,
     interaction_question_fingerprint,
     is_claude_ask_user_permission_wrapper,
     normalize_interaction,
     strip_terminal_sequences,
+)
+from .document_delivery import (
+    attach_document_delivery,
+    delivery_metadata_expression,
+    document_metadata,
+    ensure_document_delivery_state,
+    store_document_metadata,
 )
 from .ingest_service import (
     CURRENT_PENDING_QUESTIONS_KEY,
@@ -43,6 +54,10 @@ _MANUAL_TITLE_SOURCES = {
 _TITLE_REVISION_MAP_LIMIT = 32
 _INTERACTION_HISTORY_LIMIT = 32
 _LIVE_SHELL_ACTIVITY_LIMIT = 16
+# Kept only so older tests/extensions that monkeypatch the removed SCAN hook
+# fail closed instead of importing a missing symbol. Production code never
+# calls this sentinel.
+cache_delete_prefix = None
 
 
 async def _interaction_anchor_line(
@@ -92,6 +107,7 @@ def codex_thread_documents_select(
 ):
     """Lock every owner-visible copy in deterministic document-id order."""
     thread_value = str(thread_id)
+    effective_metadata = delivery_metadata_expression()
     return (
         select(Document)
         .where(
@@ -100,7 +116,7 @@ def codex_thread_documents_select(
             ),
             Document.tool_id == "codex",
             Document.category == "conversation",
-            Document.metadata_["thread_id"].astext == thread_value,
+            effective_metadata["thread_id"].astext == thread_value,
         )
         .order_by(Document.id.asc())
         .with_for_update(of=Document)
@@ -112,6 +128,7 @@ def _codex_source_thread_select(
     user_id: uuid.UUID,
     thread_id: uuid.UUID,
 ):
+    effective_metadata = delivery_metadata_expression()
     return (
         select(Document.id)
         .where(
@@ -121,7 +138,7 @@ def _codex_source_thread_select(
             ),
             Document.tool_id == "codex",
             Document.category == "conversation",
-            Document.metadata_["thread_id"].astext == str(thread_id),
+            effective_metadata["thread_id"].astext == str(thread_id),
         )
         .limit(1)
     )
@@ -324,7 +341,7 @@ async def apply_codex_thread_title_update(
     ignored = 0
     title_changed_documents: list[Document] = []
     for document in documents:
-        metadata = dict(document.metadata_ or {})
+        metadata = document_metadata(document)
         revisions = _title_revision_map(metadata)
         current_revision = revisions.get(source_machine, 0)
         is_source_document = document.machine_id == machine_id
@@ -355,7 +372,13 @@ async def apply_codex_thread_title_update(
                 metadata["codex_title_revisions"] = next_revisions
                 if is_source_document:
                     metadata["codex_title_revision"] = revision
-                document.metadata_ = metadata
+                delivery_state = await ensure_document_delivery_state(db, document)
+                attach_document_delivery(
+                    document,
+                    delivery_state,
+                    runtime_only=True,
+                )
+                store_document_metadata(document, metadata)
             ignored += 1
             continue
 
@@ -375,7 +398,9 @@ async def apply_codex_thread_title_update(
             "custom": "codex_explicit_rename",
             "fallback": "codex_source_fallback",
         }.get(title_kind, "codex_source_unknown")
-        document.metadata_ = metadata
+        delivery_state = await ensure_document_delivery_state(db, document)
+        attach_document_delivery(document, delivery_state, runtime_only=True)
+        store_document_metadata(document, metadata)
         updated += 1
         if title_changed:
             title_changed_documents.append(document)
@@ -383,13 +408,18 @@ async def apply_codex_thread_title_update(
     for document in title_changed_documents:
         await _refresh_title_search_index(db, document)
 
-    if updated:
-        await cache_delete_prefix(f"daily:detail:{user_id}:")
+    if title_changed_documents:
+        stage_cache_invalidation(db, daily_cache_namespace(user_id))
         project_ids = {
-            document.project_id for document in documents if document.project_id
+            document.project_id
+            for document in title_changed_documents
+            if document.project_id
         }
         for project_id in project_ids:
-            await cache_delete_prefix(f"project:conv:{user_id}:{project_id}:")
+            stage_cache_invalidation(
+                db,
+                project_conversations_cache_namespace(user_id, project_id),
+            )
 
     return ThreadTitleUpdateResult(
         matched=len(documents),
@@ -675,10 +705,14 @@ async def apply_conversation_interaction_update(
         document.metadata_ or {}
     ):
         return ThreadTitleUpdateResult(1, 0, 0)
-    document.metadata_ = metadata
-    await cache_delete_prefix(f"daily:detail:{user_id}:")
+    delivery_state = await ensure_document_delivery_state(db, document)
+    attach_document_delivery(document, delivery_state, runtime_only=True)
+    store_document_metadata(document, metadata)
     if document.project_id:
-        await cache_delete_prefix(f"project:conv:{user_id}:{document.project_id}:")
+        stage_cache_invalidation(
+            db,
+            project_conversations_cache_namespace(user_id, document.project_id),
+        )
     _publish_file_synced_event(document, str(user_id))
     return ThreadTitleUpdateResult(1, 1, 0)
 
@@ -801,9 +835,13 @@ async def apply_conversation_activity_update(
     if metadata == original_metadata:
         return ThreadTitleUpdateResult(1, 0, 0)
 
-    document.metadata_ = metadata
-    await cache_delete_prefix(f"daily:detail:{user_id}:")
+    delivery_state = await ensure_document_delivery_state(db, document)
+    attach_document_delivery(document, delivery_state, runtime_only=True)
+    store_document_metadata(document, metadata)
     if document.project_id:
-        await cache_delete_prefix(f"project:conv:{user_id}:{document.project_id}:")
+        stage_cache_invalidation(
+            db,
+            project_conversations_cache_namespace(user_id, document.project_id),
+        )
     _publish_file_synced_event(document, str(user_id))
     return ThreadTitleUpdateResult(1, 1, 0)

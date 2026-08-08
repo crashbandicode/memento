@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.db.models import ConversationMessage, Document
 from server.db.session import async_session_factory, engine
+from server.services.document_delivery import delivery_metadata_expression
 from server.services.ingest_service import _claude_subagent_sidecar_evidence
 from server.services.subagent_lifecycle import (
     SUBAGENT_TERMINAL_STATUSES,
@@ -300,7 +301,8 @@ async def backfill_subagent_lifecycle(
                 Document.machine_id.in_(machines),
                 Document.tool_id == "claude_code",
                 Document.category == "state",
-                Document.metadata_["is_subagent_meta"].astext == "true",
+                delivery_metadata_expression()["is_subagent_meta"].astext
+                == "true",
             )
         )
     ).scalars().all()

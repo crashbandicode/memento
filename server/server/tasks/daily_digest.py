@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .celery_app import celery_app
 from ..db.models import DailySummary, Document
 from ..db.session import async_session_factory
+from ..services.document_delivery import delivery_synced_expression
 from ..services.summary_service import generate_daily_summary
 
 
@@ -30,8 +31,11 @@ async def _generate_digest(target_date: date) -> None:
 
         result = await db.execute(
             select(Document)
-            .where(Document.synced_at >= start, Document.synced_at < end)
-            .order_by(Document.synced_at)
+            .where(
+                delivery_synced_expression() >= start,
+                delivery_synced_expression() < end,
+            )
+            .order_by(delivery_synced_expression())
         )
         docs = result.scalars().all()
 

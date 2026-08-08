@@ -7,6 +7,7 @@ import pytest
 
 from server.services.ingest_service import (
     _conversation_search_index_needs_refresh,
+    _ingest_cache_scope,
     _record_tool_sync,
 )
 
@@ -58,6 +59,36 @@ from server.services.ingest_service import (
 )
 def test_conversation_index_refresh_is_change_driven(kwargs, expected) -> None:
     assert _conversation_search_index_needs_refresh(**kwargs) is expected
+
+
+def test_tool_only_delta_does_not_invalidate_read_namespaces() -> None:
+    assert _ingest_cache_scope(
+        category="conversation",
+        mode="delta",
+        activity_advanced=False,
+        title_changed=False,
+        lifecycle_changed=False,
+    ) == (False, False)
+
+
+def test_human_activity_invalidates_daily_and_actual_project() -> None:
+    assert _ingest_cache_scope(
+        category="conversation",
+        mode="delta",
+        activity_advanced=True,
+        title_changed=False,
+        lifecycle_changed=False,
+    ) == (True, True)
+
+
+def test_non_conversation_change_does_not_invalidate_conversation_caches() -> None:
+    assert _ingest_cache_scope(
+        category="note",
+        mode="full",
+        activity_advanced=False,
+        title_changed=True,
+        lifecycle_changed=False,
+    ) == (False, False)
 
 
 class _SessionStub:

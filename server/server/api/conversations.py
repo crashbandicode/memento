@@ -55,6 +55,10 @@ from ..services.conversation_parser import (
     normalize_tool_calls,
     parse_conversation,
 )
+from ..services.document_delivery import (
+    delivery_metadata_expression,
+    delivery_synced_expression,
+)
 from ..services.ingest_service import (
     INTERACTION_HISTORY_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
@@ -326,21 +330,22 @@ async def _subagent_event_runtime_overrides(
     if not event_rows:
         return {}
 
+    effective_metadata = delivery_metadata_expression()
     child_filters = []
     if tool_use_ids:
         child_filters.append(
-            Document.metadata_["agent_tool_use_id"].astext.in_(tool_use_ids)
+            effective_metadata["agent_tool_use_id"].astext.in_(tool_use_ids)
         )
     if thread_ids:
         child_filters.extend([
-            Document.metadata_["agent_id"].astext.in_(thread_ids),
-            Document.metadata_["session_id"].astext.in_(thread_ids),
-            Document.metadata_["thread_id"].astext.in_(thread_ids),
+            effective_metadata["agent_id"].astext.in_(thread_ids),
+            effective_metadata["session_id"].astext.in_(thread_ids),
+            effective_metadata["thread_id"].astext.in_(thread_ids),
         ])
     if not child_filters:
         return {}
 
-    child_query = select(Document.metadata_).where(
+    child_query = select(effective_metadata).where(
         Document.id != document.id,
         Document.machine_id == document.machine_id,
         Document.tool_id == document.tool_id,
@@ -356,7 +361,7 @@ async def _subagent_event_runtime_overrides(
         child_query = child_query.where(
             build_conversation_companion_filter(
                 Document.tool_id,
-                Document.metadata_,
+                effective_metadata,
                 Document.relative_path,
                 {document.tool_id: {parent_root}},
             )
@@ -537,7 +542,7 @@ async def get_conversation(
             Document.id == doc.id,
             build_conversation_companion_filter(
                 Document.tool_id,
-                Document.metadata_,
+                delivery_metadata_expression(),
                 Document.relative_path,
                 roots_by_tool,
             ),
@@ -689,7 +694,7 @@ async def get_conversation(
                 Document.category == "plan",
                 Document.metadata_["session_id"].astext == session_id,
             )
-            .order_by(Document.synced_at.desc())
+            .order_by(delivery_synced_expression().desc())
         )
         # Scope related plans to same user — matching session_id alone could
         # surface another user's brain artifacts if they happened to share an ID.
@@ -955,13 +960,14 @@ async def get_pending_conversation_interactions(
         roots_by_tool = group_conversation_root_thread_ids([current_ref])
         companion_filter = build_conversation_companion_filter(
             Document.tool_id,
-            Document.metadata_,
+            delivery_metadata_expression(),
             Document.relative_path,
             roots_by_tool,
         )
+        effective_metadata = delivery_metadata_expression()
         companion_rows = (
             await db.execute(
-                select(Document.id, Document.title, Document.metadata_).where(
+                select(Document.id, Document.title, effective_metadata).where(
                     Document.machine_id == doc.machine_id,
                     Document.tool_id == doc.tool_id,
                     Document.category == "conversation",

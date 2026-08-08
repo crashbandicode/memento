@@ -18,6 +18,12 @@ from sqlalchemy import select, text
 from ..config import settings
 from ..db.models import Document
 from ..db.session import post_ingest_engine, post_ingest_session_factory
+from ..services.document_delivery import (
+    delivery_file_size_expression,
+    delivery_revision_expression,
+    delivery_synced_expression,
+    outerjoin_document_delivery,
+)
 from ..services.ingest_service import _run_post_ingest_inner
 from .celery_app import celery_app
 
@@ -178,7 +184,7 @@ async def schedule_coalesced_post_ingest(
 
     Each ingest refreshes the Redis revision, but only the caller that creates
     the per-document token sends a Celery message. The one live task retries
-    against ``Document.synced_at`` until the transcript is actually quiet.
+    against the delivery projection until the transcript is actually quiet.
     """
     token = uuid4().hex
     try:
@@ -240,18 +246,17 @@ def _quiet_seconds_remaining(
 
 async def _load_document_state(document_id: UUID) -> _DocumentState | None:
     async with post_ingest_session_factory() as db:
+        statement = select(
+            Document.tool_id,
+            Document.category,
+            delivery_revision_expression(joined=True),
+            delivery_file_size_expression(joined=True),
+            delivery_synced_expression(joined=True),
+            Document.embedding_status,
+            Document.knowledge_status,
+        ).where(Document.id == document_id)
         row = (
-            await db.execute(
-                select(
-                    Document.tool_id,
-                    Document.category,
-                    Document.content_hash,
-                    Document.file_size_bytes,
-                    Document.synced_at,
-                    Document.embedding_status,
-                    Document.knowledge_status,
-                ).where(Document.id == document_id)
-            )
+            await db.execute(outerjoin_document_delivery(statement))
         ).one_or_none()
     return _DocumentState(*row) if row is not None else None
 

@@ -100,30 +100,34 @@ def _run_migrations(conn) -> None:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN activity_at TIMESTAMPTZ"
         ))
-        # One-time backfill from normalized transcript time, never from the
-        # collector delivery time.  Tool/system rows are omitted because they
-        # can be synthetic context and should not make a dormant thread look
-        # newly active.  Future ingests maintain this value incrementally.
-        if "conversation_messages" in tables:
-            conn.execute(text(
-                "UPDATE documents AS d SET activity_at = ("
-                "  SELECT cm.timestamp "
-                "  FROM conversation_messages AS cm "
-                "  WHERE cm.document_id = d.id "
-                "    AND cm.timestamp IS NOT NULL "
-                "    AND cm.role IN ('user', 'assistant') "
-                "  ORDER BY cm.timestamp DESC "
-                "  LIMIT 1"
-                ") "
-                "WHERE d.category = 'conversation'"
-            ))
+        # No startup backfill: existing rows retain the legacy read fallback
+        # and acquire projection activity lazily on their next meaningful
+        # normalized ingest. Rewriting documents here would recreate the WAL
+        # and dead-tuple incident this migration is intended to stop.
+    # Append-heavy conversation state lives outside the canonical documents
+    # heap. This additive, lazily populated table avoids a startup backfill or
+    # documents-table rewrite on existing Postgres installations.
     conn.execute(text(
-        "CREATE INDEX IF NOT EXISTS idx_documents_activity_at "
-        "ON documents (activity_at DESC)"
+        "CREATE TABLE IF NOT EXISTS document_delivery_state ("
+        "document_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, "
+        "project_id UUID REFERENCES projects(id) ON DELETE SET NULL, "
+        "revision_hash VARCHAR(64) NOT NULL, "
+        "file_size_bytes BIGINT NOT NULL, "
+        "delivery_metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "source_modified_at TIMESTAMPTZ, "
+        "activity_at TIMESTAMPTZ, "
+        "synced_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ")"
     ))
     conn.execute(text(
-        "CREATE INDEX IF NOT EXISTS idx_documents_project_activity "
-        "ON documents (project_id, activity_at DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_document_delivery_activity "
+        "ON document_delivery_state (activity_at DESC)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_document_delivery_project_activity "
+        "ON document_delivery_state (project_id, activity_at DESC)"
     ))
     if "embedding_status" not in doc_cols:
         conn.execute(text(
@@ -522,8 +526,6 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_content_trgm "
         "ON conversation_messages USING gin (content gin_trgm_ops) "
         "WHERE role IN ('user', 'assistant')",
-        "CREATE INDEX IF NOT EXISTS idx_documents_tool_synced ON documents (tool_id, synced_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_documents_project_synced ON documents (project_id, synced_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_documents_project_category ON documents (project_id, category)",
         # Cursor can relocate one stable thread from empty-window to its real
         # project, or promote a nested subagent transcript to a root path.
@@ -553,6 +555,19 @@ def _run_migrations(conn) -> None:
             sp.commit()
         except Exception:
             sp.rollback()
+
+
+def _configure_hot_storage(conn) -> None:
+    """Apply metadata-only storage settings after fresh or upgraded DDL."""
+    from sqlalchemy import text
+
+    conn.execute(text(
+        "ALTER TABLE IF EXISTS document_delivery_state SET ("
+        "fillfactor = 70, "
+        "autovacuum_vacuum_scale_factor = 0.02, "
+        "autovacuum_vacuum_threshold = 100"
+        ")"
+    ))
 
 
 async def _schedule_daily_compaction():
@@ -673,6 +688,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     async with engine.begin() as conn:
         await conn.run_sync(_run_migrations)
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_configure_hot_storage)
     await _require_fast_embedding_server()
     # Start daily compaction in background
     compaction_task = asyncio.create_task(_schedule_daily_compaction())

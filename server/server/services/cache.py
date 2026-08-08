@@ -21,6 +21,8 @@ from ..config import settings
 logger = logging.getLogger("cache")
 
 _client: aioredis.Redis | None = None
+_PENDING_INVALIDATIONS_KEY = "memento_cache_namespace_invalidations"
+_GENERATION_PREFIX = "cache:generation:"
 
 
 def _get_client() -> aioredis.Redis | None:
@@ -59,24 +61,73 @@ async def cache_set(key: str, value: Any, ttl_seconds: int) -> None:
         logger.debug("cache_set(%s) failed: %s", key, e)
 
 
-async def cache_delete_prefix(prefix: str) -> int:
-    """Drop every key matching ``<prefix>*`` via SCAN MATCH + DEL.
+def daily_cache_namespace(user_id: object) -> str:
+    return f"daily:{user_id}"
 
-    Used by ingest_service to bust read caches for the user whose
-    project / daily we just updated, so shared timelines and daily
-    pages don't sit on a 30-60 s stale window after a sync. Best-
-    effort: returns the number of keys deleted (0 if Redis is down).
-    SCAN is preferred over KEYS to avoid blocking the Redis server on
-    a large keyspace.
-    """
+
+def project_conversations_cache_namespace(
+    user_id: object,
+    project_id: object,
+) -> str:
+    return f"project-conversations:{user_id}:{project_id}"
+
+
+async def namespaced_cache_key(namespace: str, suffix: str) -> str:
+    """Return a cache key bound to the namespace's current generation."""
+    c = _get_client()
+    if c is None:
+        generation = "0"
+    else:
+        try:
+            generation = await c.get(f"{_GENERATION_PREFIX}{namespace}") or "0"
+        except Exception as e:
+            logger.debug("cache generation read (%s) failed: %s", namespace, e)
+            generation = "0"
+    return f"cache:data:{namespace}:g{generation}:{suffix}"
+
+
+def stage_cache_invalidation(session: Any, *namespaces: str) -> None:
+    """Deduplicate invalidations in transaction-local session state."""
+    info = getattr(session, "info", None)
+    if info is None:
+        sync_session = getattr(session, "sync_session", None)
+        info = getattr(sync_session, "info", None)
+    if info is None:
+        return
+    pending = info.setdefault(_PENDING_INVALIDATIONS_KEY, set())
+    pending.update(namespace for namespace in namespaces if namespace)
+
+
+def discard_staged_cache_invalidations(session: Any) -> None:
+    info = getattr(session, "info", None)
+    if info is None:
+        sync_session = getattr(session, "sync_session", None)
+        info = getattr(sync_session, "info", None)
+    if info is not None:
+        info.pop(_PENDING_INVALIDATIONS_KEY, None)
+
+
+async def publish_staged_cache_invalidations(session: Any) -> int:
+    """Advance each changed namespace once, strictly after DB commit."""
+    info = getattr(session, "info", None)
+    if info is None:
+        sync_session = getattr(session, "sync_session", None)
+        info = getattr(sync_session, "info", None)
+    if info is None:
+        return 0
+    namespaces = sorted(info.pop(_PENDING_INVALIDATIONS_KEY, set()))
+    if not namespaces:
+        return 0
     c = _get_client()
     if c is None:
         return 0
-    deleted = 0
+    published = 0
     try:
-        async for key in c.scan_iter(match=f"{prefix}*", count=200):
-            await c.delete(key)
-            deleted += 1
+        for namespace in namespaces:
+            await c.incr(f"{_GENERATION_PREFIX}{namespace}")
+            published += 1
     except Exception as e:
-        logger.debug("cache_delete_prefix(%s) failed: %s", prefix, e)
-    return deleted
+        # The database commit already succeeded. Cache failures remain
+        # best-effort and stale generations are still bounded by data-key TTLs.
+        logger.debug("cache namespace publish failed: %s", e)
+    return published

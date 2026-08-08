@@ -17,6 +17,7 @@ from ..db.models import (
     Machine,
 )
 from .conversation_identity import conversation_session_id
+from .document_delivery import delivery_metadata_expression
 from .thread_metadata_service import (
     apply_codex_thread_title_update,
     apply_conversation_activity_update,
@@ -106,6 +107,7 @@ async def resolve_metadata_relative_path(
     """Resolve an alias path to the current canonical conversation location."""
     if not session_id:
         return relative_path
+    effective_metadata = delivery_metadata_expression()
     document = (
         await db.execute(
             select(Document.relative_path)
@@ -116,7 +118,7 @@ async def resolve_metadata_relative_path(
                 ),
                 Document.tool_id == tool_id,
                 Document.category == "conversation",
-                Document.metadata_["session_id"].astext == session_id,
+                effective_metadata["session_id"].astext == session_id,
             )
             .limit(1)
         )

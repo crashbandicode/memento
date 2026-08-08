@@ -833,6 +833,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_shell_activity_is_returned_inline(self) -> None:
         self.doc.tool_id = "claude_code"
+        activity_at = datetime.now(timezone.utc).isoformat()
         self.doc.metadata_["_live_shell_activities"] = {
             "toolu-shell-live": {
                 "id": "toolu-shell-live",
@@ -840,8 +841,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "status": "running",
                 "tool_name": "PowerShell",
                 "command": "Start-Sleep -Seconds 30",
-                "started_at": "2026-08-04T17:00:00Z",
-                "updated_at": "2026-08-04T17:00:00Z",
+                "started_at": activity_at,
+                "updated_at": activity_at,
                 "anchor_line_number": 34406,
             }
         }
@@ -1302,7 +1303,12 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         hierarchy_statement = db.statements[3]
         hierarchy_sql = str(hierarchy_statement.compile())
         hierarchy_params = hierarchy_statement.compile().params.values()
-        self.assertGreaterEqual(hierarchy_sql.count("documents.metadata ->>"), 3)
+        self.assertGreaterEqual(
+            hierarchy_sql.count("document_delivery_state.delivery_metadata"),
+            3,
+        )
+        self.assertIn("documents.metadata", hierarchy_sql)
+        self.assertIn("coalesce", hierarchy_sql)
         self.assertTrue(any(value == "root_session_id" for value in hierarchy_params))
         self.assertTrue(any(value == "session_id" for value in hierarchy_params))
 

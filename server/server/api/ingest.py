@@ -20,9 +20,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import Document, User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
-from ..services.device_service import ensure_device
 from ..services.content_sanitizer import sanitize_content_file
 from ..services.conversation_stream import ConversationFileSource
+from ..services.device_service import ensure_device
+from ..services.document_delivery import (
+    delivery_metadata_expression,
+    delivery_revision_expression,
+    outerjoin_document_delivery,
+)
 from ..services.conversation_metadata_inbox import (
     defer_conversation_metadata,
     normalized_metadata_session_id,
@@ -175,14 +180,16 @@ async def _completed_upload_needs_reprocessing(
     ):
         return False
 
+    statement = select(
+        delivery_revision_expression(joined=True).label("content_hash"),
+        delivery_metadata_expression(joined=True).label("metadata_"),
+    ).where(
+        Document.machine_id == machine_id,
+        Document.tool_id == tool_id,
+        Document.relative_path == relative_path,
+    )
     row = (
-        await db.execute(
-            select(Document.content_hash, Document.metadata_).where(
-                Document.machine_id == machine_id,
-                Document.tool_id == tool_id,
-                Document.relative_path == relative_path,
-            )
-        )
+        await db.execute(outerjoin_document_delivery(statement))
     ).one_or_none()
     if row is None or row.content_hash != expected_hash:
         return True

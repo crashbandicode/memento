@@ -29,6 +29,17 @@ from .conversation_identity import (
     should_relocate_conversation_document,
 )
 from .conversation_stream import ConversationFileSource
+from .document_delivery import (
+    attach_document_delivery,
+    delivery_metadata_expression,
+    document_delivery_state,
+    document_metadata,
+    ensure_document_delivery_state,
+    outerjoin_document_delivery,
+    store_document_metadata,
+    update_document_delivery,
+    update_document_source_modified,
+)
 from .history_recovery import (
     UserOccurrence,
     partition_recovered_occurrences,
@@ -58,6 +69,9 @@ _post_ingest_semaphore: asyncio.Semaphore | None = None
 # tsvector update). 16 leaves headroom in the 32-slot main pool for login,
 # dashboard, search, etc. — collector storms can't starve the web UI.
 _ingest_semaphore: asyncio.Semaphore | None = None
+# Compatibility sentinel for callers that used to monkeypatch prefix-SCAN
+# invalidation. No production path calls it.
+_invalidate_ingest_read_caches = None
 
 
 def _get_post_ingest_semaphore() -> asyncio.Semaphore:
@@ -339,6 +353,26 @@ def _conversation_search_index_needs_refresh(
     )
 
 
+def _ingest_cache_scope(
+    *,
+    category: str,
+    mode: str,
+    activity_advanced: bool,
+    title_changed: bool,
+    lifecycle_changed: bool,
+) -> tuple[bool, bool]:
+    """Return daily/project-conversation invalidations for visible changes."""
+    is_conversation = category == "conversation"
+    daily_changed = is_conversation and (activity_advanced or mode == "full")
+    project_changed = is_conversation and (
+        activity_advanced
+        or mode == "full"
+        or title_changed
+        or lifecycle_changed
+    )
+    return daily_changed, project_changed
+
+
 async def _record_tool_sync(
     db: AsyncSession,
     tool: Tool,
@@ -395,7 +429,7 @@ def _stored_source_is_current(
     """Return whether the persisted raw blob is complete for this revision."""
     if doc.category != "conversation":
         return True
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     return bool(
         (doc.content is not None or doc.content_s3_key)
         and (not incoming_s3_key or doc.content_s3_key == incoming_s3_key)
@@ -413,14 +447,14 @@ def _set_stored_source_identity(
 ) -> None:
     """Record the exact sanitized blob and optional full source revision."""
     encoded = content.encode("utf-8")
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     metadata[STORED_SOURCE_HASH_KEY] = hashlib.sha256(encoded).hexdigest()
     metadata[STORED_SOURCE_SIZE_KEY] = len(encoded)
     if revision_hash:
         metadata[STORED_SOURCE_REVISION_KEY] = revision_hash
     else:
         metadata.pop(STORED_SOURCE_REVISION_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _set_stored_source_proof(
@@ -435,14 +469,14 @@ def _set_stored_source_proof(
         raise ValueError("stored source hash must be a SHA-256 hex digest")
     if source_size < 0:
         raise ValueError("stored source size must be non-negative")
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     metadata[STORED_SOURCE_HASH_KEY] = source_hash
     metadata[STORED_SOURCE_SIZE_KEY] = int(source_size)
     if revision_hash:
         metadata[STORED_SOURCE_REVISION_KEY] = revision_hash
     else:
         metadata.pop(STORED_SOURCE_REVISION_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
@@ -702,7 +736,7 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
     """Seed incremental parsing from the last committed assistant identity."""
     from .conversation_parser import AssistantIdentityState
 
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     if mode != "delta":
         return AssistantIdentityState()
 
@@ -732,7 +766,7 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
 
 def _store_assistant_identity(doc: Document, assistant_identity) -> None:
     """Persist parser state so a later delta can label its assistant rows."""
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     for key, value in (
         (CURRENT_ASSISTANT_MODEL_KEY, assistant_identity.model),
         (CURRENT_ASSISTANT_REASONING_KEY, assistant_identity.reasoning_effort),
@@ -746,14 +780,14 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
             )
         else:
             metadata.pop(key, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
     """Seed active interaction IDs from the previous committed delta."""
     if mode != "delta":
         return set()
-    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    metadata = document_metadata(doc)
     stored = metadata.get(CURRENT_PENDING_QUESTIONS_KEY)
     if not isinstance(stored, list):
         return set()
@@ -763,7 +797,7 @@ def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
 def _latest_human_timestamp_for_ingest(doc: Document, mode: str) -> str:
     if mode != "delta":
         return ""
-    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    metadata = document_metadata(doc)
     return _bounded_message_text(
         str(metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY) or ""),
         128,
@@ -860,7 +894,7 @@ def _update_pending_question_ids(
 
 
 def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     bounded = sorted(pending_ids)[:64]
     if bounded:
         metadata[CURRENT_PENDING_QUESTIONS_KEY] = bounded
@@ -868,17 +902,17 @@ def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
     else:
         metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
         metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _store_latest_human_timestamp(doc: Document, timestamp: object) -> None:
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     bounded = _bounded_message_text(str(timestamp or ""), 128)
     if bounded:
         metadata[LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY] = bounded
     else:
         metadata.pop(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _normalized_interaction_ids(normalized) -> set[str]:
@@ -917,7 +951,7 @@ def _reconcile_live_interaction_signals(
     clear_all: bool,
 ) -> None:
     """Retire previews once their canonical transcript rows have arrived."""
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
     if not isinstance(raw_signals, dict):
         return
@@ -933,7 +967,7 @@ def _reconcile_live_interaction_signals(
         metadata[LIVE_INTERACTION_SIGNALS_KEY] = signals
     else:
         metadata.pop(LIVE_INTERACTION_SIGNALS_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _normalized_terminal_tool_call_ids(normalized) -> set[str]:
@@ -968,7 +1002,7 @@ def _reconcile_live_shell_activities(
     terminal_tool_call_ids: set[str],
 ) -> None:
     """Retire transient shell cards once canonical terminal rows arrive."""
-    metadata = dict(doc.metadata_ or {})
+    metadata = document_metadata(doc)
     raw_activities = metadata.get(LIVE_SHELL_ACTIVITIES_KEY)
     if not isinstance(raw_activities, dict):
         return
@@ -983,7 +1017,7 @@ def _reconcile_live_shell_activities(
         metadata[LIVE_SHELL_ACTIVITIES_KEY] = activities
     else:
         metadata.pop(LIVE_SHELL_ACTIVITIES_KEY, None)
-    doc.metadata_ = metadata
+    store_document_metadata(doc, metadata)
 
 
 def _pending_question_interactions(
@@ -1130,23 +1164,22 @@ def _advance_stored_pending_questions(
 
 async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
     """One-time repair for badges persisted before human-turn reconciliation."""
+    statement = select(Document).where(
+        Document.category == "conversation",
+        delivery_metadata_expression(joined=True).op("?")(
+            CURRENT_PENDING_QUESTIONS_KEY
+        ),
+    )
     documents = (
         (
-            await db.execute(
-                select(Document).where(
-                    Document.category == "conversation",
-                    Document.metadata_.op("?")(CURRENT_PENDING_QUESTIONS_KEY),
-                )
-            )
+            await db.execute(outerjoin_document_delivery(statement))
         )
         .scalars()
         .all()
     )
     updated = 0
     for document in documents:
-        original_metadata = (
-            dict(document.metadata_) if isinstance(document.metadata_, dict) else {}
-        )
+        original_metadata = document_metadata(document)
         if (
             original_metadata.get(PENDING_QUESTION_RECONCILIATION_VERSION_KEY)
             == PENDING_QUESTION_RECONCILIATION_VERSION
@@ -1220,7 +1253,7 @@ async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
             PENDING_QUESTION_RECONCILIATION_VERSION
         )
         if metadata != original_metadata:
-            document.metadata_ = metadata
+            store_document_metadata(document, metadata)
             updated += 1
 
     await db.commit()
@@ -1704,7 +1737,7 @@ async def _apply_friendly_conversation_title(
     doc: Document,
 ) -> str | None:
     """Replace opaque transcript identifiers with the first real user prompt."""
-    metadata = doc.metadata_ or {}
+    metadata = document_metadata(doc)
     title_source = str(metadata.get("memento_title_source") or "").strip().lower()
     legacy_title_source = str(metadata.get("title_source") or "").strip().lower()
     try:
@@ -1776,7 +1809,7 @@ async def _apply_friendly_conversation_title(
             doc.title = friendly
             return friendly
     if doc.tool_id == "codex":
-        agent_title = _friendly_codex_agent_title(doc.metadata_)
+        agent_title = _friendly_codex_agent_title(document_metadata(doc))
         if agent_title:
             doc.title = agent_title
             return agent_title
@@ -2000,7 +2033,7 @@ async def _reconcile_claude_subagent_launch_metadata(
                     sidecar_path,
                     machine_id,
                     user_id,
-                ).with_for_update()
+                ).with_for_update(of=Document)
             )
         ).scalar_one_or_none()
         if sidecar_document is None or sidecar_document.category != "state":
@@ -2023,7 +2056,7 @@ async def _reconcile_claude_subagent_launch_metadata(
                     transcript_path,
                     machine_id,
                     user_id,
-                ).with_for_update()
+                ).with_for_update(of=Document)
             )
         ).scalar_one_or_none()
     if (
@@ -2035,11 +2068,11 @@ async def _reconcile_claude_subagent_launch_metadata(
         return None
 
     agent_id = str(launch_metadata["agent_id"])
-    session_id = (transcript_document.metadata_ or {}).get("session_id")
+    session_id = document_metadata(transcript_document).get("session_id")
     if session_id and str(session_id) != f"agent-{agent_id}":
         return None
 
-    existing_metadata = dict(transcript_document.metadata_ or {})
+    existing_metadata = document_metadata(transcript_document)
     if all(
         existing_metadata.get(key) == value
         for key, value in launch_metadata.items()
@@ -2049,25 +2082,40 @@ async def _reconcile_claude_subagent_launch_metadata(
         {**existing_metadata, **launch_metadata},
         tool_id="claude_code",
     )
-    transcript_document.metadata_ = merged_metadata
+    delivery_state = await ensure_document_delivery_state(db, transcript_document)
+    attach_document_delivery(
+        transcript_document,
+        delivery_state,
+        runtime_only=True,
+    )
+    store_document_metadata(transcript_document, merged_metadata)
     return transcript_document
 
 
-async def _invalidate_ingest_read_caches(
+def _stage_ingest_read_cache_invalidations(
+    db: AsyncSession,
     user_id: str | None,
     project_id: object | None,
+    *,
+    daily: bool,
+    project: bool,
 ) -> None:
     if not user_id:
         return
-    try:
-        from .cache import cache_delete_prefix
+    from .cache import (
+        daily_cache_namespace,
+        project_conversations_cache_namespace,
+        stage_cache_invalidation,
+    )
 
-        await cache_delete_prefix(f"daily:detail:{user_id}:")
-        await cache_delete_prefix(f"daily:dates:{user_id}:")
-        if project_id:
-            await cache_delete_prefix(f"project:conv:{user_id}:{project_id}:")
-    except Exception:
-        pass
+    namespaces: list[str] = []
+    if daily:
+        namespaces.append(daily_cache_namespace(user_id))
+    if project and project_id:
+        namespaces.append(
+            project_conversations_cache_namespace(user_id, project_id)
+        )
+    stage_cache_invalidation(db, *namespaces)
 
 
 def _reconcile_subagent_document_lifecycle(
@@ -2085,30 +2133,30 @@ def _reconcile_subagent_document_lifecycle(
     if not is_conversation_subagent(
         document.tool_id,
         document.relative_path,
-        document.metadata_,
+        document_metadata(document),
     ):
         return False
     evidence = (
         child_lifecycle_evidence_from_objects(
             document.tool_id,
-            document.metadata_,
+            document_metadata(document),
             source_objects,
             source_timestamp=source_timestamp or document.source_modified_at,
         )
         if source_objects is not None
         else child_lifecycle_evidence(
             document.tool_id,
-            document.metadata_,
+            document_metadata(document),
             content,
             source_timestamp=source_timestamp or document.source_modified_at,
         )
     )
     metadata, changed = reconcile_child_lifecycle_metadata(
-        document.metadata_,
+        document_metadata(document),
         evidence,
     )
     if changed:
-        document.metadata_ = metadata
+        store_document_metadata(document, metadata)
     return changed
 
 
@@ -2154,9 +2202,12 @@ async def _reconcile_idempotent_claude_ingest(
     if enriched_child is None and not lifecycle_changed:
         return
     await db.flush()
-    await _invalidate_ingest_read_caches(
+    _stage_ingest_read_cache_invalidations(
+        db,
         user_id,
         lifecycle_document.project_id,
+        daily=False,
+        project=True,
     )
     _publish_file_synced_event(lifecycle_document, user_id)
 
@@ -2189,15 +2240,16 @@ def _scoped_conversation_identity_select(
     user_id: str | None,
 ):
     """Select all same-device aliases for one verified session UUID."""
+    effective_metadata = delivery_metadata_expression()
     statement = select(Document).where(
         Document.tool_id == tool_id,
         Document.category == "conversation",
         Document.machine_id == machine_id,
-        Document.metadata_["session_id"].astext == session_id,
+        effective_metadata["session_id"].astext == session_id,
     )
     if tool_id == "codex":
         statement = statement.where(
-            Document.metadata_["thread_id"].astext == session_id,
+            effective_metadata["thread_id"].astext == session_id,
         )
     if user_id is not None:
         statement = statement.where(
@@ -2368,7 +2420,7 @@ async def ingest_file(
                 relative_path,
                 machine_id,
                 user_id,
-            ).with_for_update()
+            ).with_for_update(of=Document)
         )
     ).scalar_one_or_none()
     doc = path_doc
@@ -2381,7 +2433,7 @@ async def ingest_file(
                         stable_source_identity,
                         machine_id,
                         user_id,
-                    ).with_for_update()
+                    ).with_for_update(of=Document)
                 )
             )
             .scalars()
@@ -2393,6 +2445,29 @@ async def ingest_file(
                 tool_id=tool_id,
                 session_id=stable_source_identity,
             )
+    delivery_state = None
+    if doc is not None and category == "conversation":
+        delivery_state = await ensure_document_delivery_state(db, doc)
+        attach_document_delivery(
+            doc,
+            delivery_state,
+            runtime_only=mode == "delta",
+        )
+    current_revision = (
+        delivery_state.revision_hash
+        if delivery_state is not None
+        else (doc.content_hash if doc is not None else None)
+    )
+    current_source_modified_at = (
+        delivery_state.source_modified_at
+        if delivery_state is not None
+        else (doc.source_modified_at if doc is not None else None)
+    )
+    current_file_size = (
+        delivery_state.file_size_bytes
+        if delivery_state is not None
+        else (doc.file_size_bytes if doc is not None else 0)
+    )
     identity_path_conflict = (
         path_doc is not None and doc is not None and path_doc.id != doc.id
     )
@@ -2405,19 +2480,24 @@ async def ingest_file(
             session_id=stable_source_identity,
             current_path=doc.relative_path,
             incoming_path=relative_path,
-            current_modified_at=doc.source_modified_at,
+            current_modified_at=current_source_modified_at,
             incoming_modified_at=source_modified_at,
         )
     )
     # Repair timestamps accepted before source-clock bounding was introduced.
     # Leaving a future value in place would make later valid FULL snapshots
     # look stale indefinitely, even though new incoming times are bounded.
-    if doc is not None and doc.source_modified_at is not None:
-        observed_at = doc.synced_at or received_at
-        doc.source_modified_at = bounded_source_timestamp(
-            doc.source_modified_at,
+    if doc is not None and current_source_modified_at is not None:
+        observed_at = (
+            delivery_state.synced_at
+            if delivery_state is not None
+            else doc.synced_at
+        ) or received_at
+        current_source_modified_at = bounded_source_timestamp(
+            current_source_modified_at,
             observed_at,
         )
+        update_document_source_modified(doc, current_source_modified_at)
     is_new_document = doc is None
     previous_title = doc.title if doc is not None else None
     previous_embedding_content_hash: str | None = None
@@ -2425,13 +2505,13 @@ async def ingest_file(
         mode=mode,
         payload_size=file_size,
         offset=offset,
-        existing_size=doc.file_size_bytes if doc is not None else 0,
+        existing_size=current_file_size,
     )
-    same_hash_before_write = doc is not None and doc.content_hash == content_hash
+    same_hash_before_write = doc is not None and current_revision == content_hash
     if (
         sync_row is not None
         and doc is not None
-        and doc.content_hash == content_hash
+        and current_revision == content_hash
         and sync_row.last_hash == content_hash
         and sync_row.last_offset == offset
         and not identity_relocation
@@ -2445,9 +2525,10 @@ async def ingest_file(
             incoming_s3_key=content_s3_key,
         )
         if pointer_is_current:
-            doc.source_modified_at = max(
-                filter(None, (doc.source_modified_at, source_modified_at))
+            latest_source_modified_at = max(
+                filter(None, (current_source_modified_at, source_modified_at))
             )
+            update_document_source_modified(doc, latest_source_modified_at)
             await _reconcile_idempotent_claude_ingest(
                 db,
                 doc,
@@ -2462,7 +2543,7 @@ async def ingest_file(
         mode == "delta"
         and doc is not None
         and sync_row is not None
-        and sync_row.last_hash == doc.content_hash
+        and sync_row.last_hash == current_revision
         and int(sync_row.last_offset or 0) >= offset
     ):
         # A delayed/replayed append can remain in the durable spool after a
@@ -2479,7 +2560,7 @@ async def ingest_file(
         committed_matches_state = (
             doc is not None
             and expected_hash is not None
-            and doc.content_hash == expected_hash
+            and current_revision == expected_hash
         )
         if (
             not committed_matches_state
@@ -2495,7 +2576,7 @@ async def ingest_file(
     if (
         mode == "full"
         and doc is not None
-        and doc.content_hash == content_hash
+        and current_revision == content_hash
         and not identity_relocation
     ):
         pointer_is_current = _stored_source_is_current(
@@ -2505,10 +2586,10 @@ async def ingest_file(
         )
         if pointer_is_current:
             if (
-                doc.source_modified_at is None
-                or source_modified_at > doc.source_modified_at
+                current_source_modified_at is None
+                or source_modified_at > current_source_modified_at
             ):
-                doc.source_modified_at = source_modified_at
+                update_document_source_modified(doc, source_modified_at)
             await _update_sync_state(
                 db,
                 tool_id,
@@ -2533,17 +2614,17 @@ async def ingest_file(
     if (
         mode == "full"
         and doc is not None
-        and doc.content_hash != content_hash
+        and current_revision != content_hash
         and not authoritative_rebase
     ):
         existing_offset = 0
-        if sync_row is not None and sync_row.last_hash == doc.content_hash:
+        if sync_row is not None and sync_row.last_hash == current_revision:
             existing_offset = int(sync_row.last_offset or 0)
         if committed_full_supersedes(
-            existing_hash=doc.content_hash,
-            existing_timestamp=doc.source_modified_at,
+            existing_hash=current_revision,
+            existing_timestamp=current_source_modified_at,
             existing_offset=existing_offset,
-            existing_size=doc.file_size_bytes,
+            existing_size=current_file_size,
             incoming_hash=content_hash,
             incoming_timestamp=source_modified_at,
             incoming_offset=offset,
@@ -2640,9 +2721,10 @@ async def ingest_file(
     if not project_id:
         session_id = metadata.get("session_id") or metadata.get("cascade_id")
         if session_id:
+            effective_metadata = delivery_metadata_expression()
             project_statement = select(Document.project_id).where(
                 Document.tool_id == tool_id,
-                Document.metadata_["session_id"].astext == session_id,
+                effective_metadata["session_id"].astext == session_id,
                 Document.project_id.isnot(None),
                 Document.machine_id == machine_id,
             )
@@ -2677,7 +2759,7 @@ async def ingest_file(
         stored_metadata["memento_title_source"] = "claude_ai_title"
     title = stored_metadata.pop("title", None) or relative_path.split("/")[-1]
     previous_stored_revision = (
-        (doc.metadata_ or {}).get(STORED_SOURCE_REVISION_KEY)
+        document_metadata(doc).get(STORED_SOURCE_REVISION_KEY)
         if doc is not None
         else None
     )
@@ -2763,9 +2845,24 @@ async def ingest_file(
             doc.content = content
         if persist_content and not preserve_externalized_delta:
             doc.content_s3_key = None
-        doc.content_hash = content_hash
-        doc.file_size_bytes = logical_file_size
-        existing_metadata = dict(doc.metadata_ or {})
+        latest_source_modified_at = max(
+            filter(None, (current_source_modified_at, source_modified_at))
+        )
+        if delivery_state is not None:
+            update_document_delivery(
+                doc,
+                delivery_state,
+                revision_hash=content_hash,
+                file_size_bytes=logical_file_size,
+                source_modified_at=latest_source_modified_at,
+                synced_at=now,
+            )
+        else:
+            doc.content_hash = content_hash
+            doc.file_size_bytes = logical_file_size
+            doc.synced_at = now
+            doc.source_modified_at = latest_source_modified_at
+        existing_metadata = document_metadata(doc)
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
         metadata_update = (
@@ -2779,14 +2876,8 @@ async def ingest_file(
             metadata_update,
             tool_id=tool_id,
         )
-        doc.metadata_ = merged_metadata
+        store_document_metadata(doc, merged_metadata)
         doc.needs_review = doc.needs_review or had_sensitive
-        doc.synced_at = now
-        if (
-            doc.source_modified_at is None
-            or source_modified_at > doc.source_modified_at
-        ):
-            doc.source_modified_at = source_modified_at
         if machine_id and not doc.machine_id:
             doc.machine_id = machine_id
         doc.title = _select_updated_document_title(
@@ -2794,13 +2885,15 @@ async def ingest_file(
             title,
             category=category,
             tool_id=tool_id,
-            metadata=doc.metadata_,
+            metadata=document_metadata(doc),
             incoming_title_is_explicit=incoming_title_is_explicit,
         )
         # Backfill project_id when newly resolved (was NULL, or changed).
         # Don't overwrite an existing link with NULL — keep last good value.
         if project_id and doc.project_id != project_id:
             doc.project_id = project_id
+        if delivery_state is not None:
+            delivery_state.project_id = doc.project_id
 
         # Conversation DELTAs are transport fragments, not independently
         # restorable document versions (content_delta is not populated). Keep
@@ -2833,6 +2926,9 @@ async def ingest_file(
     from sqlalchemy import update as _update
 
     await db.flush()
+    if category == "conversation" and delivery_state is None:
+        delivery_state = await ensure_document_delivery_state(db, doc)
+        attach_document_delivery(doc, delivery_state, runtime_only=False)
     if category == "conversation" and user_id:
         # Content and lightweight metadata travel independently. Reconcile any
         # signal accepted before this document existed while the canonical
@@ -2876,32 +2972,6 @@ async def ingest_file(
     ):
         await db.flush()
 
-    # Bump the parent project's updated_at so the projects list (sorted
-    # by Project.updated_at desc) actually reorders when a new doc
-    # lands. SQLAlchemy's `onupdate` only fires when the Project row
-    # itself is touched — a child Document INSERT doesn't cascade.
-    if doc.project_id:
-        await db.execute(
-            _update(Project)
-            .where(Project.id == doc.project_id)
-            .values(updated_at=_func.now())
-        )
-
-    # Bust read caches for this user's surface area: daily detail
-    # (60 s TTL), daily list-of-dates, per-project conversations
-    # (30 s). Without these, shared daily / shared timeline / dashboard
-    # "recent activity" lag actual sync by up to a minute. Redis down
-    # → no-op, TTL handles it.
-    await _invalidate_ingest_read_caches(user_id, doc.project_id)
-    if (
-        enriched_claude_child is not None
-        and enriched_claude_child.project_id != doc.project_id
-    ):
-        await _invalidate_ingest_read_caches(
-            user_id,
-            enriched_claude_child.project_id,
-        )
-
     # Existing-document appends dominate live sync. Updating the timestamp is
     # sufficient for those; only a new document changes the count, and that
     # increment is atomic across concurrent collectors.
@@ -2916,6 +2986,7 @@ async def ingest_file(
     # For DELTA mode, only parse new content; for FULL mode, re-parse all
     conversation_search_text = ""
     refresh_content_tsv = category != "conversation"
+    activity_advanced = False
     if category == "conversation" and (
         content_type == "jsonl" or (content_type == "json" and tool_id == "hermes")
     ):
@@ -2930,7 +3001,15 @@ async def ingest_file(
         )
         from .conversation_activity import refresh_document_activity_at
 
-        await refresh_document_activity_at(db, doc)
+        previous_activity = (
+            delivery_state.activity_at
+            if delivery_state is not None
+            else doc.activity_at
+        )
+        current_activity = await refresh_document_activity_at(db, doc)
+        activity_advanced = current_activity is not None and (
+            previous_activity is None or current_activity > previous_activity
+        )
         title = await _apply_friendly_conversation_title(db, doc) or title
         refresh_content_tsv = _conversation_search_index_needs_refresh(
             is_new_document=is_new_document,
@@ -3009,6 +3088,45 @@ async def ingest_file(
         mode=mode,
         monotonic_offset=same_hash_before_write,
     )
+
+    # Queue only namespaces whose response data changed. The session publishes
+    # these generation bumps after commit; rollback discards them. Tool-only
+    # DELTAs therefore perform no Redis work.
+    daily_changed, project_changed = _ingest_cache_scope(
+        category=category,
+        mode=mode,
+        activity_advanced=activity_advanced,
+        title_changed=previous_title != doc.title,
+        lifecycle_changed=lifecycle_changed or enriched_lifecycle_changed,
+    )
+    project_activity_changed = category != "conversation" or project_changed
+    # Reorder project activity only when a visible resource changed. Tool-only
+    # transport DELTAs must not make a dormant project look newly active.
+    if project_activity_changed and doc.project_id:
+        await db.execute(
+            _update(Project)
+            .where(Project.id == doc.project_id)
+            .values(updated_at=_func.now())
+        )
+    _stage_ingest_read_cache_invalidations(
+        db,
+        user_id,
+        doc.project_id,
+        daily=daily_changed,
+        project=project_changed,
+    )
+    if (
+        project_changed
+        and enriched_claude_child is not None
+        and enriched_claude_child.project_id != doc.project_id
+    ):
+        _stage_ingest_read_cache_invalidations(
+            db,
+            user_id,
+            enriched_claude_child.project_id,
+            daily=False,
+            project=True,
+        )
 
     # Trigger AI summary generation (async via Celery)
     if (
