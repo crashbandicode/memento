@@ -5,8 +5,8 @@ import {
   SiGooglegemini,
   SiMeta,
   SiMistralai,
-  SiOpenai,
 } from "react-icons/si";
+import { TbBrandOpenai } from "react-icons/tb";
 import styles from "./AssistantIdentityBadge.module.css";
 
 interface AssistantIdentityBadgeProps {
@@ -56,7 +56,7 @@ export function assistantModelProvider(value?: string | null): AssistantProvider
   if (/deepseek/.test(model)) return { id: "deepseek", label: "DeepSeek", monogram: "DS" };
   if (/qwen|alibaba/.test(model)) return { id: "qwen", label: "Qwen", monogram: "Q" };
   if (/openai|codex|(?:^|[-_/])gpt(?:[-_/]|$)|^o(?:1|3|4)(?:[-_/]|$)/.test(model)) {
-    return { id: "openai", label: "OpenAI", icon: SiOpenai };
+    return { id: "openai", label: "OpenAI", icon: TbBrandOpenai };
   }
   return { id: "generic", label: "AI model" };
 }

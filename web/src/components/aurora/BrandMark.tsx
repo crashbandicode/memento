@@ -8,7 +8,7 @@
  */
 import type { CSSProperties } from "react";
 import type { IconType } from "react-icons";
-import { SiClaude, SiObsidian, SiOpenai, SiWindsurf } from "react-icons/si";
+import { SiClaude, SiObsidian, SiWindsurf } from "react-icons/si";
 import { VscVscode } from "react-icons/vsc";
 
 export const BRAND_COLORS: Record<string, string> = {
@@ -104,7 +104,6 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
 /** Official vector marks available in the bundled react-icons set. */
 const OFFICIAL_MARKS: Partial<Record<BrandId, IconType>> = {
   claude_code: SiClaude,
-  codex: SiOpenai,
   obsidian: SiObsidian,
   windsurf: SiWindsurf,
   vscode: VscVscode,

@@ -43,7 +43,8 @@ import {
 import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
 import { createPortal } from "react-dom";
 import { FiType } from "react-icons/fi";
-import { SiMarkdown, SiSlack } from "react-icons/si";
+import { SiMarkdown } from "react-icons/si";
+import { TbBrandSlack } from "react-icons/tb";
 import type { IconType } from "react-icons";
 import {
   DEFAULT_CONVERSATION_VISIBILITY,
@@ -4220,7 +4221,7 @@ const COPY_FORMAT_OPTIONS: Array<{
     labelKey: "copySlack",
     iconColor: "#4A154B",
     iconBg: "color-mix(in srgb, #4A154B 12%, var(--aurora-surface-solid))",
-    Icon: SiSlack,
+    Icon: TbBrandSlack,
   },
 ];
 
@@ -4444,7 +4445,7 @@ function SlackCopySheet({
               border: "1px solid color-mix(in srgb, #4A154B 22%, var(--aurora-border))",
             }}
           >
-            <SiSlack size={15} />
+            <TbBrandSlack size={15} />
           </span>
           <div style={{ fontSize: 15, fontWeight: 650, color: "var(--aurora-fg1)" }}>
             {t.conversation.slackCopyTitle}
