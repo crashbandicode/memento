@@ -33,13 +33,16 @@ from server.db.models import (
 )
 from server.services.dashboard_projection import (
     backfill_dashboard_document_projections,
+    dashboard_backfill_documents_statement,
     dashboard_projection_values,
     refresh_dashboard_document_projection,
 )
 from server.services.document_delivery import attach_document_delivery
 from server.services.ingest_service import _conversation_event_changes
 from server.services.conversation_read_model import (
+    conversation_backfill_documents_statement,
     refresh_conversation_read_model,
+    refresh_conversation_read_model_in_batches,
 )
 
 TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
@@ -96,6 +99,29 @@ def test_timeline_preview_query_caps_rows_per_document_in_database() -> None:
     assert "PREVIEW_RANK <=" in sql
     assert "ORDER BY RANKED_TIMELINE_PREVIEWS.DOCUMENT_ID" in sql
     assert " OFFSET " not in sql
+
+
+def test_projection_backfills_keyset_only_lightweight_document_columns() -> None:
+    after_id = uuid.uuid4()
+    conversation_sql = str(
+        conversation_backfill_documents_statement(
+            after_id=after_id,
+            batch_size=25,
+        ).compile(dialect=postgresql.dialect())
+    ).upper()
+    dashboard_sql = str(
+        dashboard_backfill_documents_statement(
+            after_id=after_id,
+        ).compile(dialect=postgresql.dialect())
+    ).upper()
+
+    for sql in (conversation_sql, dashboard_sql):
+        assert "DOCUMENTS.ID >" in sql
+        assert " LIMIT " in sql
+        assert "DOCUMENTS.CONTENT," not in sql
+        assert "DOCUMENTS.CONTENT_TSV" not in sql
+        assert "DOCUMENTS.RENDERED_HTML" not in sql
+        assert "DOCUMENTS.AI_SUMMARY" not in sql
 
 
 def test_timeline_cursor_round_trip_preserves_ordering_tuple() -> None:
@@ -231,6 +257,82 @@ async def _document(
     session.add(document)
     await session.flush()
     return document
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_conversation_read_backfill_batches_message_rows(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"{uuid.uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(),
+            name="read-backfill-test",
+            collector_token_hash=str(uuid.uuid4()),
+            user_id=user.id,
+        )
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="Cursor"))
+        project = Project(
+            id=uuid.uuid4(),
+            slug=f"read-backfill-{uuid.uuid4()}",
+            title="Read backfill",
+            tool_id="cursor",
+        )
+        session.add_all([user, machine, project])
+        await session.flush()
+        document = await _document(
+            session,
+            project=project,
+            machine=machine,
+        )
+        session.add_all([
+            ConversationMessage(
+                document_id=document.id,
+                line_number=line,
+                role="user" if line % 2 else "assistant",
+                message_type="message",
+                content=f"message {line}",
+                timestamp=datetime.now(UTC) + timedelta(seconds=line),
+            )
+            for line in range(1, 6)
+        ])
+        await session.flush()
+
+        statements: list[str] = []
+        bind = session_factory.kw["bind"]
+
+        def capture(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement.lower())
+
+        event.listen(bind.sync_engine, "before_cursor_execute", capture)
+        try:
+            projection = await refresh_conversation_read_model_in_batches(
+                session,
+                document,
+                batch_size=2,
+            )
+        finally:
+            event.remove(bind.sync_engine, "before_cursor_execute", capture)
+
+        assert projection.message_count == 5
+        assert projection.projected_through_line == 5
+        message_reads = [
+            statement
+            for statement in statements
+            if statement.lstrip().startswith("select")
+            and "from conversation_messages" in statement
+            and "order by conversation_messages.line_number" in statement
+        ]
+        assert len(message_reads) == 3
+        assert all(" limit " in statement for statement in message_reads)
+        await session.rollback()
 
 
 @requires_postgres

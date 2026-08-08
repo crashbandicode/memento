@@ -6,6 +6,7 @@ from collections.abc import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..db.models import (
     ConversationReadModel,
@@ -256,6 +257,40 @@ async def _set_backfill_complete(db: AsyncSession) -> None:
     await db.flush()
 
 
+def dashboard_backfill_documents_statement(
+    *,
+    document_ids: Iterable[object] = (),
+    after_id: object | None = None,
+):
+    """Select one keyset batch without loading raw document bodies."""
+    statement = (
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.machine_id,
+            Document.project_id,
+            Document.tool_id,
+            Document.relative_path,
+            Document.category,
+            Document.title,
+            Document.file_size_bytes,
+            Document.metadata_,
+            Document.visibility,
+            Document.source_modified_at,
+            Document.activity_at,
+            Document.synced_at,
+        ))
+        .order_by(Document.id)
+        .limit(DASHBOARD_BACKFILL_BATCH_SIZE)
+    )
+    ids = list(document_ids)
+    if ids:
+        statement = statement.where(Document.id.in_(ids))
+    if after_id is not None:
+        statement = statement.where(Document.id > after_id)
+    return statement
+
+
 async def backfill_dashboard_document_projections(
     db: AsyncSession,
     document_ids: Iterable[object] | None = None,
@@ -266,26 +301,32 @@ async def backfill_dashboard_document_projections(
     visited = 0
     changed = 0
     while True:
-        statement = select(Document).order_by(Document.id).limit(
-            DASHBOARD_BACKFILL_BATCH_SIZE
-        )
-        if requested_ids:
-            statement = statement.where(Document.id.in_(requested_ids))
-        if last_id is not None:
-            statement = statement.where(Document.id > last_id)
-        documents = (await db.execute(statement)).scalars().all()
+        documents = (
+            await db.execute(
+                dashboard_backfill_documents_statement(
+                    document_ids=requested_ids,
+                    after_id=last_id,
+                )
+            )
+        ).scalars().all()
         if not documents:
             break
         for document in documents:
             if document.category == "conversation":
-                from .conversation_read_model import refresh_conversation_read_model
-
-                await refresh_conversation_read_model(
-                    db,
-                    document,
-                    mode="full",
-                    force_full=True,
+                from .conversation_read_model import (
+                    READ_MODEL_VERSION,
+                    refresh_conversation_read_model_in_batches,
                 )
+
+                read_model = await db.get(ConversationReadModel, document.id)
+                if (
+                    read_model is None
+                    or read_model.projection_version != READ_MODEL_VERSION
+                ):
+                    await refresh_conversation_read_model_in_batches(
+                        db,
+                        document,
+                    )
             _, projection_changed = await refresh_dashboard_document_projection(
                 db,
                 document,

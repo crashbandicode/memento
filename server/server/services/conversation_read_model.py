@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..db.models import (
     ConversationMessage,
@@ -35,6 +36,8 @@ from .subagent_lifecycle import (
 )
 
 READ_MODEL_VERSION = 1
+READ_MODEL_BACKFILL_DOCUMENT_BATCH_SIZE = 100
+READ_MODEL_BACKFILL_MESSAGE_BATCH_SIZE = 1_000
 MAX_PENDING_INTERACTIONS = 64
 MAX_INFERRED_RESPONSES = 64
 MAX_LIVE_ACTIVITIES = 64
@@ -482,6 +485,7 @@ async def refresh_conversation_read_model(
     mode: str,
     dirty_line_numbers: Iterable[int] = (),
     force_full: bool = False,
+    row_limit: int | None = None,
 ) -> ConversationReadModel:
     """Refresh one projection, scanning only the newly committed delta."""
     projection = await db.get(ConversationReadModel, document.id)
@@ -500,6 +504,8 @@ async def refresh_conversation_read_model(
         after_line=previous_through if incremental else None,
         dirty_line_numbers=dirty,
     )
+    if row_limit is not None:
+        statement = statement.limit(max(1, int(row_limit)))
     rows = (
         (
             await db.execute(statement)
@@ -620,26 +626,99 @@ async def refresh_conversation_read_model(
     return projection
 
 
+async def refresh_conversation_read_model_in_batches(
+    db: AsyncSession,
+    document: Document,
+    *,
+    batch_size: int = READ_MODEL_BACKFILL_MESSAGE_BATCH_SIZE,
+) -> ConversationReadModel:
+    """Rebuild one historical projection without materializing every message."""
+    max_line = await db.scalar(
+        select(func.max(ConversationMessage.line_number)).where(
+            ConversationMessage.document_id == document.id
+        )
+    )
+    first_batch = True
+    previous_line = -1
+    while True:
+        projection = await refresh_conversation_read_model(
+            db,
+            document,
+            mode="full" if first_batch else "delta",
+            force_full=first_batch,
+            row_limit=batch_size,
+        )
+        projected_line = int(projection.projected_through_line or 0)
+        if max_line is None or projected_line >= int(max_line):
+            return projection
+        if projected_line <= previous_line:
+            raise RuntimeError(
+                f"conversation read-model backfill stalled for {document.id}"
+            )
+        previous_line = projected_line
+        first_batch = False
+
+
+def conversation_backfill_documents_statement(
+    *,
+    document_ids: Iterable[object] = (),
+    after_id: object | None = None,
+    batch_size: int = READ_MODEL_BACKFILL_DOCUMENT_BATCH_SIZE,
+):
+    """Select only projection inputs, keyset-bounded by document ID."""
+    statement = (
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.machine_id,
+            Document.tool_id,
+            Document.relative_path,
+            Document.metadata_,
+        ))
+        .where(Document.category == "conversation")
+        .order_by(Document.id)
+        .limit(max(1, int(batch_size)))
+    )
+    ids = list(document_ids)
+    if ids:
+        statement = statement.where(Document.id.in_(ids))
+    if after_id is not None:
+        statement = statement.where(Document.id > after_id)
+    return statement
+
+
 async def backfill_conversation_read_models(
     db: AsyncSession,
     document_ids: Iterable[object] | None = None,
 ) -> dict[str, int]:
-    """Build projections for historical normalized conversations."""
-    statement = select(Document).where(Document.category == "conversation")
+    """Build historical projections with bounded document and message reads."""
     ids = list(document_ids or [])
-    if ids:
-        statement = statement.where(Document.id.in_(ids))
-    documents = (await db.execute(statement.order_by(Document.id))).scalars().all()
+    last_id = None
+    visited = 0
     updated = 0
-    for document in documents:
-        before = await db.get(ConversationReadModel, document.id)
-        previous = before.updated_at if before is not None else None
-        projection = await refresh_conversation_read_model(
-            db,
-            document,
-            mode="full",
-            force_full=True,
-        )
-        if before is None or projection.updated_at != previous:
-            updated += 1
-    return {"documents": len(documents), "created_or_updated": updated}
+    while True:
+        documents = (
+            await db.execute(
+                conversation_backfill_documents_statement(
+                    document_ids=ids,
+                    after_id=last_id,
+                )
+            )
+        ).scalars().all()
+        if not documents:
+            break
+        for document in documents:
+            before = await db.get(ConversationReadModel, document.id)
+            previous = before.updated_at if before is not None else None
+            projection = await refresh_conversation_read_model_in_batches(
+                db,
+                document,
+            )
+            if before is None or projection.updated_at != previous:
+                updated += 1
+            visited += 1
+        last_id = documents[-1].id
+        await db.flush()
+        if ids:
+            break
+    return {"documents": visited, "created_or_updated": updated}
