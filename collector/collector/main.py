@@ -13,6 +13,8 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from concurrent_log_handler import ConcurrentRotatingFileHandler
+
 from .canvas_sync import sync_pending_canvases
 from .claude_pending_hook import install_claude_pending_hooks
 from .claude_pending_questions import (
@@ -42,8 +44,12 @@ LEGACY_RECONCILIATION_INTERVAL = 60
 PACKAGE_NAME = "memento-brain-collector"
 DISCOVERY_TIMEOUT = 10        # Discovery HTTP timeout
 SOURCE_CHANGE_CHECK_INTERVAL = 1  # Cheap stat tokens; expensive work is change-driven
+COLLECTOR_LOG_MAX_BYTES = 5 * 1024 * 1024
+COLLECTOR_LOG_BACKUP_COUNT = 3
+_COLLECTOR_LOG_HANDLER_MARKER = "_memento_collector_managed"
 _canvas_sync_lock = threading.Lock()
 _command_poll_lock = threading.Lock()
+_logging_setup_lock = threading.Lock()
 
 
 class _CanvasPollSchedule:
@@ -112,33 +118,71 @@ def _load_saved_config() -> CollectorConfig:
 
 
 def _setup_logging(config: CollectorConfig) -> None:
-    config.log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = config.log_dir / "collector.log"
-    # Force UTF-8 on the log file — default is locale.getpreferredencoding(),
-    # which on Chinese Windows is cp936/GBK. The desktop log viewer reads the
-    # file as UTF-8, so any non-ASCII char (Chinese titles, the `→` arrow in
-    # update messages) shows up as replacement chars.
-    handlers: list[logging.Handler] = [
-        logging.FileHandler(log_file, encoding="utf-8")
-    ]
-    # Console: same problem on Windows — sys.stdout is mbcs unless we
-    # explicitly reconfigure it. Best-effort; ignore if the stream doesn't
-    # support reconfigure (e.g. it was replaced with a non-text wrapper).
-    try:
-        sys.stdout.write("")
-        sys.stdout.flush()
+    """Configure bounded collector logging without leaking handlers.
+
+    ``ConcurrentRotatingFileHandler`` serializes rollover across both threads
+    and processes. This matters during service restarts/upgrades, when an old
+    collector can briefly overlap its replacement.
+    """
+    with _logging_setup_lock:
+        config.log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = config.log_dir / "collector.log"
+        formatter = logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+        )
+
+        # Force UTF-8 on the log file — the platform locale may otherwise be
+        # cp936/GBK on Windows. Three 5 MiB backups plus the active file cap
+        # normal retained collector logs at about 20 MiB.
+        file_handler = ConcurrentRotatingFileHandler(
+            log_file,
+            mode="a",
+            maxBytes=COLLECTOR_LOG_MAX_BYTES,
+            backupCount=COLLECTOR_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+            delay=True,
+        )
+        file_handler.setFormatter(formatter)
+        setattr(file_handler, _COLLECTOR_LOG_HANDLER_MARKER, True)
+        handlers: list[logging.Handler] = [file_handler]
+
+        # Console: same encoding issue as the file on Windows. Best-effort;
+        # pythonw and replaced streams may not provide a usable stdout.
         try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+            sys.stdout.write("")
+            sys.stdout.flush()
+            try:
+                sys.stdout.reconfigure(  # type: ignore[attr-defined]
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except Exception:
+                pass
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
+            setattr(console_handler, _COLLECTOR_LOG_HANDLER_MARKER, True)
+            handlers.append(console_handler)
         except Exception:
             pass
-        handlers.append(logging.StreamHandler(sys.stdout))
-    except Exception:
-        pass
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        handlers=handlers,
-    )
+
+        root = logging.getLogger()
+        previous_handlers = [
+            handler
+            for handler in root.handlers
+            if getattr(handler, _COLLECTOR_LOG_HANDLER_MARKER, False)
+        ]
+        for handler in previous_handlers:
+            root.removeHandler(handler)
+        root.setLevel(logging.INFO)
+        for handler in handlers:
+            root.addHandler(handler)
+        for handler in previous_handlers:
+            handler.close()
+
+        # httpx logs every successful request at INFO. Polling makes those
+        # entries high-volume but low-signal; warnings and errors still flow.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _send_discovery(config: CollectorConfig, logger: logging.Logger) -> None:

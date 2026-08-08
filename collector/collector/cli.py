@@ -24,6 +24,37 @@ _LEGACY_SYSTEMD_UNIT = "daily-report-collector"
 # install/uninstall flow tries to clean it up on upgrade.
 _LEGACY_WIN_TASK_NAME = "DailyReportCollector"
 _LEGACY_DATA_DIR = Path.home() / ".daily-report"
+RECENT_LOG_READ_BYTES = 64 * 1024
+
+
+def _read_last_log_line(
+    log_file: Path,
+    *,
+    max_bytes: int = RECENT_LOG_READ_BYTES,
+) -> str | None:
+    """Read at most ``max_bytes`` from the end of one UTF-8 log file."""
+    try:
+        with log_file.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            if size == 0:
+                return None
+            stream.seek(max(0, size - max_bytes), os.SEEK_SET)
+            chunk = stream.read(max_bytes)
+    except OSError:
+        return None
+
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    return lines[-1] if lines else None
+
+
+def _read_recent_log_line(log_file: Path) -> str | None:
+    """Read the current log tail, falling back to the newest rotation."""
+    for candidate in (log_file, Path(f"{log_file}.1")):
+        line = _read_last_log_line(candidate)
+        if line is not None:
+            return line
+    return None
 
 
 def _uninstall_legacy_pip_packages() -> None:
@@ -815,10 +846,9 @@ def status() -> None:
 
     # Recent log
     log_file = config.log_dir / "collector.log"
-    if log_file.exists():
-        lines = log_file.read_text().splitlines()
-        if lines:
-            print(f"\nLast log: {lines[-1]}")
+    last_log_line = _read_recent_log_line(log_file)
+    if last_log_line is not None:
+        print(f"\nLast log: {last_log_line}")
 
 
 def requeue() -> None:

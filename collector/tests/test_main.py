@@ -1,8 +1,18 @@
+import logging
 from types import SimpleNamespace
 
 import httpx
+import pytest
+from concurrent_log_handler import ConcurrentRotatingFileHandler
 
-from collector.main import _CanvasPollSchedule, _log_queue_heartbeat, _poll_commands
+import collector.main as collector_main
+from collector.main import (
+    _COLLECTOR_LOG_HANDLER_MARKER,
+    _CanvasPollSchedule,
+    _log_queue_heartbeat,
+    _poll_commands,
+    _setup_logging,
+)
 
 
 class Response:
@@ -12,6 +22,105 @@ class Response:
 
     def json(self):
         return self._body
+
+
+@pytest.fixture
+def collector_logging_cleanup():
+    root = logging.getLogger()
+    original_level = root.level
+    dependency_levels = {
+        name: logging.getLogger(name).level for name in ("httpx", "httpcore")
+    }
+    yield
+    for handler in list(root.handlers):
+        if getattr(handler, _COLLECTOR_LOG_HANDLER_MARKER, False):
+            root.removeHandler(handler)
+            handler.close()
+    root.setLevel(original_level)
+    for name, level in dependency_levels.items():
+        logging.getLogger(name).setLevel(level)
+
+
+def _collector_file_handlers() -> list[ConcurrentRotatingFileHandler]:
+    return [
+        handler
+        for handler in logging.getLogger().handlers
+        if isinstance(handler, ConcurrentRotatingFileHandler)
+        and getattr(handler, _COLLECTOR_LOG_HANDLER_MARKER, False)
+    ]
+
+
+def test_logging_rotates_with_bounded_retention(
+    tmp_path,
+    monkeypatch,
+    collector_logging_cleanup,
+):
+    monkeypatch.setattr(collector_main, "COLLECTOR_LOG_MAX_BYTES", 512)
+    monkeypatch.setattr(collector_main, "COLLECTOR_LOG_BACKUP_COUNT", 2)
+
+    _setup_logging(SimpleNamespace(log_dir=tmp_path))
+
+    handlers = _collector_file_handlers()
+    assert len(handlers) == 1
+    handler = handlers[0]
+    assert handler.maxBytes == 512
+    assert handler.backupCount == 2
+    assert handler.encoding.lower().replace("-", "") == "utf8"
+
+    logger = logging.getLogger("collector.rotation-test")
+    for index in range(20):
+        logger.info("rotation record %02d %s", index, "x" * 100)
+    handler.flush()
+
+    assert (tmp_path / "collector.log.1").exists()
+    assert not (tmp_path / "collector.log.3").exists()
+
+
+def test_logging_suppresses_routine_http_dependency_info(
+    tmp_path,
+    collector_logging_cleanup,
+):
+    _setup_logging(SimpleNamespace(log_dir=tmp_path))
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    assert logging.getLogger("collector").getEffectiveLevel() == logging.INFO
+
+
+def test_repeated_logging_setup_replaces_and_closes_managed_handlers(
+    tmp_path,
+    collector_logging_cleanup,
+):
+    config = SimpleNamespace(log_dir=tmp_path)
+    _setup_logging(config)
+    first = _collector_file_handlers()[0]
+    logging.getLogger("collector.setup-test").info("open the first handler")
+    first_stream = first.stream
+
+    _setup_logging(config)
+
+    second = _collector_file_handlers()
+    assert len(second) == 1
+    assert second[0] is not first
+    assert first not in logging.getLogger().handlers
+    assert first.stream is None or first.stream.closed
+    if first_stream is not None:
+        assert first_stream.closed
+
+
+def test_logging_writes_utf8(
+    tmp_path,
+    collector_logging_cleanup,
+):
+    _setup_logging(SimpleNamespace(log_dir=tmp_path))
+    handler = _collector_file_handlers()[0]
+
+    logging.getLogger("collector.utf8-test").info("同步标题 → complete")
+    handler.flush()
+    handler.close()
+
+    text = (tmp_path / "collector.log").read_bytes().decode("utf-8")
+    assert "同步标题 → complete" in text
 
 
 def test_command_is_not_executed_until_ack_succeeds(monkeypatch):
