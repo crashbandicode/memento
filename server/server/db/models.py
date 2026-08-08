@@ -605,6 +605,15 @@ class ConversationReadModel(Base):
     is_subagent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    user_message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    assistant_message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    human_character_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
     projected_through_line: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
@@ -665,6 +674,143 @@ class ConversationReadModel(Base):
             "tool_id",
             "agent_tool_use_id",
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard document projection
+# ---------------------------------------------------------------------------
+class DashboardDocumentProjection(Base):
+    """One narrow, ingest-owned dashboard row per document."""
+
+    __tablename__ = "dashboard_document_projections"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    machine_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE")
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    visibility: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="private"
+    )
+
+    title: Mapped[str | None] = mapped_column(Text)
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    source_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    session_id: Mapped[str | None] = mapped_column(String(512))
+    root_thread_id: Mapped[str | None] = mapped_column(String(512))
+    parent_thread_id: Mapped[str | None] = mapped_column(String(512))
+    is_subagent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    hierarchy_metadata: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    user_message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    assistant_message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    human_character_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    pending_question_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    agent_mode: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
+    projection_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_dashboard_projection_machine", "machine_id"),
+        Index(
+            "idx_dashboard_projection_machine_tool_category",
+            "machine_id",
+            "tool_id",
+            "category",
+        ),
+        Index(
+            "idx_dashboard_projection_project_session",
+            "project_id",
+            "session_id",
+        ),
+        Index(
+            "idx_dashboard_projection_root",
+            "machine_id",
+            "tool_id",
+            "root_thread_id",
+        ),
+        Index(
+            "idx_dashboard_projection_activity",
+            activity_at.desc(),
+            "document_id",
+        ),
+        Index(
+            "idx_dashboard_projection_synced",
+            synced_at.desc(),
+            "document_id",
+        ),
+        Index(
+            "idx_dashboard_projection_effective_activity",
+            func.coalesce(activity_at, source_modified_at, synced_at).desc(),
+            document_id.desc(),
+            postgresql_where=category == "conversation",
+        ),
+    )
+
+
+class DashboardProjectionState(Base):
+    """Marks completion of the one-time legacy dashboard backfill."""
+
+    __tablename__ = "dashboard_projection_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    projection_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+    backfill_complete: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 

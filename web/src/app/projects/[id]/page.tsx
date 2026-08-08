@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { useI18n } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
+import { eventInvalidatesProject } from "@/lib/realtime-events";
+import { useSSE } from "@/lib/use-sse";
 import { Icon, ToolGlyph, CategoryIcon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar, SectionLabel } from "@/components/aurora/primitives";
 import BrowseFileRow from "@/components/conversations/BrowseFileRow";
@@ -36,6 +38,8 @@ export default function ProjectDetailPage() {
   const params = useParams();
   const projectId = params.id as string;
   const [project, setProject] = useState<ProjectDetail | null>(null);
+  const [realtimeVersion, setRealtimeVersion] = useState(0);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { t, locale } = useI18n();
   const dateFmt = locale === "zh-CN" ? "zh-CN" : "en-US";
 
@@ -52,7 +56,20 @@ export default function ProjectDetailPage() {
         }
       });
     return () => controller.abort();
-  }, [projectId]);
+  }, [projectId, realtimeVersion]);
+
+  useSSE((event) => {
+    if (!eventInvalidatesProject(event, projectId)) return;
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      setRealtimeVersion((version) => version + 1);
+    }, event.type === "realtime_reset" ? 0 : 500);
+  });
+
+  useEffect(() => () => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+  }, []);
 
   // Hit the server's per-project markdown export endpoint and trigger
   // a browser download. authFetch attaches the JWT; we read the body

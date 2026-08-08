@@ -202,6 +202,7 @@ def test_tool_only_delta_does_not_refresh_prompt_search_or_inbox() -> None:
         "conversation.messages",
         "conversation.metadata",
         "dashboard",
+        "project",
     ]
 
 
@@ -218,4 +219,5 @@ def test_user_interaction_delta_scopes_all_affected_read_models() -> None:
         "conversation.prompts",
         "conversation.search",
         "dashboard",
+        "project",
     ]

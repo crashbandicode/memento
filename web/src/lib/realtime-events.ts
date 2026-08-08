@@ -4,7 +4,8 @@ export type RealtimeChange =
   | "conversation.pending_interactions"
   | "conversation.prompts"
   | "conversation.search"
-  | "dashboard";
+  | "dashboard"
+  | "project";
 
 export interface RealtimeEventData {
   document_id?: string;
@@ -12,6 +13,7 @@ export interface RealtimeEventData {
   category?: string;
   relative_path?: string;
   title?: string;
+  project_id?: string | null;
   changes?: RealtimeChange[];
   reason?: string;
 }
@@ -118,6 +120,19 @@ export function eventInvalidatesDashboard(event: RealtimeEventLike): boolean {
   if (event.type !== "file_synced") return false;
   return !Array.isArray(event.data.changes)
     || event.data.changes.includes("dashboard");
+}
+
+export function eventInvalidatesProject(
+  event: RealtimeEventLike,
+  projectId: string,
+): boolean {
+  if (event.type === "realtime_reset") return true;
+  if (event.type !== "file_synced") return false;
+  if (
+    Array.isArray(event.data.changes)
+    && !event.data.changes.includes("project")
+  ) return false;
+  return !event.data.project_id || event.data.project_id === projectId;
 }
 
 export function buildEventStreamUrl(base: string, lastEventId: string): string {

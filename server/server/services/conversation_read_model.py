@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
@@ -523,11 +523,51 @@ async def refresh_conversation_read_model(
         if incremental
         else rows
     )
-    message_count = (
-        int(projection.message_count or 0) + len(new_rows)
-        if incremental and projection is not None
-        else len(rows)
-    )
+    if incremental and dirty:
+        stats = (
+            await db.execute(
+                select(
+                    func.count(),
+                    func.count().filter(ConversationMessage.role == "user"),
+                    func.count().filter(ConversationMessage.role == "assistant"),
+                    func.coalesce(
+                        func.sum(func.length(ConversationMessage.content)).filter(
+                            ConversationMessage.role.in_(("user", "assistant"))
+                        ),
+                        0,
+                    ),
+                ).where(ConversationMessage.document_id == document.id)
+            )
+        ).one()
+        message_count, user_count, assistant_count, human_characters = (
+            int(value or 0) for value in stats
+        )
+    else:
+        new_user_count = sum(row.role == "user" for row in new_rows)
+        new_assistant_count = sum(row.role == "assistant" for row in new_rows)
+        new_human_characters = sum(
+            len(row.content or "")
+            for row in new_rows
+            if row.role in ("user", "assistant")
+        )
+        if incremental and projection is not None:
+            message_count = int(projection.message_count or 0) + len(new_rows)
+            user_count = (
+                int(projection.user_message_count or 0) + new_user_count
+            )
+            assistant_count = (
+                int(projection.assistant_message_count or 0)
+                + new_assistant_count
+            )
+            human_characters = (
+                int(projection.human_character_count or 0)
+                + new_human_characters
+            )
+        else:
+            message_count = len(rows)
+            user_count = new_user_count
+            assistant_count = new_assistant_count
+            human_characters = new_human_characters
     projected_through = max(
         [previous_through, *(int(row.line_number or 0) for row in rows)],
         default=previous_through,
@@ -548,6 +588,9 @@ async def refresh_conversation_read_model(
     values = {
         **_identity_values(document),
         "message_count": message_count,
+        "user_message_count": user_count,
+        "assistant_message_count": assistant_count,
+        "human_character_count": human_characters,
         "projected_through_line": projected_through,
         "latest_assistant_line": latest_assistant,
         "generation": (

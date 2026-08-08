@@ -681,6 +681,8 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
 ) -> None:
     bind = session_factory.kw["bind"]
     async with bind.begin() as connection:
+        await connection.execute(text("DROP TABLE dashboard_projection_state"))
+        await connection.execute(text("DROP TABLE dashboard_document_projections"))
         await connection.execute(text("DROP TABLE conversation_prompt_projections"))
         await connection.execute(text("DROP TABLE conversation_read_models"))
         await connection.execute(text("DROP TABLE conversation_task_states"))
@@ -701,6 +703,16 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         prompt_exists = (
             await connection.execute(
                 text("SELECT to_regclass('conversation_prompt_projections')")
+            )
+        ).scalar_one()
+        dashboard_exists = (
+            await connection.execute(
+                text("SELECT to_regclass('dashboard_document_projections')")
+            )
+        ).scalar_one()
+        dashboard_state_exists = (
+            await connection.execute(
+                text("SELECT to_regclass('dashboard_projection_state')")
             )
         ).scalar_one()
         indexes = set(
@@ -736,9 +748,33 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
                 )
             ).scalars()
         )
+        dashboard_indexes = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename = 'dashboard_document_projections'"
+                    )
+                )
+            ).scalars()
+        )
+        read_columns = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'conversation_read_models'"
+                    )
+                )
+            ).scalars()
+        )
     assert exists == "conversation_task_states"
     assert read_exists == "conversation_read_models"
     assert prompt_exists == "conversation_prompt_projections"
+    assert dashboard_exists == "dashboard_document_projections"
+    assert dashboard_state_exists == "dashboard_projection_state"
     assert {
         "conversation_task_states_pkey",
         "idx_task_state_machine",
@@ -766,3 +802,18 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         "conversation_prompt_projections_pkey",
         "idx_conversation_prompt_line",
     } <= prompt_indexes
+    assert {
+        "user_message_count",
+        "assistant_message_count",
+        "human_character_count",
+    } <= read_columns
+    assert {
+        "dashboard_document_projections_pkey",
+        "idx_dashboard_projection_machine",
+        "idx_dashboard_projection_machine_tool_category",
+        "idx_dashboard_projection_project_session",
+        "idx_dashboard_projection_root",
+        "idx_dashboard_projection_activity",
+        "idx_dashboard_projection_synced",
+        "idx_dashboard_projection_effective_activity",
+    } <= dashboard_indexes

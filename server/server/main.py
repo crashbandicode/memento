@@ -434,6 +434,9 @@ def _run_migrations(conn) -> None:
                 "agent_depth INTEGER NOT NULL DEFAULT 0, "
                 "is_subagent BOOLEAN NOT NULL DEFAULT FALSE, "
                 "message_count INTEGER NOT NULL DEFAULT 0, "
+                "user_message_count INTEGER NOT NULL DEFAULT 0, "
+                "assistant_message_count INTEGER NOT NULL DEFAULT 0, "
+                "human_character_count BIGINT NOT NULL DEFAULT 0, "
                 "projected_through_line INTEGER NOT NULL DEFAULT 0, "
                 "latest_assistant_line INTEGER, "
                 "generation INTEGER NOT NULL DEFAULT 1, "
@@ -449,6 +452,22 @@ def _run_migrations(conn) -> None:
                 "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
                 ")"
             ))
+        else:
+            read_columns = {
+                column["name"]
+                for column in insp.get_columns("conversation_read_models")
+            }
+            for column_name, column_type in (
+                ("user_message_count", "INTEGER"),
+                ("assistant_message_count", "INTEGER"),
+                ("human_character_count", "BIGINT"),
+            ):
+                if column_name not in read_columns:
+                    conn.execute(text(
+                        "ALTER TABLE conversation_read_models "
+                        f"ADD COLUMN {column_name} {column_type} "
+                        "NOT NULL DEFAULT 0"
+                    ))
         for read_index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_conversation_read_root "
             "ON conversation_read_models (machine_id, tool_id, root_thread_id)",
@@ -479,6 +498,73 @@ def _run_migrations(conn) -> None:
             "ON conversation_prompt_projections "
             "(document_id, line_number, message_id)"
         ))
+
+        # Dashboard refreshes aggregate this narrow, current row instead of
+        # rescanning documents and normalized transcript history. A completion
+        # marker keeps mixed-version deployments correct while the dedicated
+        # backfill populates historical rows.
+        if "dashboard_document_projections" not in tables:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS dashboard_document_projections ("
+                "document_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, "
+                "machine_id UUID REFERENCES machines(id) ON DELETE CASCADE, "
+                "project_id UUID REFERENCES projects(id) ON DELETE SET NULL, "
+                "tool_id VARCHAR(50) NOT NULL, "
+                "category VARCHAR(50) NOT NULL, "
+                "visibility VARCHAR(20) NOT NULL DEFAULT 'private', "
+                "title TEXT, "
+                "relative_path TEXT NOT NULL, "
+                "file_size_bytes BIGINT NOT NULL DEFAULT 0, "
+                "synced_at TIMESTAMPTZ NOT NULL, "
+                "source_modified_at TIMESTAMPTZ, "
+                "activity_at TIMESTAMPTZ, "
+                "session_id VARCHAR(512), "
+                "root_thread_id VARCHAR(512), "
+                "parent_thread_id VARCHAR(512), "
+                "is_subagent BOOLEAN NOT NULL DEFAULT FALSE, "
+                "hierarchy_metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "message_count INTEGER NOT NULL DEFAULT 0, "
+                "user_message_count INTEGER NOT NULL DEFAULT 0, "
+                "assistant_message_count INTEGER NOT NULL DEFAULT 0, "
+                "human_character_count BIGINT NOT NULL DEFAULT 0, "
+                "pending_question_count INTEGER NOT NULL DEFAULT 0, "
+                "agent_mode VARCHAR(64) NOT NULL DEFAULT '', "
+                "projection_version INTEGER NOT NULL DEFAULT 1, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ))
+        for dashboard_index_sql in (
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_machine "
+            "ON dashboard_document_projections (machine_id)",
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_dashboard_projection_machine_tool_category "
+            "ON dashboard_document_projections (machine_id, tool_id, category)",
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_project_session "
+            "ON dashboard_document_projections (project_id, session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_root "
+            "ON dashboard_document_projections "
+            "(machine_id, tool_id, root_thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_activity "
+            "ON dashboard_document_projections (activity_at DESC, document_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_synced "
+            "ON dashboard_document_projections (synced_at DESC, document_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_effective_activity "
+            "ON dashboard_document_projections "
+            "(COALESCE(activity_at, source_modified_at, synced_at) DESC, document_id DESC) "
+            "WHERE category = 'conversation'",
+        ):
+            conn.execute(text(dashboard_index_sql))
+
+        if "dashboard_projection_state" not in tables:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS dashboard_projection_state ("
+                "id INTEGER PRIMARY KEY, "
+                "projection_version INTEGER NOT NULL DEFAULT 1, "
+                "backfill_complete BOOLEAN NOT NULL DEFAULT FALSE, "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ))
 
     # Data migration: assign owner token + bind existing machines to owner
     result = conn.execute(text(
@@ -632,6 +718,18 @@ def _configure_hot_storage(conn) -> None:
     ))
 
 
+def _initialize_dashboard_projection_state(conn) -> None:
+    """Seed the compatibility marker after both upgrade and fresh-install DDL."""
+    from sqlalchemy import text
+
+    conn.execute(text(
+        "INSERT INTO dashboard_projection_state "
+        "(id, projection_version, backfill_complete) "
+        "SELECT 1, 1, NOT EXISTS (SELECT 1 FROM documents) "
+        "ON CONFLICT (id) DO NOTHING"
+    ))
+
+
 async def _schedule_daily_compaction():
     """Run memory compaction once per day in background."""
     import asyncio
@@ -746,11 +844,17 @@ async def _require_fast_embedding_server() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     import asyncio
+
     settings.validate_production()
     async with engine.begin() as conn:
         await conn.run_sync(_run_migrations)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_configure_hot_storage)
+        # Fresh databases are complete immediately because every subsequent
+        # ingest writes its document and dashboard projection atomically.
+        # Existing databases remain in compatibility mode until the explicit
+        # idempotent backfill marks them complete.
+        await conn.run_sync(_initialize_dashboard_projection_state)
     # Large CREATE INDEX CONCURRENTLY operations are owned by the deployment
     # migration controller. API readiness must not wait for them.
     await _require_fast_embedding_server()

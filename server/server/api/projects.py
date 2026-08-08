@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
 from ..db.models import (
-    ConversationMessage, Document, KnowledgeEntity, KnowledgeObservation,
-    KnowledgeRelation, Project, Tool, User,
+    ConversationMessage, ConversationReadModel, DashboardDocumentProjection,
+    Document, KnowledgeEntity, KnowledgeObservation, KnowledgeRelation,
+    Project, Tool, User,
 )
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
@@ -46,6 +50,246 @@ from ..services.document_delivery import (
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+TIMELINE_PREVIEW_LIMIT = 4
+
+
+def _timeline_session_expression():
+    metadata = delivery_metadata_expression()
+    metadata_session = func.coalesce(
+        metadata["session_id"].astext,
+        metadata["thread_id"].astext,
+        metadata["cascade_id"].astext,
+    )
+    conversation_session = func.coalesce(
+        ConversationReadModel.root_thread_id,
+        metadata["root_session_id"].astext,
+        ConversationReadModel.thread_id,
+        metadata_session,
+    )
+    return case(
+        (Document.category == "conversation", conversation_session),
+        else_=metadata_session,
+    )
+
+
+def _timeline_group_key_expression():
+    session_id = _timeline_session_expression()
+    return case(
+        (
+            session_id.is_(None),
+            literal("document:") + cast(Document.id, String),
+        ),
+        else_=literal("session:") + session_id,
+    )
+
+
+def _timeline_document_timestamp_expression():
+    return case(
+        (
+            Document.category == "conversation",
+            func.coalesce(
+                delivery_activity_expression(),
+                delivery_source_modified_expression(),
+                delivery_synced_expression(),
+            ),
+        ),
+        else_=func.coalesce(
+            delivery_source_modified_expression(),
+            delivery_synced_expression(),
+        ),
+    )
+
+
+def _timeline_visible_documents_statement(
+    project_id: uuid.UUID,
+    *,
+    category: str | None,
+    machine_ids: list[uuid.UUID] | None,
+):
+    session_id = _timeline_session_expression()
+    group_key = _timeline_group_key_expression()
+    document_timestamp = _timeline_document_timestamp_expression()
+    statement = (
+        select(
+            group_key.label("group_key"),
+            func.coalesce(session_id, cast(Document.id, String)).label(
+                "sort_key"
+            ),
+            document_timestamp.label("document_timestamp"),
+            case(
+                (
+                    Document.category == "conversation",
+                    document_timestamp,
+                ),
+                else_=None,
+            ).label("conversation_timestamp"),
+        )
+        .select_from(Document)
+        .outerjoin(
+            ConversationReadModel,
+            ConversationReadModel.document_id == Document.id,
+        )
+        .where(
+            Document.project_id == project_id,
+            ~Document.relative_path.contains(".resolved"),
+            ~Document.relative_path.contains(".meta.json"),
+            ~Document.relative_path.contains(".metadata.json"),
+        )
+    )
+    if category:
+        statement = statement.where(Document.category == category)
+    return apply_user_filter(statement, machine_ids, Document.machine_id)
+
+
+def project_timeline_groups_statement(
+    project_id: uuid.UUID,
+    *,
+    category: str | None,
+    machine_ids: list[uuid.UUID] | None,
+):
+    """Group timeline sessions in SQL without returning every project row."""
+    visible = _timeline_visible_documents_statement(
+        project_id,
+        category=category,
+        machine_ids=machine_ids,
+    ).subquery("timeline_documents")
+    return (
+        select(
+            visible.c.group_key,
+            visible.c.sort_key,
+            func.coalesce(
+                func.max(visible.c.conversation_timestamp),
+                func.max(visible.c.document_timestamp),
+            ).label("timestamp"),
+        )
+        .group_by(visible.c.group_key, visible.c.sort_key)
+    )
+
+
+def project_timeline_page_statement(
+    project_id: uuid.UUID,
+    *,
+    category: str | None,
+    machine_ids: list[uuid.UUID] | None,
+    order: str,
+    limit: int,
+    offset: int = 0,
+    cursor_timestamp: datetime | None = None,
+    cursor_sort_key: str | None = None,
+):
+    grouped = project_timeline_groups_statement(
+        project_id,
+        category=category,
+        machine_ids=machine_ids,
+    ).subquery("timeline_groups")
+    descending = order == "desc"
+    statement = select(grouped)
+    if cursor_timestamp is not None and cursor_sort_key is not None:
+        comparison = (
+            or_(
+                grouped.c.timestamp < cursor_timestamp,
+                and_(
+                    grouped.c.timestamp == cursor_timestamp,
+                    grouped.c.sort_key < cursor_sort_key,
+                ),
+            )
+            if descending
+            else or_(
+                grouped.c.timestamp > cursor_timestamp,
+                and_(
+                    grouped.c.timestamp == cursor_timestamp,
+                    grouped.c.sort_key > cursor_sort_key,
+                ),
+            )
+        )
+        statement = statement.where(comparison)
+    elif offset:
+        statement = statement.offset(offset)
+    direction = (
+        (grouped.c.timestamp.desc(), grouped.c.sort_key.desc())
+        if descending
+        else (grouped.c.timestamp.asc(), grouped.c.sort_key.asc())
+    )
+    return statement.order_by(*direction).limit(limit)
+
+
+def timeline_preview_statement(
+    document_ids: set[uuid.UUID],
+    *,
+    preview_limit: int = TIMELINE_PREVIEW_LIMIT,
+):
+    """Return at most ``preview_limit`` ordered messages per document."""
+    ranked = (
+        select(
+            ConversationMessage.id.label("id"),
+            ConversationMessage.document_id.label("document_id"),
+            ConversationMessage.role.label("role"),
+            ConversationMessage.content.label("content"),
+            ConversationMessage.timestamp.label("timestamp"),
+            ConversationMessage.line_number.label("line_number"),
+            func.row_number().over(
+                partition_by=ConversationMessage.document_id,
+                order_by=(
+                    ConversationMessage.line_number,
+                    ConversationMessage.id,
+                ),
+            ).label("preview_rank"),
+        )
+        .where(
+            ConversationMessage.document_id.in_(document_ids),
+            ConversationMessage.role.in_(("user", "assistant")),
+        )
+        .subquery("ranked_timeline_previews")
+    )
+    return (
+        select(ranked)
+        .where(ranked.c.preview_rank <= preview_limit)
+        .order_by(
+            ranked.c.document_id,
+            ranked.c.line_number,
+            ranked.c.id,
+        )
+    )
+
+
+def _encode_timeline_cursor(row, order: str) -> str:
+    payload = json.dumps({
+        "v": 1,
+        "order": order,
+        "timestamp": row.timestamp.isoformat(),
+        "sort_key": row.sort_key,
+    }, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_timeline_cursor(
+    value: str | None,
+    *,
+    order: str,
+) -> tuple[datetime | None, str | None]:
+    if not value:
+        return None, None
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(value + padding).decode()
+        )
+        if payload.get("v") != 1 or payload.get("order") != order:
+            raise ValueError
+        timestamp = datetime.fromisoformat(str(payload["timestamp"]))
+        sort_key = str(payload["sort_key"])
+        if not sort_key:
+            raise ValueError
+        return timestamp, sort_key
+    except (
+        binascii.Error,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=422, detail="Invalid timeline cursor") from exc
 
 
 async def _resolve_project_device_ids(
@@ -401,6 +645,10 @@ async def get_project_timeline(
     limit: int = Query(50, ge=1, le=200),
     category: str | None = None,
     order: str = Query("desc", regex="^(asc|desc)$"),
+    cursor: str | None = Query(
+        None,
+        description="Opaque keyset cursor returned by the previous page",
+    ),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -423,55 +671,111 @@ async def get_project_timeline(
     for t in tools_result.scalars().all():
         tool_map[t.id] = {"display_name": t.display_name, "icon": t.icon}
 
-    # Phase 1: lightweight scan — only metadata columns, NO content/rendered_html
-    # content can be up to 1MB per doc; loading every doc's content is the main cost.
-    meta_cols = (
-        Document.id, Document.tool_id, Document.category, Document.content_type,
-        Document.relative_path, Document.title, delivery_file_size_expression(),
-        Document.ai_summary, delivery_metadata_expression(),
-        delivery_source_modified_expression(), delivery_synced_expression(),
-        Document.machine_id, delivery_activity_expression(),
+    cursor_timestamp, cursor_sort_key = _decode_timeline_cursor(
+        cursor,
+        order=order,
     )
-    q = (
-        select(*meta_cols)
-        .where(Document.project_id == project_id)
+    groups_statement = project_timeline_groups_statement(
+        project_id,
+        category=category,
+        machine_ids=mids,
+    )
+    total = (
+        await db.execute(
+            select(func.count()).select_from(groups_statement.subquery())
+        )
+    ).scalar() or 0
+    page_groups = (
+        await db.execute(
+            project_timeline_page_statement(
+                project_id,
+                category=category,
+                machine_ids=mids,
+                order=order,
+                limit=limit,
+                offset=offset,
+                cursor_timestamp=cursor_timestamp,
+                cursor_sort_key=cursor_sort_key,
+            )
+        )
+    ).all()
+    group_keys = [row.group_key for row in page_groups]
+
+    if not group_keys:
+        return {
+            "project": {
+                "id": str(project.id),
+                "slug": project.slug,
+                "title": project.title,
+                "tool_id": project.tool_id,
+                "source_path": project.source_path,
+            },
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "events": [],
+            "next_cursor": None,
+        }
+
+    group_key = _timeline_group_key_expression()
+    page_documents_q = (
+        select(
+            Document.id.label("id"),
+            Document.tool_id.label("tool_id"),
+            Document.category.label("category"),
+            Document.content_type.label("content_type"),
+            Document.relative_path.label("relative_path"),
+            Document.title.label("title"),
+            delivery_file_size_expression().label("file_size_bytes"),
+            Document.ai_summary.label("ai_summary"),
+            delivery_metadata_expression().label("metadata"),
+            delivery_source_modified_expression().label("source_modified_at"),
+            delivery_synced_expression().label("synced_at"),
+            Document.machine_id.label("machine_id"),
+            delivery_activity_expression().label("activity_at"),
+            group_key.label("group_key"),
+        )
+        .outerjoin(
+            ConversationReadModel,
+            ConversationReadModel.document_id == Document.id,
+        )
+        .where(
+            Document.project_id == project_id,
+            group_key.in_(group_keys),
+            ~Document.relative_path.contains(".resolved"),
+            ~Document.relative_path.contains(".meta.json"),
+            ~Document.relative_path.contains(".metadata.json"),
+        )
         .order_by(
-            case(
-                (
-                    Document.category == "conversation",
-                    func.coalesce(
-                        delivery_activity_expression(),
-                        delivery_source_modified_expression(),
-                        delivery_synced_expression(),
-                    ),
-                ),
-                else_=func.coalesce(
-                    delivery_source_modified_expression(),
-                    delivery_synced_expression(),
-                ),
-            ).desc(),
+            _timeline_document_timestamp_expression().desc(),
             Document.id.desc(),
         )
     )
     if category:
-        q = q.where(Document.category == category)
-    q = apply_user_filter(q, mids, Document.machine_id)
-    all_rows = (await db.execute(q)).all()
+        page_documents_q = page_documents_q.where(
+            Document.category == category
+        )
+    page_documents_q = apply_user_filter(
+        page_documents_q,
+        mids,
+        Document.machine_id,
+    )
+    page_rows = (await db.execute(page_documents_q)).all()
 
     conversation_refs = [
         ConversationRef(
-            document_id=row[0],
-            tool_id=row[1],
-            relative_path=row[4],
-            metadata=row[8],
-            title=row[5],
-            source_modified_at=row[9],
-            activity_at=row[12],
-            synced_at=row[10],
-            file_size_bytes=row[6],
+            document_id=row.id,
+            tool_id=row.tool_id,
+            relative_path=row.relative_path,
+            metadata=row.metadata,
+            title=row.title,
+            source_modified_at=row.source_modified_at,
+            activity_at=row.activity_at,
+            synced_at=row.synced_at,
+            file_size_bytes=row.file_size_bytes,
         )
-        for row in all_rows
-        if row[2] == "conversation"
+        for row in page_rows
+        if row.category == "conversation"
     ]
     conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
@@ -483,19 +787,26 @@ async def get_project_timeline(
         conversation_refs,
     )
 
-    # Group by session_id — build sessions (no content yet)
     sessions: dict[str, dict] = {}
-    standalone: list[dict] = []
+    standalone: dict[str, dict] = {}
+    group_timestamp = {
+        row.group_key: row.timestamp.isoformat()
+        for row in page_groups
+    }
 
-    for r in all_rows:
-        d_id, d_tool_id, d_category, d_ctype, d_path, d_title, d_size, \
-            d_ai_summary, d_meta, d_src_mod, d_synced, _d_mid, _d_activity = r
-        # Skip noise files
-        # `.meta.json` is the Claude Code subagent sidecar (just type +
-        # description, no conversation content). `.metadata.json` and
-        # `.resolved` are transient versions. All are noise on a timeline.
-        if ".resolved" in d_path or ".meta.json" in d_path or ".metadata.json" in d_path:
-            continue
+    for row in page_rows:
+        d_id = row.id
+        d_tool_id = row.tool_id
+        d_category = row.category
+        d_ctype = row.content_type
+        d_path = row.relative_path
+        d_title = row.title
+        d_size = row.file_size_bytes
+        d_ai_summary = row.ai_summary
+        d_meta = row.metadata
+        d_src_mod = row.source_modified_at
+        d_synced = row.synced_at
+        d_activity = row.activity_at
         if (
             d_category == "conversation"
             and d_id not in conversation_hierarchy.visible_document_ids
@@ -514,6 +825,7 @@ async def get_project_timeline(
         timestamp = effective_activity or d_src_mod or d_synced
         ts = timestamp.isoformat()
         tool_info = tool_map.get(d_tool_id, {})
+        internal_group_key = row.group_key
 
         if not session_id:
             event: dict = {
@@ -542,11 +854,12 @@ async def get_project_timeline(
                     d_id in conversation_hierarchy.orphan_document_ids
                 )
                 event["subagents"] = subagents_by_document.get(d_id, [])
-            standalone.append(event)
+            event["timestamp"] = group_timestamp[internal_group_key]
+            standalone[internal_group_key] = event
             continue
 
-        if session_id not in sessions:
-            sessions[session_id] = {
+        if internal_group_key not in sessions:
+            sessions[internal_group_key] = {
                 "session_id": session_id,
                 "logical_session_id": logical_session_id,
                 "type": "session",
@@ -560,7 +873,7 @@ async def get_project_timeline(
                 "subagent_count": 0,
                 "is_subagent_orphan": False,
             }
-        session = sessions[session_id]
+        session = sessions[internal_group_key]
         if ts > session["timestamp"]:
             session["timestamp"] = ts
 
@@ -612,24 +925,19 @@ async def get_project_timeline(
                 "file_size_bytes": d_size,
             })
 
-    # Artifacts can be synced after their conversation.  A conversation card
-    # remains anchored to effective thread activity; artifact-only sessions
-    # keep their prior latest-document behavior.
-    for session in sessions.values():
+    for internal_group_key, session in sessions.items():
         if session.get("conversation") and session.get("activity_at"):
             session["timestamp"] = session["activity_at"]
+        # SQL's grouped timestamp is the ordering authority and includes folded
+        # child activity without loading any off-page document rows.
+        session["timestamp"] = group_timestamp[internal_group_key]
 
-    # Merge + sort + paginate BEFORE touching content
-    all_events = list(sessions.values()) + standalone
-    all_events.sort(
-        key=lambda e: (
-            e.get("timestamp", ""),
-            e.get("session_id") or e.get("id") or "",
-        ),
-        reverse=(order == "desc"),
-    )
-    total = len(all_events)
-    page = all_events[offset:offset + limit]
+    events_by_group = {**standalone, **sessions}
+    page = [
+        events_by_group[row.group_key]
+        for row in page_groups
+        if row.group_key in events_by_group
+    ]
 
     # Set session title from conversation or first artifact
     for ev in page:
@@ -655,45 +963,59 @@ async def get_project_timeline(
         else:
             page_plan_ids.add(uuid.UUID(ev["id"]))
 
-    # Message counts for paginated conversations — one GROUP BY query
-    msg_counts: dict = {}
+    # Exact ingest-owned counts avoid rescanning long transcripts. During the
+    # one-time legacy backfill, only missing page rows use the old aggregate.
+    msg_counts: dict[uuid.UUID, int] = {}
     if page_conv_ids:
-        cnt_result = await db.execute(
-            select(ConversationMessage.document_id, func.count())
-            .where(ConversationMessage.document_id.in_(page_conv_ids))
-            .where(ConversationMessage.role.in_(("user", "assistant")))
-            .group_by(ConversationMessage.document_id)
-        )
-        msg_counts = {row[0]: row[1] for row in cnt_result.all()}
-
-    # Preview messages — fetch first 6 user/assistant messages per conv doc
-    previews: dict = {}
-    if page_conv_ids:
-        # Use a window function via a lateral-like approach: just fetch first 10 rows per doc
-        # by line_number, then filter in Python. Small constant per doc.
-        msg_rows = await db.execute(
-            select(ConversationMessage.id, ConversationMessage.document_id, ConversationMessage.role,
-                   ConversationMessage.content, ConversationMessage.timestamp,
-                   ConversationMessage.line_number)
-            .where(ConversationMessage.document_id.in_(page_conv_ids))
-            .where(ConversationMessage.role.in_(("user", "assistant")))
-            .order_by(
-                ConversationMessage.document_id,
-                ConversationMessage.line_number,
-                ConversationMessage.id,
+        projected_counts = (
+            await db.execute(
+                select(
+                    DashboardDocumentProjection.document_id,
+                    (
+                        DashboardDocumentProjection.user_message_count
+                        + DashboardDocumentProjection.assistant_message_count
+                    ).label("message_count"),
+                ).where(
+                    DashboardDocumentProjection.document_id.in_(page_conv_ids),
+                    DashboardDocumentProjection.projection_version == 1,
+                )
             )
+        ).all()
+        msg_counts = {
+            document_id: count
+            for document_id, count in projected_counts
+        }
+        missing_count_ids = page_conv_ids - set(msg_counts)
+        if missing_count_ids:
+            cnt_result = await db.execute(
+                select(ConversationMessage.document_id, func.count())
+                .where(ConversationMessage.document_id.in_(missing_count_ids))
+                .where(ConversationMessage.role.in_(("user", "assistant")))
+                .group_by(ConversationMessage.document_id)
+            )
+            msg_counts.update({
+                row[0]: row[1]
+                for row in cnt_result.all()
+            })
+
+    previews: dict[uuid.UUID, list[dict]] = {}
+    if page_conv_ids:
+        msg_rows = await db.execute(
+            timeline_preview_statement(page_conv_ids)
         )
-        for message_id, doc_id, role, content, ts_val, line_number in msg_rows.all():
-            lst = previews.setdefault(doc_id, [])
-            if len(lst) < 4:
-                lst.append({
-                    "id": message_id,
-                    "line_number": line_number,
-                    "role": role,
-                    "content": (content or "")[:300],
-                    "tool_name": "",
-                    "timestamp": ts_val.isoformat() if ts_val else None,
-                })
+        for message in msg_rows:
+            previews.setdefault(message.document_id, []).append({
+                "id": message.id,
+                "line_number": message.line_number,
+                "role": message.role,
+                "content": (message.content or "")[:300],
+                "tool_name": "",
+                "timestamp": (
+                    message.timestamp.isoformat()
+                    if message.timestamp
+                    else None
+                ),
+            })
 
     # Plan/other content previews — fetch only content for page plan docs
     plan_previews: dict = {}
@@ -736,6 +1058,11 @@ async def get_project_timeline(
         "offset": offset,
         "limit": limit,
         "events": page,
+        "next_cursor": (
+            _encode_timeline_cursor(page_groups[-1], order)
+            if len(page_groups) == limit
+            else None
+        ),
     }
 
 

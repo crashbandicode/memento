@@ -5,23 +5,44 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Date, cast, func, select
+from sqlalchemy import (
+    Date,
+    Integer,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    union_all,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Machine, Project, Tool, User
+from ..db.models import (
+    ConversationMessage,
+    DashboardDocumentProjection,
+    Document,
+    Machine,
+    Project,
+    Tool,
+    User,
+)
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
-    effective_conversation_activity_expression,
     is_low_activity_summary,
 )
 from ..services.conversation_hierarchy import (
     ConversationRef,
-    build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
+    build_conversation_companion_filter,
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
+)
+from ..services.dashboard_projection import (
+    dashboard_projection_backfill_complete,
 )
 from ..services.device_grouping import resolve_device_scope_ids
 from ..services.document_delivery import (
@@ -38,10 +59,126 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
 
 
-def _apply_device_filter(query, machine_ids):
+def _apply_device_filter(query, machine_ids, machine_column):
     if machine_ids is None:
         return query
-    return query.where(Document.machine_id.in_(machine_ids))
+    return query.where(machine_column.in_(machine_ids))
+
+
+def _dashboard_projection_select():
+    projection = DashboardDocumentProjection
+    return select(
+        projection.document_id.label("id"),
+        projection.tool_id.label("tool_id"),
+        projection.title.label("title"),
+        projection.synced_at.label("synced_at"),
+        projection.project_id.label("project_id"),
+        projection.file_size_bytes.label("file_size_bytes"),
+        projection.relative_path.label("relative_path"),
+        projection.hierarchy_metadata.label("hierarchy_metadata"),
+        projection.source_modified_at.label("source_modified_at"),
+        projection.activity_at.label("activity_at"),
+        projection.machine_id.label("machine_id"),
+        projection.category.label("category"),
+        projection.visibility.label("visibility"),
+        projection.session_id.label("session_id"),
+        projection.root_thread_id.label("root_thread_id"),
+        projection.parent_thread_id.label("parent_thread_id"),
+        projection.is_subagent.label("is_subagent"),
+        projection.message_count.label("message_count"),
+        projection.user_message_count.label("user_message_count"),
+        projection.assistant_message_count.label("assistant_message_count"),
+        projection.human_character_count.label("human_character_count"),
+        projection.pending_question_count.label("pending_question_count"),
+        projection.agent_mode.label("agent_mode"),
+        literal(True).label("projected"),
+    )
+
+
+def _legacy_dashboard_select():
+    """Compatibility rows used only until the explicit backfill completes."""
+    metadata = delivery_metadata_expression()
+    session_id = func.coalesce(
+        metadata["session_id"].astext,
+        metadata["thread_id"].astext,
+        metadata["cascade_id"].astext,
+    )
+    root_thread_id = func.coalesce(
+        metadata["root_session_id"].astext,
+        session_id,
+    )
+    pending_text = metadata["pending_question_count"].astext
+    pending_count = case(
+        (
+            pending_text.op("~")(r"^[0-9]+$"),
+            cast(pending_text, Integer),
+        ),
+        else_=0,
+    )
+    return (
+        select(
+            Document.id.label("id"),
+            Document.tool_id.label("tool_id"),
+            Document.title.label("title"),
+            delivery_synced_expression().label("synced_at"),
+            Document.project_id.label("project_id"),
+            delivery_file_size_expression().label("file_size_bytes"),
+            Document.relative_path.label("relative_path"),
+            metadata.label("hierarchy_metadata"),
+            delivery_source_modified_expression().label("source_modified_at"),
+            delivery_activity_expression().label("activity_at"),
+            Document.machine_id.label("machine_id"),
+            Document.category.label("category"),
+            Document.visibility.label("visibility"),
+            session_id.label("session_id"),
+            root_thread_id.label("root_thread_id"),
+            metadata["parent_thread_id"].astext.label("parent_thread_id"),
+            literal(False).label("is_subagent"),
+            literal(0).label("message_count"),
+            literal(0).label("user_message_count"),
+            literal(0).label("assistant_message_count"),
+            literal(0).label("human_character_count"),
+            pending_count.label("pending_question_count"),
+            func.coalesce(
+                metadata["_assistant_agent_mode"].astext,
+                "",
+            ).label("agent_mode"),
+            literal(False).label("projected"),
+        )
+        .outerjoin(
+            DashboardDocumentProjection,
+            DashboardDocumentProjection.document_id == Document.id,
+        )
+        .where(DashboardDocumentProjection.document_id.is_(None))
+    )
+
+
+def dashboard_source_statement(*, include_legacy: bool):
+    """Return the narrow dashboard source, with a temporary legacy union."""
+    projected = _dashboard_projection_select()
+    if not include_legacy:
+        return projected
+    return union_all(projected, _legacy_dashboard_select())
+
+
+def _row_metadata(row) -> dict:
+    metadata = (
+        dict(row.hierarchy_metadata)
+        if isinstance(row.hierarchy_metadata, dict)
+        else {}
+    )
+    if row.session_id:
+        metadata["session_id"] = row.session_id
+        metadata["thread_id"] = row.session_id
+    if row.root_thread_id:
+        metadata["root_session_id"] = row.root_thread_id
+    if row.parent_thread_id:
+        metadata["parent_thread_id"] = row.parent_thread_id
+    if row.is_subagent:
+        metadata["is_subagent"] = True
+        if row.tool_id == "codex":
+            metadata["thread_source"] = "subagent"
+    return metadata
 
 
 @router.get("")
@@ -64,167 +201,157 @@ async def get_dashboard(
     now = datetime.now(tz)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Tools with stats — one-shot aggregation instead of 3 COUNT queries per
-    # tool. With N tools, this was 3N+1 round-trips; now it's 2 (tool list +
-    # single GROUP BY).
+    include_legacy = not await dashboard_projection_backfill_complete(db)
+    source = dashboard_source_statement(
+        include_legacy=include_legacy
+    ).subquery("dashboard_source")
+
+    def scoped(query):
+        query = _apply_device_filter(
+            query,
+            selected_machine_ids,
+            source.c.machine_id,
+        )
+        return apply_user_filter(query, mids, source.c.machine_id)
+
     tools_result = await db.execute(select(Tool).order_by(Tool.display_name))
     tool_records = list(tools_result.scalars().all())
 
-    cat_agg_q = select(Document.tool_id, Document.category, func.count().label("n"))
-    cat_agg_q = _apply_device_filter(cat_agg_q, selected_machine_ids)
-    cat_agg_q = apply_user_filter(cat_agg_q, mids, Document.machine_id)
-    cat_agg_q = cat_agg_q.group_by(Document.tool_id, Document.category)
+    cat_agg_q = scoped(
+        select(source.c.tool_id, source.c.category, func.count().label("n"))
+    ).group_by(source.c.tool_id, source.c.category)
     categories_by_tool: dict[str, dict[str, int]] = {}
-    for tid, cat, n in (await db.execute(cat_agg_q)).all():
-        categories_by_tool.setdefault(tid, {})[cat] = n
+    for tid, cat, count in (await db.execute(cat_agg_q)).all():
+        categories_by_tool.setdefault(tid, {})[cat] = count
 
-    today_q = (
-        select(Document.tool_id, func.count().label("n"))
-        .where(delivery_synced_expression() >= today_start)
-    )
-    today_q = _apply_device_filter(today_q, selected_machine_ids)
-    today_q = apply_user_filter(today_q, mids, Document.machine_id)
-    today_q = today_q.group_by(Document.tool_id)
-    today_by_tool: dict[str, int] = {tid: n for tid, n in (await db.execute(today_q)).all()}
-
+    today_q = scoped(
+        select(source.c.tool_id, func.count().label("n")).where(
+            source.c.synced_at >= today_start
+        )
+    ).group_by(source.c.tool_id)
+    today_by_tool = {
+        tool_id: count
+        for tool_id, count in (await db.execute(today_q)).all()
+    }
     tools = []
-    for t in tool_records:
-        categories = categories_by_tool.get(t.id, {})
+    for tool in tool_records:
+        categories = categories_by_tool.get(tool.id, {})
         if (device_id or mids is not None) and not categories:
             continue
         tools.append({
-            "id": t.id,
-            "display_name": t.display_name,
-            "total_files": sum(categories.values()) if (device_id or mids is not None) else t.total_files,
-            "last_sync_at": t.last_sync_at.isoformat() if t.last_sync_at else None,
+            "id": tool.id,
+            "display_name": tool.display_name,
+            "total_files": sum(categories.values()),
+            "last_sync_at": (
+                tool.last_sync_at.isoformat() if tool.last_sync_at else None
+            ),
             "categories": categories,
-            "today_count": today_by_tool.get(t.id, 0),
+            "today_count": today_by_tool.get(tool.id, 0),
             "conversation_count": categories.get("conversation", 0),
         })
 
-    # Fetch a bounded, activity-ordered candidate set instead of folding every
-    # visible conversation on each dashboard refresh.  If a candidate is a
-    # child transcript, pull its logical companions so the visible root still
-    # absorbs the child in dashboard presentation for every supported tool.
-    activity_expr = effective_conversation_activity_expression(
-        delivery_activity_expression(),
-        delivery_source_modified_expression(),
-        delivery_synced_expression(),
+    conversation_columns = (
+        source.c.id,
+        source.c.tool_id,
+        source.c.title,
+        source.c.synced_at,
+        source.c.project_id,
+        source.c.file_size_bytes,
+        Project.title.label("project_title"),
+        source.c.relative_path,
+        source.c.hierarchy_metadata,
+        source.c.source_modified_at,
+        source.c.activity_at,
+        source.c.machine_id,
+        source.c.session_id,
+        source.c.root_thread_id,
+        source.c.parent_thread_id,
+        source.c.is_subagent,
+        source.c.message_count,
+        source.c.user_message_count,
+        source.c.assistant_message_count,
+        source.c.human_character_count,
+        source.c.pending_question_count,
+        source.c.agent_mode,
+        source.c.projected,
+    )
+    activity_expr = func.coalesce(
+        source.c.activity_at,
+        source.c.source_modified_at,
+        source.c.synced_at,
     )
     recent_convos_q = (
-        select(Document.id, Document.tool_id, Document.title,
-               delivery_synced_expression(), Document.project_id,
-               delivery_file_size_expression(),
-               Project.title.label("project_title"), Document.relative_path,
-               delivery_metadata_expression(),
-               delivery_source_modified_expression(),
-               delivery_activity_expression())
-        .outerjoin(Project, Document.project_id == Project.id)
-        .where(Document.category == "conversation")
-        .order_by(activity_expr.desc(), Document.id.desc())
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
+        .where(source.c.category == "conversation")
+        .order_by(activity_expr.desc(), source.c.id.desc())
         .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
-    recent_convos_q = _apply_device_filter(recent_convos_q, selected_machine_ids)
-    recent_convos_q = apply_user_filter(recent_convos_q, mids, Document.machine_id)
-    candidate_rows = list((await db.execute(recent_convos_q)).all())
-    # Pending questions are an inbox, not merely recent activity. Pin every
-    # active interaction even when its thread falls outside the bounded recent
-    # window, then fold any child result into its logical root below.
+    candidate_rows = list(
+        (await db.execute(scoped(recent_convos_q))).all()
+    )
+
     attention_convos_q = (
-        select(
-            Document.id,
-            Document.tool_id,
-            Document.title,
-            delivery_synced_expression(),
-            Document.project_id,
-            delivery_file_size_expression(),
-            Project.title.label("project_title"),
-            Document.relative_path,
-            delivery_metadata_expression(),
-            delivery_source_modified_expression(),
-            delivery_activity_expression(),
-        )
-        .outerjoin(Project, Document.project_id == Project.id)
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
         .where(
-            Document.category == "conversation",
-            delivery_metadata_expression().op("?")("pending_question_count"),
-            delivery_metadata_expression()["pending_question_count"].astext != "0",
+            source.c.category == "conversation",
+            source.c.pending_question_count > 0,
         )
-    )
-    attention_convos_q = _apply_device_filter(
-        attention_convos_q,
-        selected_machine_ids,
-    )
-    attention_convos_q = apply_user_filter(
-        attention_convos_q,
-        mids,
-        Document.machine_id,
     )
     rows_by_id = {row.id: row for row in candidate_rows}
-    for row in (await db.execute(attention_convos_q)).all():
+    for row in (await db.execute(scoped(attention_convos_q))).all():
         rows_by_id[row.id] = row
     candidate_rows = list(rows_by_id.values())
 
-    candidate_refs = [
-        ConversationRef(
-            document_id=row[0],
-            tool_id=row[1],
-            relative_path=row[7],
-            metadata=row[8],
-            title=row[2],
-            source_modified_at=row[9],
-            activity_at=row[10],
-            synced_at=row[3],
-            file_size_bytes=row[5],
+    def conversation_ref(row) -> ConversationRef:
+        return ConversationRef(
+            document_id=row.id,
+            tool_id=row.tool_id,
+            relative_path=row.relative_path,
+            metadata=_row_metadata(row),
+            title=row.title,
+            source_modified_at=row.source_modified_at,
+            activity_at=row.activity_at,
+            synced_at=row.synced_at,
+            file_size_bytes=row.file_size_bytes,
         )
-        for row in candidate_rows
-    ]
+
     roots_by_tool = group_conversation_root_thread_ids(
-        candidate_refs,
+        [conversation_ref(row) for row in candidate_rows],
         path_children_only=True,
     )
-
-    all_convo_rows_by_id = {row[0]: row for row in candidate_rows}
-    if roots_by_tool:
+    all_convo_rows_by_id = {row.id: row for row in candidate_rows}
+    companion_filters = [
+        and_(
+            source.c.tool_id == tool_id,
+            source.c.root_thread_id.in_(root_ids),
+        )
+        for tool_id, root_ids in roots_by_tool.items()
+        if root_ids
+    ]
+    if companion_filters:
         companions_q = (
-            select(Document.id, Document.tool_id, Document.title,
-                   delivery_synced_expression(), Document.project_id,
-                   delivery_file_size_expression(),
-                   Project.title.label("project_title"), Document.relative_path,
-                   delivery_metadata_expression(),
-                   delivery_source_modified_expression(),
-                   delivery_activity_expression())
-            .outerjoin(Project, Document.project_id == Project.id)
+            select(*conversation_columns)
+            .outerjoin(Project, source.c.project_id == Project.id)
             .where(
-                Document.category == "conversation",
-                build_conversation_companion_filter(
-                    Document.tool_id,
-                    delivery_metadata_expression(),
-                    Document.relative_path,
-                    roots_by_tool,
+                source.c.category == "conversation",
+                or_(
+                    *companion_filters,
+                    build_conversation_companion_filter(
+                        source.c.tool_id,
+                        source.c.hierarchy_metadata,
+                        source.c.relative_path,
+                        roots_by_tool,
+                    ),
                 ),
             )
         )
-        companions_q = _apply_device_filter(companions_q, selected_machine_ids)
-        companions_q = apply_user_filter(companions_q, mids, Document.machine_id)
-        for row in (await db.execute(companions_q)).all():
-            all_convo_rows_by_id[row[0]] = row
+        for row in (await db.execute(scoped(companions_q))).all():
+            all_convo_rows_by_id[row.id] = row
 
     all_convo_rows = list(all_convo_rows_by_id.values())
-    conversation_refs = [
-        ConversationRef(
-            document_id=row[0],
-            tool_id=row[1],
-            relative_path=row[7],
-            metadata=row[8],
-            title=row[2],
-            source_modified_at=row[9],
-            activity_at=row[10],
-            synced_at=row[3],
-            file_size_bytes=row[5],
-        )
-        for row in all_convo_rows
-    ]
+    conversation_refs = [conversation_ref(row) for row in all_convo_rows]
     conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
@@ -236,11 +363,7 @@ async def get_dashboard(
     )
     pending_question_counts: dict = {}
     for row in all_convo_rows:
-        metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
-        try:
-            count = max(0, int(metadata.get("pending_question_count") or 0))
-        except (TypeError, ValueError):
-            count = 0
+        count = max(0, int(row.pending_question_count or 0))
         if not count:
             continue
         canonical_id = conversation_hierarchy.canonical_document_ids.get(
@@ -250,11 +373,13 @@ async def get_dashboard(
         pending_question_counts[canonical_id] = (
             pending_question_counts.get(canonical_id, 0) + count
         )
+
     visible_convo_rows = [
         row
         for row in all_convo_rows
         if row.id in conversation_hierarchy.visible_document_ids
     ]
+
     def activity_key(row):
         return (
             logical_activity_by_document.get(row.id)
@@ -263,6 +388,7 @@ async def get_dashboard(
             or row.synced_at,
             str(row.id),
         )
+
     attention_rows = [
         row
         for row in visible_convo_rows
@@ -277,16 +403,30 @@ async def get_dashboard(
         + sorted(recent_rows, key=activity_key, reverse=True)[:20]
     )
 
-    # Batch both display counts and meaningful human/assistant activity in one
-    # GROUP BY instead of one query per document.
-    msg_activity: dict = {}
-    if convos_rows:
-        msg_count_q = (
+    # Only temporary legacy rows fall back to message aggregation. Once the
+    # backfill marker is complete, no dashboard query references message text.
+    message_activity = {
+        row.id: (
+            int(row.message_count or 0),
+            int(row.user_message_count or 0),
+            int(row.assistant_message_count or 0),
+            int(row.human_character_count or 0),
+        )
+        for row in convos_rows
+        if row.projected
+    }
+    legacy_ids = [row.id for row in convos_rows if not row.projected]
+    if legacy_ids:
+        legacy_message_q = (
             select(
                 ConversationMessage.document_id,
                 func.count().label("message_count"),
-                func.count().filter(ConversationMessage.role == "user").label("user_count"),
-                func.count().filter(ConversationMessage.role == "assistant").label("assistant_count"),
+                func.count().filter(
+                    ConversationMessage.role == "user"
+                ).label("user_count"),
+                func.count().filter(
+                    ConversationMessage.role == "assistant"
+                ).label("assistant_count"),
                 func.coalesce(
                     func.sum(func.length(ConversationMessage.content)).filter(
                         ConversationMessage.role.in_(("user", "assistant"))
@@ -294,39 +434,42 @@ async def get_dashboard(
                     0,
                 ).label("human_character_count"),
             )
-            .where(ConversationMessage.document_id.in_([r.id for r in convos_rows]))
+            .where(ConversationMessage.document_id.in_(legacy_ids))
             .group_by(ConversationMessage.document_id)
         )
-        msg_activity = {
-            did: (total, users, assistants, characters)
-            for did, total, users, assistants, characters
-            in (await db.execute(msg_count_q)).all()
-        }
+        message_activity.update({
+            document_id: (total, users, assistants, characters)
+            for document_id, total, users, assistants, characters
+            in (await db.execute(legacy_message_q)).all()
+        })
 
     recent_conversations = []
-    for r in convos_rows:
-        activity_at = logical_activity_by_document.get(r.id) or r.activity_at
-        metadata = r.metadata_ if isinstance(r.metadata_, dict) else {}
-        pending_question_count = pending_question_counts.get(r.id, 0)
-        total, users, assistants, characters = msg_activity.get(
-            r.id,
+    for row in convos_rows:
+        activity_at = (
+            logical_activity_by_document.get(row.id) or row.activity_at
+        )
+        total, users, assistants, characters = message_activity.get(
+            row.id,
             (0, 0, 0, 0),
         )
         recent_conversations.append({
-            "id": str(r.id),
-            "tool_id": r.tool_id,
-            "title": r.title,
+            "id": str(row.id),
+            "tool_id": row.tool_id,
+            "title": row.title,
             "activity_at": activity_at.isoformat() if activity_at else None,
-            "synced_at": r.synced_at.isoformat(),
-            "project_title": r.project_title,
+            "synced_at": row.synced_at.isoformat(),
+            "project_title": row.project_title,
             "message_count": total,
-            "pending_question_count": pending_question_count,
-            "agent_mode": str(metadata.get("_assistant_agent_mode") or ""),
-            "subagent_count": conversation_hierarchy.subagent_counts.get(r.id, 0),
-            "is_subagent_orphan": (
-                r.id in conversation_hierarchy.orphan_document_ids
+            "pending_question_count": pending_question_counts.get(row.id, 0),
+            "agent_mode": row.agent_mode or "",
+            "subagent_count": conversation_hierarchy.subagent_counts.get(
+                row.id,
+                0,
             ),
-            "subagents": subagents_by_document.get(r.id, []),
+            "is_subagent_orphan": (
+                row.id in conversation_hierarchy.orphan_document_ids
+            ),
+            "subagents": subagents_by_document.get(row.id, []),
             "is_low_activity": is_low_activity_summary(
                 users,
                 assistants,
@@ -334,93 +477,85 @@ async def get_dashboard(
             ),
         })
 
-    # Recent activity (last 7 days by date, timezone-adjusted)
     cutoff = now - timedelta(days=7)
-    tz_adjusted_synced = (
-        delivery_synced_expression() + timedelta(minutes=-tz_offset)
-    )
-    daily_q = (
-        select(cast(tz_adjusted_synced, Date).label("day"), func.count().label("count"))
-        .where(delivery_synced_expression() >= cutoff)
-    )
-    daily_q = _apply_device_filter(daily_q, selected_machine_ids)
-    daily_q = apply_user_filter(daily_q, mids, Document.machine_id)
-    daily_result = await db.execute(daily_q.group_by("day").order_by("day"))
-    daily = [{"date": str(r.day), "count": r.count} for r in daily_result.all()]
+    tz_adjusted_synced = source.c.synced_at + timedelta(minutes=-tz_offset)
+    daily_q = scoped(
+        select(
+            cast(tz_adjusted_synced, Date).label("day"),
+            func.count().label("count"),
+        ).where(source.c.synced_at >= cutoff)
+    ).group_by("day").order_by("day")
+    daily = [
+        {"date": str(row.day), "count": row.count}
+        for row in (await db.execute(daily_q)).all()
+    ]
 
-    # Activity by tool (last 7 days)
-    tool_daily_q = (
-        select(Document.tool_id,
-               cast(tz_adjusted_synced, Date).label("day"),
-               func.count().label("count"))
-        .where(delivery_synced_expression() >= cutoff)
-    )
-    tool_daily_q = _apply_device_filter(tool_daily_q, selected_machine_ids)
-    tool_daily_q = apply_user_filter(tool_daily_q, mids, Document.machine_id)
-    tool_daily_result = await db.execute(
-        tool_daily_q.group_by(Document.tool_id, "day").order_by("day")
-    )
+    tool_daily_q = scoped(
+        select(
+            source.c.tool_id,
+            cast(tz_adjusted_synced, Date).label("day"),
+            func.count().label("count"),
+        ).where(source.c.synced_at >= cutoff)
+    ).group_by(source.c.tool_id, "day").order_by("day")
     tool_daily: dict[str, list] = {}
-    for r in tool_daily_result.all():
-        tool_daily.setdefault(r.tool_id, []).append({"date": str(r.day), "count": r.count})
+    for row in (await db.execute(tool_daily_q)).all():
+        tool_daily.setdefault(row.tool_id, []).append({
+            "date": str(row.day),
+            "count": row.count,
+        })
 
-    # Active devices — batch per-device document counts in a single GROUP BY
-    # instead of N+1.
     devices_q = select(Machine).order_by(Machine.name).limit(10)
     if mids is not None:
         devices_q = devices_q.where(Machine.id.in_(mids))
     machine_rows = list((await db.execute(devices_q)).scalars().all())
-
-    dev_counts: dict = {}
+    device_counts: dict = {}
     if machine_rows:
-        dev_count_q = (
-            select(Document.machine_id, func.count())
-            .where(Document.machine_id.in_([m.id for m in machine_rows]))
-            .group_by(Document.machine_id)
+        device_count_q = (
+            select(source.c.machine_id, func.count())
+            .where(source.c.machine_id.in_([machine.id for machine in machine_rows]))
+            .group_by(source.c.machine_id)
         )
-        dev_counts = {mid: n for mid, n in (await db.execute(dev_count_q)).all()}
+        device_counts = {
+            machine_id: count
+            for machine_id, count in (await db.execute(device_count_q)).all()
+        }
+    devices = [{
+        "id": str(machine.id),
+        "device_id": machine.collector_token_hash,
+        "name": machine.name,
+        "last_heartbeat": (
+            machine.last_heartbeat.isoformat()
+            if machine.last_heartbeat
+            else None
+        ),
+        "collector_version": machine.collector_version,
+        "total_files": device_counts.get(machine.id, 0),
+    } for machine in machine_rows]
 
-    devices = []
-    for m in machine_rows:
-        devices.append({
-            "id": str(m.id),
-            "device_id": m.collector_token_hash,
-            "name": m.name,
-            "last_heartbeat": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
-            "collector_version": m.collector_version,
-            "total_files": dev_counts.get(m.id, 0),
-        })
-
-    # Today's stats
-    today_total_q = select(func.count()).where(
-        delivery_synced_expression() >= today_start
+    today_total_q = scoped(
+        select(func.count()).select_from(source).where(
+            source.c.synced_at >= today_start
+        )
     )
-    today_total_q = _apply_device_filter(today_total_q, selected_machine_ids)
-    today_total_q = apply_user_filter(today_total_q, mids, Document.machine_id)
     today_total = (await db.execute(today_total_q)).scalar() or 0
-
-    today_conv_q = select(func.count()).where(
-        delivery_synced_expression() >= today_start,
-        Document.category == "conversation",
+    today_conversation_q = scoped(
+        select(func.count()).select_from(source).where(
+            source.c.synced_at >= today_start,
+            source.c.category == "conversation",
+        )
     )
-    today_conv_q = _apply_device_filter(today_conv_q, selected_machine_ids)
-    today_conv_q = apply_user_filter(today_conv_q, mids, Document.machine_id)
-    today_conversations = (await db.execute(today_conv_q)).scalar() or 0
+    today_conversations = (
+        await db.execute(today_conversation_q)
+    ).scalar() or 0
 
-    # Total stats
-    doc_count_q = select(func.count()).select_from(Document)
-    doc_count_q = _apply_device_filter(doc_count_q, selected_machine_ids)
-    doc_count_q = apply_user_filter(doc_count_q, mids, Document.machine_id)
-    total_docs = (await db.execute(doc_count_q)).scalar() or 0
-    # Count only projects the user has ingested into — Project has no user_id,
-    # so scope via Document.machine_id → Machine.user_id (same path as mids).
-    proj_count_q = (
-        select(func.count(func.distinct(Document.project_id)))
-        .where(Document.project_id.isnot(None))
+    document_count_q = scoped(select(func.count()).select_from(source))
+    total_documents = (await db.execute(document_count_q)).scalar() or 0
+    project_count_q = scoped(
+        select(func.count(func.distinct(source.c.project_id)))
+        .select_from(source)
+        .where(source.c.project_id.isnot(None))
     )
-    proj_count_q = _apply_device_filter(proj_count_q, selected_machine_ids)
-    proj_count_q = apply_user_filter(proj_count_q, mids, Document.machine_id)
-    total_projects = (await db.execute(proj_count_q)).scalar() or 0
+    total_projects = (await db.execute(project_count_q)).scalar() or 0
 
     return {
         "tools": tools,
@@ -429,7 +564,7 @@ async def get_dashboard(
         "tool_daily": tool_daily,
         "devices": devices,
         "stats": {
-            "total_documents": total_docs,
+            "total_documents": total_documents,
             "total_projects": total_projects,
             "total_tools": len(tools),
             "total_devices": len(devices),

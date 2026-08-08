@@ -833,8 +833,16 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.synced_at, "unchanged")
         self.assertEqual(document.activity_at, "unchanged")
         self.assertEqual(invalidate.await_count, 0)
-        pending_namespaces = next(iter(db.info.values()))
+        pending_namespaces = db.info["memento_cache_namespace_invalidations"]
         self.assertEqual(len(pending_namespaces), 2)
+        event_type, event_data, event_user_id = db.info[
+            "memento_pending_realtime_events"
+        ][0]
+        self.assertEqual(event_type, "file_synced")
+        self.assertEqual(event_data["project_id"], str(document.project_id))
+        self.assertIn("dashboard", event_data["changes"])
+        self.assertIn("project", event_data["changes"])
+        self.assertEqual(event_user_id, str(user_id))
         compiled_statements = [
             statement.compile(dialect=postgresql.dialect())
             for statement in db.statements

@@ -2187,6 +2187,7 @@ def _conversation_event_changes(
         "conversation.messages",
         "conversation.metadata",
         "dashboard",
+        "project",
     }
     if mode == "full" or "[user]" in search_text:
         changes.add("conversation.prompts")
@@ -2202,7 +2203,7 @@ def _publish_file_synced_event(
     document: Document,
     user_id: str | None,
     *,
-    changes: list[str] | tuple[str, ...] | set[str] | None = None,
+    changes: Iterable[str] | None = None,
 ) -> None:
     from ..db.session import queue_realtime_event
 
@@ -2216,10 +2217,14 @@ def _publish_file_synced_event(
                 "conversation.prompts",
                 "conversation.search",
                 "dashboard",
+                "project",
             }
             if document.category == "conversation"
-            else {"dashboard"}
+            else {"dashboard", "project"}
         )
+    scoped_changes = set(event_changes)
+    if document.project_id is None:
+        scoped_changes.discard("project")
     queue_realtime_event(
         db,
         "file_synced",
@@ -2229,7 +2234,12 @@ def _publish_file_synced_event(
             "category": document.category,
             "relative_path": document.relative_path,
             "title": document.title,
-            "changes": sorted(set(event_changes)),
+            "project_id": (
+                str(document.project_id)
+                if document.project_id is not None
+                else None
+            ),
+            "changes": sorted(scoped_changes),
         },
         user_id=user_id,
     )
@@ -2258,6 +2268,9 @@ async def _reconcile_idempotent_claude_ingest(
     if enriched_child is None and not lifecycle_changed:
         return
     await db.flush()
+    from .dashboard_projection import refresh_dashboard_document_projection
+
+    await refresh_dashboard_document_projection(db, lifecycle_document)
     _stage_ingest_read_cache_invalidations(
         db,
         user_id,
@@ -2269,7 +2282,7 @@ async def _reconcile_idempotent_claude_ingest(
         db,
         lifecycle_document,
         user_id,
-        changes={"conversation.metadata"},
+        changes={"conversation.metadata", "dashboard", "project"},
     )
 
 
@@ -2562,7 +2575,7 @@ async def ingest_file(
     is_new_document = doc is None
     previous_title = doc.title if doc is not None else None
     previous_interaction_signature = _interaction_event_signature(
-        doc.metadata_ if doc is not None else {}
+        document_metadata(doc) if doc is not None else {}
     )
     previous_embedding_content_hash: str | None = None
     logical_file_size = _logical_document_file_size(
@@ -2876,6 +2889,8 @@ async def ingest_file(
         db.add(doc)
     else:
         # Update existing document
+        doc.category = category
+        doc.content_type = content_type
         if identity_relocation:
             doc.relative_path = relative_path
         preserve_externalized_delta = _is_externalized_delta_update(
@@ -3141,6 +3156,18 @@ async def ingest_file(
             .values(content_tsv=_func.to_tsvector("simple", tsv_input))
         )
 
+    # Dashboard reads only this narrow replacement row. It is refreshed in the
+    # same transaction after normalized messages, activity, title, hierarchy,
+    # visibility, and category have reached their final current values.
+    from .dashboard_projection import refresh_dashboard_document_projection
+
+    await refresh_dashboard_document_projection(db, doc)
+    if (
+        enriched_claude_child is not None
+        and enriched_claude_child.id != doc.id
+    ):
+        await refresh_dashboard_document_projection(db, enriched_claude_child)
+
     # Update sync state
     await _update_sync_state(
         db,
@@ -3216,12 +3243,12 @@ async def ingest_file(
             title_changed=doc.title != previous_title,
             interactions_changed=(
                 bool(getattr(doc, "_memento_interactions_changed", False))
-                or _interaction_event_signature(doc.metadata_)
+                or _interaction_event_signature(document_metadata(doc))
                 != previous_interaction_signature
             ),
         )
     else:
-        event_changes = ["dashboard"]
+        event_changes = ["dashboard", "project"]
     _publish_file_synced_event(
         db,
         doc,
@@ -3236,7 +3263,7 @@ async def ingest_file(
             db,
             enriched_claude_child,
             user_id,
-            changes={"conversation.metadata"},
+            changes={"conversation.metadata", "dashboard", "project"},
         )
 
     # Generate embeddings + extract knowledge graph (async, non-blocking)

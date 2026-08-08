@@ -117,6 +117,7 @@ async def test_api_lifespan_readiness_does_not_wait_for_online_indexes(
         server_main._run_migrations,
         server_main.Base.metadata.create_all,
         server_main._configure_hot_storage,
+        server_main._initialize_dashboard_projection_state,
     ]
     assert schema_engine.disposed is True
 

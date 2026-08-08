@@ -407,6 +407,23 @@ async def apply_codex_thread_title_update(
 
     for document in title_changed_documents:
         await _refresh_title_search_index(db, document)
+        if isinstance(document, Document):
+            from .dashboard_projection import (
+                refresh_dashboard_document_projection,
+            )
+
+            await refresh_dashboard_document_projection(db, document)
+        _publish_file_synced_event(
+            db,
+            document,
+            str(user_id),
+            changes={
+                "conversation.metadata",
+                "conversation.search",
+                "dashboard",
+                "project",
+            },
+        )
 
     if title_changed_documents:
         stage_cache_invalidation(db, daily_cache_namespace(user_id))
@@ -707,6 +724,10 @@ async def apply_conversation_interaction_update(
     delivery_state = await ensure_document_delivery_state(db, document)
     attach_document_delivery(document, delivery_state, runtime_only=True)
     store_document_metadata(document, metadata)
+    if isinstance(document, Document):
+        from .dashboard_projection import refresh_dashboard_document_projection
+
+        await refresh_dashboard_document_projection(db, document)
     if document.project_id:
         stage_cache_invalidation(
             db,

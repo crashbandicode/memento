@@ -36,6 +36,7 @@ class _Session:
         self.statements = []
         self.flush_count = 0
         self.info = {}
+        self.entities = {}
 
     async def execute(self, statement, parameters=None):
         self.statements.append((statement, parameters))
@@ -45,6 +46,13 @@ class _Session:
 
     async def flush(self) -> None:
         self.flush_count += 1
+
+    async def get(self, model, identity):
+        return self.entities.get((model, identity))
+
+    def add(self, value) -> None:
+        identity = getattr(value, "document_id", getattr(value, "id", None))
+        self.entities[(type(value), identity)] = value
 
 
 def _sidecar_payload(
@@ -276,7 +284,10 @@ async def test_existing_child_enrichment_publishes_one_child_event() -> None:
     assert event_data["document_id"] == str(transcript.id)
     assert event_data["category"] == "conversation"
     assert event_data["relative_path"] == TRANSCRIPT_PATH
-    assert event_data["changes"] == ["conversation.metadata"]
+    assert event_data["changes"] == [
+        "conversation.metadata",
+        "dashboard",
+    ]
 
 
 @pytest.mark.asyncio

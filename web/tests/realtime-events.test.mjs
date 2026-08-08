@@ -5,6 +5,7 @@ import {
   buildEventStreamUrl,
   conversationInvalidationForEvent,
   eventInvalidatesDashboard,
+  eventInvalidatesProject,
   NO_CONVERSATION_INVALIDATION,
 } from "../src/lib/realtime-events.ts";
 
@@ -140,5 +141,30 @@ test("dashboard refreshes only for dashboard-scoped updates or resets", () => {
       event({ reason: "replay_expired" }, "realtime_reset"),
     ),
     true,
+  );
+});
+
+
+test("project refreshes stay scoped to the affected project", () => {
+  assert.equal(
+    eventInvalidatesProject(event({
+      project_id: "current",
+      changes: ["project"],
+    }), "current"),
+    true,
+  );
+  assert.equal(
+    eventInvalidatesProject(event({
+      project_id: "other",
+      changes: ["project"],
+    }), "current"),
+    false,
+  );
+  assert.equal(
+    eventInvalidatesProject(event({
+      project_id: "current",
+      changes: ["dashboard"],
+    }), "current"),
+    false,
   );
 });
