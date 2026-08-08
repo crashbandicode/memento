@@ -961,6 +961,123 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activity["line_number"], 34406)
         self.assertEqual(activity["command"], "Start-Sleep -Seconds 30")
 
+    async def test_projected_shell_activities_apply_running_and_terminal_ttls(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+
+        def activity(activity_id: str, status: str, age: timedelta | None):
+            timestamp = (now - age).isoformat() if age is not None else None
+            return {
+                "document_id": str(self.doc_id),
+                "activity_id": activity_id,
+                "activity_type": "shell",
+                "status": status,
+                "tool_name": "PowerShell",
+                "command": "python worker.py",
+                "started_at": timestamp,
+                "updated_at": timestamp,
+            }
+
+        projection = self.read_model(live_activities=[
+            activity("recent-running", "running", timedelta(hours=23)),
+            activity("stale-running", "running", timedelta(hours=25)),
+            activity("recent-terminal", "completed", timedelta(minutes=59)),
+            activity("stale-terminal", "failed", timedelta(minutes=61)),
+            activity("missing-time", "running", None),
+        ])
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[(self.doc, projection)]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            {
+                item["activity_id"]
+                for item in payload["live_activities"]
+            },
+            {"recent-running", "recent-terminal"},
+        )
+
+    async def test_fallback_shell_activities_use_same_ttls_and_reject_no_time(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        self.doc.metadata_["_live_shell_activities"] = {
+            "recent-running": {
+                "id": "recent-running",
+                "status": "running",
+                "tool_name": "PowerShell",
+                "command": "python live.py",
+                "updated_at": (now - timedelta(hours=23)).isoformat(),
+            },
+            "stale-running": {
+                "id": "stale-running",
+                "status": "running",
+                "tool_name": "PowerShell",
+                "command": "python stale.py",
+                "updated_at": (now - timedelta(hours=25)).isoformat(),
+            },
+            "recent-terminal": {
+                "id": "recent-terminal",
+                "status": "completed",
+                "tool_name": "PowerShell",
+                "command": "python done.py",
+                "updated_at": (now - timedelta(minutes=59)).isoformat(),
+            },
+            "stale-terminal": {
+                "id": "stale-terminal",
+                "status": "failed",
+                "tool_name": "PowerShell",
+                "command": "python failed.py",
+                "updated_at": (now - timedelta(minutes=61)).isoformat(),
+            },
+            "missing-time": {
+                "id": "missing-time",
+                "status": "running",
+                "tool_name": "PowerShell",
+                "command": "python unknown.py",
+            },
+        }
+        canonical_without_time = SimpleNamespace(
+            id=101,
+            document_id=self.doc_id,
+            line_number=88,
+            message_type="tool_call",
+            timestamp=None,
+            metadata_={
+                "tool_call_id": "canonical-missing-time",
+                "tool_name": "exec_command",
+                "tool_input": '{"command":"python unknown.py"}',
+            },
+        )
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[]),
+            _Result(rows=[canonical_without_time]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            {
+                item["activity_id"]
+                for item in payload["live_activities"]
+            },
+            {"recent-running", "recent-terminal"},
+        )
+
     async def test_recent_canonical_shell_call_is_inferred_as_running(self) -> None:
         self.doc.tool_id = "codex"
         shell_call = SimpleNamespace(

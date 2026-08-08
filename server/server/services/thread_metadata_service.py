@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, Machine
@@ -21,6 +22,10 @@ from .conversation_parser import (
     is_claude_ask_user_permission_wrapper,
     normalize_interaction,
     strip_terminal_sequences,
+)
+from .conversation_activity import (
+    ACTIVITY_FUTURE_CLOCK_SKEW,
+    parse_conversation_activity_timestamp,
 )
 from .document_delivery import (
     attach_document_delivery,
@@ -54,6 +59,24 @@ _MANUAL_TITLE_SOURCES = {
 _TITLE_REVISION_MAP_LIMIT = 32
 _INTERACTION_HISTORY_LIMIT = 32
 _LIVE_SHELL_ACTIVITY_LIMIT = 16
+_TERMINAL_ACTIVITY_MESSAGE_TYPES = {
+    "question_tool_output",
+    "tool_output",
+    "tool_result",
+}
+_TERMINAL_ACTIVITY_TOOL_STATUSES = {
+    "aborted",
+    "cancelled",
+    "canceled",
+    "complete",
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "interrupted",
+    "success",
+    "succeeded",
+}
 # Kept only so older tests/extensions that monkeypatch the removed SCAN hook
 # fail closed instead of importing a missing symbol. Production code never
 # calls this sentinel.
@@ -79,6 +102,33 @@ async def _interaction_anchor_line(
         return max(0, int(line_number or 0))
     except (TypeError, ValueError):
         return 0
+
+
+async def _canonical_activity_is_terminal(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    activity_id: str,
+) -> bool:
+    """Return whether normalized history has already retired this activity."""
+    terminal_id = (
+        await db.execute(
+            select(ConversationMessage.id)
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.metadata_["tool_call_id"].astext == activity_id,
+                or_(
+                    ConversationMessage.message_type.in_(
+                        _TERMINAL_ACTIVITY_MESSAGE_TYPES
+                    ),
+                    ConversationMessage.metadata_["tool_status"].astext.in_(
+                        _TERMINAL_ACTIVITY_TOOL_STATUSES
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return terminal_id is not None
 
 
 @dataclass(frozen=True)
@@ -771,14 +821,19 @@ async def apply_conversation_activity_update(
         strip_terminal_sequences(str(command or "")).replace("\x00", "").strip(),
         8_000,
     )
+    event_at = parse_conversation_activity_timestamp(timestamp)
     if (
         tool_id not in {"claude_code", "codex", "cursor"}
         or not relative_path
         or not activity_id
         or status not in {"running", "completed", "failed", "cancelled"}
         or (status == "running" and not clean_command)
+        or event_at is None
+        or event_at
+        > datetime.now(timezone.utc) + ACTIVITY_FUTURE_CLOCK_SKEW
     ):
         return ThreadTitleUpdateResult(0, 0, 1, valid=False)
+    event_timestamp = event_at.isoformat()
 
     document = (
         await db.execute(
@@ -812,16 +867,54 @@ async def apply_conversation_activity_update(
         else {}
     )
     previous = activities.get(activity_id)
+    previous_status = (
+        str(previous.get("status") or "").strip().casefold()
+        if isinstance(previous, dict)
+        else ""
+    )
+    previous_at = parse_conversation_activity_timestamp(
+        (
+            previous.get("updated_at")
+            or previous.get("started_at")
+            if isinstance(previous, dict)
+            else None
+        )
+    )
+    if isinstance(previous, dict):
+        if previous_status != "running" and status == "running":
+            # Activity IDs are immutable lifecycle identities. A completed
+            # command cannot legitimately begin running again.
+            return ThreadTitleUpdateResult(1, 0, 0)
+        if previous_at is not None and (
+            event_at < previous_at
+            or (
+                event_at == previous_at
+                and (
+                    status == previous_status
+                    or previous_status != "running"
+                    or status == "running"
+                )
+            )
+        ):
+            return ThreadTitleUpdateResult(1, 0, 0)
     if status != "running" and not isinstance(previous, dict):
         # A canonical result may already have retired the live card. Never
         # resurrect it when a delayed terminal metadata update arrives.
+        return ThreadTitleUpdateResult(1, 0, 0)
+    if (
+        status == "running"
+        and not isinstance(previous, dict)
+        and await _canonical_activity_is_terminal(db, document.id, activity_id)
+    ):
+        # Canonical reconciliation removes the transient card. A delayed start
+        # must not recreate it after the normalized terminal row has committed.
         return ThreadTitleUpdateResult(1, 0, 0)
 
     started_at = (
         str(previous.get("started_at") or "")
         if isinstance(previous, dict)
         else ""
-    ) or str(timestamp or "")
+    ) or event_timestamp
     anchor_line_number = (
         previous.get("anchor_line_number", 0)
         if isinstance(previous, dict)
@@ -853,7 +946,7 @@ async def apply_conversation_activity_update(
             else ""
         ),
         "started_at": _bounded_message_text(started_at, 128),
-        "updated_at": _bounded_message_text(str(timestamp or started_at), 128),
+        "updated_at": _bounded_message_text(event_timestamp, 128),
         "anchor_line_number": anchor_line_number,
     }
     activities.pop(activity_id, None)

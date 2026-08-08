@@ -522,7 +522,7 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(),
         ):
             running = await apply_conversation_activity_update(
-                _Session([document], [34406]),
+                _Session([document], [], [34406]),
                 machine_id=machine_id,
                 user_id=user_id,
                 tool_id="claude_code",
@@ -565,6 +565,82 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(activity["status"], "completed")
         self.assertEqual(activity["command"], "Start-Sleep -Seconds 30")
+
+        delayed_running = await apply_conversation_activity_update(
+            _Session([document]),
+            machine_id=machine_id,
+            user_id=user_id,
+            tool_id="claude_code",
+            relative_path="projects/thread.jsonl",
+            activity_id="toolu-shell-live",
+            activity_status="running",
+            activity_tool="PowerShell",
+            command="Start-Sleep -Seconds 30",
+            timestamp="2026-08-04T17:00:05Z",
+        )
+
+        self.assertEqual(
+            (delayed_running.matched, delayed_running.updated),
+            (1, 0),
+        )
+        self.assertEqual(
+            document.metadata_[LIVE_SHELL_ACTIVITIES_KEY][
+                "toolu-shell-live"
+            ]["status"],
+            "completed",
+        )
+
+    async def test_running_does_not_resurrect_canonically_retired_activity(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        db = _Session([document], [987])
+
+        result = await apply_conversation_activity_update(
+            db,
+            machine_id=machine_id,
+            user_id=user_id,
+            tool_id="cursor",
+            relative_path="projects/thread.jsonl",
+            activity_id="call-shell-retired",
+            activity_status="running",
+            activity_tool="PowerShell",
+            command="python worker.py",
+            timestamp="2026-08-07T16:00:00Z",
+        )
+
+        self.assertEqual((result.matched, result.updated), (1, 0))
+        self.assertNotIn(LIVE_SHELL_ACTIVITIES_KEY, document.metadata_)
+        canonical_query = db.statements[1].compile(
+            dialect=postgresql.dialect()
+        )
+        self.assertIn("conversation_messages.metadata", str(canonical_query))
+        self.assertIn("tool_call_id", canonical_query.params.values())
+        self.assertIn("tool_status", canonical_query.params.values())
+
+    async def test_activity_update_requires_parseable_event_timestamp(self) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+
+        result = await apply_conversation_activity_update(
+            _Session([document]),
+            machine_id=machine_id,
+            user_id=user_id,
+            tool_id="cursor",
+            relative_path="projects/thread.jsonl",
+            activity_id="call-shell-unknown-time",
+            activity_status="running",
+            activity_tool="PowerShell",
+            command="python worker.py",
+            timestamp="not-a-timestamp",
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.updated, 0)
+        self.assertNotIn(LIVE_SHELL_ACTIVITIES_KEY, document.metadata_)
 
     async def test_live_ask_user_permission_wrapper_is_question_and_closes(
         self,

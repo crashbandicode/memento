@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,44 @@ _CANCELLED_STATUSES = {
     "skipped",
     "timeout",
 }
+_RUNNING_SHELL_STATUSES = {
+    "executing",
+    "in_progress",
+    "loading",
+    "pending",
+    "running",
+    "started",
+}
+_COMPLETED_SHELL_STATUSES = {
+    "complete",
+    "completed",
+    "done",
+    "success",
+    "succeeded",
+}
+_ACTIVE_CURSOR_COMPOSER_STATUSES = {
+    "executing",
+    "generating",
+    "running",
+    "streaming",
+    "thinking",
+}
+_TERMINAL_CURSOR_COMPOSER_STATUSES = {
+    "aborted",
+    "cancelled",
+    "canceled",
+    "complete",
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "interrupted",
+}
+_CURSOR_RUNNING_ACTIVITY_MAX_AGE = timedelta(hours=24)
+_CURSOR_TERMINAL_ACTIVITY_MAX_AGE = timedelta(hours=1)
+_CURSOR_ACTIVITY_FUTURE_SKEW = timedelta(minutes=5)
+_MAX_TRACKED_CURSOR_ACTIVITIES = 512
+_MAX_TRACKED_CURSOR_PROJECTIONS = 256
 
 
 def _tail_lines(path: Path) -> list[bytes]:
@@ -298,7 +338,7 @@ def _shell_command(value: object) -> str:
     return ""
 
 
-def _shell_activity_status(value: object) -> str:
+def _shell_activity_status(value: object) -> str | None:
     status = str(value or "").strip().casefold()
     if status in {"failed", "error"}:
         return "failed"
@@ -312,9 +352,13 @@ def _shell_activity_status(value: object) -> str:
         "timeout",
     }:
         return "cancelled"
-    if status in {"completed", "complete", "done", "success", "succeeded"}:
+    if status in _COMPLETED_SHELL_STATUSES:
         return "completed"
-    return "running"
+    if status in _RUNNING_SHELL_STATUSES:
+        return "running"
+    # Cursor keeps old tool bubbles whose status is absent or has changed shape
+    # across releases. Unknown native state is not evidence of live execution.
+    return None
 
 
 def _activity_record(
@@ -452,6 +496,9 @@ def _extract_shell_activity_updates(
             ).strip()
             activity_tool = record.get("tool_name")
             if activity_id and _is_shell_tool(activity_tool):
+                status = _shell_activity_status(record.get("tool_status"))
+                if status is None:
+                    continue
                 activities[activity_id] = _activity_record(
                     tool_name=tool_name,
                     relative_path=relative_path,
@@ -459,7 +506,7 @@ def _extract_shell_activity_updates(
                     activity_tool=activity_tool,
                     command=_shell_command(record.get("tool_input")),
                     timestamp=timestamp,
-                    status=_shell_activity_status(record.get("tool_status")),
+                    status=status,
                     previous=activities.get(activity_id),
                 )
 
@@ -502,3 +549,173 @@ def extract_content_activity_updates(
         tool_name=tool_name,
         relative_path=relative_path,
     )
+
+
+def _parsed_activity_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recent_cursor_activity(
+    activity: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    observed_at = _parsed_activity_timestamp(activity.get("timestamp"))
+    if observed_at is None or observed_at - now > _CURSOR_ACTIVITY_FUTURE_SKEW:
+        return False
+    max_age = (
+        _CURSOR_RUNNING_ACTIVITY_MAX_AGE
+        if activity.get("activity_status") == "running"
+        else _CURSOR_TERMINAL_ACTIVITY_MAX_AGE
+    )
+    return now - observed_at <= max_age
+
+
+def _timestamp_from_seconds(value: float | None) -> str:
+    if value is None:
+        return ""
+    try:
+        parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return ""
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class CursorActivityProjection:
+    """Select bounded live lifecycle metadata from complete Cursor snapshots.
+
+    The full state projection contains the entire conversation. This tracker
+    remembers only a bounded set of observed shell records so cold projection
+    can publish genuinely current work without replaying old terminal history,
+    while later revisions can still emit running-to-terminal transitions.
+    """
+
+    _observed: dict[str, tuple[str, str, str, str]] = field(default_factory=dict)
+    _published_running: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _seen_projections: dict[str, None] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        self._observed.clear()
+        self._published_running.clear()
+        self._seen_projections.clear()
+
+    def select_updates(
+        self,
+        content: str,
+        *,
+        relative_path: str,
+        projection_id: str,
+        composer_status: object,
+        source_modified_at: float | None,
+        now: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return only current starts and bounded terminal transitions."""
+        observed_now = now or datetime.now(timezone.utc)
+        if observed_now.tzinfo is None:
+            observed_now = observed_now.replace(tzinfo=timezone.utc)
+        else:
+            observed_now = observed_now.astimezone(timezone.utc)
+        identity = projection_id or relative_path
+        initial_projection = identity not in self._seen_projections
+        self._seen_projections.pop(identity, None)
+        self._seen_projections[identity] = None
+        while len(self._seen_projections) > _MAX_TRACKED_CURSOR_PROJECTIONS:
+            self._seen_projections.pop(next(iter(self._seen_projections)))
+
+        composer_state = str(composer_status or "").strip().casefold()
+        composer_is_active = composer_state in _ACTIVE_CURSOR_COMPOSER_STATUSES
+        composer_is_terminal = composer_state in _TERMINAL_CURSOR_COMPOSER_STATUSES
+        extracted = extract_content_activity_updates(
+            content,
+            tool_name="cursor",
+            relative_path=relative_path,
+        )
+        selected: dict[str, dict[str, Any]] = {}
+        projection_prefix = f"cursor:{relative_path}:"
+
+        for key, activity in extracted.items():
+            fingerprint = (
+                str(activity.get("activity_status") or ""),
+                str(activity.get("timestamp") or ""),
+                str(activity.get("activity_tool") or ""),
+                str(activity.get("command") or ""),
+            )
+            previous_fingerprint = self._observed.pop(key, None)
+            self._observed[key] = fingerprint
+            status = fingerprint[0]
+            recent = _recent_cursor_activity(activity, now=observed_now)
+
+            if status == "running":
+                if composer_is_terminal:
+                    was_published = key in self._published_running
+                    terminal = _activity_record(
+                        tool_name="cursor",
+                        relative_path=relative_path,
+                        activity_id=str(activity.get("activity_id") or ""),
+                        activity_tool=activity.get("activity_tool"),
+                        command=activity.get("command"),
+                        timestamp=_timestamp_from_seconds(source_modified_at),
+                        status="cancelled",
+                        previous=activity,
+                    )
+                    if (
+                        initial_projection
+                        or was_published
+                        or previous_fingerprint != fingerprint
+                    ) and _recent_cursor_activity(terminal, now=observed_now):
+                        selected[key] = terminal
+                    self._published_running.pop(key, None)
+                    continue
+                if not recent:
+                    continue
+                publish_start = (
+                    (initial_projection and composer_is_active)
+                    or (
+                        not initial_projection
+                        and previous_fingerprint != fingerprint
+                    )
+                )
+                if publish_start:
+                    selected[key] = activity
+                    self._published_running[key] = activity
+                continue
+
+            if key in self._published_running or (
+                recent and previous_fingerprint != fingerprint
+            ):
+                selected[key] = activity
+            self._published_running.pop(key, None)
+
+        if composer_is_terminal:
+            terminal_timestamp = _timestamp_from_seconds(source_modified_at)
+            for key, previous in list(self._published_running.items()):
+                if not key.startswith(projection_prefix):
+                    continue
+                terminal = _activity_record(
+                    tool_name="cursor",
+                    relative_path=relative_path,
+                    activity_id=str(previous.get("activity_id") or ""),
+                    activity_tool=previous.get("activity_tool"),
+                    command=previous.get("command"),
+                    timestamp=terminal_timestamp,
+                    status="cancelled",
+                    previous=previous,
+                )
+                if _recent_cursor_activity(terminal, now=observed_now):
+                    selected[key] = terminal
+                self._published_running.pop(key, None)
+
+        while len(self._observed) > _MAX_TRACKED_CURSOR_ACTIVITIES:
+            oldest = next(iter(self._observed))
+            self._observed.pop(oldest, None)
+            self._published_running.pop(oldest, None)
+        return selected

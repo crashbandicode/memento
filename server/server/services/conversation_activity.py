@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import case, func, select
@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 
 SHORT_EXCHANGE_CHARACTER_LIMIT = 120
 REAL_ACTIVITY_ROLES = ("user", "assistant")
+RUNNING_ACTIVITY_MAX_AGE = timedelta(hours=24)
+TERMINAL_ACTIVITY_MAX_AGE = timedelta(hours=1)
+ACTIVITY_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
+CONVERSATION_ACTIVITY_STATUSES = {
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +50,56 @@ class ConversationActivitySummary:
             self.assistant_count,
             self.human_character_count,
         )
+
+
+def parse_conversation_activity_timestamp(value: object) -> datetime | None:
+    """Parse a source event timestamp into aware UTC, or reject it."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def conversation_activity_is_fresh(
+    activity: Mapping[str, object],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a persisted activity card is safe to expose."""
+    status = str(activity.get("status") or "").strip().casefold()
+    if status not in CONVERSATION_ACTIVITY_STATUSES:
+        return False
+    event_at = parse_conversation_activity_timestamp(
+        activity.get("updated_at")
+        or activity.get("started_at")
+        or activity.get("timestamp")
+    )
+    if event_at is None:
+        return False
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    else:
+        observed_at = observed_at.astimezone(timezone.utc)
+    if event_at - observed_at > ACTIVITY_FUTURE_CLOCK_SKEW:
+        return False
+    max_age = (
+        RUNNING_ACTIVITY_MAX_AGE
+        if status == "running"
+        else TERMINAL_ACTIVITY_MAX_AGE
+    )
+    return observed_at - event_at <= max_age
 
 
 def effective_conversation_activity(

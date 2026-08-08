@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -742,8 +743,20 @@ def test_empty_header_does_not_starve_older_valid_composers(tmp_path):
     assert exporter.export_changed(limit=1) == []
 
 
-def test_enqueue_uses_complete_snapshot_and_state_database_source(tmp_path):
+def test_cold_completed_composer_does_not_replay_historical_activity(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["status"] = "completed"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.commit()
+    connection.close()
     queue = SimpleNamespace(items=[], metadata_items=[])
 
     def enqueue(**kwargs):
@@ -761,11 +774,177 @@ def test_enqueue_uses_complete_snapshot_and_state_database_source(tmp_path):
     assert queue.items[0]["sync_strategy"] == "full"
     assert queue.items[0]["tool_name"] == "cursor"
     assert queue.items[0]["source_path"].endswith("state.vscdb")
-    assert queue.metadata_items[0]["namespace"] == "conversation_activities"
+    assert queue.metadata_items == []
+
+
+def _set_cursor_shell_state(
+    tool: FixtureCursorTool,
+    session_id: str,
+    *,
+    composer_status: str,
+    tool_status: str | None,
+    timestamp: datetime,
+) -> None:
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["status"] = composer_status
+    tool_bubble = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"bubbleId:{session_id}:tool-1",),
+    ).fetchone()[0])
+    tool_bubble["createdAt"] = timestamp.isoformat()
+    if tool_status is None:
+        tool_bubble["toolFormerData"].pop("status", None)
+    else:
+        tool_bubble["toolFormerData"]["status"] = tool_status
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(tool_bubble), f"bubbleId:{session_id}:tool-1"),
+    )
+    connection.execute(
+        """
+        UPDATE composerHeaders
+        SET lastUpdatedAt=?, checkpointAt=?
+        WHERE composerId=?
+        """,
+        (timestamp.isoformat(), timestamp.isoformat(), session_id),
+    )
+    connection.commit()
+    connection.close()
+
+
+def _cursor_export_queue() -> SimpleNamespace:
+    queue = SimpleNamespace(items=[], metadata_items=[])
+    queue.enqueue = lambda **kwargs: queue.items.append(kwargs) or 1
+    queue.enqueue_metadata_changes = lambda **kwargs: (
+        queue.metadata_items.append(kwargs) or 1
+    )
+    queue.get_delta_base = lambda _tool, _path: (None, 0)
+    return queue
+
+
+def test_cold_live_composer_publishes_current_unresolved_shell(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="generating",
+        tool_status="running",
+        timestamp=now,
+    )
+    queue = _cursor_export_queue()
+
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+
+    records = queue.metadata_items[0]["records"]
+    activity = next(iter(records.values()))
+    assert activity["activity_status"] == "running"
+    assert activity["command"] == "Stop-Process"
+    assert activity["session_id"] == session_id
+
+
+def test_cold_cursor_shell_with_unknown_status_is_not_running(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="generating",
+        tool_status=None,
+        timestamp=datetime.now(timezone.utc).replace(microsecond=0),
+    )
+    queue = _cursor_export_queue()
+
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+    assert queue.metadata_items == []
+
+
+def test_cold_recent_terminal_composer_closes_native_running_shell(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="completed",
+        tool_status="running",
+        timestamp=datetime.now(timezone.utc).replace(microsecond=0),
+    )
+    queue = _cursor_export_queue()
+
+    assert enqueue_cursor_state_snapshots(CursorStateExporter(tool), queue) == 1
+
+    activity = next(iter(queue.metadata_items[0]["records"].values()))
+    assert activity["activity_status"] == "cancelled"
+
+
+def test_cursor_running_to_terminal_transition_is_published(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    started_at = datetime.now(timezone.utc).replace(microsecond=0)
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="generating",
+        tool_status="running",
+        timestamp=started_at,
+    )
+    exporter = CursorStateExporter(tool)
+    queue = _cursor_export_queue()
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+
+    _set_cursor_shell_state(
+        tool,
+        session_id,
+        composer_status="completed",
+        tool_status="completed",
+        timestamp=started_at + timedelta(seconds=30),
+    )
+    queue.metadata_items.clear()
+
+    assert enqueue_cursor_state_snapshots(exporter, queue) == 1
+    activity = next(iter(queue.metadata_items[0]["records"].values()))
+    assert activity["activity_status"] == "completed"
+
+
+def test_state_snapshot_uses_native_time_not_projection_observation(tmp_path):
+    tool, _transcript, session_id = _write_state_fixture(tmp_path)
+    connection = sqlite3.connect(tool.state_database_path)
+    composer = json.loads(connection.execute(
+        "SELECT value FROM cursorDiskKV WHERE key=?",
+        (f"composerData:{session_id}",),
+    ).fetchone()[0])
+    composer["fullConversationHeadersOnly"] = [{
+        "bubbleId": "tool-1",
+        "type": 2,
+    }]
+    composer["todos"] = []
+    composer["status"] = "completed"
+    connection.execute(
+        "UPDATE cursorDiskKV SET value=? WHERE key=?",
+        (json.dumps(composer), f"composerData:{session_id}"),
+    )
+    connection.commit()
+    connection.close()
+
+    snapshot = CursorStateExporter(tool).export_changed(limit=20)[0]
+
     assert {
-        record["session_id"]
-        for record in queue.metadata_items[0]["records"].values()
-    } == {session_id}
+        json.loads(line)["role"]
+        for line in snapshot.content.splitlines()
+    } == {"tool"}
+    assert snapshot.source_modified_at == datetime(
+        2026,
+        7,
+        18,
+        14,
+        20,
+        tzinfo=timezone.utc,
+    ).timestamp()
 
 
 def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_path):

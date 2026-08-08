@@ -15,13 +15,12 @@ import json
 import math
 import re
 import sqlite3
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .interaction_signals import extract_content_activity_updates
+from .interaction_signals import CursorActivityProjection
 from .tools.base import Category, ContentType
 from .tools.cursor import CursorTool
 
@@ -152,6 +151,34 @@ def _iso_timestamp(value: object) -> str:
     else:
         timespec = "microseconds"
     return parsed.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _snapshot_source_modified_at(
+    header: _ComposerHeader,
+    records: list[dict[str, object]],
+    transcript: Path | None,
+) -> float:
+    """Return the newest trustworthy native conversation timestamp.
+
+    Wall-clock projection time is not conversation activity. Prefer native
+    header and record times, then the compatibility transcript mtime. The epoch
+    sentinel keeps an entirely timestamp-free snapshot from appearing current.
+    """
+    candidates = [
+        _timestamp_seconds(header.created_at),
+        _timestamp_seconds(header.last_updated_at),
+        _timestamp_seconds(header.checkpoint_at),
+    ]
+    candidates.extend(_timestamp_seconds(record.get("timestamp")) for record in records)
+    native = [candidate for candidate in candidates if candidate is not None]
+    if native:
+        return max(native)
+    if transcript is not None:
+        try:
+            return transcript.stat().st_mtime
+        except OSError:
+            pass
+    return 0.0
 
 
 def _compatibility_source_id(record: dict[str, object]) -> str:
@@ -582,13 +609,28 @@ class CursorStateExporter:
         self._transcript_paths: dict[str, Path] | None = None
         self._last_source_token: tuple[object, ...] | None = None
         self._backlog_pending = False
+        self._activity_projection = CursorActivityProjection()
 
     def invalidate(self) -> None:
         self._seen_revisions.clear()
         self._transcript_paths = None
         self._last_source_token = None
         self._backlog_pending = False
+        self._activity_projection.reset()
         self.tool._state_session_ids_checked_at = 0.0
+
+    def activity_updates(
+        self,
+        snapshot: CursorStateSnapshot,
+    ) -> dict[str, dict[str, object]]:
+        """Select lifecycle metadata for this snapshot revision."""
+        return self._activity_projection.select_updates(
+            snapshot.content,
+            relative_path=snapshot.relative_path,
+            projection_id=str(snapshot.metadata.get("session_id") or ""),
+            composer_status=snapshot.metadata.get("composer_status"),
+            source_modified_at=snapshot.source_modified_at,
+        )
 
     def _source_token(self) -> tuple[object, ...]:
         """Track SQLite and its WAL without opening the database."""
@@ -776,11 +818,11 @@ class CursorStateExporter:
             content=content,
             content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             metadata=metadata,
-            # This is a newly generated authoritative snapshot, not the mtime
-            # of Cursor's older sparse compatibility file.  Observation time
-            # therefore orders it after that file while the records retain
-            # their exact native activity timestamps.
-            source_modified_at=time.time(),
+            source_modified_at=_snapshot_source_modified_at(
+                header,
+                records,
+                transcript,
+            ),
         )
 
     def _metadata_and_path(
@@ -939,11 +981,7 @@ def enqueue_cursor_state_snapshots(
     """Project changed composers and enqueue complete coalescible snapshots."""
     queued = 0
     for snapshot in exporter.export_changed(limit=limit):
-        activity_updates = extract_content_activity_updates(
-            snapshot.content,
-            tool_name="cursor",
-            relative_path=snapshot.relative_path,
-        )
+        activity_updates = exporter.activity_updates(snapshot)
         session_id = str(snapshot.metadata.get("session_id") or "").strip()
         if session_id:
             for activity in activity_updates.values():

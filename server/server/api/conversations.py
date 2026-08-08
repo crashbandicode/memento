@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
@@ -27,6 +27,7 @@ from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
 from ..services.canvas_artifact_store import normalized_path_hash
 from ..services.canvas_artifacts import detect_message_canvases
+from ..services.conversation_activity import conversation_activity_is_fresh
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
     ConversationRef,
@@ -1140,6 +1141,7 @@ async def _projected_pending_interactions(
     inferred: list[dict] = []
     activities_by_id: dict[tuple[str, str], dict] = {}
     seen_interaction_ids: set[str] = set()
+    activity_now = datetime.now(timezone.utc)
     for source_document, state in rows:
         title = conversation_display_title(
             source_document.tool_id,
@@ -1165,7 +1167,13 @@ async def _projected_pending_interactions(
             if isinstance(item, dict):
                 inferred.append(dict(item))
         for raw_activity in state.live_activities or []:
-            if not isinstance(raw_activity, dict):
+            if (
+                not isinstance(raw_activity, dict)
+                or not conversation_activity_is_fresh(
+                    raw_activity,
+                    now=activity_now,
+                )
+            ):
                 continue
             activity_id = str(raw_activity.get("activity_id") or "").strip()
             if activity_id:
@@ -1266,7 +1274,7 @@ async def _projected_pending_interactions(
                     }
                 ):
                     continue
-                activities_by_id[(str(source_document.id), canonical_id)] = {
+                activity = {
                     "document_id": str(source_document.id),
                     "source_title": title,
                     "message_id": 0,
@@ -1282,6 +1290,10 @@ async def _projected_pending_interactions(
                     "started_at": raw_activity.get("started_at") or None,
                     "updated_at": raw_activity.get("updated_at") or None,
                 }
+                if conversation_activity_is_fresh(activity, now=activity_now):
+                    activities_by_id[(str(source_document.id), canonical_id)] = (
+                        activity
+                    )
 
     interactions.sort(
         key=lambda item: (
@@ -1518,6 +1530,7 @@ async def get_pending_conversation_interactions(
     pending = pending[-64:]
     live_pending: list[dict] = []
     live_activities_by_key: dict[tuple[uuid.UUID, str], dict] = {}
+    activity_now = datetime.now(timezone.utc)
     for message in reversed(recent_tool_rows):
         message_metadata = (
             message.metadata_ if isinstance(message.metadata_, dict) else {}
@@ -1550,15 +1563,8 @@ async def get_pending_conversation_interactions(
         command = _shell_command_text(message_metadata.get("tool_input"))
         if not _is_shell_tool_name(tool_name) or not command:
             continue
-        if (
-            message.timestamp is not None
-            and datetime.now(timezone.utc)
-            - message.timestamp.astimezone(timezone.utc)
-            > timedelta(hours=24)
-        ):
-            continue
         timestamp = message.timestamp.isoformat() if message.timestamp else None
-        live_activities_by_key[activity_key] = {
+        activity = {
             "document_id": str(message.document_id),
             "source_title": source_documents.get(message.document_id),
             "message_id": message.id,
@@ -1571,6 +1577,8 @@ async def get_pending_conversation_interactions(
             "started_at": timestamp,
             "updated_at": timestamp,
         }
+        if conversation_activity_is_fresh(activity, now=activity_now):
+            live_activities_by_key[activity_key] = activity
     inline_interactions_by_id: dict[str, dict] = {}
     seen_question_fingerprints = {
         interaction_question_fingerprint(interaction)
@@ -1699,24 +1707,12 @@ async def get_pending_conversation_interactions(
             activity_at = raw_activity.get("updated_at") or raw_activity.get(
                 "started_at"
             )
-            try:
-                parsed_activity_at = datetime.fromisoformat(
-                    str(activity_at or "").replace("Z", "+00:00")
-                )
-                if parsed_activity_at.tzinfo is None:
-                    parsed_activity_at = parsed_activity_at.replace(
-                        tzinfo=timezone.utc
-                    )
-            except (TypeError, ValueError):
-                parsed_activity_at = None
-            max_age = (
-                timedelta(hours=24)
-                if status == "running"
-                else timedelta(hours=1)
-            )
-            if (
-                parsed_activity_at is not None
-                and datetime.now(timezone.utc) - parsed_activity_at > max_age
+            if not conversation_activity_is_fresh(
+                {
+                    "status": status,
+                    "updated_at": activity_at,
+                },
+                now=activity_now,
             ):
                 continue
             try:
