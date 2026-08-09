@@ -505,6 +505,12 @@ async def get_dashboard(
         })
 
     devices_q = select(Machine).order_by(Machine.name).limit(10)
+    if selected_machine_ids is not None:
+        # The dashboard selector scopes the whole page, including the device
+        # summary. Previously every document-backed section changed while the
+        # device count/list continued to show all machines, making a valid
+        # selection look only partially applied.
+        devices_q = devices_q.where(Machine.id.in_(selected_machine_ids))
     if mids is not None:
         devices_q = devices_q.where(Machine.id.in_(mids))
     machine_rows = list((await db.execute(devices_q)).scalars().all())

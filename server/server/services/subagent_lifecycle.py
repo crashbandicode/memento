@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -69,6 +69,19 @@ def _lifecycle_timestamp(value: object) -> str | None:
     if isinstance(value, datetime):
         return value.isoformat()
     return _safe_scalar(value, 128)
+
+
+def _lifecycle_epoch(value: object) -> float | None:
+    text = _lifecycle_timestamp(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _lifecycle_evidence(
@@ -169,7 +182,13 @@ def _codex_child_lifecycle(
             continue
         event_type = str(payload.get("type") or "").strip().casefold()
         timestamp = record.get("timestamp")
-        if event_type == "task_started" and latest is None:
+        if event_type == "task_started":
+            # Codex subagent rollouts are fork snapshots: the child file starts
+            # with inherited parent turns and their task_complete markers, then
+            # appends the child's own task_started event.  Lifecycle is an
+            # ordered state machine, so every new start must supersede an older
+            # terminal marker.  Keeping only the first start incorrectly marks
+            # a newly spawned (or resumed) child as already completed.
             latest = _lifecycle_evidence(
                 "running",
                 source="codex_child_transcript",
@@ -341,7 +360,26 @@ def reconcile_child_lifecycle_metadata(
         and current["status"] in SUBAGENT_TERMINAL_STATUSES
         and status not in SUBAGENT_TERMINAL_STATUSES
     ):
-        return reconciled, False
+        # A generic late/replayed non-terminal observation must not regress a
+        # finished child.  Codex transcripts are the exception only when the
+        # same authoritative event stream contains a strictly newer
+        # task_started marker: subagents can be resumed, and fork snapshots can
+        # contain an inherited terminal marker immediately before their own
+        # start.  Restricting this to the exact source/evidence pair preserves
+        # the cross-source terminal guard for Cursor and Claude.
+        current_timestamp = _lifecycle_epoch(current.get("timestamp"))
+        incoming_timestamp = _lifecycle_epoch(evidence.get("timestamp"))
+        codex_restart = (
+            current.get("source") == "codex_child_transcript"
+            and source == "codex_child_transcript"
+            and _safe_scalar(evidence.get("evidence"), 256)
+            == "event_msg.task_started"
+            and current_timestamp is not None
+            and incoming_timestamp is not None
+            and incoming_timestamp > current_timestamp
+        )
+        if not codex_restart:
+            return reconciled, False
 
     reconciled[SUBAGENT_LIFECYCLE_STATUS_KEY] = status
     reconciled[SUBAGENT_LIFECYCLE_SOURCE_KEY] = source

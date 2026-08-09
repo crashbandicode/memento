@@ -23,6 +23,7 @@ from server.api.conversations import (  # noqa: E402
     get_pending_conversation_interactions,
     search_conversation_messages,
 )
+from server.services.conversation_read_model import READ_MODEL_VERSION  # noqa: E402
 
 
 class _Result:

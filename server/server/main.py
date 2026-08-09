@@ -686,6 +686,13 @@ def _run_migrations(conn) -> None:
         CODEX_SESSION_UNIQUE_INDEX_SQL,
         "CREATE INDEX IF NOT EXISTS idx_documents_title_trgm ON documents USING gin (title gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_documents_path_trgm ON documents USING gin (relative_path gin_trgm_ops)",
+        # Do not build a raw-content trigram index here. Document body search
+        # uses ``content_tsv`` and conversation fuzzy search uses the bounded,
+        # role-filtered ``conversation_messages`` trigram index. The raw
+        # ``documents.content`` index was therefore unused, while creating it
+        # during startup took a table lock for many minutes on the production
+        # corpus and blocked collector writes. Large optional indexes belong in
+        # an explicit concurrent migration, never the API lifespan transaction.
         # Vector ANN index for semantic search. Without this, /api/memory/semantic
         # seq-scans document_embeddings — fine at 50 rows, fatal at 1M. HNSW
         # preferred over IVFFlat: no training step, better recall, pgvector

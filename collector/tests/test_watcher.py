@@ -1539,6 +1539,57 @@ def test_redacted_secret_changes_keep_sanitized_identity(tmp_path: Path) -> None
         queue.close()
 
 
+def test_restarted_scan_retries_observed_delta_with_uncommitted_tail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    first = '{"role":"user","message":{"content":"first"}}\n'
+    second = '{"role":"assistant","message":{"content":"second"}}\n'
+    path.write_text(first + second, encoding="utf-8")
+    base_offset = len(first.encode("utf-8"))
+    base_hash = _delta_hash_revision(path, size=base_offset)
+    source_stat = path.stat()
+
+    class RewoundQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_source_revision(self, _tool_name: str, _relative_path: str):
+            return source_stat.st_size, source_stat.st_mtime_ns
+
+        def get_delta_base(self, _tool_name: str, _relative_path: str):
+            return base_hash, base_offset
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return base_hash, base_offset
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/session.jsonl",
+    )
+    tool = SimpleNamespace(classify_file=lambda _path: classification)
+    queue = RewoundQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {str(tmp_path): tool}
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    watcher._process_file_changed(path, emit_live_signals=False)
+
+    assert len(queue.enqueued) == 1
+    assert queue.enqueued[0]["base_hash"] == base_hash
+    assert queue.enqueued[0]["base_offset"] == base_offset
+    assert queue.enqueued[0]["offset"] == source_stat.st_size
+
+
 def test_delta_processing_uses_guarded_base_and_force_full_fallback(
     tmp_path: Path,
 ) -> None:

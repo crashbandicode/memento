@@ -398,6 +398,59 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.expected_offset, 100)
         self.assertEqual(doc.content_hash, "committed-hash")
 
+    async def test_guarded_delta_reports_document_when_sync_state_is_ahead(
+        self,
+    ) -> None:
+        doc = _document(content_hash="committed-hash", timestamp=100.0, offset=100)
+        sync = _sync_state(doc, offset=200)
+        sync.last_hash = "uncommitted-hash"
+        db = _OrderedSession(None, sync, doc)
+
+        with self.assertRaises(DeltaBaseMismatch) as raised:
+            await ingest_file(
+                db,
+                **_ingest_kwargs(
+                    doc,
+                    content_hash="delta-hash",
+                    file_size=10,
+                    mode="delta",
+                    offset=210,
+                    base_hash="uncommitted-hash",
+                    base_offset=200,
+                ),
+            )
+
+        self.assertEqual(raised.exception.expected_hash, "committed-hash")
+        self.assertEqual(raised.exception.expected_offset, 100)
+        self.assertEqual(doc.content_hash, "committed-hash")
+
+    async def test_guarded_delta_can_resume_from_document_when_sync_state_is_ahead(
+        self,
+    ) -> None:
+        committed_hash = "d2:" + ("a" * 61)
+        doc = _document(content_hash=committed_hash, timestamp=100.0, offset=100)
+        sync = _sync_state(doc, offset=200)
+        sync.last_hash = "d2:" + ("b" * 61)
+        db = _OrderedSession(None, sync, doc)
+
+        with patch(
+            "server.services.ingest_service.ensure_tool",
+            new=AsyncMock(side_effect=RuntimeError("committed base accepted")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "committed base accepted"):
+                await ingest_file(
+                    db,
+                    **_ingest_kwargs(
+                        doc,
+                        content_hash="d2:" + ("c" * 61),
+                        file_size=10,
+                        mode="delta",
+                        offset=110,
+                        base_hash=committed_hash,
+                        base_offset=100,
+                    ),
+                )
+
     async def test_guarded_delta_accepts_exact_committed_base(self) -> None:
         doc = _document(content_hash="committed-hash", timestamp=100.0, offset=100)
         sync = _sync_state(doc, offset=100)

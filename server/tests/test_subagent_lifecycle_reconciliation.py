@@ -99,6 +99,55 @@ def test_failed_cancelled_and_interrupted_sources_remain_distinct(
     assert evidence["status"] == expected
 
 
+def test_codex_child_latest_turn_state_wins_in_forked_transcript() -> None:
+    content = "\n".join([
+        json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-08-01T12:05:00Z",
+            "payload": {"type": "task_complete"},
+        }),
+        json.dumps({
+            "type": "event_msg",
+            "timestamp": "2026-08-01T12:06:00Z",
+            "payload": {"type": "task_started"},
+        }),
+    ])
+
+    evidence = child_lifecycle_evidence("codex", {}, content)
+
+    assert evidence == {
+        "status": "running",
+        "source": "codex_child_transcript",
+        "timestamp": "2026-08-01T12:06:00Z",
+        "evidence": "event_msg.task_started",
+    }
+
+
+def test_newer_codex_task_start_can_reopen_completed_child() -> None:
+    completed, changed = reconcile_child_lifecycle_metadata({}, {
+        "status": "completed",
+        "source": "codex_child_transcript",
+        "timestamp": "2026-08-01T12:05:00Z",
+        "evidence": "event_msg.task_complete",
+    })
+    assert changed is True
+
+    running, changed = reconcile_child_lifecycle_metadata(completed, {
+        "status": "running",
+        "source": "codex_child_transcript",
+        "timestamp": "2026-08-01T12:06:00Z",
+        "evidence": "event_msg.task_started",
+    })
+
+    assert changed is True
+    assert persisted_child_lifecycle(running) == {
+        "status": "running",
+        "source": "codex_child_transcript",
+        "timestamp": "2026-08-01T12:06:00Z",
+        "evidence": "event_msg.task_started",
+    }
+
+
 def test_terminal_metadata_is_sticky_across_late_running_reparse() -> None:
     completed, changed = reconcile_child_lifecycle_metadata({}, {
         "status": "completed",

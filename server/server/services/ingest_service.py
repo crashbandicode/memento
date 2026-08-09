@@ -417,6 +417,27 @@ class CursorProjectionOrderMismatch(DeltaBaseMismatch):
         self.args = (reason,)
 
 
+def _committed_delta_base(
+    doc: Document | None,
+    sync_row: SyncState | None,
+) -> tuple[str | None, int]:
+    """Return the source revision that is actually safe to extend.
+
+    ``sync_state`` is a delivery cursor, while the document is the committed
+    source revision.  A process crash or an older ingest bug can advance the
+    cursor without committing the matching document.  Advertising that newer
+    cursor forever makes every subsequent delta impossible to apply.  Prefer
+    the cursor only while it describes the committed document; otherwise
+    expose the document revision so a reproducible delta can resume from it or
+    the collector can request an authoritative full rebase.
+    """
+    if doc is None or not doc.content_hash:
+        return None, 0
+    if sync_row is not None and sync_row.last_hash == doc.content_hash:
+        return doc.content_hash, max(0, int(sync_row.last_offset or 0))
+    return doc.content_hash, max(0, int(doc.file_size_bytes or 0))
+
+
 def _logical_document_file_size(
     *,
     mode: str,
@@ -2665,16 +2686,9 @@ async def ingest_file(
         return doc
 
     if mode == "delta" and base_hash is not None:
-        expected_hash = sync_row.last_hash if sync_row is not None else None
-        expected_offset = int(sync_row.last_offset or 0) if sync_row is not None else 0
-        committed_matches_state = (
-            doc is not None
-            and expected_hash is not None
-            and current_revision == expected_hash
-        )
+        expected_hash, expected_offset = _committed_delta_base(doc, sync_row)
         if (
-            not committed_matches_state
-            or expected_hash != base_hash
+            expected_hash != base_hash
             or base_offset is None
             or expected_offset != int(base_offset)
         ):

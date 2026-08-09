@@ -669,9 +669,20 @@ class FileWatcher:
                 )
             if observed_source_revision == source_revision:
                 # Startup/catch-up scans can contain thousands of durable,
-                # unchanged files. Their exact stat token is enough to avoid
-                # rereading the first 256 KiB and reparsing the full payload.
-                return
+                # unchanged files. A DELTA stat token proves only that the
+                # source was observed, not that its entire length committed.
+                # A base conflict intentionally preserves the current stat
+                # while rewinding the committed offset, so skipping solely on
+                # the stat would strand that source across every restart.
+                source_is_committed = True
+                if classification.sync_strategy == SyncStrategy.DELTA:
+                    _, committed_offset = self._queue.get_delta_base(
+                        classification.tool_name,
+                        classification.relative_path,
+                    )
+                    source_is_committed = committed_offset == file_size
+                if source_is_committed:
+                    return
 
         legacy_adoption_hash = None
         legacy_source_hash = ""
