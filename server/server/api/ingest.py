@@ -168,8 +168,6 @@ async def _completed_upload_needs_reprocessing(
     meta: dict,
 ) -> bool:
     """Check whether a receipt predates the database's current source proof."""
-    if meta.get("mode", "full") != "full":
-        return False
     tool_id = meta.get("tool")
     relative_path = meta.get("relative_path")
     expected_hash = meta.get("hash")
@@ -186,7 +184,7 @@ async def _completed_upload_needs_reprocessing(
     statement = select(
         delivery_revision_expression(joined=True).label("content_hash"),
         delivery_metadata_expression(joined=True).label("metadata_"),
-    ).where(
+    ).select_from(Document).where(
         Document.machine_id == machine_id,
         Document.tool_id == tool_id,
         Document.relative_path == relative_path,
@@ -196,7 +194,7 @@ async def _completed_upload_needs_reprocessing(
     ).one_or_none()
     if row is None or row.content_hash != expected_hash:
         return True
-    if meta.get("category") != "conversation":
+    if meta.get("category") != "conversation" or meta.get("mode", "full") != "full":
         return False
     stored_metadata = row.metadata_ if isinstance(row.metadata_, dict) else {}
     return stored_metadata.get(STORED_SOURCE_REVISION_KEY) != expected_hash

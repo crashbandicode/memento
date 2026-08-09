@@ -1554,7 +1554,14 @@ def test_restarted_scan_retries_observed_delta_with_uncommitted_tail(
         def __init__(self) -> None:
             self.enqueued: list[dict] = []
 
-        def get_source_revision(self, _tool_name: str, _relative_path: str):
+        def get_source_revision(
+            self,
+            _tool_name: str,
+            _relative_path: str,
+            *,
+            identity_version: str | None = None,
+        ):
+            del identity_version
             return source_stat.st_size, source_stat.st_mtime_ns
 
         def get_delta_base(self, _tool_name: str, _relative_path: str):

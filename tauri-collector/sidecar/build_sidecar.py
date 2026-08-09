@@ -109,11 +109,17 @@ def main() -> int:
     except ImportError:
         print("PyInstaller not installed. Run: pip install pyinstaller", file=sys.stderr)
         return 1
-    # Sanity: both packages importable?
+    # Sanity: both runtime entry points importable?  Importing only the package
+    # root is insufficient: collector.__init__ intentionally has no runtime
+    # dependencies, so PyInstaller could otherwise emit a binary that crashes
+    # immediately when collector.main imports an omitted direct dependency.
     try:
-        import collector  # noqa: F401
+        import collector.main  # noqa: F401
     except ImportError:
-        print("collector not importable. Run: pip install -e ../../collector", file=sys.stderr)
+        print(
+            "collector runtime not importable. Run: pip install -e ../../collector",
+            file=sys.stderr,
+        )
         return 1
     try:
         import mcp_server  # noqa: F401

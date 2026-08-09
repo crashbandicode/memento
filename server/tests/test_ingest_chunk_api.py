@@ -264,6 +264,40 @@ class ChunkIngestApiTests(unittest.TestCase):
         )
         self.assertFalse(needs_reprocessing)
 
+    def test_delta_receipt_requires_current_delivery_revision(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        row = SimpleNamespace(content_hash="newer-full-hash", metadata_={})
+        async def execute(statement):
+            # Exercise SQLAlchemy's join compilation as well as the receipt
+            # decision.  A mocked execute alone would not catch an ambiguous
+            # DocumentDeliveryState left side.
+            str(statement.compile())
+            return SimpleNamespace(one_or_none=lambda: row)
+
+        db = SimpleNamespace(
+            execute=AsyncMock(side_effect=execute)
+        )
+        meta = {**self._meta(0), "mode": "delta"}
+
+        needs_reprocessing = asyncio.run(
+            ingest_api._completed_upload_needs_reprocessing(
+                db,
+                machine_id=machine_id,
+                meta=meta,
+            )
+        )
+        self.assertTrue(needs_reprocessing)
+
+        row.content_hash = "hash-1"
+        needs_reprocessing = asyncio.run(
+            ingest_api._completed_upload_needs_reprocessing(
+                db,
+                machine_id=machine_id,
+                meta=meta,
+            )
+        )
+        self.assertFalse(needs_reprocessing)
+
     def test_guarded_delta_mismatch_returns_resyncable_conflict(self) -> None:
         with (
             patch.object(ingest_api, "ensure_device", new_callable=AsyncMock),
