@@ -32,7 +32,6 @@ from .conversation_stream import ConversationFileSource
 from .document_delivery import (
     attach_document_delivery,
     delivery_metadata_expression,
-    document_delivery_state,
     document_metadata,
     ensure_document_delivery_state,
     outerjoin_document_delivery,
@@ -4406,6 +4405,7 @@ async def _extract_messages(
 
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.
+    recovered_history_changed = False
     if user_history and isinstance(user_history, list):
         codex_normalizer = None
         if tool_id == "codex":
@@ -4535,7 +4535,13 @@ async def _extract_messages(
             injected += 1
         if injected:
             await db.flush()
-        await _reconcile_recovered_history_rows(db, doc.id)
+        removed_history, placed_history = await _reconcile_recovered_history_rows(
+            db,
+            doc.id,
+        )
+        recovered_history_changed = bool(
+            injected or removed_history or placed_history
+        )
     elif not user_history:
         # Fallback: first_user_message from state_5.sqlite
         first_user_msg = (first_user_message or "").strip()
@@ -4594,6 +4600,7 @@ async def _extract_messages(
                 )
                 add_search_text("user", clean_first_user)
                 await db.flush()
+                recovered_history_changed = True
 
     # Read projections commit with normalized history. Ordinary DELTAs inspect
     # only rows beyond the prior high-water mark plus explicitly mutated rows.
@@ -4616,7 +4623,7 @@ async def _extract_messages(
         doc,
         mode=projection_mode,
         dirty_line_numbers=dirty_projection_lines,
-        force_full=bool(user_history or first_user_message),
+        force_full=recovered_history_changed,
     )
     await upsert_search_terms(db, search_terms)
     setattr(doc, "_memento_interactions_changed", interactions_changed)

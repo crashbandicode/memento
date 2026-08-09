@@ -1324,6 +1324,101 @@ async def test_cursor_projection_delta_rejects_malformed_and_far_tail_hints(
 
 
 @pytest.mark.asyncio
+async def test_codex_history_only_rebuilds_projection_when_rows_change(
+    session_factory,
+    monkeypatch,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="codex")
+        first = json.dumps({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "Initial prompt",
+            },
+        })
+        history = [{"text": "Initial prompt", "ts": 0}]
+        await _extract_messages(
+            session,
+            document,
+            first,
+            "full",
+            user_history=history,
+        )
+        await session.flush()
+
+        from server.services import conversation_read_model as read_model_service
+
+        original_refresh = read_model_service.refresh_conversation_read_model
+        refresh_calls: list[dict] = []
+
+        async def recording_refresh(*args, **kwargs):
+            refresh_calls.append(dict(kwargs))
+            return await original_refresh(*args, **kwargs)
+
+        monkeypatch.setattr(
+            read_model_service,
+            "refresh_conversation_read_model",
+            recording_refresh,
+        )
+
+        await _extract_messages(
+            session,
+            document,
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "First reply",
+                },
+            }),
+            "delta",
+            user_history=history,
+        )
+
+        assert refresh_calls[-1]["mode"] == "delta"
+        assert refresh_calls[-1]["force_full"] is False
+
+        await _extract_messages(
+            session,
+            document,
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Second reply",
+                },
+            }),
+            "delta",
+            user_history=[
+                *history,
+                {"text": "Interrupted prompt", "ts": 0},
+            ],
+        )
+
+        assert refresh_calls[-1]["mode"] == "delta"
+        assert refresh_calls[-1]["force_full"] is True
+        recovered = (
+            await session.execute(
+                select(ConversationMessage)
+                .where(
+                    ConversationMessage.document_id == document.id,
+                    ConversationMessage.role == "user",
+                )
+                .order_by(ConversationMessage.line_number)
+            )
+        ).scalars().all()
+        assert [row.content for row in recovered] == [
+            "Initial prompt",
+            "Interrupted prompt",
+        ]
+        projection = await session.get(ConversationReadModel, document.id)
+        assert projection is not None
+        assert projection.user_message_count == 2
+        await session.rollback()
+
+
+@pytest.mark.asyncio
 async def test_full_rebase_preserves_unchanged_message_prefix(
     session_factory,
 ) -> None:
