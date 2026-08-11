@@ -7,9 +7,85 @@ import remarkGfm from "remark-gfm";
 
 export type ClipboardFormat = "rich" | "markdown" | "slack";
 
+type AndroidClipboardBridge = {
+  postMessage: (message: string) => void;
+  addEventListener: (type: "message", listener: (event: MessageEvent<string>) => void) => void;
+  removeEventListener: (type: "message", listener: (event: MessageEvent<string>) => void) => void;
+};
+
+declare global {
+  interface Window {
+    MementoAndroidClipboard?: AndroidClipboardBridge;
+  }
+}
+
 export function isAndroidClipboardHost(): boolean {
   if (typeof navigator === "undefined") return false;
   return /Android/i.test(navigator.userAgent || "");
+}
+
+function nativeAndroidClipboardBridge(): AndroidClipboardBridge | null {
+  if (typeof window === "undefined") return null;
+  const bridge = window.MementoAndroidClipboard;
+  if (!bridge
+    || typeof bridge.postMessage !== "function"
+    || typeof bridge.addEventListener !== "function"
+    || typeof bridge.removeEventListener !== "function") {
+    return null;
+  }
+  return bridge;
+}
+
+async function copyViaNativeAndroidBridge(
+  html: string,
+  plain: string,
+): Promise<"rich" | "plain" | null> {
+  const bridge = nativeAndroidClipboardBridge();
+  if (!bridge) return null;
+
+  const requestId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `memento-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: "rich" | "plain" | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      bridge.removeEventListener("message", onMessage);
+      resolve(result);
+    };
+    const onMessage = (event: MessageEvent<string>) => {
+      try {
+        const reply = JSON.parse(String(event.data || "")) as {
+          requestId?: string;
+          ok?: boolean;
+          format?: string;
+        };
+        if (reply.requestId !== requestId) return;
+        if (!reply.ok) {
+          finish(null);
+          return;
+        }
+        finish(reply.format === "html" ? "rich" : "plain");
+      } catch {
+        // Ignore unrelated messages on the origin-scoped bridge.
+      }
+    };
+    const timer = window.setTimeout(() => finish(null), 4_000);
+    bridge.addEventListener("message", onMessage);
+    try {
+      bridge.postMessage(JSON.stringify({
+        type: "copy-rich-clipboard",
+        requestId,
+        html,
+        plain,
+      }));
+    } catch {
+      finish(null);
+    }
+  });
 }
 
 function clipboardMarkdown(markdown: string): string {
@@ -421,6 +497,9 @@ export async function copySlackRichDomToClipboard(
   html: string,
   plain: string,
 ): Promise<"rich" | "plain"> {
+  const nativeResult = await copyViaNativeAndroidBridge(html, plain);
+  if (nativeResult) return nativeResult;
+
   // Let Android Chrome serialize the visible formatted selection first. This
   // is the browser path that maps to Android's HTML-capable ClipData. An
   // intercepted copy event can report success while Android exposes only its

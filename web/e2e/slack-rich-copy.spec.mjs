@@ -111,6 +111,40 @@ test.describe("Android Slack rich copy", () => {
     expect(clipboard.plain).not.toContain("```powershell");
   });
 
+  test("uses the origin-scoped native Android clipboard bridge when available", async ({ page }) => {
+    await page.addInitScript(() => {
+      const listeners = new Set();
+      window.MementoAndroidClipboard = {
+        addEventListener: (_type, listener) => listeners.add(listener),
+        removeEventListener: (_type, listener) => listeners.delete(listener),
+        postMessage: (message) => {
+          const payload = JSON.parse(message);
+          window.__mementoNativeClipboardPayload = payload;
+          queueMicrotask(() => {
+            const event = { data: JSON.stringify({
+              requestId: payload.requestId,
+              ok: true,
+              format: "html",
+            }) };
+            listeners.forEach((listener) => listener(event));
+          });
+        },
+      };
+    });
+
+    await openSlackCopy(page);
+    const sheet = page.locator("[data-slack-copy-sheet]");
+    await sheet.locator("[data-slack-copy-action]").click();
+    await expect(sheet).toHaveAttribute("data-slack-copy-result", "rich");
+
+    const payload = await page.evaluate(() => window.__mementoNativeClipboardPayload);
+    expect(payload.type).toBe("copy-rich-clipboard");
+    expect(payload.html).toMatch(/<b[^>]*>Release ready<\/b>/i);
+    expect(payload.html).toMatch(/<ol/i);
+    expect(payload.plain).toContain("1. Deploy the API");
+    expect(payload.plain).not.toContain("*Release ready*");
+  });
+
   test("offers a visible native-selection fallback without changing the viewport", async ({ page }) => {
     await openSlackCopy(page);
     const sheet = page.locator("[data-slack-copy-sheet]");

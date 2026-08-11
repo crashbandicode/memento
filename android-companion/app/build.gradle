@@ -1,0 +1,87 @@
+plugins {
+    id "com.android.application"
+}
+
+def signingFile = System.getenv("MEMENTO_ANDROID_KEYSTORE_FILE")
+def signingStorePassword = System.getenv("MEMENTO_ANDROID_KEYSTORE_PASSWORD")
+def signingAlias = System.getenv("MEMENTO_ANDROID_KEY_ALIAS")
+def signingKeyPassword = System.getenv("MEMENTO_ANDROID_KEY_PASSWORD")
+def hasReleaseSigning = [signingFile, signingStorePassword, signingAlias, signingKeyPassword]
+    .every { value -> value != null && !value.isBlank() }
+
+android {
+    namespace "com.babypotatofarm.memento"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.babypotatofarm.memento"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(signingFile)
+                storePassword signingStorePassword
+                keyAlias signingAlias
+                keyPassword signingKeyPassword
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+                enableV4Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+}
+
+dependencies {
+    implementation "androidx.activity:activity:1.10.1"
+    implementation "androidx.webkit:webkit:1.13.0"
+
+    testImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test.ext:junit:1.2.1"
+    androidTestImplementation "androidx.test.espresso:espresso-core:3.6.1"
+}
+
+tasks.register("verifyReleaseSigning") {
+    doLast {
+        if (!hasReleaseSigning) {
+            throw new GradleException("Release signing environment variables are required.")
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == "assembleRelease") {
+        task.dependsOn tasks.named("verifyReleaseSigning")
+    }
+}
