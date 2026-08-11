@@ -106,8 +106,9 @@ test.describe("Android Slack rich copy", () => {
     expect(clipboard.types).toContain("text/plain");
     expect(clipboard.html).toMatch(/<b[^>]*>Release ready<\/b>/i);
     expect(clipboard.html).toMatch(/<ol/i);
-    expect(clipboard.plain).toContain("1. Deploy the API");
-    expect(clipboard.plain).toContain("https://example.com/runbook");
+    expect(clipboard.plain).toContain("Deploy the API");
+    expect(clipboard.plain).not.toContain("*Release ready*");
+    expect(clipboard.plain).not.toContain("```powershell");
   });
 
   test("offers a visible native-selection fallback without changing the viewport", async ({ page }) => {
@@ -119,6 +120,32 @@ test.describe("Android Slack rich copy", () => {
     await expect(sheet).toHaveAttribute("data-slack-copy-result", "selected");
     expect(page.viewportSize()).toEqual(before);
     await expect(sheet.locator("[data-slack-copy-surface]")).toBeInViewport();
+  });
+
+  test("degrades to readable plain text without literal Markdown punctuation", async ({ page }) => {
+    await openSlackCopy(page);
+    await page.evaluate(() => {
+      document.execCommand = () => false;
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          write: async () => { throw new Error("rich clipboard blocked"); },
+          writeText: async (value) => { window.__mementoPlainClipboard = value; },
+        },
+      });
+    });
+
+    const sheet = page.locator("[data-slack-copy-sheet]");
+    await sheet.locator("[data-slack-copy-action]").click();
+    await expect(sheet).toHaveAttribute("data-slack-copy-result", "plain");
+
+    const plain = await page.evaluate(() => window.__mementoPlainClipboard || "");
+    expect(plain).toContain("1. Deploy the API");
+    expect(plain).toContain("runbook (https://example.com/runbook)");
+    expect(plain).toContain("Get-Service memento");
+    expect(plain).not.toContain("*Release ready*");
+    expect(plain).not.toContain("`Get-Service memento`");
+    expect(plain).not.toContain("```");
   });
 });
 

@@ -179,11 +179,14 @@ function inlineSlackText(node: Node): string {
     return `${label} (${href})`;
   }
   if (tag === "CODE" && node.parentElement?.tagName !== "PRE") {
-    return `\`${decodeEntityText(node.textContent || "")}\``;
+    return decodeEntityText(node.textContent || "");
   }
-  if (tag === "B" || tag === "STRONG") return `*${children()}*`;
-  if (tag === "I" || tag === "EM") return `_${children()}_`;
-  if (tag === "DEL" || tag === "S") return `~${children()}~`;
+  // A receiver that declines text/html treats these characters literally.
+  // Keep the plain fallback readable instead of leaking Markdown syntax into
+  // editors such as Slack Android's composer.
+  if (tag === "B" || tag === "STRONG") return children();
+  if (tag === "I" || tag === "EM") return children();
+  if (tag === "DEL" || tag === "S") return children();
   return children();
 }
 
@@ -231,7 +234,7 @@ function slackBlockText(node: Node): string {
     return slackListText(node as HTMLOListElement | HTMLUListElement, 0);
   }
   if (node.tagName === "PRE") {
-    return `\`\`\`\n${node.textContent?.replace(/\n+$/, "") || ""}\n\`\`\``;
+    return node.textContent?.replace(/\n+$/, "") || "";
   }
   if (node.tagName === "BLOCKQUOTE") {
     return Array.from(node.childNodes)
@@ -338,13 +341,16 @@ export function selectDomContents(host: HTMLElement): boolean {
   try {
     const selection = window.getSelection();
     if (!selection) return false;
+    // Focus first. Android Chromium can discard or broaden an existing range
+    // when focus moves afterward, causing adjacent message metadata to leak
+    // into the clipboard.
+    if (typeof host.focus === "function") {
+      try { host.focus({ preventScroll: true } as FocusOptions); } catch { host.focus(); }
+    }
     const range = document.createRange();
     range.selectNodeContents(host);
     selection.removeAllRanges();
     selection.addRange(range);
-    if (typeof host.focus === "function") {
-      try { host.focus({ preventScroll: true } as FocusOptions); } catch { host.focus(); }
-    }
     return selection.rangeCount === 1;
   } catch {
     return false;
@@ -415,7 +421,12 @@ export async function copySlackRichDomToClipboard(
   html: string,
   plain: string,
 ): Promise<"rich" | "plain"> {
-  if (copyDomSelection(host, { html, plain })) return "rich";
+  // Let Android Chrome serialize the visible formatted selection first. This
+  // is the browser path that maps to Android's HTML-capable ClipData. An
+  // intercepted copy event can report success while Android exposes only its
+  // explicit text/plain member to another app, which is exactly how literal
+  // Markdown reached Slack.
+  if (copyDomSelection(host)) return "rich";
 
   if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
     try {
@@ -429,7 +440,10 @@ export async function copySlackRichDomToClipboard(
     }
   }
 
-  if (copyDomSelection(host)) return "rich";
+  // Older embedded browsers may only copy when the copy event supplies the
+  // representations explicitly. Keep this behind the native serialization
+  // and use a syntax-free plain representation for receivers that coerce it.
+  if (copyDomSelection(host, { html, plain })) return "rich";
   await writePlainClipboard(plain);
   return "plain";
 }
