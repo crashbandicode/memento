@@ -509,6 +509,27 @@ html[data-skin="baseline"] .aurora-btn-danger:hover {
 }
 .prose code { font-size: 0.875rem; word-break: break-all; }
 
+/* The Android Slack copy surface is both the visual preview and the exact DOM
+   subtree serialized onto the clipboard. Keep its semantics visible and clean. */
+[data-slack-copy-surface] > div > :first-child { margin-top: 0; }
+[data-slack-copy-surface] > div > :last-child { margin-bottom: 0; }
+[data-slack-copy-surface] p { margin: 0 0 0.65rem; }
+[data-slack-copy-surface] a { color: #4a154b; text-decoration: underline; }
+[data-slack-copy-surface] pre {
+  margin: 0.75rem 0;
+  padding: 0.7rem 0.8rem;
+  overflow-x: auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.55rem;
+  background: #f8fafc;
+  color: #1f2937;
+  white-space: pre-wrap;
+}
+[data-slack-copy-surface] code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+}
+
 /* =========================================================================
    iPhone safe area
    ========================================================================= */

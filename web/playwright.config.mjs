@@ -6,6 +6,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error(`Invalid MEMENTO_E2E_PORT: ${process.env.MEMENTO_E2E_PORT}`);
 }
 const baseURL = `http://localhost:${port}`;
+const reuseExistingServer = process.env.MEMENTO_E2E_REUSE_SERVER === "1";
 
 /**
  * Playwright configuration for the Memento web regression suite (Workstream D).
@@ -52,7 +53,7 @@ export default defineConfig({
   webServer: {
     command: `npm run dev -- -H 127.0.0.1 -p ${port}`,
     url: `${baseURL}/auth/login`,
-    reuseExistingServer: false,
+    reuseExistingServer,
     timeout: 120_000,
     // Same-origin API base → intercepted requests need no CORS negotiation.
     env: { NEXT_PUBLIC_MEMENTO_API_BASE: baseURL },

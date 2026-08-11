@@ -248,7 +248,7 @@ function slackBlockText(node: Node): string {
   return Array.from(node.childNodes).map(slackBlockText).filter(Boolean).join("\n\n");
 }
 
-function slackHtmlToPlainText(html: string): string {
+export function slackClipboardPlainTextFromHtml(html: string): string {
   const container = document.createElement("div");
   container.innerHTML = html;
   return Array.from(container.childNodes)
@@ -265,7 +265,7 @@ function slackHtmlToPlainText(html: string): string {
  * to text/plain, so preserve hierarchy explicitly instead of losing markers.
  */
 export async function slackClipboardPlainText(markdown: string): Promise<string> {
-  return slackHtmlToPlainText(await slackClipboardHtml(markdown));
+  return slackClipboardPlainTextFromHtml(await slackClipboardHtml(markdown));
 }
 
 function copyWithExecCommand(payload: Record<string, string>): boolean {
@@ -308,7 +308,6 @@ export function copyDomSelection(
   host: HTMLElement,
   opts?: { html?: string; plain?: string },
 ): boolean {
-  const selection = window.getSelection();
   const onCopy = opts?.html
     ? (event: ClipboardEvent) => {
         event.clipboardData?.setData("text/html", opts.html || "");
@@ -319,13 +318,7 @@ export function copyDomSelection(
 
   if (onCopy) document.addEventListener("copy", onCopy);
   try {
-    const range = document.createRange();
-    range.selectNodeContents(host);
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    if (typeof host.focus === "function") {
-      try { host.focus({ preventScroll: true } as FocusOptions); } catch { host.focus(); }
-    }
+    if (!selectDomContents(host)) return false;
     // First try: let the browser serialize the selected HTML itself (no preventDefault).
     if (!onCopy) {
       return document.execCommand("copy");
@@ -336,7 +329,25 @@ export function copyDomSelection(
     return false;
   } finally {
     if (onCopy) document.removeEventListener("copy", onCopy);
-    selection?.removeAllRanges();
+    window.getSelection()?.removeAllRanges();
+  }
+}
+
+/** Select a visible rich preview and leave it selected for Android's native Copy action. */
+export function selectDomContents(host: HTMLElement): boolean {
+  try {
+    const selection = window.getSelection();
+    if (!selection) return false;
+    const range = document.createRange();
+    range.selectNodeContents(host);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (typeof host.focus === "function") {
+      try { host.focus({ preventScroll: true } as FocusOptions); } catch { host.focus(); }
+    }
+    return selection.rangeCount === 1;
+  } catch {
+    return false;
   }
 }
 
@@ -393,6 +404,36 @@ export async function copySlackPlainTextToClipboard(markdown: string): Promise<s
   return text;
 }
 
+/**
+ * Copy the visible Slack preview with both HTML and plain representations.
+ * A real DOM selection is important on Android: it follows the same browser
+ * path as a long-press Copy, while the explicit payload preserves a readable
+ * fallback for receivers that decline text/html.
+ */
+export async function copySlackRichDomToClipboard(
+  host: HTMLElement,
+  html: string,
+  plain: string,
+): Promise<"rich" | "plain"> {
+  if (copyDomSelection(host, { html, plain })) return "rich";
+
+  if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/plain": new Blob([plain], { type: "text/plain" }),
+        "text/html": new Blob([html], { type: "text/html" }),
+      })]);
+      return "rich";
+    } catch {
+      // A native selection remains the best Android fallback.
+    }
+  }
+
+  if (copyDomSelection(host)) return "rich";
+  await writePlainClipboard(plain);
+  return "plain";
+}
+
 async function copySlackClipboard(markdown: string): Promise<boolean> {
   const plain = clipboardMarkdown(markdown);
   const html = await slackClipboardHtml(markdown);
@@ -402,17 +443,6 @@ async function copySlackClipboard(markdown: string): Promise<boolean> {
     slackDelta = await convert(plain, { format: "markdown" });
   } catch {
     slackDelta = null;
-  }
-
-  // Android Chrome/Slack coercively expose only text/plain across apps. Use a
-  // fallback that keeps explicit numbers, bullets, URLs, and code markers.
-  if (isAndroidClipboardHost()) {
-    try {
-      await writePlainClipboard(slackHtmlToPlainText(html));
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   const payload: Record<string, string> = {

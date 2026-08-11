@@ -35,9 +35,11 @@ import TaskProgressCard from "./TaskProgressCard";
 import { Icon } from "@/components/aurora/Icon";
 import {
   copyMarkdownToClipboard,
-  copySlackPlainTextToClipboard,
+  copySlackRichDomToClipboard,
   isAndroidClipboardHost,
-  slackClipboardPlainText,
+  selectDomContents,
+  slackClipboardHtml,
+  slackClipboardPlainTextFromHtml,
   type ClipboardFormat,
 } from "@/lib/rich-clipboard";
 import { useOverflowsVisibleScrollport } from "@/lib/use-overflows-visible-scrollport";
@@ -4362,24 +4364,34 @@ function SlackCopySheet({
   onCopied: () => void;
   t: ReturnType<typeof useI18n>["t"];
 }) {
-  const [copied, setCopied] = useState(false);
+  const [copyResult, setCopyResult] = useState<"rich" | "plain" | "selected" | "error" | null>(null);
+  const [html, setHtml] = useState("");
   const [plainText, setPlainText] = useState("");
+  const previewRef = useRef<HTMLDivElement>(null);
+  const ready = Boolean(html && plainText);
 
   useEffect(() => {
     if (!open) {
       const resetTimer = window.setTimeout(() => {
-        setCopied(false);
+        setCopyResult(null);
+        setHtml("");
         setPlainText("");
       }, 0);
       return () => window.clearTimeout(resetTimer);
     }
     let cancelled = false;
-    void slackClipboardPlainText(markdown)
-      .then((next) => {
-        if (!cancelled) setPlainText(next);
+    void slackClipboardHtml(markdown)
+      .then((nextHtml) => {
+        if (!cancelled) {
+          setHtml(nextHtml);
+          setPlainText(slackClipboardPlainTextFromHtml(nextHtml));
+        }
       })
       .catch(() => {
-        if (!cancelled) setPlainText(markdown);
+        if (!cancelled) {
+          setHtml("");
+          setPlainText(markdown);
+        }
       });
     return () => {
       cancelled = true;
@@ -4387,16 +4399,34 @@ function SlackCopySheet({
   }, [open, markdown]);
 
   const copyPreview = useCallback(async () => {
-    if (!plainText) return false;
+    const host = previewRef.current;
+    if (!host || !html || !plainText) return false;
     try {
-      await copySlackPlainTextToClipboard(markdown);
-      setCopied(true);
+      const result = await copySlackRichDomToClipboard(host, html, plainText);
+      setCopyResult(result);
       onCopied();
       return true;
     } catch {
+      setCopyResult("error");
       return false;
     }
-  }, [markdown, onCopied, plainText]);
+  }, [html, onCopied, plainText]);
+
+  const selectPreview = useCallback(() => {
+    const host = previewRef.current;
+    if (!host || !selectDomContents(host)) return;
+    setCopyResult("selected");
+  }, []);
+
+  const statusMessage = copyResult === "rich"
+    ? t.conversation.slackCopyRichSuccess
+    : copyResult === "plain"
+      ? t.conversation.slackCopyPlainFallback
+      : copyResult === "selected"
+        ? t.conversation.slackCopySelected
+        : copyResult === "error"
+          ? t.conversation.copyFailed
+          : t.conversation.slackCopyHint;
 
   if (!open || typeof document === "undefined") return null;
 
@@ -4406,6 +4436,8 @@ function SlackCopySheet({
       aria-modal="true"
       aria-label={t.conversation.slackCopyTitle}
       data-slack-copy-sheet
+      data-slack-copy-ready={ready ? "true" : "false"}
+      data-slack-copy-result={copyResult || ""}
       style={{
         position: "fixed",
         inset: 0,
@@ -4452,10 +4484,14 @@ function SlackCopySheet({
           </div>
         </div>
         <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.45, color: "var(--aurora-fg3)" }}>
-          {copied ? t.conversation.copiedSlack : t.conversation.slackCopyHint}
+          {statusMessage}
         </p>
-        <pre
+        <div
+          ref={previewRef}
           data-slack-copy-surface
+          data-copy-surface-format="html"
+          role="document"
+          aria-label={t.conversation.slackCopyPreviewLabel}
           tabIndex={0}
           style={{
             maxHeight: "46vh",
@@ -4470,19 +4506,20 @@ function SlackCopySheet({
             fontFamily: "ui-sans-serif, system-ui, sans-serif",
             WebkitUserSelect: "text",
             userSelect: "text",
-            whiteSpace: "pre-wrap",
+            whiteSpace: "normal",
             overflowWrap: "anywhere",
             outline: "none",
           }}
-        >
-          {plainText || "…"}
-        </pre>
-        <div style={{ display: "flex", gap: 8 }}>
+          dangerouslySetInnerHTML={{ __html: html || "…" }}
+        />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
           <button
             type="button"
+            data-slack-copy-action
+            disabled={!ready}
             onClick={() => { void copyPreview(); }}
             style={{
-              flex: 1,
+              gridColumn: "1 / -1",
               minHeight: 42,
               border: 0,
               borderRadius: 11,
@@ -4490,10 +4527,31 @@ function SlackCopySheet({
               color: "#fff",
               fontWeight: 650,
               fontSize: 13.5,
-              cursor: "pointer",
+              cursor: ready ? "pointer" : "wait",
+              opacity: ready ? 1 : 0.62,
             }}
           >
-            {copied ? t.conversation.copiedSlack : t.conversation.slackCopyAction}
+            {copyResult === "rich" ? t.conversation.copiedSlack : t.conversation.slackCopyAction}
+          </button>
+          <button
+            type="button"
+            data-slack-select-action
+            disabled={!ready}
+            onClick={selectPreview}
+            style={{
+              minHeight: 42,
+              padding: "0 14px",
+              borderRadius: 11,
+              border: "1px solid color-mix(in srgb, #4A154B 24%, var(--aurora-border))",
+              background: "color-mix(in srgb, #4A154B 7%, var(--aurora-surface-solid))",
+              color: "#4A154B",
+              fontWeight: 650,
+              fontSize: 13.5,
+              cursor: ready ? "pointer" : "wait",
+              opacity: ready ? 1 : 0.62,
+            }}
+          >
+            {t.conversation.slackCopySelectAction}
           </button>
           <button
             type="button"
@@ -4539,8 +4597,8 @@ function MessageCopyFrame({
   const androidHost = typeof navigator !== "undefined" && isAndroidClipboardHost();
 
   const copy = async (format: ClipboardFormat) => {
-    // Android Chrome cannot publish text/html to other apps via ClipboardItem.
-    // Open a selectable preview sheet so Slack receives a real rich selection.
+    // Android cross-app clipboard support varies by browser. The sheet copies
+    // a visible semantic DOM selection and also exposes a native-selection path.
     if (format === "slack" && androidHost) {
       setSlackSheetOpen(true);
       return;
