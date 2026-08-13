@@ -241,6 +241,8 @@ const zhCN = {
     elicitationRequest: "外部输入请求",
     agentNeedsInput: "代理等待输入",
     answered: "已回答",
+    resolved: "已处理",
+    resolvedAnswerUnavailable: "Claude Code 未记录所选择的选项。",
     awaitingResponse: "等待回答",
     planMode: "计划模式",
     cancelled: "已取消",

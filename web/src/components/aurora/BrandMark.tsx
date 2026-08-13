@@ -8,6 +8,7 @@
  */
 import type { CSSProperties } from "react";
 import type { IconType } from "react-icons";
+import { AiFillOpenAI } from "react-icons/ai";
 import { SiClaude, SiObsidian, SiWindsurf } from "react-icons/si";
 import { VscVscode } from "react-icons/vsc";
 
@@ -49,16 +50,12 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
     </g>
   ),
   cursor: (fill) => (
-    /* Cursor's faceted cube, simplified for legibility at 16-24 px. */
-    <g fill={fill} stroke={fill} strokeWidth="0.35" strokeLinejoin="round">
-      <path d="M12 2.2 3.2 7.3 12 12z" opacity="0.58" />
-      <path d="M12 2.2 20.8 7.3 12 12z" opacity="0.92" />
-      <path d="M3.2 7.3 12 12 3.2 17.2z" opacity="0.82" />
-      <path d="M20.8 7.3 12 12 20.8 17.2z" opacity="0.68" />
-      <path d="M3.2 17.2 12 12 12 21.8z" opacity="0.48" />
-      <path d="M20.8 17.2 12 12 12 21.8z" opacity="0.75" />
-      <path d="M3.2 7.3h17.6L12 12z" opacity="1" />
-    </g>
+    /* Official Cursor 2D cube, fitted from its 466.73 x 532.09 brand viewBox. */
+    <path
+      fill={fill}
+      transform="translate(1.47 0) scale(.0451)"
+      d="M457.43 125.94 244.42 2.96a22.13 22.13 0 0 0-22.12 0L9.3 125.94A18.6 18.6 0 0 0 0 142.05v247.99a18.6 18.6 0 0 0 9.3 16.11l213.01 122.98a22.13 22.13 0 0 0 22.12 0l213.01-122.98a18.6 18.6 0 0 0 9.3-16.11V142.05a18.6 18.6 0 0 0-9.3-16.11h-.01ZM444.05 151.99 238.42 508.15c-1.39 2.4-5.06 1.42-5.06-1.36V273.58c0-4.66-2.49-8.97-6.53-11.31L24.87 145.67c-2.4-1.39-1.42-5.06 1.36-5.06h411.26c5.84 0 9.49 6.33 6.57 11.39h-.01Z"
+    />
   ),
   windsurf: (fill) => (
     <g fill="none" stroke={fill} strokeWidth="2" strokeLinecap="round">
@@ -104,6 +101,7 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
 /** Official vector marks available in the bundled react-icons set. */
 const OFFICIAL_MARKS: Partial<Record<BrandId, IconType>> = {
   claude_code: SiClaude,
+  codex: AiFillOpenAI,
   obsidian: SiObsidian,
   windsurf: SiWindsurf,
   vscode: VscVscode,
@@ -136,6 +134,8 @@ export function BrandMark({
     return (
       <OfficialMark
         aria-hidden="true"
+        data-brand-mark={brandId}
+        data-brand-source="bundled-official"
         size={size}
         color={fill}
         style={{ flexShrink: 0, ...style }}
@@ -143,7 +143,15 @@ export function BrandMark({
     );
   }
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" style={{ flexShrink: 0, ...style }}>
+    <svg
+      aria-hidden="true"
+      data-brand-mark={brandId}
+      data-brand-source={brandId === "cursor" ? "cursor-brand-kit" : "memento-custom"}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      style={{ flexShrink: 0, ...style }}
+    >
       {draw(fill)}
     </svg>
   );

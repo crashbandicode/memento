@@ -198,6 +198,75 @@ export const sameRowQuestionResponse = {
 };
 
 /**
+ * Permission side files historically knew that Claude resumed, but not which
+ * native option the user chose. The UI must not render three empty radios as
+ * if a selected answer had been lost silently.
+ */
+export const resolvedPermissionWithoutRecordedChoice = {
+  docId: "conv-permission-choice-unavailable",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-permission-choice-unavailable",
+    tool_id: "claude_code",
+    title: "Resolved Bash permission",
+    relative_path: "claude/sessions/resolved-bash-permission.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    pending_question_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Check the repository status.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "tool",
+      content: "Permission resolved",
+      interaction: /** @type {QuestionInteraction} */ ({
+        kind: "question",
+        id: "permission-bash-resolved",
+        source: "claude_code",
+        tool_name: "PermissionRequest",
+        interaction_type: "permission_request",
+        requested_tool: "Bash",
+        questions: [{
+          id: "permission-decision",
+          header: "Bash",
+          prompt: "Claude Code wants permission to use Bash.",
+          type: "single_select",
+          allow_custom: false,
+          options: [
+            { id: "allow", label: "Yes", description: "git status" },
+            { id: "allow-always", label: "Yes, and allow Bash for this session" },
+            { id: "deny", label: "No" },
+          ],
+        }],
+      }),
+      interaction_response: {
+        kind: "question_response",
+        interaction_id: "permission-bash-resolved",
+        status: "answered",
+        answers: [],
+        raw_text: "",
+      },
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Check the repository status.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
+/**
  * Regression #2 — missing live prompt on metadata-only ingest (no SSE).
  *
  * The prompt outline is delivered purely by GET .../prompts. The SSE stream is
@@ -1291,6 +1360,7 @@ export const urlNavigationCanvasThread = {
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
+  [resolvedPermissionWithoutRecordedChoice.docId]: resolvedPermissionWithoutRecordedChoice,
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
   [subagentLifecycleMatrix.docId]: subagentLifecycleMatrix,

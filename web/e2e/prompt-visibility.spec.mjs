@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import {
   metadataOnlyPrompts,
   permissionWrappedQuestion,
+  resolvedPermissionWithoutRecordedChoice,
   sameRowQuestionResponse,
 } from "./fixtures/conversation-scenarios.mjs";
 import { openConversation, transcript } from "./support/conversation-page.mjs";
@@ -52,6 +53,20 @@ test.describe("prompt visibility & question wrapper unwrap", () => {
       transcript(page).locator('[data-question-interaction="int-cancelled-db"]'),
     ).toHaveCount(1);
     await expect(page.locator("#conversation-line-2")).toHaveCount(1);
+  });
+
+  test("resolved permission without an authoritative choice says so explicitly", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, resolvedPermissionWithoutRecordedChoice);
+
+    const card = transcript(page).locator(
+      '[data-question-interaction="permission-bash-resolved"]',
+    );
+    await expect(card).toContainText("Resolved");
+    await expect(card.locator("[data-question-response-unavailable]")).toContainText(
+      "Claude Code did not record which option was selected.",
+    );
+    await expect(card.locator('[data-question-option][data-selected="true"]')).toHaveCount(0);
   });
 
   test("live prompt outline appears on metadata-only ingest with no SSE stream [regression #2]", async ({ page }) => {

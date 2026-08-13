@@ -3510,8 +3510,22 @@ function QuestionInteractionCard({
   t: ReturnType<typeof useI18n>["t"];
 }) {
   const response = pairedResponse?.response;
+  const hasRecordedAnswer = Boolean(
+    response?.raw_text?.trim()
+    || response?.answers.some((answer) => (
+      answer.selected_option_ids.length > 0
+      || Boolean(answer.text?.trim())
+    )),
+  );
+  const resolvedWithoutRecordedAnswer = Boolean(
+    interaction.interaction_type === "permission_request"
+    && response?.status === "answered"
+    && !hasRecordedAnswer
+  );
   const statusLabel = response?.status === "cancelled"
     ? t.conversation.cancelled
+    : resolvedWithoutRecordedAnswer
+      ? t.conversation.resolved
     : response
       ? t.conversation.answered
       : t.conversation.awaitingResponse;
@@ -3769,6 +3783,29 @@ function QuestionInteractionCard({
                     <div style={{ color: "var(--aurora-fg2)", fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
                       {answer?.text}
                     </div>
+                  </div>
+                )}
+                {resolvedWithoutRecordedAnswer && (
+                  <div
+                    data-question-response-unavailable
+                    role="note"
+                    style={{
+                      marginTop: 9,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 7,
+                      padding: "8px 10px",
+                      borderRadius: 10,
+                      border: "1px solid color-mix(in srgb, var(--aurora-fg4) 22%, var(--aurora-border))",
+                      background: "color-mix(in srgb, var(--aurora-chip) 42%, transparent)",
+                      color: "var(--aurora-fg4)",
+                      fontSize: 10.5,
+                      fontWeight: 560,
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    <Icon name="check" size={12} />
+                    {t.conversation.resolvedAnswerUnavailable}
                   </div>
                 )}
               </section>

@@ -236,6 +236,8 @@ const enUS: Translations = {
     elicitationRequest: "External input request",
     agentNeedsInput: "Agent needs input",
     answered: "Answered",
+    resolved: "Resolved",
+    resolvedAnswerUnavailable: "Claude Code did not record which option was selected.",
     awaitingResponse: "Awaiting response",
     planMode: "Plan mode",
     cancelled: "Cancelled",
