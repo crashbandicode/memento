@@ -180,6 +180,25 @@ test("desktop groups hosts, aggregates filters, and preserves child access", asy
   expectNoPageErrors(errors);
 });
 
+test("Codex tool tiles keep the OpenAI mark white outside Aurora skin", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("dr_skin", "arc"));
+  await openShell(page, { width: 390, height: 844 });
+
+  await page.getByRole("button", { name: "Menu" }).click();
+  const butterbridge = host(page, "butterbridge");
+  await butterbridge.locator("button").first().click();
+  const windowsIdentity = butterbridge.locator(
+    `[data-testid="sidebar-identity"][data-device-id="${butterbridgeIdentities[4].device_id}"]`,
+  );
+  await windowsIdentity.locator("button").first().click();
+
+  const glyph = windowsIdentity.locator('[data-tool-glyph="codex"]').first();
+  const mark = glyph.locator('[data-brand-mark="codex"]');
+  await expect(glyph).toHaveAttribute("data-tool-mark-tone", "white");
+  await expect(mark).toHaveAttribute("color", "#fff");
+  await expect(glyph).toHaveCSS("background-image", /linear-gradient/);
+});
+
 test("mobile defaults compact and keeps drawer behavior while filtering a group", async ({ page }) => {
   const errors = collectPageErrors(page);
   await openShell(page, { width: 390, height: 844 });

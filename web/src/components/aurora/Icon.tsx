@@ -135,6 +135,7 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
   const tool = TOOL_HUE[id] ?? TOOL_HUE.claude_code;
   const radius = Math.max(6, size * 0.28);
   const brandColor = BRAND_COLORS[id] || tool.bg;
+  const usesWhiteMark = id === "codex";
 
   // Aurora: colored gradient tile + white brand mark + highlight
   if (skin === "aurora") {
@@ -143,6 +144,7 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
         role="img"
         aria-label={`${id.replaceAll("_", " ")} tool`}
         data-tool-glyph={id}
+        data-tool-mark-tone="white"
         style={{
           width: size,
           height: size,
@@ -183,14 +185,21 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
       role="img"
       aria-label={`${id.replaceAll("_", " ")} tool`}
       data-tool-glyph={id}
+      data-tool-mark-tone={usesWhiteMark ? "white" : "brand"}
       style={{
         width: size,
         height: size,
         borderRadius: radius,
         background: pad
-          ? `linear-gradient(180deg, ${tint}, transparent 70%), var(--aurora-surface-solid)`
+          ? usesWhiteMark
+            ? tool.bg
+            : `linear-gradient(180deg, ${tint}, transparent 70%), var(--aurora-surface-solid)`
           : "transparent",
-        border: pad ? "1px solid var(--aurora-border)" : "none",
+        border: pad
+          ? usesWhiteMark
+            ? "1px solid rgba(255,255,255,0.16)"
+            : "1px solid var(--aurora-border)"
+          : "none",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -198,7 +207,12 @@ export function ToolGlyph({ id, size = 36 }: { id: string; size?: number }) {
         boxShadow: size >= 32 ? "0 1px 0 var(--aurora-border)" : "none",
       }}
     >
-      <BrandMark id={id} size={pad ? size * 0.64 : size * 0.9} colored />
+      <BrandMark
+        id={id}
+        size={pad ? size * 0.64 : size * 0.9}
+        colored={!usesWhiteMark}
+        inverted={usesWhiteMark}
+      />
     </div>
   );
 }
