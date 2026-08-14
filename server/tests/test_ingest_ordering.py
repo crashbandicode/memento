@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "server"))
 from server.db.models import Document, SyncState  # noqa: E402
 from server.services.ingest_service import (  # noqa: E402
     DeltaBaseMismatch,
+    _extract_messages,
     _merge_delta_metadata,
     _preserve_interaction_provenance,
     _set_stored_source_identity,
@@ -99,6 +100,9 @@ def _ingest_kwargs(doc: Document, **overrides) -> dict:
 
 
 class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
+    def test_extract_messages_does_not_shadow_document_metadata_helper(self) -> None:
+        self.assertNotIn("document_metadata", _extract_messages.__code__.co_varnames)
+
     def test_delta_metadata_accumulates_counts_and_preserves_first_timestamp(
         self,
     ) -> None:

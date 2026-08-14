@@ -4009,12 +4009,6 @@ async def _extract_messages(
             backfill_legacy_interaction_origins,
             refresh_claude_lineage,
         )
-        from .document_delivery import (
-            attach_document_delivery,
-            document_metadata,
-            ensure_document_delivery_state,
-            store_document_metadata,
-        )
         from .conversation_hierarchy import is_conversation_subagent
 
         effective_metadata = document_metadata(doc)
