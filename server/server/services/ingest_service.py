@@ -517,6 +517,7 @@ def _set_stored_source_proof(
 
 def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
     """Accumulate parser statistics while preserving first-source metadata."""
+    incoming = _preserve_interaction_provenance(existing, incoming)
     merged = {**existing, **incoming}
     existing_lines = existing.get("total_lines")
     incoming_lines = incoming.get("total_lines")
@@ -535,6 +536,127 @@ def _merge_delta_metadata(existing: dict, incoming: dict) -> dict:
 
     if existing.get("first_timestamp"):
         merged["first_timestamp"] = existing["first_timestamp"]
+    return merged
+
+
+def _interaction_entry_id(key: object, entry: object) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    interaction = entry.get("interaction")
+    if isinstance(interaction, dict) and interaction.get("id"):
+        return str(interaction["id"])
+    return str(key or "")
+
+
+def _interaction_entries_by_id(value: object) -> dict[str, dict]:
+    if isinstance(value, dict):
+        candidates = value.items()
+    elif isinstance(value, list):
+        candidates = enumerate(value)
+    else:
+        return {}
+    return {
+        interaction_id: entry
+        for key, entry in candidates
+        if (interaction_id := _interaction_entry_id(key, entry))
+        and isinstance(entry, dict)
+    }
+
+
+def _preserve_interaction_entry_provenance(
+    prior: object,
+    incoming: object,
+) -> object:
+    if not isinstance(prior, dict) or not isinstance(incoming, dict):
+        return incoming
+    merged = dict(incoming)
+    prior_interaction = prior.get("interaction")
+    incoming_interaction = incoming.get("interaction")
+    prior_timestamp = str(prior.get("timestamp") or "")
+    incoming_timestamp = str(incoming.get("timestamp") or "")
+    same_event = (
+        bool(prior_timestamp)
+        and prior_timestamp == incoming_timestamp
+        and isinstance(prior_interaction, dict)
+        and isinstance(incoming_interaction, dict)
+        and prior_interaction.get("interaction_type") == "permission_request"
+        and incoming_interaction.get("interaction_type") == "permission_request"
+        and bool(prior_interaction.get("requested_tool"))
+        and prior_interaction.get("requested_tool")
+        == incoming_interaction.get("requested_tool")
+    )
+    if (
+        same_event
+        and "interaction_origin" not in merged
+        and "interaction_origin" in prior
+    ):
+        next_interaction = dict(incoming_interaction)
+        if (
+            not isinstance(next_interaction.get("tool_input"), dict)
+            and isinstance(prior_interaction.get("tool_input"), dict)
+        ):
+            # Exact legacy backfill restores only bounded JSON mappings. Keep
+            # that fingerprint input with the origin when the old collector
+            # re-emits the exact same hook event without it.
+            next_interaction["tool_input"] = json.loads(
+                json.dumps(prior_interaction["tool_input"])
+            )
+        merged["interaction"] = next_interaction
+        merged["interaction_origin"] = prior["interaction_origin"]
+    if (
+        same_event
+        and "interaction_origin" in merged
+        and "interaction_origin_backfill" not in merged
+        and "interaction_origin_backfill" in prior
+        and merged["interaction_origin"] == prior.get("interaction_origin")
+    ):
+        merged["interaction_origin_backfill"] = prior[
+            "interaction_origin_backfill"
+        ]
+    return merged
+
+
+def _preserve_interaction_container_provenance(
+    prior: object,
+    incoming: object,
+) -> object:
+    """Retain server-proven origins while accepting newer interaction state."""
+    prior_by_id = _interaction_entries_by_id(prior)
+    if isinstance(incoming, list):
+        return [
+            _preserve_interaction_entry_provenance(
+                prior_by_id.get(_interaction_entry_id(index, entry)),
+                entry,
+            )
+            for index, entry in enumerate(incoming)
+        ]
+    if isinstance(incoming, dict):
+        return {
+            key: _preserve_interaction_entry_provenance(
+                prior_by_id.get(_interaction_entry_id(key, entry)),
+                entry,
+            )
+            for key, entry in incoming.items()
+        }
+    return incoming
+
+
+def _preserve_interaction_provenance(existing: dict, incoming: dict) -> dict:
+    """Keep authoritative origins across old-collector metadata refreshes.
+
+    Collector metadata remains authoritative for pending/answered state and
+    response text.  Provenance is server-enriched during a FULL replay, so an
+    older collector's later DELTA must not erase it merely because the side
+    record predates provenance support.  Visibility still validates every
+    retained origin against the exact permission payload and lineage row.
+    """
+    merged = dict(incoming)
+    for key in (INTERACTION_HISTORY_KEY, LIVE_INTERACTION_SIGNALS_KEY):
+        if key in incoming and key in existing:
+            merged[key] = _preserve_interaction_container_provenance(
+                existing[key],
+                incoming[key],
+            )
     return merged
 
 
@@ -3018,7 +3140,13 @@ async def ingest_file(
         metadata_update = (
             _merge_delta_metadata(existing_metadata, stored_metadata)
             if mode == "delta"
-            else {**existing_metadata, **stored_metadata}
+            else {
+                **existing_metadata,
+                **_preserve_interaction_provenance(
+                    existing_metadata,
+                    stored_metadata,
+                ),
+            }
         )
         if incoming_title_is_explicit:
             metadata_update["memento_title_source"] = "claude_ai_title"

@@ -14,6 +14,7 @@ from server.db.models import Document, SyncState  # noqa: E402
 from server.services.ingest_service import (  # noqa: E402
     DeltaBaseMismatch,
     _merge_delta_metadata,
+    _preserve_interaction_provenance,
     _set_stored_source_identity,
     ingest_file,
 )
@@ -126,6 +127,187 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(merged["first_timestamp"], "first")
         self.assertEqual(merged["last_timestamp"], "new-last")
+
+    def test_old_collector_refresh_preserves_server_interaction_provenance(
+        self,
+    ) -> None:
+        origin = {
+            "version": 1,
+            "kind": "claude_record",
+            "record_uuid": "record-1",
+            "fingerprint": "a" * 64,
+        }
+        existing = {
+            "_interaction_history": [
+                {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                        "tool_input": {"command": "git status"},
+                    },
+                    "timestamp": "2026-08-14T10:00:00Z",
+                    "status": "pending",
+                    "interaction_origin": origin,
+                    "interaction_origin_backfill": "exact_unique_v1",
+                }
+            ],
+            "_live_interaction_signals": {
+                "permission-1": {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                        "tool_input": {"command": "git status"},
+                    },
+                    "timestamp": "2026-08-14T10:00:00Z",
+                    "interaction_origin": origin,
+                }
+            },
+        }
+        incoming = {
+            "_interaction_history": [
+                {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                    },
+                    "timestamp": "2026-08-14T10:00:00Z",
+                    "status": "answered",
+                    "response": {"behavior": "allow"},
+                }
+            ],
+            "_live_interaction_signals": {
+                "permission-1": {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                    },
+                    "timestamp": "2026-08-14T10:00:00Z",
+                }
+            },
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        history = merged["_interaction_history"][0]
+        self.assertEqual(history["status"], "answered")
+        self.assertEqual(history["response"], {"behavior": "allow"})
+        self.assertEqual(
+            history["interaction"]["tool_input"],
+            {"command": "git status"},
+        )
+        self.assertEqual(history["interaction_origin"], origin)
+        self.assertEqual(
+            history["interaction_origin_backfill"],
+            "exact_unique_v1",
+        )
+        signal = merged["_live_interaction_signals"]["permission-1"]
+        self.assertEqual(signal["timestamp"], "2026-08-14T10:00:00Z")
+        self.assertEqual(
+            signal["interaction"]["tool_input"],
+            {"command": "git status"},
+        )
+        self.assertEqual(signal["interaction_origin"], origin)
+
+    def test_repeated_identical_permission_id_with_new_timestamp_fails_open(
+        self,
+    ) -> None:
+        interaction = {
+            "id": "reused-synthetic-id",
+            "interaction_type": "permission_request",
+            "requested_tool": "Bash",
+            "tool_input": {"command": "git status"},
+        }
+        existing = {
+            "_interaction_history": [
+                {
+                    "interaction": interaction,
+                    "timestamp": "2026-08-14T10:00:00Z",
+                    "interaction_origin": {"record_uuid": "abandoned-record"},
+                    "interaction_origin_backfill": "exact_unique_v1",
+                }
+            ]
+        }
+        incoming = {
+            "_interaction_history": [
+                {
+                    "interaction": interaction,
+                    "timestamp": "2026-08-14T10:05:00Z",
+                    "status": "pending",
+                }
+            ]
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        history = merged["_interaction_history"][0]
+        self.assertNotIn("interaction_origin", history)
+        self.assertNotIn("interaction_origin_backfill", history)
+
+    def test_interaction_provenance_is_not_copied_to_a_different_id(self) -> None:
+        existing = {
+            "_interaction_history": {
+                "permission-1": {
+                    "interaction": {"id": "permission-1"},
+                    "interaction_origin": {"record_uuid": "record-1"},
+                }
+            }
+        }
+        incoming = {
+            "_interaction_history": {
+                "permission-2": {
+                    "interaction": {"id": "permission-2"},
+                    "status": "pending",
+                }
+            }
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        self.assertNotIn(
+            "interaction_origin",
+            merged["_interaction_history"]["permission-2"],
+        )
+
+    def test_explicit_new_origin_replaces_old_backfill_without_old_marker(self) -> None:
+        old_origin = {"record_uuid": "record-1"}
+        new_origin = {"record_uuid": "record-2"}
+        existing = {
+            "_interaction_history": [
+                {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                    },
+                    "timestamp": "same-event",
+                    "interaction_origin": old_origin,
+                    "interaction_origin_backfill": "exact_unique_v1",
+                }
+            ]
+        }
+        incoming = {
+            "_interaction_history": [
+                {
+                    "interaction": {
+                        "id": "permission-1",
+                        "interaction_type": "permission_request",
+                        "requested_tool": "Bash",
+                    },
+                    "timestamp": "same-event",
+                    "interaction_origin": new_origin,
+                }
+            ]
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        history = merged["_interaction_history"][0]
+        self.assertEqual(history["interaction_origin"], new_origin)
+        self.assertNotIn("interaction_origin_backfill", history)
 
     async def test_committed_newer_full_rejects_older_full_under_source_lock(
         self,
