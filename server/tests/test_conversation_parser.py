@@ -13,6 +13,7 @@ from server.services.conversation_markdown import (  # noqa: E402
 )
 from server.services.conversation_parser import (  # noqa: E402
     AssistantIdentityState,
+    build_question_response,
     coerce_claude_live_interaction,
     count_conversation_messages,
     extract_codex_session_metadata,
@@ -1053,6 +1054,21 @@ class ConversationParserTests(unittest.TestCase):
             "notes": "push straight to fastapi and then test e2e no Mr",
         }])
         self.assertNotIn("The user answered", response["answers"][0]["notes"])
+
+        fallback = build_question_response(
+            messages[0].interaction or {},
+            (
+                f'The user answered: "{prompt}"=(no option selected) '
+                "notes: push straight to fastapi and then test e2e no Mr. "
+                "Read the answers carefully — follow what they actually say."
+            ),
+        )
+        self.assertEqual(fallback["answers"], [{
+            "question_id": "Next step",
+            "text": "",
+            "selected_option_ids": [],
+            "notes": "push straight to fastapi and then test e2e no Mr",
+        }])
 
     def test_claude_historical_permission_wrapper_reparses_as_question(
         self,

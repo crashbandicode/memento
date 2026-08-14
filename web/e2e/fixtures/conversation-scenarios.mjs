@@ -318,11 +318,10 @@ export const claudeQuestionWithNotesOnly = {
         status: "answered",
         answers: [{
           question_id: "Next step",
-          text: "",
+          text: "The user answered: \"How do you want to proceed to the remote / in-cluster e2e?\"=(no option selected) notes: push straight to fastapi and then test e2e no Mr. Read the answers carefully — follow what they actually say.",
           selected_option_ids: [],
-          notes: "push straight to fastapi and then test e2e no Mr",
         }],
-        raw_text: "structured Claude toolUseResult",
+        raw_text: "legacy Claude wrapper",
       },
       timestamp: T2,
     },

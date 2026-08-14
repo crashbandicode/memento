@@ -23,6 +23,7 @@ import {
   InferredConversationInteractionResponse,
   LiveConversationActivity,
   PendingConversationInteraction,
+  QuestionAnswer,
   QuestionInteraction,
   QuestionInteractionResponse,
 } from "@/lib/api-client";
@@ -3496,6 +3497,21 @@ function questionSourceLabel(source: string): string {
   return source || "AI tool";
 }
 
+function legacyClaudeQuestionNotes(text: string): string {
+  const match = text.match(
+    /\((?:no option selected|notes only)\)\s+notes:\s*([\s\S]*?)(?:\.\s+Read the answers carefully\b[\s\S]*|$)/i,
+  );
+  return match?.[1]?.trim().replace(/\.$/, "") || "";
+}
+
+function questionAnswerNotes(answer: QuestionAnswer): string {
+  return answer.notes?.trim() || legacyClaudeQuestionNotes(answer.text);
+}
+
+function questionAnswerText(answer: QuestionAnswer): string {
+  return legacyClaudeQuestionNotes(answer.text) ? "" : answer.text;
+}
+
 function QuestionInteractionCard({
   interaction,
   pairedResponse,
@@ -3515,8 +3531,8 @@ function QuestionInteractionCard({
     response?.raw_text?.trim()
     || response?.answers.some((answer) => (
       answer.selected_option_ids.length > 0
-      || Boolean(answer.text?.trim())
-      || Boolean(answer.notes?.trim())
+      || Boolean(questionAnswerText(answer).trim())
+      || Boolean(questionAnswerNotes(answer))
     )),
   );
   const resolvedWithoutRecordedAnswer = Boolean(
@@ -3642,13 +3658,15 @@ function QuestionInteractionCard({
           {interaction.questions.map((question, questionIndex) => {
             const answer = response?.answers.find((item) => item.question_id === question.id);
             const selectedIds = new Set(answer?.selected_option_ids || []);
+            const answerText = answer ? questionAnswerText(answer) : "";
+            const answerNotes = answer ? questionAnswerNotes(answer) : "";
             const hint = question.type === "multi_select"
               ? t.conversation.chooseMany
               : question.type === "single_select"
                 ? t.conversation.chooseOne
                 : t.conversation.freeResponse;
-            const showCustomAnswer = Boolean(answer?.text && selectedIds.size === 0);
-            const showNotes = Boolean(answer?.notes?.trim());
+            const showCustomAnswer = Boolean(answerText && selectedIds.size === 0);
+            const showNotes = Boolean(answerNotes);
             return (
               <section
                 key={`${question.id}-${questionIndex}`}
@@ -3784,7 +3802,7 @@ function QuestionInteractionCard({
                       {t.conversation.customResponse}
                     </div>
                     <div style={{ color: "var(--aurora-fg2)", fontSize: 12.5, lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-                      {answer?.text}
+                      {answerText}
                     </div>
                   </div>
                 )}
@@ -3821,7 +3839,7 @@ function QuestionInteractionCard({
                         overflowWrap: "anywhere",
                       }}
                     >
-                      {answer?.notes}
+                      {answerNotes}
                     </div>
                   </div>
                 )}
@@ -3865,7 +3883,7 @@ function QuestionResponseCard({
   t: ReturnType<typeof useI18n>["t"];
 }) {
   const text = response.answers
-    .flatMap((answer) => [answer.text, answer.notes])
+    .flatMap((answer) => [questionAnswerText(answer), questionAnswerNotes(answer)])
     .filter(Boolean)
     .join("\n\n")
     || response.raw_text;

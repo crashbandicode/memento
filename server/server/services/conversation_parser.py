@@ -3762,6 +3762,29 @@ def _claude_answer_for_prompt(
     return _bounded_interaction_text(raw_text[start:end].rstrip('". '), 4096)
 
 
+def extract_claude_question_notes(raw_text: str, prompt: str) -> str:
+    """Extract Claude's legacy note-only wrapper without exposing boilerplate."""
+    marker = f'"{prompt}"='
+    start = raw_text.find(marker)
+    if start < 0:
+        return ""
+    segment = raw_text[start + len(marker):]
+    match = re.match(
+        r"\s*\((?:no option selected|notes only)\)\s+notes:\s*(?P<notes>.*)",
+        segment,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return ""
+    notes = re.split(
+        r"\.\s+Read the answers carefully\b",
+        match.group("notes"),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return _bounded_interaction_text(notes.strip().rstrip("."), 4096)
+
+
 def build_question_response(
     interaction: dict[str, object],
     raw_output: object,
@@ -3853,6 +3876,11 @@ def build_question_response(
             ).strip()
         else:
             annotation_note = ""
+        legacy_notes = (
+            extract_claude_question_notes(raw_text, prompt)
+            if raw_text and not has_structured_answer_payload
+            else ""
+        )
         notes = annotation_note or next(
             (
                 notes_by_question[key]
@@ -3860,7 +3888,7 @@ def build_question_response(
                 if key in notes_by_question
             ),
             "",
-        )
+        ) or legacy_notes
         if not answer_values and raw_text and not has_structured_answer_payload:
             next_prompt = None
             if index + 1 < len(questions) and isinstance(questions[index + 1], dict):
@@ -3873,6 +3901,7 @@ def build_question_response(
             and len(questions) == 1
             and raw_text
             and not has_structured_answer_payload
+            and not notes
         ):
             answer_values = [raw_text]
 

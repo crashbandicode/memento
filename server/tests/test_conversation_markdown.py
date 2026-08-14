@@ -236,6 +236,41 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertIn("**Notes:** Run the smoke test immediately after deploy.", text)
         self.assertEqual(text.count("Production"), 2)
 
+    def test_legacy_claude_note_wrapper_exports_as_notes(self) -> None:
+        prompt = "How should this ship?"
+        interaction = {
+            "id": "question-notes",
+            "source": "claude_code",
+            "questions": [{
+                "id": "ship",
+                "header": "Ship",
+                "prompt": prompt,
+                "options": [{"id": "push", "label": "Push"}],
+            }],
+        }
+        wrapper = (
+            f'The user answered: "{prompt}"=(no option selected) '
+            "notes: push straight to fastapi. Read the answers carefully."
+        )
+        response = {
+            "interaction_id": "question-notes",
+            "status": "answered",
+            "answers": [{
+                "question_id": "ship",
+                "selected_option_ids": [],
+                "text": wrapper,
+            }],
+        }
+
+        text, _stats = self.render(
+            [message(1, "tool", "question", metadata={"interaction": interaction})],
+            responses={"question-notes": response},
+        )
+
+        self.assertIn("**Notes:** push straight to fastapi", text)
+        self.assertNotIn("The user answered", text)
+        self.assertNotIn("no option selected", text)
+
     def test_optional_sections_can_be_removed(self) -> None:
         items = [
             message(1, "user", "Hello", metadata={"session_context": "Private context"}),

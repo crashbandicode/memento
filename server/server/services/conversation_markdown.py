@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TextIO
 
-from .conversation_parser import is_scheduled_automation_content
+from .conversation_parser import (
+    extract_claude_question_notes,
+    is_scheduled_automation_content,
+)
 
 
 _MAX_PROMPT_RANGE_LENGTH = 512
@@ -312,13 +315,20 @@ def _write_interaction(
                 suffix = f" — {description}" if description else ""
                 _write(writer, f"> - [{'x' if checked else ' '}] {label}{suffix}")
         answer_text = str(answer.get("text") or "").strip() if isinstance(answer, dict) else ""
+        legacy_notes = extract_claude_question_notes(answer_text, prompt)
+        if legacy_notes:
+            answer_text = ""
         if answer_text:
             answer_lines = answer_text.splitlines() or [answer_text]
             _write(writer, ">")
             _write(writer, f"> **Response:** {answer_lines[0]}")
             for line in answer_lines[1:]:
                 _write(writer, f"> {line}")
-        notes = str(answer.get("notes") or "").strip() if isinstance(answer, dict) else ""
+        notes = (
+            str(answer.get("notes") or "").strip()
+            if isinstance(answer, dict)
+            else ""
+        ) or legacy_notes
         if notes:
             note_lines = notes.splitlines() or [notes]
             _write(writer, ">")
