@@ -258,19 +258,24 @@ async def _upsert_lineage_batch(
         )
         row = existing.get(record_uuid)
         if row is None:
-            db.add(
-                ClaudeConversationLineageRecord(
-                    document_id=document_id,
-                    record_uuid=record_uuid,
-                    parent_uuid=_record_parent_uuid(record) or None,
-                    source_order=source_order,
-                    is_sidechain=is_sidechain,
-                    is_subagent=is_subagent,
-                    agent_id=_record_agent_id(record) or None,
-                    is_eligible=_record_is_eligible(record),
-                    active=False,
-                )
+            row = ClaudeConversationLineageRecord(
+                document_id=document_id,
+                record_uuid=record_uuid,
+                parent_uuid=_record_parent_uuid(record) or None,
+                source_order=source_order,
+                is_sidechain=is_sidechain,
+                is_subagent=is_subagent,
+                agent_id=_record_agent_id(record) or None,
+                is_eligible=_record_is_eligible(record),
+                active=False,
             )
+            db.add(row)
+            # Claude can repeat a record UUID inside one physical JSONL
+            # snapshot. Make the pending ORM row visible to later values in
+            # this batch so they enrich/update it instead of scheduling a
+            # second INSERT for the same primary key. FULL replay below keeps
+            # the last physical occurrence's authoritative source order.
+            existing[record_uuid] = row
             continue
         # A replayed DELTA can enrich parent/agent data. A record's original
         # source order remains stable; a FULL replay is authoritative ordering.

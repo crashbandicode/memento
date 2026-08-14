@@ -598,6 +598,10 @@ async def test_durable_full_delta_rewind_and_child_sidechain_lineage(
             [
                 {"uuid": "A", "type": "user"},
                 {"uuid": "B", "parentUuid": "A", "type": "assistant"},
+                # Real Claude transcripts can repeat a UUID inside one FULL
+                # batch. It must update the pending row rather than enqueue a
+                # duplicate INSERT for the composite primary key.
+                {"uuid": "B", "parentUuid": "A", "type": "assistant"},
                 {"uuid": "progress", "parentUuid": "B", "type": "progress"},
                 {"uuid": "C", "parentUuid": "B", "type": "user"},
             ],
@@ -616,6 +620,8 @@ async def test_durable_full_delta_rewind_and_child_sidechain_lineage(
             .all()
         )
         self_by_id = {row.record_uuid: row for row in rows}
+        assert len(self_by_id) == 4
+        assert self_by_id["B"].source_order == 3
         assert {key for key, row in self_by_id.items() if row.active} == {"A", "B", "C"}
         assert self_by_id["progress"].active is False
 
