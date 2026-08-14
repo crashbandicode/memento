@@ -49,6 +49,13 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(interaction["id"], "permission-1")
         self.assertEqual(interaction["interaction_type"], "permission_request")
         self.assertEqual(interaction["requested_tool"], "PowerShell")
+        self.assertEqual(
+            interaction["tool_input"],
+            {
+                "command": "git push fork main",
+                "description": "Push changes",
+            },
+        )
         question = interaction["questions"][0]
         self.assertEqual(question["header"], "PowerShell")
         self.assertEqual(question["options"][0]["id"], "allow")
@@ -64,6 +71,21 @@ class ConversationParserTests(unittest.TestCase):
                 "No",
             ],
         )
+
+    def test_claude_permission_request_does_not_retain_oversized_tool_input(self) -> None:
+        interaction = normalize_interaction(
+            "PermissionRequest",
+            {
+                "interaction_type": "permission_request",
+                "requested_tool": "Write",
+                "tool_input": {"content": "x" * (64 * 1024)},
+            },
+            source="claude_code",
+            interaction_id="permission-large",
+        )
+
+        assert interaction is not None
+        self.assertNotIn("tool_input", interaction)
 
     def test_claude_permission_request_preserves_always_allow_rule(self) -> None:
         interaction = normalize_interaction(

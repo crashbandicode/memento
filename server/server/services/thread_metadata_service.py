@@ -27,6 +27,11 @@ from .conversation_activity import (
     ACTIVITY_FUTURE_CLOCK_SKEW,
     parse_conversation_activity_timestamp,
 )
+from .claude_lineage import (
+    INTERACTION_ORIGIN_KEY,
+    normalize_interaction_origin,
+    origin_matches_permission_interaction,
+)
 from .document_delivery import (
     attach_document_delivery,
     delivery_metadata_expression,
@@ -506,6 +511,7 @@ async def apply_conversation_interaction_update(
     interaction_status: str,
     question_tool: str,
     interaction_input: object,
+    interaction_origin: object = None,
     timestamp: str = "",
 ) -> ThreadTitleUpdateResult:
     """Apply a live question preview without waiting for its transcript delta."""
@@ -563,6 +569,19 @@ async def apply_conversation_interaction_update(
     )
 
     previous_signal = signals.get(interaction_id)
+    previous_history = _interaction_history(metadata).get(interaction_id)
+    previous_history_origin = (
+        normalize_interaction_origin(
+            previous_history.get(INTERACTION_ORIGIN_KEY)
+        )
+        if isinstance(previous_history, dict)
+        else None
+    )
+    origin = (
+        normalize_interaction_origin(interaction_origin)
+        if tool_id == "claude_code" and status == "pending"
+        else None
+    )
     stale_pending = status == "pending" and interaction_at_or_before_human(
         timestamp,
         metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY),
@@ -583,6 +602,14 @@ async def apply_conversation_interaction_update(
             if recovered is None:
                 return ThreadTitleUpdateResult(1, 0, 1, valid=False)
             interaction = recovered
+        if origin is not None and not origin_matches_permission_interaction(
+            origin,
+            interaction,
+        ):
+            # Provenance is an authority to hide only when it is bound to this
+            # exact normalized PermissionRequest. A mismatched collector value
+            # remains an ordinary fail-open live interaction.
+            origin = None
         fingerprint = interaction_question_fingerprint(interaction)
         normalized_question_tool = re.sub(
             r"[^a-z0-9]",
@@ -626,7 +653,7 @@ async def apply_conversation_interaction_update(
                 for sibling_id in duplicate_question_ids:
                     signals.pop(sibling_id, None)
                     pending_ids.discard(sibling_id)
-            signals[interaction_id] = {
+            signal = {
                 "interaction": interaction,
                 "timestamp": _bounded_message_text(str(timestamp or ""), 128),
                 "tool_name": _bounded_message_text(
@@ -634,6 +661,20 @@ async def apply_conversation_interaction_update(
                     256,
                 ),
             }
+            if origin is not None:
+                signal[INTERACTION_ORIGIN_KEY] = origin
+            else:
+                previous_origin = (
+                    normalize_interaction_origin(
+                        previous_signal.get(INTERACTION_ORIGIN_KEY)
+                    )
+                    if isinstance(previous_signal, dict)
+                    else None
+                )
+                retained_origin = previous_origin or previous_history_origin
+                if retained_origin is not None:
+                    signal[INTERACTION_ORIGIN_KEY] = retained_origin
+            signals[interaction_id] = signal
             pending_ids.add(interaction_id)
             if interaction.get("interaction_type") == "permission_request":
                 anchor_line_number = await _interaction_anchor_line(
@@ -641,19 +682,23 @@ async def apply_conversation_interaction_update(
                     document.id,
                     timestamp,
                 )
+                history_entry = {
+                    "interaction": interaction,
+                    "timestamp": _bounded_message_text(
+                        str(timestamp or ""),
+                        128,
+                    ),
+                    "status": "pending",
+                    "response": None,
+                    "anchor_line_number": anchor_line_number,
+                }
+                retained_origin = origin or previous_history_origin
+                if retained_origin is not None:
+                    history_entry[INTERACTION_ORIGIN_KEY] = retained_origin
                 _upsert_interaction_history(
                     metadata,
                     interaction_id,
-                    {
-                        "interaction": interaction,
-                        "timestamp": _bounded_message_text(
-                            str(timestamp or ""),
-                            128,
-                        ),
-                        "status": "pending",
-                        "response": None,
-                        "anchor_line_number": anchor_line_number,
-                    },
+                    history_entry,
                 )
 
             # Also prune legacy malformed wrappers that cannot be recovered
@@ -736,25 +781,35 @@ async def apply_conversation_interaction_update(
                         document.id,
                         resolved_timestamp,
                     )
+                resolved_entry = {
+                    "interaction": interaction,
+                    "timestamp": _bounded_message_text(
+                        resolved_timestamp,
+                        128,
+                    ),
+                    "status": status,
+                    "response": {
+                        "kind": "question_response",
+                        "interaction_id": interaction_id,
+                        "status": status,
+                        "answers": [],
+                        "raw_text": "",
+                    },
+                    "anchor_line_number": anchor_line_number,
+                }
+                retained_origin = origin or (
+                    normalize_interaction_origin(
+                        history_entry.get(INTERACTION_ORIGIN_KEY)
+                    )
+                    if isinstance(history_entry, dict)
+                    else None
+                )
+                if retained_origin is not None:
+                    resolved_entry[INTERACTION_ORIGIN_KEY] = retained_origin
                 _upsert_interaction_history(
                     metadata,
                     interaction_id,
-                    {
-                        "interaction": interaction,
-                        "timestamp": _bounded_message_text(
-                            resolved_timestamp,
-                            128,
-                        ),
-                        "status": status,
-                        "response": {
-                            "kind": "question_response",
-                            "interaction_id": interaction_id,
-                            "status": status,
-                            "answers": [],
-                            "raw_text": "",
-                        },
-                        "anchor_line_number": anchor_line_number,
-                    },
+                    resolved_entry,
                 )
 
     bounded_ids = sorted(pending_ids)[:64]

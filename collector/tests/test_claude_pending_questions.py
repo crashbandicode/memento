@@ -399,6 +399,19 @@ def test_new_question_closes_replaced_permission_without_session_state(
         "interaction_status": "answered",
         "timestamp": "2026-08-05T13:01:07Z",
         "resolved_at": "2026-08-05T13:04:08Z",
+        "interaction_origin": {
+            "version": 1,
+            "kind": "hook_only",
+            "record_uuid": "",
+            "parent_uuid": "",
+            "tool_use_id": "",
+            "fingerprint": hook_module._permission_fingerprint(
+                "PowerShell",
+                {"command": "git push origin HEAD:main"},
+            ),
+            "agent_id": "",
+            "is_sidechain": False,
+        },
     }]
 
     records = extract_claude_pending_interaction_updates(claude_root)
@@ -878,6 +891,713 @@ def test_shell_activity_does_not_refresh_pending_permission_timestamp(
     assert interaction["interaction_status"] == "answered"
 
 
+def _claude_tool_record(
+    *,
+    uuid: str,
+    parent_uuid: str,
+    tool_use_id: str,
+    tool_name: str,
+    tool_input: dict,
+    **record_fields: object,
+) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "parentUuid": parent_uuid,
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": tool_name,
+                "input": tool_input,
+            }],
+        },
+        **record_fields,
+    }
+
+
+def _permission_payload(
+    *,
+    session_id: str,
+    transcript: Path,
+    tool_name: str = "Bash",
+    tool_input: dict | None = None,
+) -> dict:
+    return {
+        "hook_event_name": "PermissionRequest",
+        "session_id": session_id,
+        "transcript_path": str(transcript),
+        "tool_name": tool_name,
+        "tool_input": tool_input or {"command": "git status"},
+        "timestamp": "2026-08-14T12:00:00Z",
+    }
+
+
+def test_permission_fingerprint_v1_contract_fixture() -> None:
+    assert hook_module._permission_fingerprint("Bash", {"command": "ls"}) == (
+        "679eb83c897d20b481ff8e75961f8076d6721d232a7ad433cf4528bdeaf4099e"
+    )
+
+
+def test_permission_origin_resolves_exact_main_transcript_record(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-origin.jsonl"
+    transcript.parent.mkdir(parents=True)
+    requested_input = {"command": "git status", "timeout": 30}
+    transcript.write_text(
+        json.dumps(_claude_tool_record(
+            uuid="record-main",
+            parent_uuid="parent-main",
+            tool_use_id="toolu-main",
+            tool_name="Bash",
+            tool_input={"timeout": 30, "command": "git status"},
+        )) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-origin",
+        transcript=transcript,
+        tool_input=requested_input,
+    ))
+
+    side_record = json.loads(
+        (pending_directory / "session-origin.json").read_text(encoding="utf-8")
+    )
+    origin = side_record["interaction_origin"]
+    assert origin == {
+        "version": 1,
+        "kind": "claude_record",
+        "record_uuid": "record-main",
+        "parent_uuid": "parent-main",
+        "tool_use_id": "toolu-main",
+        "fingerprint": hook_module._permission_fingerprint("Bash", requested_input),
+        "agent_id": "",
+        "is_sidechain": False,
+        "transcript_path": "projects/demo/session-origin.jsonl",
+    }
+    assert origin["fingerprint"] == hook_module._permission_fingerprint(
+        "Bash",
+        {"timeout": 30, "command": "git status"},
+    )
+
+
+def test_permission_origin_chooses_latest_exact_duplicate(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-latest.jsonl"
+    transcript.parent.mkdir(parents=True)
+    requested_input = {"command": "git status"}
+    transcript.write_text(
+        "\n".join(json.dumps(record) for record in [
+            _claude_tool_record(
+                uuid="record-earlier",
+                parent_uuid="parent-1",
+                tool_use_id="toolu-earlier",
+                tool_name="Bash",
+                tool_input=requested_input,
+            ),
+            _claude_tool_record(
+                uuid="record-latest",
+                parent_uuid="parent-2",
+                tool_use_id="toolu-latest",
+                tool_name="Bash",
+                tool_input=requested_input,
+            ),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-latest",
+        transcript=transcript,
+        tool_input=requested_input,
+    ))
+
+    origin = json.loads(
+        (pending_directory / "session-latest.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert origin["record_uuid"] == "record-latest"
+    assert origin["tool_use_id"] == "toolu-latest"
+
+
+def test_permission_origin_never_fuzzy_matches_and_handles_large_malformed_tail(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-hook-only.jsonl"
+    transcript.parent.mkdir(parents=True)
+    requested_input = {"command": "git status"}
+    # This prefix is larger than the resolver's tail and has no newline, so a
+    # full-file scan would be observable while the bounded tail still finds the
+    # valid final row after skipping the partial oversized line.
+    transcript.write_bytes(
+        b"x" * (hook_module._TRANSCRIPT_TAIL_BYTES + 1)
+        + b"\nnot-json\n"
+        + json.dumps(_claude_tool_record(
+            uuid="record-different-input",
+            parent_uuid="parent-different-input",
+            tool_use_id="toolu-different-input",
+            tool_name="Bash",
+            tool_input={"command": "git status --short"},
+        )).encode("utf-8")
+        + b"\n"
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-hook-only",
+        transcript=transcript,
+        tool_input=requested_input,
+    ))
+
+    origin = json.loads(
+        (pending_directory / "session-hook-only.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert origin["kind"] == "hook_only"
+    assert origin["record_uuid"] == ""
+    assert origin["tool_use_id"] == ""
+    assert origin["fingerprint"] == hook_module._permission_fingerprint(
+        "Bash", requested_input
+    )
+
+
+def test_permission_origin_classifies_subagent_transcript(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root
+        / "projects"
+        / "demo"
+        / "session-parent"
+        / "subagents"
+        / "agent-42.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(_claude_tool_record(
+            uuid="record-agent",
+            parent_uuid="parent-agent",
+            tool_use_id="toolu-agent",
+            tool_name="PowerShell",
+            tool_input={"command": "Get-Date"},
+            isSidechain=True,
+            agentId="agent-42",
+        )) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-parent",
+        transcript=transcript,
+        tool_name="PowerShell",
+        tool_input={"command": "Get-Date"},
+    ))
+
+    origin = json.loads(
+        (pending_directory / "session-parent.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert origin["kind"] == "claude_subagent_record"
+    assert origin["agent_id"] == "agent-42"
+    assert origin["is_sidechain"] is True
+    assert origin["transcript_path"] == (
+        "projects/demo/session-parent/subagents/agent-42.jsonl"
+    )
+
+
+def test_permission_origin_survives_resolved_history_and_signal_extraction(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-history.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(_claude_tool_record(
+            uuid="record-history",
+            parent_uuid="parent-history",
+            tool_use_id="toolu-history",
+            tool_name="Bash",
+            tool_input={"command": "git status"},
+        )) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+    hook_module.process_payload(_permission_payload(
+        session_id="session-history",
+        transcript=transcript,
+    ))
+    side_path = pending_directory / "session-history.json"
+    permission_id = json.loads(side_path.read_text(encoding="utf-8"))["interaction_id"]
+
+    hook_module.process_payload({
+        "hook_event_name": "PreToolUse",
+        "session_id": "session-history",
+        "transcript_path": str(transcript),
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": "toolu-next",
+        "tool_input": {"questions": [{"question": "Continue?"}]},
+    })
+
+    side_record = json.loads(side_path.read_text(encoding="utf-8"))
+    history_origin = side_record["resolved_interactions"][0]["interaction_origin"]
+    assert history_origin["record_uuid"] == "record-history"
+    records = extract_claude_pending_interaction_updates(claude_root)
+    signal = records[
+        "claude_code:projects/demo/session-history.jsonl:" + permission_id
+    ]
+    assert signal["interaction_origin"] == history_origin
+
+
+def test_session_end_cancels_only_pending_hook_only_permission(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-end.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+    hook_module.process_payload(_permission_payload(
+        session_id="session-end",
+        transcript=transcript,
+    ))
+    side_path = pending_directory / "session-end.json"
+
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-end",
+        "timestamp": "2026-08-14T12:01:00Z",
+    })
+
+    cancelled = json.loads(side_path.read_text(encoding="utf-8"))
+    assert cancelled["interaction_status"] == "cancelled"
+    assert cancelled["session_end_timestamp"] == "2026-08-14T12:01:00Z"
+
+    answered_history = [{
+        "interaction_id": "memento-permission-prior",
+        "question_tool": "PermissionRequest",
+        "interaction_input": {"interaction_type": "permission_request"},
+        "interaction_status": "answered",
+        "interaction_origin": cancelled["interaction_origin"],
+    }]
+    preserved = {
+        **cancelled,
+        "interaction_id": "toolu-current-question",
+        "question_tool": "AskUserQuestion",
+        "interaction_input": {"questions": [{"question": "Keep history?"}]},
+        "interaction_status": "pending",
+        "resolved_interactions": answered_history,
+    }
+    side_path.write_text(json.dumps(preserved), encoding="utf-8")
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-end",
+        "timestamp": "2026-08-14T12:02:00Z",
+    })
+    assert json.loads(side_path.read_text(encoding="utf-8")) == preserved
+
+
+@pytest.mark.parametrize("origin_kind", [
+    "claude_record",
+    "claude_subagent_record",
+    "hook_only",
+])
+def test_session_end_cancels_every_pending_permission_origin(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin_kind: str,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-terminal.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    side_path = pending_directory / "session-terminal.json"
+    side_path.write_text(json.dumps({
+        "session_id": "session-terminal",
+        "transcript_path": str(transcript),
+        "interaction_id": "memento-permission-terminal",
+        "question_tool": "PermissionRequest",
+        "interaction_input": {"interaction_type": "permission_request"},
+        "interaction_status": "pending",
+        "interaction_origin": {
+            "version": 1,
+            "kind": origin_kind,
+            "record_uuid": "record-terminal" if origin_kind != "hook_only" else "",
+            "parent_uuid": "parent-terminal" if origin_kind != "hook_only" else "",
+            "tool_use_id": "toolu-terminal" if origin_kind != "hook_only" else "",
+            "fingerprint": "f" * 64,
+            "agent_id": "agent-terminal" if origin_kind == "claude_subagent_record" else "",
+            "is_sidechain": origin_kind == "claude_subagent_record",
+        },
+    }), encoding="utf-8")
+
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-terminal",
+        "reason": "logout",
+        "timestamp": "2026-08-14T12:03:00Z",
+    })
+
+    terminal = json.loads(side_path.read_text(encoding="utf-8"))
+    assert terminal["interaction_status"] == "cancelled"
+    assert terminal["session_end_reason"] == "logout"
+
+
+@pytest.mark.parametrize("status", ["answered", "cancelled"])
+def test_session_end_preserves_existing_terminal_permission(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    side_path = pending_directory / "session-already-terminal.json"
+    existing = {
+        "session_id": "session-already-terminal",
+        "interaction_id": "memento-permission-terminal",
+        "question_tool": "PermissionRequest",
+        "interaction_input": {"interaction_type": "permission_request"},
+        "interaction_status": status,
+        "interaction_origin": {"kind": "hook_only", "version": 1},
+    }
+    side_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-already-terminal",
+        "reason": "clear",
+        "timestamp": "2026-08-14T12:04:00Z",
+    })
+
+    assert json.loads(side_path.read_text(encoding="utf-8")) == existing
+
+
+def test_session_end_marker_prevents_late_permission_resurrection(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-race.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    # SessionEnd publishes its durable marker before obtaining the side-file
+    # lock. A PermissionRequest that arrives after that point cannot recreate
+    # a pending side record, even if it would otherwise be valid.
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-race",
+        "reason": "user_exit",
+    })
+    hook_module.process_payload(_permission_payload(
+        session_id="session-race",
+        transcript=transcript,
+    ))
+
+    assert not (pending_directory / "session-race.json").exists()
+    marker = json.loads(
+        (pending_directory / ".session-race.session-ended").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["reason"] == "user_exit"
+
+
+def test_permission_then_session_end_cancels_race_winner(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-race-winner.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-race-winner",
+        transcript=transcript,
+    ))
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-race-winner",
+        "reason": "clear",
+    })
+
+    terminal = json.loads(
+        (pending_directory / "session-race-winner.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert terminal["interaction_status"] == "cancelled"
+    assert terminal["session_end_reason"] == "clear"
+
+
+def test_session_start_clears_terminal_marker_without_reviving_permission(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-resume.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+    payload = _permission_payload(
+        session_id="session-resume",
+        transcript=transcript,
+    )
+    hook_module.process_payload(payload)
+    side_path = pending_directory / "session-resume.json"
+    cancelled_id = json.loads(side_path.read_text(encoding="utf-8"))["interaction_id"]
+    hook_module.process_payload({
+        "hook_event_name": "SessionEnd",
+        "session_id": "session-resume",
+        "reason": "compact",
+    })
+    hook_module.process_payload({
+        "hook_event_name": "SessionStart",
+        "session_id": "session-resume",
+        "reason": "resume",
+    })
+    assert not (pending_directory / ".session-resume.session-ended").exists()
+
+    hook_module.process_payload(payload)
+
+    resumed = json.loads(side_path.read_text(encoding="utf-8"))
+    assert resumed["interaction_status"] == "pending"
+    assert resumed["interaction_id"] != cancelled_id
+    assert resumed["session_start_generation"] == 1
+    assert resumed["resolved_interactions"][0]["interaction_id"] == cancelled_id
+    assert resumed["resolved_interactions"][0]["interaction_status"] == "cancelled"
+
+
+def test_permission_origin_rejects_unrelated_and_nonassistant_records(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    unrelated = claude_root / "projects" / "demo" / "other-session.jsonl"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text(json.dumps(_claude_tool_record(
+        uuid="record-unrelated",
+        parent_uuid="parent-unrelated",
+        tool_use_id="toolu-unrelated",
+        tool_name="Bash",
+        tool_input={"command": "git status"},
+    )) + "\n", encoding="utf-8")
+    main = claude_root / "projects" / "demo" / "session-assistant.jsonl"
+    main.write_text(json.dumps({
+        **_claude_tool_record(
+            uuid="record-user",
+            parent_uuid="parent-user",
+            tool_use_id="toolu-user",
+            tool_name="Bash",
+            tool_input={"command": "git status"},
+        ),
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu-user",
+                "name": "Bash",
+                "input": {"command": "git status"},
+            }],
+        },
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-owner",
+        transcript=unrelated,
+    ))
+    unrelated_origin = json.loads(
+        (pending_directory / "session-owner.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert unrelated_origin["kind"] == "hook_only"
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-assistant",
+        transcript=main,
+    ))
+    nonassistant_origin = json.loads(
+        (pending_directory / "session-assistant.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert nonassistant_origin["kind"] == "hook_only"
+
+
+def test_permission_origin_accepts_nested_subagent_topology(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root
+        / "projects"
+        / "demo"
+        / "session-root"
+        / "subagents"
+        / "child-agent"
+        / "subagents"
+        / "grandchild-agent.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps(_claude_tool_record(
+        uuid="record-grandchild",
+        parent_uuid="parent-grandchild",
+        tool_use_id="toolu-grandchild",
+        tool_name="Bash",
+        tool_input={"command": "git status"},
+    )) + "\n", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-root",
+        transcript=transcript,
+    ))
+
+    origin = json.loads(
+        (pending_directory / "session-root.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert origin["kind"] == "claude_subagent_record"
+    assert origin["transcript_path"] == (
+        "projects/demo/session-root/subagents/child-agent/subagents/"
+        "grandchild-agent.jsonl"
+    )
+
+
+def test_permission_duplicate_keeps_prior_exact_origin_after_fallback(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-retain.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps(_claude_tool_record(
+        uuid="record-retain",
+        parent_uuid="parent-retain",
+        tool_use_id="toolu-retain",
+        tool_name="Bash",
+        tool_input={"command": "git status"},
+    )) + "\n", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+    payload = _permission_payload(
+        session_id="session-retain",
+        transcript=transcript,
+    )
+    hook_module.process_payload(payload)
+    side_path = pending_directory / "session-retain.json"
+    exact_origin = json.loads(side_path.read_text(encoding="utf-8"))["interaction_origin"]
+
+    transcript.unlink()
+    hook_module.process_payload(payload)
+
+    origin = json.loads(side_path.read_text(encoding="utf-8"))["interaction_origin"]
+    assert origin == exact_origin
+
+
+def test_signal_drops_corrupt_legacy_origin_transcript_path(
+    tmp_path: Path,
+    pending_directory: Path,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-origin-path.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    _write_side_file(
+        pending_directory,
+        session_id="session-origin-path",
+        transcript_path=transcript,
+        status="pending",
+        question_tool="PermissionRequest",
+    )
+    side_path = pending_directory / "session-origin-path.json"
+    side_record = json.loads(side_path.read_text(encoding="utf-8"))
+    side_record["interaction_origin"] = {
+        "version": 1,
+        "kind": "claude_record",
+        "record_uuid": "record-safe",
+        "parent_uuid": "parent-safe",
+        "tool_use_id": "toolu-safe",
+        "fingerprint": "f" * 64,
+        "agent_id": "",
+        "is_sidechain": False,
+        "transcript_path": "../../outside.jsonl",
+    }
+    side_path.write_text(json.dumps(side_record), encoding="utf-8")
+
+    signal = next(
+        iter(extract_claude_pending_interaction_updates(claude_root).values())
+    )
+
+    assert signal["interaction_origin"]["record_uuid"] == "record-safe"
+    assert "transcript_path" not in signal["interaction_origin"]
+
+
+def test_nonfinite_permission_input_never_matches_or_crashes(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = claude_root / "projects" / "demo" / "session-nonfinite.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    monkeypatch.setattr(hook_module, "_claude_root", lambda: claude_root)
+
+    hook_module.process_payload(_permission_payload(
+        session_id="session-nonfinite",
+        transcript=transcript,
+        tool_input={"timeout": float("nan")},
+    ))
+
+    origin = json.loads(
+        (pending_directory / "session-nonfinite.json").read_text(encoding="utf-8")
+    )["interaction_origin"]
+    assert origin["kind"] == "hook_only"
+    assert origin["record_uuid"] == ""
+
+
 def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
     config_directory = tmp_path / ".claude"
     config_directory.mkdir()
@@ -952,6 +1672,8 @@ def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
     assert settings["hooks"]["PermissionRequest"][0]["matcher"] == ".*"
     assert settings["hooks"]["Elicitation"][0]["matcher"] == ".*"
     assert settings["hooks"]["ElicitationResult"][0]["matcher"] == ".*"
+    assert settings["hooks"]["SessionEnd"][0]["matcher"] == ".*"
+    assert settings["hooks"]["SessionStart"][0]["matcher"] == ".*"
     assert {
         entry["matcher"] for entry in settings["hooks"]["Notification"]
     } == {"agent_needs_input", "agent_completed"}

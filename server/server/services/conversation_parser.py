@@ -2455,6 +2455,7 @@ _CURSOR_ANSWERED_INTERACTION_STATUSES = {
 }
 _MAX_INTERACTION_QUESTIONS = 8
 _MAX_INTERACTION_OPTIONS = 12
+_MAX_PERMISSION_TOOL_INPUT_BYTES = 64 * 1024
 CURSOR_QUESTION_RESPONSE_WINDOW = 4
 
 
@@ -2468,6 +2469,33 @@ def _json_mapping(value: object) -> dict:
     except (json.JSONDecodeError, TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _bounded_permission_tool_input(value: object) -> dict | None:
+    """Return an exact JSON mapping only while it fits the origin contract.
+
+    Claude permission provenance is bound to the literal structured tool
+    input.  Retaining that input lets later branch-lineage checks recompute the
+    digest without trusting a collector-supplied classification.  The same
+    64-KiB ceiling used by the collector prevents document metadata from
+    growing without bound; larger/non-standard inputs remain hook-only and
+    therefore fail open.
+    """
+    if not isinstance(value, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > _MAX_PERMISSION_TOOL_INPUT_BYTES:
+        return None
+    return json.loads(encoded)
 
 
 _NESTED_CODEX_UPDATE_PLAN_RE = re.compile(
@@ -3462,7 +3490,7 @@ def normalize_claude_live_prompt_interaction(
         interaction_type = "agent_needs_input"
         requested_tool_name = ""
 
-    return {
+    interaction = {
         "kind": "question",
         "interaction_type": interaction_type,
         "id": _bounded_interaction_text(interaction_id, 512),
@@ -3471,6 +3499,11 @@ def normalize_claude_live_prompt_interaction(
         "requested_tool": requested_tool_name,
         "questions": questions,
     }
+    if interaction_type == "permission_request":
+        retained_tool_input = _bounded_permission_tool_input(tool_input)
+        if retained_tool_input is not None:
+            interaction["tool_input"] = retained_tool_input
+    return interaction
 
 
 def normalize_cursor_plan_mode_interaction(
@@ -3677,13 +3710,13 @@ def _repair_claude_question_interaction_text(
             repaired_questions.append(raw_question)
             continue
         question = dict(raw_question)
-        for field in ("id", "header", "prompt"):
-            value = question.get(field)
+        for field_name in ("id", "header", "prompt"):
+            value = question.get(field_name)
             if not isinstance(value, str):
                 continue
             repaired = _repair_detectable_utf8_cp1252_mojibake(value)
             if repaired != value:
-                question[field] = repaired
+                question[field_name] = repaired
                 changed = True
 
         raw_options = question.get("options")
@@ -3694,13 +3727,13 @@ def _repair_claude_question_interaction_text(
                     repaired_options.append(raw_option)
                     continue
                 option = dict(raw_option)
-                for field in ("id", "label", "short_label", "description"):
-                    value = option.get(field)
+                for field_name in ("id", "label", "short_label", "description"):
+                    value = option.get(field_name)
                     if not isinstance(value, str):
                         continue
                     repaired = _repair_detectable_utf8_cp1252_mojibake(value)
                     if repaired != value:
-                        option[field] = repaired
+                        option[field_name] = repaired
                         changed = True
                 repaired_options.append(option)
             question["options"] = repaired_options

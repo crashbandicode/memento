@@ -730,6 +730,31 @@ def iter_stored_conversation_objects(
     )
 
 
+def iter_claude_lineage_records(
+    content: str,
+    *,
+    conversation_source: ConversationFileSource | None = None,
+) -> Iterator[object]:
+    """Yield raw Claude records for lineage without normalizing UI content.
+
+    The streamed source is re-opened by its source abstraction; DELTAs contain
+    only their new records, while FULL is the authoritative complete replay.
+    This deliberately observes only record identity/parents, not message text.
+    """
+    if conversation_source is not None:
+        yield from conversation_source.iter_objects()
+        return
+    import json
+
+    for raw_line in content.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            yield record
+
+
 def _iter_stored_normalized_messages(
     messages: Iterable[object],
 ) -> Iterator[tuple[object, str, dict, datetime | None]]:
@@ -3847,6 +3872,57 @@ async def _extract_messages(
         return "".join(search_parts)
 
     tool_id = doc.tool_id
+    lineage_changed = False
+    if tool_id == "claude_code":
+        # Persist the raw parent UUID tree before rendering projections. This
+        # path sees UUID-bearing progress/file-history records even when the
+        # semantic parser intentionally emits no corresponding UI row.
+        from .claude_lineage import (
+            backfill_legacy_interaction_origins,
+            refresh_claude_lineage,
+        )
+        from .document_delivery import (
+            attach_document_delivery,
+            document_metadata,
+            ensure_document_delivery_state,
+            store_document_metadata,
+        )
+        from .conversation_hierarchy import is_conversation_subagent
+
+        effective_metadata = document_metadata(doc)
+        lineage_changed = await refresh_claude_lineage(
+            db,
+            doc,
+            iter_claude_lineage_records(
+                content,
+                conversation_source=conversation_source,
+            ),
+            mode=mode,
+            document_is_subagent=is_conversation_subagent(
+                doc.tool_id,
+                doc.relative_path,
+                effective_metadata,
+            ),
+        )
+        if mode == "full" and backfill_legacy_interaction_origins(
+            effective_metadata,
+            iter_claude_lineage_records(
+                content,
+                conversation_source=conversation_source,
+            ),
+            document_is_subagent=is_conversation_subagent(
+                doc.tool_id,
+                doc.relative_path,
+                effective_metadata,
+            ),
+            session_id=str(effective_metadata.get("session_id") or ""),
+        ):
+            # The history list remains bounded by its existing owner. Only an
+            # exact, unique origin annotation changed, so no message reparse
+            # or document-level UUID chain is introduced.
+            delivery_state = await ensure_document_delivery_state(db, doc)
+            attach_document_delivery(doc, delivery_state, runtime_only=True)
+            store_document_metadata(doc, effective_metadata)
     cursor_projection_delta = (
         mode == "delta"
         and tool_id == "cursor"
@@ -3910,7 +3986,7 @@ async def _extract_messages(
     pending_question_ids = _pending_question_ids_for_ingest(doc, mode)
     latest_human_timestamp = _latest_human_timestamp_for_ingest(doc, mode)
     canonical_interaction_ids: set[str] = set()
-    interactions_changed = mode == "full"
+    interactions_changed = mode == "full" or lineage_changed
     terminal_tool_call_ids: set[str] = set()
     clear_live_interaction_signals = False
     line_num = start_line

@@ -278,6 +278,7 @@ async def apply_deferred_conversation_metadata(
                 interaction_status=str(payload.get("interaction_status") or ""),
                 question_tool=str(payload.get("question_tool") or ""),
                 interaction_input=payload.get("interaction_input") or {},
+                interaction_origin=payload.get("interaction_origin"),
                 timestamp=str(payload.get("timestamp") or ""),
             )
         elif metadata_type == "conversation_activity":

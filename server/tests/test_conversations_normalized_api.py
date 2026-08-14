@@ -23,7 +23,9 @@ from server.api.conversations import (  # noqa: E402
     get_pending_conversation_interactions,
     search_conversation_messages,
 )
-from server.services.conversation_read_model import READ_MODEL_VERSION  # noqa: E402
+from server.services.claude_lineage import (  # noqa: E402
+    canonical_permission_fingerprint,
+)
 
 
 class _Result:
@@ -1476,6 +1478,202 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         for statement in db.statements:
             sql = str(statement.compile(dialect=postgresql.dialect())).upper()
             self.assertNotIn("CONVERSATION_MESSAGES", sql)
+
+    async def test_claude_lineage_history_predicate_matches_projected_and_fallback(self) -> None:
+        self.doc.tool_id = "claude_code"
+
+        def history(interaction_id: str, requested_tool: str, origin: dict) -> dict:
+            return {
+                "interaction": {
+                    "id": interaction_id,
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "PermissionRequest",
+                    "requested_tool": requested_tool,
+                    "tool_input": {"command": interaction_id},
+                    "interaction_type": "permission_request",
+                    "questions": [],
+                },
+                "timestamp": "2026-08-14T12:00:00Z",
+                "status": "answered",
+                "response": {"kind": "question_response", "status": "answered"},
+                "anchor_line_number": 5,
+                "interaction_origin": origin,
+            }
+
+        def origin(
+            kind: str,
+            record_uuid: str,
+            requested_tool: str,
+            interaction_id: str,
+            *,
+            agent_id: str = "",
+            is_sidechain: bool = False,
+        ) -> dict:
+            return {
+                "version": 1,
+                "kind": kind,
+                "record_uuid": record_uuid,
+                "parent_uuid": "",
+                "tool_use_id": "tool-use",
+                "fingerprint": canonical_permission_fingerprint(
+                    requested_tool,
+                    {"command": interaction_id},
+                ),
+                "agent_id": agent_id,
+                "is_sidechain": is_sidechain,
+            }
+
+        self.doc.metadata_["_interaction_history"] = [
+            history(
+                "inactive",
+                "Bash",
+                origin("claude_record", "inactive-record", "Bash", "inactive"),
+            ),
+            history(
+                "active",
+                "PowerShell",
+                origin(
+                    "claude_record",
+                    "active-record",
+                    "PowerShell",
+                    "active",
+                ),
+            ),
+            history(
+                "subagent",
+                "Read",
+                origin(
+                    "claude_subagent_record",
+                    "child-record",
+                    "Read",
+                    "subagent",
+                    agent_id="agent-child",
+                    is_sidechain=True,
+                ),
+            ),
+            history(
+                "hook",
+                "Write",
+                origin("hook_only", "", "Write", "hook"),
+            ),
+        ]
+        self.doc.metadata_["_live_interaction_signals"] = {
+            "inactive-live": {
+                "interaction": history(
+                    "inactive-live",
+                    "Bash",
+                    {},
+                )["interaction"],
+                "timestamp": "2026-08-14T12:01:00Z",
+                "interaction_origin": origin(
+                    "claude_record",
+                    "inactive-live-record",
+                    "Bash",
+                    "inactive-live",
+                ),
+            },
+            "active-live": {
+                "interaction": history(
+                    "active-live",
+                    "PowerShell",
+                    {},
+                )["interaction"],
+                "timestamp": "2026-08-14T12:01:01Z",
+                "interaction_origin": origin(
+                    "claude_record",
+                    "active-live-record",
+                    "PowerShell",
+                    "active-live",
+                ),
+            },
+            "subagent-live": {
+                "interaction": history(
+                    "subagent-live",
+                    "Read",
+                    {},
+                )["interaction"],
+                "timestamp": "2026-08-14T12:01:02Z",
+                "interaction_origin": origin(
+                    "claude_subagent_record",
+                    "child-live-record",
+                    "Read",
+                    "subagent-live",
+                    agent_id="agent-child",
+                    is_sidechain=True,
+                ),
+            },
+            "hook-live": {
+                "interaction": history(
+                    "hook-live",
+                    "Write",
+                    {},
+                )["interaction"],
+                "timestamp": "2026-08-14T12:01:03Z",
+                "interaction_origin": origin(
+                    "hook_only",
+                    "",
+                    "Write",
+                    "hook-live",
+                ),
+            },
+        }
+        projection = self.read_model(projected_through_line=5)
+        projected_db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[
+                (self.doc_id, "inactive-record", False, False, False, ""),
+                (self.doc_id, "active-record", True, False, False, ""),
+                (self.doc_id, "child-record", True, True, True, "agent-child"),
+                (self.doc_id, "inactive-live-record", False, False, False, ""),
+                (self.doc_id, "active-live-record", True, False, False, ""),
+                (self.doc_id, "child-live-record", True, True, True, "agent-child"),
+            ]),
+        ])
+        projected = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=projected_db,
+            _user=self.owner,
+        )
+
+        fallback_doc = SimpleNamespace(**self.doc.__dict__)
+        fallback_db = _Db([
+            _Result(scalar_value=fallback_doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[(self.doc_id, 5)]),
+            _Result(rows=[]),
+            _Result(rows=[
+                (self.doc_id, "inactive-record", False, False, False, ""),
+                (self.doc_id, "active-record", True, False, False, ""),
+                (self.doc_id, "child-record", True, True, True, "agent-child"),
+                (self.doc_id, "inactive-live-record", False, False, False, ""),
+                (self.doc_id, "active-live-record", True, False, False, ""),
+                (self.doc_id, "child-live-record", True, True, True, "agent-child"),
+            ]),
+            _Result(rows=[]),
+        ])
+        fallback = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=fallback_db,
+            _user=self.owner,
+        )
+
+        expected = ["active", "active-live", "hook", "hook-live"]
+        self.assertEqual(
+            sorted(
+                item["interaction"]["id"]
+                for item in projected["inline_interactions"]
+            ),
+            expected,
+        )
+        self.assertEqual(
+            sorted(
+                item["interaction"]["id"]
+                for item in fallback["inline_interactions"]
+            ),
+            expected,
+        )
 
     async def test_claude_child_parent_messages_are_not_prompt_navigation(self) -> None:
         self.doc.tool_id = "claude_code"

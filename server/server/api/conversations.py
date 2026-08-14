@@ -58,9 +58,16 @@ from ..services.conversation_parser import (
     parse_conversation,
 )
 from ..services.conversation_read_model import conversation_prompt_rows_statement
+from ..services.claude_lineage import (
+    INTERACTION_ORIGIN_KEY,
+    history_entry_is_visible,
+    load_lineage_active_states,
+    normalize_interaction_origin,
+)
 from ..services.document_delivery import (
     delivery_metadata_expression,
     delivery_synced_expression,
+    document_metadata,
 )
 from ..services.ingest_service import (
     INTERACTION_HISTORY_KEY,
@@ -272,6 +279,19 @@ def _stored_interaction_history(metadata: object) -> list[dict]:
     else:
         return []
     return [entry for entry in entries if isinstance(entry, dict)][-32:]
+
+
+def _lineage_visibility_entries(metadata: object) -> list[dict]:
+    """Return retained history plus live signals that carry provenance."""
+    entries = list(_stored_interaction_history(metadata))
+    if not isinstance(metadata, dict):
+        return entries
+    signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+    if isinstance(signals, dict):
+        entries.extend(
+            signal for signal in signals.values() if isinstance(signal, dict)
+        )
+    return entries
 
 
 def _current_interaction_history_anchor(
@@ -516,7 +536,8 @@ async def _get_conversation_identity(
                 Document.title,
                 Document.relative_path,
                 Document.metadata_,
-            )
+            ),
+            joinedload(Document.delivery_state),
         )
         .where(Document.id == doc_id)
     )
@@ -1145,6 +1166,7 @@ async def _projected_pending_interactions(
         .where(Document.machine_id == document.machine_id)
         .order_by(Document.id)
         .limit(257)
+        .options(joinedload(Document.delivery_state))
     )
     if projection.root_thread_id:
         statement = statement.where(
@@ -1158,6 +1180,17 @@ async def _projected_pending_interactions(
     if not rows:
         rows = [(document, projection)]
 
+    lineage_states = await load_lineage_active_states(
+        db,
+        (
+            (source_document.id, entry)
+            for source_document, _state in rows
+            for entry in _lineage_visibility_entries(
+                document_metadata(source_document)
+            )
+        ),
+    )
+
     interactions: list[dict] = []
     inline_by_id: dict[str, dict] = {}
     inferred: list[dict] = []
@@ -1165,10 +1198,16 @@ async def _projected_pending_interactions(
     seen_interaction_ids: set[str] = set()
     activity_now = datetime.now(timezone.utc)
     for source_document, state in rows:
+        metadata = document_metadata(source_document)
+        source_is_subagent = is_conversation_subagent(
+            source_document.tool_id,
+            source_document.relative_path,
+            metadata,
+        )
         title = conversation_display_title(
             source_document.tool_id,
             source_document.relative_path,
-            source_document.metadata_,
+            metadata,
             source_document.title,
         )
         for raw_item in state.pending_interactions or []:
@@ -1204,11 +1243,6 @@ async def _projected_pending_interactions(
                     "source_title": title,
                 }
 
-        metadata = (
-            source_document.metadata_
-            if isinstance(source_document.metadata_, dict)
-            else {}
-        )
         signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
         if isinstance(signals, dict):
             for interaction_id, signal in signals.items():
@@ -1222,6 +1256,27 @@ async def _projected_pending_interactions(
                 )
                 if not isinstance(interaction, dict):
                     continue
+                if interaction.get("interaction_type") == "permission_request":
+                    origin = normalize_interaction_origin(
+                        signal.get(INTERACTION_ORIGIN_KEY)
+                    )
+                    lineage_state = (
+                        lineage_states.get(
+                            (
+                                str(source_document.id),
+                                str(origin.get("record_uuid") or ""),
+                            )
+                        )
+                        if origin is not None
+                        else None
+                    )
+                    if not history_entry_is_visible(
+                        signal,
+                        projected_through_line=state.projected_through_line,
+                        lineage_state=lineage_state,
+                        document_is_subagent=source_is_subagent,
+                    ):
+                        continue
                 canonical_id = str(
                     interaction.get("id") or interaction_id
                 ).strip()
@@ -1259,12 +1314,27 @@ async def _projected_pending_interactions(
                 "cancelled",
             }:
                 continue
-            anchor_line_number = _current_interaction_history_anchor(
-                entry,
-                state.projected_through_line,
+            origin = normalize_interaction_origin(
+                entry.get(INTERACTION_ORIGIN_KEY)
             )
-            if anchor_line_number is None:
+            lineage_state = (
+                lineage_states.get(
+                    (str(source_document.id), str(origin.get("record_uuid") or ""))
+                )
+                if origin is not None
+                else None
+            )
+            if not history_entry_is_visible(
+                entry,
+                projected_through_line=state.projected_through_line,
+                lineage_state=lineage_state,
+                document_is_subagent=source_is_subagent,
+            ):
                 continue
+            anchor_line_number = max(
+                0,
+                int(entry.get("anchor_line_number") or 0),
+            )
             response = entry.get("response")
             inline_by_id[interaction_id] = {
                 "document_id": str(source_document.id),
@@ -1371,20 +1441,28 @@ async def get_pending_conversation_interactions(
     doc, read_model = await _get_conversation_identity(db, _user, doc_id)
     if read_model is not None:
         return await _projected_pending_interactions(db, doc, read_model)
+    effective_doc_metadata = document_metadata(doc)
     source_documents = {
         doc.id: conversation_display_title(
             doc.tool_id,
             doc.relative_path,
-            doc.metadata_,
+            effective_doc_metadata,
             doc.title,
         )
     }
-    source_metadata = {doc.id: doc.metadata_}
+    source_metadata = {doc.id: effective_doc_metadata}
     source_origins = {
         doc.id: conversation_user_role_origin(
             doc.tool_id,
             doc.relative_path,
-            doc.metadata_,
+            effective_doc_metadata,
+        )
+    }
+    source_is_subagent = {
+        doc.id: is_conversation_subagent(
+            doc.tool_id,
+            doc.relative_path,
+            effective_doc_metadata,
         )
     }
 
@@ -1393,7 +1471,7 @@ async def get_pending_conversation_interactions(
             document_id=doc.id,
             tool_id=doc.tool_id,
             relative_path=doc.relative_path,
-            metadata=doc.metadata_,
+            metadata=effective_doc_metadata,
             title=doc.title,
         )
         roots_by_tool = group_conversation_root_thread_ids([current_ref])
@@ -1427,6 +1505,34 @@ async def get_pending_conversation_interactions(
                 None,
                 companion_metadata,
             )
+            source_is_subagent[companion_id] = is_conversation_subagent(
+                doc.tool_id,
+                None,
+                companion_metadata,
+            )
+
+    # The fallback must apply the same range guard as a read model. Its later
+    # interaction scan intentionally selects only relevant semantic rows, so
+    # it cannot safely infer the transcript high-water mark from that subset.
+    history_document_ids = [
+        document_id
+        for document_id, metadata in source_metadata.items()
+        if _stored_interaction_history(metadata)
+    ]
+    projected_through_lines: dict[uuid.UUID, int] = {}
+    if history_document_ids:
+        projected_rows = await db.execute(
+            select(
+                ConversationMessage.document_id,
+                func.max(ConversationMessage.line_number),
+            )
+            .where(ConversationMessage.document_id.in_(history_document_ids))
+            .group_by(ConversationMessage.document_id)
+        )
+        projected_through_lines = {
+            document_id: max(0, int(last_line or 0))
+            for document_id, last_line in projected_rows.all()
+        }
 
     rows = (
         (
@@ -1449,6 +1555,14 @@ async def get_pending_conversation_interactions(
         )
         .scalars()
         .all()
+    )
+    lineage_states = await load_lineage_active_states(
+        db,
+        (
+            (source_document_id, entry)
+            for source_document_id, metadata in source_metadata.items()
+            for entry in _lineage_visibility_entries(metadata)
+        ),
     )
     recent_tool_rows = (
         (
@@ -1634,6 +1748,33 @@ async def get_pending_conversation_interactions(
                 )
                 if not isinstance(interaction, dict):
                     continue
+                if interaction.get("interaction_type") == "permission_request":
+                    origin = normalize_interaction_origin(
+                        signal.get(INTERACTION_ORIGIN_KEY)
+                    )
+                    lineage_state = (
+                        lineage_states.get(
+                            (
+                                str(source_document_id),
+                                str(origin.get("record_uuid") or ""),
+                            )
+                        )
+                        if origin is not None
+                        else None
+                    )
+                    if not history_entry_is_visible(
+                        signal,
+                        projected_through_line=projected_through_lines.get(
+                            source_document_id,
+                            0,
+                        ),
+                        lineage_state=lineage_state,
+                        document_is_subagent=source_is_subagent.get(
+                            source_document_id,
+                            False,
+                        ),
+                    ):
+                        continue
                 fingerprint = interaction_question_fingerprint(interaction)
                 if fingerprint and fingerprint in seen_question_fingerprints:
                     continue
@@ -1677,6 +1818,29 @@ async def get_pending_conversation_interactions(
             status = str(entry.get("status") or "").strip().lower()
             if status not in {"pending", "answered", "cancelled"}:
                 continue
+            origin = normalize_interaction_origin(
+                entry.get(INTERACTION_ORIGIN_KEY)
+            )
+            lineage_state = (
+                lineage_states.get(
+                    (str(source_document_id), str(origin.get("record_uuid") or ""))
+                )
+                if origin is not None
+                else None
+            )
+            if not history_entry_is_visible(
+                entry,
+                projected_through_line=projected_through_lines.get(
+                    source_document_id,
+                    0,
+                ),
+                lineage_state=lineage_state,
+                document_is_subagent=source_is_subagent.get(
+                    source_document_id,
+                    False,
+                ),
+            ):
+                continue
             if (
                 status == "pending"
                 and interaction_id in inline_interactions_by_id
@@ -1687,13 +1851,10 @@ async def get_pending_conversation_interactions(
                 continue
             if fingerprint:
                 seen_question_fingerprints.add(fingerprint)
-            try:
-                anchor_line_number = max(
-                    0,
-                    int(entry.get("anchor_line_number") or 0),
-                )
-            except (TypeError, ValueError):
-                anchor_line_number = 0
+            anchor_line_number = max(
+                0,
+                int(entry.get("anchor_line_number") or 0),
+            )
             response = entry.get("response")
             inline_interactions_by_id[interaction_id] = {
                 "document_id": str(source_document_id),

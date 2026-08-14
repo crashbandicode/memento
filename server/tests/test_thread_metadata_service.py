@@ -44,6 +44,7 @@ from server.services.thread_metadata_service import (  # noqa: E402
     codex_thread_documents_select,
     sanitize_explicit_codex_title,
 )
+from server.services.claude_lineage import canonical_permission_fingerprint  # noqa: E402
 
 
 class _ScalarRows:
@@ -464,6 +465,78 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 "raw_text": "",
             },
         )
+
+    async def test_claude_permission_origin_survives_mixed_rollout_pending_and_resolved_updates(
+        self,
+    ) -> None:
+        machine_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        document = _document(machine_id=machine_id)
+        interaction_input = {
+            "interaction_type": "permission_request",
+            "requested_tool": "Bash",
+            "tool_input": {"command": "git status"},
+        }
+        origin = {
+            "version": 1,
+            "kind": "claude_record",
+            "record_uuid": "record-main",
+            "parent_uuid": "record-parent",
+            "tool_use_id": "tool-use",
+            "fingerprint": canonical_permission_fingerprint(
+                "Bash",
+                {"command": "git status"},
+            ),
+            "agent_id": "",
+            "is_sidechain": False,
+        }
+        with patch(
+            "server.services.thread_metadata_service.cache_delete_prefix",
+            new=AsyncMock(),
+        ):
+            await apply_conversation_interaction_update(
+                _Session([document], [12]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-origin",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input=interaction_input,
+                interaction_origin=origin,
+                timestamp="2026-08-14T12:00:00Z",
+            )
+            # An old collector retry does not carry v1 provenance. It must not
+            # erase the already-durable value in either live or history state.
+            await apply_conversation_interaction_update(
+                _Session([document], [12]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-origin",
+                interaction_status="pending",
+                question_tool="PermissionRequest",
+                interaction_input=interaction_input,
+                timestamp="2026-08-14T12:00:00Z",
+            )
+            await apply_conversation_interaction_update(
+                _Session([document]),
+                machine_id=machine_id,
+                user_id=user_id,
+                tool_id="claude_code",
+                relative_path="projects/thread.jsonl",
+                interaction_id="permission-origin",
+                interaction_status="answered",
+                question_tool="PermissionRequest",
+                interaction_input={},
+                timestamp="2026-08-14T12:01:00Z",
+            )
+
+        history = document.metadata_[INTERACTION_HISTORY_KEY][0]
+        self.assertEqual(history["interaction_origin"], origin)
+        self.assertEqual(history["status"], "answered")
 
     async def test_permission_terminal_update_repairs_polluted_open_timestamp(
         self,

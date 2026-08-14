@@ -358,6 +358,64 @@ class ConversationMetadataInbox(Base):
 
 
 # ---------------------------------------------------------------------------
+# Claude transcript branch lineage
+# ---------------------------------------------------------------------------
+class ClaudeConversationLineageRecord(Base):
+    """One UUID-bearing Claude raw transcript record.
+
+    Normalized conversation rows intentionally omit non-visual records. The
+    branch tree therefore lives separately, keyed by raw record UUID, so a
+    resumed parent can invalidate an abandoned suffix without storing an
+    unbounded UUID chain in document metadata.
+    """
+
+    __tablename__ = "claude_conversation_lineage_records"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    record_uuid: Mapped[str] = mapped_column(String(512), primary_key=True)
+    parent_uuid: Mapped[str | None] = mapped_column(String(512))
+    source_order: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_sidechain: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # ``is_sidechain`` preserves Claude's literal record flag. ``is_subagent``
+    # is the effective branch scope (explicit sidechain OR agentId OR child
+    # transcript), used for active-leaf eligibility.
+    is_subagent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    agent_id: Mapped[str | None] = mapped_column(String(512))
+    is_eligible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_claude_lineage_document_active",
+            "document_id",
+            "active",
+        ),
+        Index(
+            "idx_claude_lineage_document_order",
+            "document_id",
+            "source_order",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Captured Cursor Canvas artifacts
 # ---------------------------------------------------------------------------
 class CanvasArtifactBlob(Base):

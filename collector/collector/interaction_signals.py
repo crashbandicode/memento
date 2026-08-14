@@ -17,6 +17,11 @@ from typing import Any
 
 _TAIL_BYTES = 512 * 1024
 _MAX_SIGNALS = 64
+_INTERACTION_ORIGIN_KINDS = {
+    "claude_record",
+    "claude_subagent_record",
+    "hook_only",
+}
 _QUESTION_TOOLS = {
     "askquestion",
     "ask_question",
@@ -155,6 +160,36 @@ def _human_text(record: dict[str, Any]) -> str:
     return " ".join(texts).strip()
 
 
+def _interaction_origin(
+    value: object,
+    *,
+    relative_path: str,
+) -> dict[str, Any] | None:
+    """Keep the hook's v1 provenance contract bounded in metadata signals."""
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    kind = str(value.get("kind") or "")
+    if kind not in _INTERACTION_ORIGIN_KINDS:
+        return None
+    origin: dict[str, Any] = {
+        "version": 1,
+        "kind": kind,
+        "record_uuid": str(value.get("record_uuid") or "")[:512],
+        "parent_uuid": str(value.get("parent_uuid") or "")[:512],
+        "tool_use_id": str(value.get("tool_use_id") or "")[:512],
+        "fingerprint": str(value.get("fingerprint") or "")[:128],
+        "agent_id": str(value.get("agent_id") or "")[:512],
+        "is_sidechain": value.get("is_sidechain") is True,
+    }
+    transcript_path = value.get("transcript_path")
+    # The surrounding side record has already resolved ``relative_path``
+    # against the configured Claude root/session topology. Legacy side files
+    # must not inject a different or absolute origin path into the signal.
+    if transcript_path == relative_path and len(relative_path) <= 2_048:
+        origin["transcript_path"] = relative_path
+    return origin
+
+
 def _signal_record(
     *,
     tool_name: str,
@@ -164,8 +199,9 @@ def _signal_record(
     raw_input: object,
     timestamp: object,
     status: str,
+    interaction_origin: object = None,
 ) -> dict[str, Any]:
-    return {
+    signal = {
         "metadata_type": "conversation_interaction",
         "tool": tool_name,
         "relative_path": relative_path,
@@ -175,6 +211,13 @@ def _signal_record(
         "interaction_input": raw_input,
         "timestamp": str(timestamp or "")[:128],
     }
+    origin = _interaction_origin(
+        interaction_origin,
+        relative_path=relative_path,
+    )
+    if origin is not None:
+        signal["interaction_origin"] = origin
+    return signal
 
 
 def extract_conversation_interaction_updates(

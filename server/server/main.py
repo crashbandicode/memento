@@ -129,6 +129,48 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_document_delivery_project_activity "
         "ON document_delivery_state (project_id, activity_at DESC)"
     ))
+    # Claude transcripts are parent-linked trees. Keep their raw UUID lineage
+    # normalized instead of putting an unbounded branch path in documents
+    # metadata; this is additive and populated lazily by authoritative ingest.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS claude_conversation_lineage_records ("
+        "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+        "record_uuid VARCHAR(512) NOT NULL, "
+        "parent_uuid VARCHAR(512), "
+        "source_order BIGINT NOT NULL, "
+        "is_sidechain BOOLEAN NOT NULL DEFAULT FALSE, "
+        "is_subagent BOOLEAN NOT NULL DEFAULT FALSE, "
+        "agent_id VARCHAR(512), "
+        "is_eligible BOOLEAN NOT NULL DEFAULT FALSE, "
+        "active BOOLEAN NOT NULL DEFAULT FALSE, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "PRIMARY KEY (document_id, record_uuid)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_claude_lineage_document_active "
+        "ON claude_conversation_lineage_records (document_id, active)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_claude_lineage_document_order "
+        "ON claude_conversation_lineage_records (document_id, source_order)"
+    ))
+    lineage_columns = {
+        column["name"]
+        for column in insp.get_columns("claude_conversation_lineage_records")
+    }
+    if "is_subagent" not in lineage_columns:
+        conn.execute(text(
+            "ALTER TABLE claude_conversation_lineage_records "
+            "ADD COLUMN is_subagent BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        # Existing records are conservatively classified from the persisted
+        # explicit flag/agent identity; a FULL replay refines child scope.
+        conn.execute(text(
+            "UPDATE claude_conversation_lineage_records "
+            "SET is_subagent = is_sidechain OR agent_id IS NOT NULL"
+        ))
     if "embedding_status" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN embedding_status VARCHAR(20) "

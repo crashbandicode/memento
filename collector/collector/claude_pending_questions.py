@@ -51,14 +51,25 @@ def _relative_transcript_path(
 
     if isinstance(transcript_path, str) and transcript_path.strip():
         candidate = Path(transcript_path).expanduser()
-        if candidate.name == expected_name:
-            try:
-                relative_project_path = candidate.resolve(strict=False).relative_to(
-                    projects_root.resolve(strict=False)
-                )
-            except (OSError, RuntimeError, ValueError):
-                pass
-            else:
+        try:
+            relative_project_path = candidate.resolve(strict=False).relative_to(
+                projects_root.resolve(strict=False)
+            )
+        except (OSError, RuntimeError, ValueError):
+            pass
+        else:
+            parts = relative_project_path.parts
+            is_main = (
+                len(parts) == 2
+                and candidate.name == expected_name
+                and candidate.suffix.casefold() == ".jsonl"
+            )
+            is_subagent = (
+                len(parts) >= 4
+                and parts[1] == session_id
+                and _is_nested_subagent_path(parts[2:])
+            )
+            if is_main or is_subagent:
                 return (Path("projects") / relative_project_path).as_posix()
 
     try:
@@ -77,6 +88,22 @@ def _relative_transcript_path(
         except (OSError, ValueError):
             continue
     return None
+
+
+def _is_nested_subagent_path(parts: tuple[str, ...]) -> bool:
+    """Match Claude's repeating ``subagents/<child>/`` transcript layout."""
+    index = 0
+    while index < len(parts):
+        if parts[index] != "subagents":
+            return False
+        index += 1
+        if index >= len(parts):
+            return False
+        child_or_transcript = parts[index]
+        if index == len(parts) - 1:
+            return Path(child_or_transcript).suffix.casefold() == ".jsonl"
+        index += 1
+    return False
 
 
 def _read_side_file(path: Path) -> dict[str, Any]:
@@ -306,6 +333,7 @@ def extract_claude_pending_interaction_updates(
                     or interaction_record.get("timestamp")
                 ),
                 status=status,
+                interaction_origin=interaction_record.get("interaction_origin"),
             )
             key = f"claude_code:{relative_path}:{interaction_id}"
             records[key] = signal

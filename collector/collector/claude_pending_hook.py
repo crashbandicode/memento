@@ -8,6 +8,8 @@ import os
 import re
 import stat
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,9 +27,16 @@ _HOOK_SPECS = {
     "Elicitation": (".*",),
     "ElicitationResult": (".*",),
     "Notification": ("agent_needs_input", "agent_completed"),
+    "SessionEnd": (".*",),
+    "SessionStart": (".*",),
 }
 _SHELL_TOOLS = {"bash", "powershell", "shell"}
 _RESOLVED_INTERACTION_LIMIT = 16
+_TRANSCRIPT_TAIL_BYTES = 512 * 1024
+_TRANSCRIPT_TAIL_RECORD_LIMIT = 2_048
+_CANONICAL_MATCH_INPUT_BYTES = 64 * 1024
+_ORIGIN_TRANSCRIPT_PATH_LIMIT = 2_048
+_SESSION_LOCK_TIMEOUT_SECONDS = 2.0
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _MEMENTO_HOOK_MARKERS = (
     "pending_question_hook.py",
@@ -176,6 +185,369 @@ def _synthetic_interaction_id(
     return f"memento-{kind}-{digest}"
 
 
+def _canonical_json(
+    value: object,
+    *,
+    max_bytes: int | None = None,
+) -> str | None:
+    """Return bounded canonical JSON for an exact structured comparison."""
+    try:
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        chunks: list[str] = []
+        size = 0
+        for chunk in encoder.iterencode(value):
+            encoded = chunk.encode("utf-8")
+            size += len(encoded)
+            if max_bytes is not None and size > max_bytes:
+                return None
+            chunks.append(chunk)
+        return "".join(chunks)
+    except (TypeError, ValueError):
+        return None
+
+
+def _permission_fingerprint(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Hash the versioned, canonical request identity (never time or an anchor)."""
+    # The prefix is part of the public v1 origin contract, so this digest can
+    # never collide with a generic JSON hash or a later fingerprint format.
+    prefix = b"memento.claude.permission-origin.v1\x00"
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    try:
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        for chunk in encoder.iterencode({
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }):
+            digest.update(chunk.encode("utf-8"))
+    except (TypeError, ValueError):
+        # A non-finite/non-JSON hook payload can never be an exact source
+        # match. Keep the fallback deterministic without serializing it using
+        # Python's non-standard NaN/Infinity tokens.
+        return hashlib.sha256(prefix + b"invalid-canonical-json").hexdigest()
+    return digest.hexdigest()
+
+
+def _claude_root() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _safe_transcript_identity(
+    transcript_path: object,
+    session_id: str,
+) -> tuple[Path, str, bool] | None:
+    """Return only the owning main/session-nested subagent JSONL transcript."""
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return None
+    try:
+        candidate = Path(transcript_path).expanduser().resolve(strict=False)
+        projects_root = (_claude_root() / "projects").resolve(strict=False)
+        relative = candidate.relative_to(projects_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    parts = relative.parts
+    if candidate.suffix.casefold() != ".jsonl" or len(parts) < 2:
+        return None
+    expected_name = f"{session_id}.jsonl"
+    is_main_transcript = len(parts) == 2 and candidate.name == expected_name
+    is_subagent_transcript = (
+        len(parts) >= 4
+        and parts[1] == session_id
+        and _is_nested_subagent_path(parts[2:])
+    )
+    relative_path = (Path("projects") / relative).as_posix()
+    if (
+        not (is_main_transcript or is_subagent_transcript)
+        or len(relative_path) > _ORIGIN_TRANSCRIPT_PATH_LIMIT
+    ):
+        return None
+    return (
+        candidate,
+        relative_path,
+        is_subagent_transcript,
+    )
+
+
+def _is_nested_subagent_path(parts: tuple[str, ...]) -> bool:
+    """Accept Claude's repeating ``subagents/<child>/`` transcript layout."""
+    index = 0
+    while index < len(parts):
+        if parts[index] != "subagents":
+            return False
+        index += 1
+        if index >= len(parts):
+            return False
+        child_or_transcript = parts[index]
+        if index == len(parts) - 1:
+            return Path(child_or_transcript).suffix.casefold() == ".jsonl"
+        index += 1
+    return False
+
+
+def _session_end_marker(path: Path) -> Path:
+    return path.with_name(f".{path.stem}.session-ended")
+
+
+def _write_session_end_marker(path: Path, payload: dict[str, Any]) -> None:
+    """Publish terminal intent before waiting for the side-file lock."""
+    marker = _session_end_marker(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": _event_timestamp(payload),
+        "reason": str(
+            payload.get("reason") or payload.get("session_end_reason") or ""
+        )[:256],
+    }
+    _write_atomic(marker, record)
+
+
+def _read_session_end_marker(path: Path) -> dict[str, Any]:
+    return _read_mapping(_session_end_marker(path))
+
+
+def _clear_session_end_marker(path: Path) -> None:
+    _session_end_marker(path).unlink(missing_ok=True)
+
+
+def _mark_session_started(path: Path, payload: dict[str, Any]) -> None:
+    """Advance the side-file generation without reopening a terminal prompt."""
+    existing = _read_mapping(path)
+    if not existing:
+        return
+    previous = existing.get("session_start_generation")
+    try:
+        generation = max(0, int(previous)) + 1
+    except (TypeError, ValueError):
+        generation = 1
+    record = dict(existing)
+    record["session_start_generation"] = generation
+    record["session_start_timestamp"] = _event_timestamp(payload)
+    _write_atomic(path, record)
+
+
+@contextmanager
+def _session_file_lock(
+    path: Path,
+    *,
+    timeout: float | None = _SESSION_LOCK_TIMEOUT_SECONDS,
+) -> Any:
+    """Serialize side-file mutation across independent Claude hook processes."""
+    lock_path = path.with_name(f".{path.stem}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"0")
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Claude side-file lock timed out")
+                    time.sleep(0.01)
+            unlock = lambda: msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Claude side-file lock timed out")
+                    time.sleep(0.01)
+            unlock = lambda: fcntl.flock(descriptor, fcntl.LOCK_UN)
+        try:
+            yield
+        finally:
+            unlock()
+    finally:
+        os.close(descriptor)
+
+
+def _origin_value(value: object, limit: int = 512) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _hook_only_origin(
+    *,
+    fingerprint: str,
+    relative_path: str | None,
+) -> dict[str, Any]:
+    """Build the bounded v1 fallback when no exact transcript source exists."""
+    origin: dict[str, Any] = {
+        "version": 1,
+        "kind": "hook_only",
+        "record_uuid": "",
+        "parent_uuid": "",
+        "tool_use_id": "",
+        "fingerprint": fingerprint,
+        "agent_id": "",
+        "is_sidechain": False,
+    }
+    if relative_path:
+        origin["transcript_path"] = relative_path
+    return origin
+
+
+def _message_tool_uses(record: dict[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        part
+        for part in content
+        if isinstance(part, dict)
+        and str(part.get("type") or "").casefold() in {"tool_use", "toolcall"}
+    ]
+
+
+def _is_assistant_record(record: dict[str, Any]) -> bool:
+    """Accept Claude assistant rows, never tool-shaped user/system rows."""
+    record_type = str(record.get("type") or "").casefold()
+    message = record.get("message")
+    message_role = (
+        str(message.get("role") or "").casefold()
+        if isinstance(message, dict)
+        else ""
+    )
+    return record_type == "assistant" or (
+        not record_type and message_role == "assistant"
+    )
+
+
+def _permission_interaction_origin(
+    *,
+    transcript_path: object,
+    session_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the latest exact Claude tool-use in a bounded transcript tail.
+
+    A match requires both the literal requested tool name and canonical JSON of
+    the structured input to agree.  Deliberately do not normalize, substring,
+    or otherwise fuzzy-match either field: an incorrect UUID is worse than a
+    hook-only origin.
+    """
+    fingerprint = _permission_fingerprint(tool_name, tool_input)
+    identity = _safe_transcript_identity(transcript_path, session_id)
+    if identity is None:
+        return _hook_only_origin(
+            fingerprint=fingerprint,
+            relative_path=None,
+        )
+    transcript, relative_path, is_subagent_path = identity
+    requested_input = _canonical_json(
+        tool_input,
+        max_bytes=_CANONICAL_MATCH_INPUT_BYTES,
+    )
+    if requested_input is None:
+        return _hook_only_origin(
+            fingerprint=fingerprint,
+            relative_path=relative_path,
+        )
+    try:
+        with transcript.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - _TRANSCRIPT_TAIL_BYTES)
+            stream.seek(start)
+            payload = stream.read(_TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return _hook_only_origin(
+            fingerprint=fingerprint,
+            relative_path=relative_path,
+        )
+    if start:
+        newline = payload.find(b"\n")
+        if newline < 0:
+            return _hook_only_origin(
+                fingerprint=fingerprint,
+                relative_path=relative_path,
+            )
+        payload = payload[newline + 1:]
+
+    # Reverse scan gives the latest causal record and the last matching part in
+    # that record, without reading the unbounded transcript history.
+    for raw_line in reversed(payload.splitlines()[-_TRANSCRIPT_TAIL_RECORD_LIMIT:]):
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if not _is_assistant_record(record):
+            continue
+        for part in reversed(_message_tool_uses(record)):
+            if str(part.get("name") or "") != tool_name:
+                continue
+            source_input = part.get("input")
+            if not isinstance(source_input, dict):
+                continue
+            if _canonical_json(
+                source_input,
+                max_bytes=_CANONICAL_MATCH_INPUT_BYTES,
+            ) != requested_input:
+                continue
+            agent_id = _origin_value(
+                record.get("agentId") or record.get("agent_id")
+            )
+            is_sidechain = record.get("isSidechain") is True
+            is_subagent = (
+                is_subagent_path
+                or transcript.name.casefold().startswith("agent-")
+                or is_sidechain
+                or bool(agent_id)
+            )
+            return {
+                "version": 1,
+                "kind": (
+                    "claude_subagent_record"
+                    if is_subagent
+                    else "claude_record"
+                ),
+                "record_uuid": _origin_value(
+                    record.get("uuid") or record.get("record_uuid")
+                ),
+                "parent_uuid": _origin_value(
+                    record.get("parentUuid") or record.get("parent_uuid")
+                ),
+                "tool_use_id": _origin_value(
+                    part.get("id") or part.get("tool_use_id")
+                ),
+                "fingerprint": fingerprint,
+                "agent_id": agent_id,
+                "is_sidechain": is_sidechain,
+                "transcript_path": relative_path,
+            }
+    return _hook_only_origin(
+        fingerprint=fingerprint,
+        relative_path=relative_path,
+    )
+
+
 def _read_mapping(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -232,7 +604,7 @@ def _resolved_interactions(
             for item in resolved
             if str(item.get("interaction_id") or "").strip() != existing_id
         ]
-        resolved.append({
+        resolved_record = {
             "interaction_id": existing_id,
             "question_tool": existing_tool,
             "interaction_input": existing_input,
@@ -243,7 +615,11 @@ def _resolved_interactions(
                 or ""
             ),
             "resolved_at": resolved_at,
-        })
+        }
+        existing_origin = existing.get("interaction_origin")
+        if isinstance(existing_origin, dict):
+            resolved_record["interaction_origin"] = existing_origin
+        resolved.append(resolved_record)
     return resolved[-_RESOLVED_INTERACTION_LIMIT:]
 
 
@@ -270,7 +646,7 @@ def _read_stdin_payload(stream: object | None = None) -> object:
     return json.loads(text)
 
 
-def process_payload(payload: object) -> None:
+def _process_payload_unlocked(payload: object) -> None:
     """Update one pending-interaction side file, ignoring malformed payloads."""
     if not isinstance(payload, dict):
         return
@@ -300,6 +676,7 @@ def process_payload(payload: object) -> None:
         event_name == "notification"
         and notification_type in {"agent_needs_input", "agent_completed"}
     )
+    is_session_end = event_name == "sessionend"
     is_shell_event = (
         event_name in {"pretooluse", "posttooluse", "posttoolusefailure"}
         and _normalized_tool_name(tool_name) in _SHELL_TOOLS
@@ -310,6 +687,7 @@ def process_payload(payload: object) -> None:
         or is_elicitation
         or is_agent_notification
         or is_shell_event
+        or is_session_end
     ):
         return
 
@@ -324,6 +702,26 @@ def process_payload(payload: object) -> None:
     path = _pending_directory() / f"{session_id}.json"
     existing = _read_mapping(path)
     existing_id = str(existing.get("interaction_id") or "").strip()
+
+    if is_session_end:
+        if (
+            str(existing.get("interaction_status") or "").casefold()
+            != "pending"
+            or _normalized_tool_name(existing.get("question_tool"))
+            != "permissionrequest"
+        ):
+            return
+        record = dict(existing)
+        record["interaction_status"] = "cancelled"
+        marker = _read_session_end_marker(path)
+        record["session_end_timestamp"] = str(
+            marker.get("timestamp") or _event_timestamp(payload)
+        )[:128]
+        reason = str(marker.get("reason") or "")[:256]
+        if reason:
+            record["session_end_reason"] = reason
+        _write_atomic(path, record)
+        return
 
     if is_shell_event:
         activity_id = _interaction_id(payload)
@@ -446,12 +844,34 @@ def process_payload(payload: object) -> None:
         tool_input = payload.get("tool_input")
         if not isinstance(tool_input, dict):
             tool_input = {}
-        interaction_id = _interaction_id(payload) or _synthetic_interaction_id(
-            "permission",
-            session_id,
-            tool_name,
-            tool_input,
-        )
+        session_generation = existing.get("session_start_generation")
+        try:
+            session_generation = max(0, int(session_generation))
+        except (TypeError, ValueError):
+            session_generation = 0
+        interaction_id = _interaction_id(payload)
+        if not interaction_id:
+            interaction_id = _synthetic_interaction_id(
+                "permission",
+                session_id,
+                tool_name,
+                tool_input,
+                *([session_generation] if session_generation else []),
+            )
+        elif (
+            session_generation
+            and interaction_id == existing_id
+            and str(existing.get("interaction_status") or "").casefold()
+            in {"answered", "cancelled"}
+        ):
+            interaction_id = _synthetic_interaction_id(
+                "permission-resumed",
+                session_id,
+                interaction_id,
+                tool_name,
+                tool_input,
+                session_generation,
+            )
         raw_input = {
             "interaction_type": "permission_request",
             "requested_tool": tool_name,
@@ -462,6 +882,24 @@ def process_payload(payload: object) -> None:
         question_tool = "PermissionRequest"
         status = "pending"
         interaction_alias_ids = []
+        interaction_origin = _permission_interaction_origin(
+            transcript_path=payload.get("transcript_path"),
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+        )
+        existing_origin = existing.get("interaction_origin")
+        if (
+            interaction_origin.get("kind") == "hook_only"
+            and existing_id == interaction_id
+            and isinstance(existing_origin, dict)
+            and existing_origin.get("version") == 1
+            and existing_origin.get("kind")
+            in {"claude_record", "claude_subagent_record"}
+            and existing_origin.get("fingerprint")
+            == interaction_origin.get("fingerprint")
+        ):
+            interaction_origin = existing_origin
     elif is_elicitation:
         interaction_id = (
             str(payload.get("elicitation_id") or "").strip()
@@ -547,6 +985,11 @@ def process_payload(payload: object) -> None:
         "interaction_timestamp": interaction_timestamp,
         "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
     }
+    if is_permission:
+        record["interaction_origin"] = interaction_origin
+    session_generation = existing.get("session_start_generation")
+    if isinstance(session_generation, int) and session_generation > 0:
+        record["session_start_generation"] = session_generation
     resolved_interactions = _resolved_interactions(
         existing,
         interaction_id,
@@ -559,6 +1002,42 @@ def process_payload(payload: object) -> None:
     if isinstance(existing.get("shell_activities"), dict):
         record["shell_activities"] = existing["shell_activities"]
     _write_atomic(path, record)
+
+
+def process_payload(payload: object) -> None:
+    """Serialize per-session hook updates and make SessionEnd terminal."""
+    if not isinstance(payload, dict):
+        return
+    session_id = str(payload.get("session_id") or "").strip()
+    if (
+        not session_id
+        or session_id in {".", ".."}
+        or not _SAFE_SESSION_ID.fullmatch(session_id)
+    ):
+        return
+    path = _pending_directory() / f"{session_id}.json"
+    is_session_end = _event_name(payload) == "sessionend"
+    is_session_start = _event_name(payload) == "sessionstart"
+    try:
+        if is_session_end:
+            # Publish before the lock: a PermissionRequest that wins the lock
+            # race still observes this marker before it can write pending.
+            _write_session_end_marker(path, payload)
+        with _session_file_lock(
+            path,
+            timeout=None if is_session_end else _SESSION_LOCK_TIMEOUT_SECONDS,
+        ):
+            if is_session_start:
+                _clear_session_end_marker(path)
+                _mark_session_started(path, payload)
+                return
+            if not is_session_end and _read_session_end_marker(path):
+                return
+            _process_payload_unlocked(payload)
+    except (OSError, TimeoutError):
+        # Hook failures must never block Claude. A SessionEnd marker remains
+        # durable even if an individual side-file write cannot complete.
+        return
 
 
 def _settings_path() -> Path:
