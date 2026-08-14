@@ -1422,6 +1422,61 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("CONVERSATION_MESSAGES", sql)
             self.assertNotIn("METADATA ?", sql)
 
+    async def test_projected_permission_history_drops_superseded_branch_anchor(
+        self,
+    ) -> None:
+        self.doc.tool_id = "claude_code"
+        def history_entry(interaction_id: str, anchor: int) -> dict:
+            return {
+                "interaction": {
+                    "id": interaction_id,
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "PermissionRequest",
+                    "requested_tool": "Bash",
+                    "interaction_type": "permission_request",
+                    "questions": [],
+                },
+                "timestamp": "2026-08-13T23:24:44Z",
+                "status": "answered",
+                "response": {
+                    "kind": "question_response",
+                    "interaction_id": interaction_id,
+                    "status": "answered",
+                    "answers": [],
+                    "raw_text": "",
+                },
+                "anchor_line_number": anchor,
+            }
+
+        self.doc.metadata_["_interaction_history"] = [
+            history_entry("permission-on-current-branch", 812),
+            history_entry("permission-from-abandoned-branch", 2203),
+        ]
+        projection = self.read_model(projected_through_line=813)
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[(self.doc, projection)]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(
+            [
+                item["interaction"]["id"]
+                for item in payload["inline_interactions"]
+            ],
+            ["permission-on-current-branch"],
+        )
+        self.assertEqual(len(db.statements), 2)
+        for statement in db.statements:
+            sql = str(statement.compile(dialect=postgresql.dialect())).upper()
+            self.assertNotIn("CONVERSATION_MESSAGES", sql)
+
     async def test_claude_child_parent_messages_are_not_prompt_navigation(self) -> None:
         self.doc.tool_id = "claude_code"
         self.doc.relative_path = (

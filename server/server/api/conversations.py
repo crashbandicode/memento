@@ -274,6 +274,28 @@ def _stored_interaction_history(metadata: object) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict)][-32:]
 
 
+def _current_interaction_history_anchor(
+    entry: dict,
+    projected_through_line: object,
+) -> int | None:
+    """Return an anchor only when it still belongs to this projection.
+
+    Claude permission prompts arrive through a document-level hook side
+    channel.  Rewinding/resuming a Claude session can replace the normalized
+    branch while leaving an older interaction-history entry behind.  Its line
+    number then refers to the superseded projection and must not be appended
+    after the current branch's real final message.
+    """
+    try:
+        anchor = max(0, int(entry.get("anchor_line_number") or 0))
+        current_last_line = max(0, int(projected_through_line or 0))
+    except (TypeError, ValueError):
+        return None
+    if anchor > current_last_line:
+        return None
+    return anchor
+
+
 def _stored_task_state(metadata: object) -> dict | None:
     if not isinstance(metadata, dict):
         return None
@@ -1237,12 +1259,18 @@ async def _projected_pending_interactions(
                 "cancelled",
             }:
                 continue
+            anchor_line_number = _current_interaction_history_anchor(
+                entry,
+                state.projected_through_line,
+            )
+            if anchor_line_number is None:
+                continue
             response = entry.get("response")
             inline_by_id[interaction_id] = {
                 "document_id": str(source_document.id),
                 "source_title": title,
                 "message_id": 0,
-                "line_number": max(0, int(entry.get("anchor_line_number") or 0)),
+                "line_number": anchor_line_number,
                 "interaction": interaction,
                 **({"response": response} if isinstance(response, dict) else {}),
                 "model": entry.get("model", ""),
