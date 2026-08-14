@@ -61,6 +61,7 @@ import {
   readSearchHistory,
 } from "@/lib/search-history";
 import {
+  coalesceTaskStateCallResults,
   contextBeforeIncludingTarget,
   isMirroredActiveTaskMessage,
   mergeMessagesChronologically,
@@ -1485,7 +1486,7 @@ export default function ConversationViewer({
       | { kind: "interaction"; line: number; order: number; interaction: PendingConversationInteraction }
       | { kind: "activity"; line: number; order: number; activity: LiveConversationActivity }
     > = [
-      ...sequenceMessages
+      ...coalesceTaskStateCallResults(sequenceMessages)
         .filter((message) => {
           if (
             !message.tool_call_id

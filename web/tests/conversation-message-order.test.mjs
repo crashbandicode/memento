@@ -2,11 +2,99 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  coalesceTaskStateCallResults,
   contextBeforeIncludingTarget,
   isMirroredActiveTaskMessage,
   mergeMessagesChronologically,
   placeTargetWindow,
 } from "../src/lib/conversation-message-order.ts";
+
+const taskSnapshot = {
+  source: "claude_code",
+  revision: 70,
+  completed_count: 17,
+  total_count: 20,
+  tasks: [{ id: "18", content: "Write findings", status: "pending" }],
+};
+
+test("adjacent task call and result render as one finalized snapshot", () => {
+  const call = {
+    id: 1,
+    line_number: 1045,
+    role: "tool",
+    message_type: "tool_use",
+    tool_name: "TaskCreate",
+    tool_call_id: "toolu_task_18",
+    task_state: { ...taskSnapshot, revision: 69 },
+  };
+  const result = {
+    id: 2,
+    line_number: 1046,
+    role: "tool",
+    message_type: "tool_result",
+    tool_name: "Tool result",
+    tool_call_id: "toolu_task_18",
+    task_state: taskSnapshot,
+  };
+
+  assert.deepEqual(coalesceTaskStateCallResults([call, result]), [result]);
+});
+
+test("task snapshots are not coalesced across a gap or mismatched call id", () => {
+  const call = {
+    id: 1,
+    line_number: 10,
+    role: "tool",
+    message_type: "tool_use",
+    tool_name: "TaskUpdate",
+    tool_call_id: "call-one",
+    task_state: taskSnapshot,
+  };
+  const result = {
+    id: 2,
+    line_number: 12,
+    role: "tool",
+    message_type: "tool_result",
+    tool_name: "Tool result",
+    tool_call_id: "call-two",
+    task_state: taskSnapshot,
+  };
+
+  assert.deepEqual(coalesceTaskStateCallResults([call, result]), [call, result]);
+});
+
+test("orphaned task rows and ordinary tool pairs remain visible", () => {
+  const orphanedResult = {
+    id: 1,
+    line_number: 20,
+    role: "tool",
+    message_type: "tool_result",
+    tool_name: "Tool result",
+    tool_call_id: "orphan",
+    task_state: taskSnapshot,
+  };
+  const ordinaryCall = {
+    id: 2,
+    line_number: 21,
+    role: "tool",
+    message_type: "tool_use",
+    tool_name: "Read",
+    tool_call_id: "read-one",
+  };
+  const ordinaryResult = {
+    id: 3,
+    line_number: 22,
+    role: "tool",
+    message_type: "tool_result",
+    tool_name: "Tool result",
+    tool_call_id: "read-one",
+  };
+
+  assert.deepEqual(
+    coalesceTaskStateCallResults([orphanedResult, ordinaryCall, ordinaryResult]),
+    [orphanedResult, ordinaryCall, ordinaryResult],
+  );
+});
 
 test("live reparses replace rows by server line instead of database id", () => {
   const stale = [

@@ -27,6 +27,68 @@ interface TaskSnapshot {
   tasks: TaskSnapshotTask[];
 }
 
+interface TaskStateCarrierMessage extends ServerOrderedMessage {
+  role?: string | null;
+  message_type?: string | null;
+  raw_type?: string | null;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  task_state?: unknown | null;
+}
+
+const TOOL_RESULT_MESSAGE_TYPES = new Set([
+  "question_tool_output",
+  "tool_output",
+  "tool_result",
+]);
+
+function isTaskStateToolMessage(message: TaskStateCarrierMessage): boolean {
+  return (message.role || message.message_type) === "tool"
+    && Boolean(message.task_state)
+    && Boolean(message.tool_call_id);
+}
+
+function isToolResultMessage(message: TaskStateCarrierMessage): boolean {
+  const type = String(message.raw_type || message.message_type || "").toLowerCase();
+  return TOOL_RESULT_MESSAGE_TYPES.has(type)
+    || String(message.tool_name || "").toLowerCase() === "tool result";
+}
+
+/**
+ * Render one semantic task snapshot for an adjacent tool-call/result pair.
+ *
+ * Claude emits a TaskCreate/TaskUpdate call and its acknowledgement as two
+ * source records. Both legitimately carry the same normalized task snapshot
+ * and must remain stored/exportable, but showing both as TaskProgressCard
+ * entries makes one action look duplicated. Prefer the finalized result row
+ * only when both adjacent rows are unambiguously paired by tool_call_id.
+ * Orphaned page-boundary rows and unrelated/non-task tools stay untouched.
+ */
+export function coalesceTaskStateCallResults<
+  T extends TaskStateCarrierMessage,
+>(messages: T[]): T[] {
+  const coalesced: T[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const call = messages[index];
+    const result = messages[index + 1];
+    if (
+      result
+      && result.line_number === call.line_number + 1
+      && isTaskStateToolMessage(call)
+      && !isToolResultMessage(call)
+      && isTaskStateToolMessage(result)
+      && isToolResultMessage(result)
+      && result.tool_call_id === call.tool_call_id
+    ) {
+      coalesced.push(result);
+      index += 1;
+      continue;
+    }
+    coalesced.push(call);
+  }
+  return coalesced;
+}
+
 /**
  * Merge refreshed pages by the server's stable within-document identity.
  *
