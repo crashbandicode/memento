@@ -3516,6 +3516,7 @@ function QuestionInteractionCard({
     || response?.answers.some((answer) => (
       answer.selected_option_ids.length > 0
       || Boolean(answer.text?.trim())
+      || Boolean(answer.notes?.trim())
     )),
   );
   const resolvedWithoutRecordedAnswer = Boolean(
@@ -3647,6 +3648,7 @@ function QuestionInteractionCard({
                 ? t.conversation.chooseOne
                 : t.conversation.freeResponse;
             const showCustomAnswer = Boolean(answer?.text && selectedIds.size === 0);
+            const showNotes = Boolean(answer?.notes?.trim());
             return (
               <section
                 key={`${question.id}-${questionIndex}`}
@@ -3786,6 +3788,43 @@ function QuestionInteractionCard({
                     </div>
                   </div>
                 )}
+                {showNotes && (
+                  <div
+                    data-question-notes
+                    role="note"
+                    style={{
+                      marginTop: 9,
+                      padding: "9px 10px",
+                      borderRadius: 10,
+                      border: "1px solid color-mix(in srgb, #8B5CF6 25%, var(--aurora-border))",
+                      background: "color-mix(in srgb, #8B5CF6 6%, var(--aurora-surface-solid))",
+                    }}
+                  >
+                    <div
+                      style={{
+                        marginBottom: 4,
+                        color: "#8B5CF6",
+                        fontSize: 9.5,
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.06em",
+                      }}
+                    >
+                      {t.conversation.notes}
+                    </div>
+                    <div
+                      style={{
+                        color: "var(--aurora-fg2)",
+                        fontSize: 12.5,
+                        lineHeight: 1.5,
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {answer?.notes}
+                    </div>
+                  </div>
+                )}
                 {resolvedWithoutRecordedAnswer && (
                   <div
                     data-question-response-unavailable
@@ -3825,7 +3864,10 @@ function QuestionResponseCard({
   response: QuestionInteractionResponse;
   t: ReturnType<typeof useI18n>["t"];
 }) {
-  const text = response.answers.map((answer) => answer.text).filter(Boolean).join("\n\n")
+  const text = response.answers
+    .flatMap((answer) => [answer.text, answer.notes])
+    .filter(Boolean)
+    .join("\n\n")
     || response.raw_text;
   return (
     <div

@@ -969,6 +969,91 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(response["interaction_id"], "toolu-1")
         self.assertEqual(response["answers"][0]["selected_option_ids"], ["Deploy now"])
 
+    def test_claude_notes_only_question_uses_structured_annotation(self) -> None:
+        prompt = (
+            "The two-phase teardown is built + locally validated (commit "
+            "bc44aa93). How do you want to proceed to the remote / in-cluster e2e?"
+        )
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "assistant-notes",
+                "timestamp": "2026-08-14T00:33:02Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-notes",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [{
+                                "header": "Next step",
+                                "question": prompt,
+                                "multiSelect": False,
+                                "options": [
+                                    {
+                                        "label": "Push + MR + e2e",
+                                        "description": "Push, open an MR, then test.",
+                                    },
+                                    {
+                                        "label": "Hold — review locally first",
+                                        "description": "Do not push yet.",
+                                    },
+                                ],
+                            }],
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "user-notes",
+                "timestamp": "2026-08-14T01:00:34Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-notes",
+                        "content": (
+                            f'The user answered: "{prompt}"=(no option selected) '
+                            "notes: push straight to fastapi and then test e2e no Mr. "
+                            "Read the answers carefully."
+                        ),
+                    }],
+                },
+                "toolUseResult": {
+                    "questions": [{
+                        "question": prompt,
+                        "header": "Next step",
+                        "options": [
+                            {"label": "Push + MR + e2e"},
+                            {"label": "Hold — review locally first"},
+                        ],
+                        "multiSelect": False,
+                    }],
+                    "answers": {prompt: "(notes only)"},
+                    "annotations": {
+                        prompt: {
+                            "notes": "push straight to fastapi and then test e2e no Mr",
+                        },
+                    },
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        response = messages[1].interaction_response
+        assert response is not None
+        self.assertEqual(response["status"], "answered")
+        self.assertEqual(response["answers"], [{
+            "question_id": "Next step",
+            "text": "",
+            "selected_option_ids": [],
+            "notes": "push straight to fastapi and then test e2e no Mr",
+        }])
+        self.assertNotIn("The user answered", response["answers"][0]["notes"])
+
     def test_claude_historical_permission_wrapper_reparses_as_question(
         self,
     ) -> None:

@@ -251,6 +251,7 @@ const zhCN = {
     freeResponse: "自由回答",
     yourResponse: "你的回答",
     customResponse: "自定义回答",
+    notes: "备注",
     diagnostics: "导出诊断",
     diagnosticsHelp: "用于判断会话缺失发生在 LS、元数据还是本地缓存层。",
     stepFetchFailed: "步骤抓取失败",

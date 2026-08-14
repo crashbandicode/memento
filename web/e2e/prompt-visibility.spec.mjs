@@ -1,6 +1,7 @@
 // @ts-check
 import { expect, test } from "@playwright/test";
 import {
+  claudeQuestionWithNotesOnly,
   metadataOnlyPrompts,
   permissionWrappedQuestion,
   resolvedPermissionWithoutRecordedChoice,
@@ -67,6 +68,22 @@ test.describe("prompt visibility & question wrapper unwrap", () => {
       "Claude Code did not record which option was selected.",
     );
     await expect(card.locator('[data-question-option][data-selected="true"]')).toHaveCount(0);
+  });
+
+  test("Claude note-only answer renders the note without inventing a selected option", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, claudeQuestionWithNotesOnly);
+
+    const card = transcript(page).locator(
+      '[data-question-interaction="toolu-notes-only"]',
+    );
+    await expect(card).toContainText("Answered");
+    await expect(card.locator("[data-question-notes]")).toContainText(
+      "push straight to fastapi and then test e2e no Mr",
+    );
+    await expect(card.locator('[data-question-option][data-selected="true"]')).toHaveCount(0);
+    await expect(card).not.toContainText("The user answered:");
+    await expect(card).not.toContainText("(no option selected)");
   });
 
   test("live prompt outline appears on metadata-only ingest with no SSE stream [regression #2]", async ({ page }) => {

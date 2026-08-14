@@ -246,6 +246,7 @@ const enUS: Translations = {
     freeResponse: "Free response",
     yourResponse: "Your response",
     customResponse: "Custom response",
+    notes: "Notes",
     diagnostics: "Export Diagnostics",
     diagnosticsHelp: "Helps locate whether data loss happened in LS, metadata, or local cache recovery.",
     stepFetchFailed: "Step fetch failed",

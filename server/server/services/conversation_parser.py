@@ -3778,6 +3778,7 @@ def build_question_response(
         parsed = raw_output if isinstance(raw_output, dict) else {}
     structured_answers = parsed.get("answers")
     has_structured_answer_payload = isinstance(structured_answers, (dict, list))
+    notes_by_question: dict[str, str] = {}
     if isinstance(structured_answers, list):
         answers_by_question: dict[str, list[str]] = {}
         for item in structured_answers:
@@ -3798,9 +3799,19 @@ def build_question_response(
             if freeform:
                 values.append(freeform)
             answers_by_question[question_id] = values
+            note = _bounded_interaction_text(
+                item.get("notes", item.get("note")),
+                4096,
+            ).strip()
+            if note:
+                notes_by_question[question_id] = note
         structured_answers = answers_by_question
     elif not isinstance(structured_answers, dict):
         structured_answers = {}
+
+    structured_annotations = parsed.get("annotations")
+    if not isinstance(structured_annotations, dict):
+        structured_annotations = {}
 
     raw_questions = interaction.get("questions")
     questions = raw_questions if isinstance(raw_questions, list) else []
@@ -3809,9 +3820,48 @@ def build_question_response(
         if not isinstance(question, dict):
             continue
         question_id = _coerce_text(question.get("id"))
-        answer_values = _answer_texts(structured_answers.get(question_id))
+        prompt = _coerce_text(question.get("prompt"))
+        header = _coerce_text(question.get("header"))
+        lookup_keys = [
+            key for key in dict.fromkeys((question_id, prompt, header)) if key
+        ]
+        structured_answer = next(
+            (
+                structured_answers[key]
+                for key in lookup_keys
+                if key in structured_answers
+            ),
+            None,
+        )
+        answer_values = [
+            value
+            for value in _answer_texts(structured_answer)
+            if value.strip().casefold() not in {"(notes only)", "notes only"}
+        ]
+        annotation = next(
+            (
+                structured_annotations[key]
+                for key in lookup_keys
+                if key in structured_annotations
+            ),
+            None,
+        )
+        if isinstance(annotation, dict):
+            annotation_note = _bounded_interaction_text(
+                annotation.get("notes", annotation.get("note")),
+                4096,
+            ).strip()
+        else:
+            annotation_note = ""
+        notes = annotation_note or next(
+            (
+                notes_by_question[key]
+                for key in lookup_keys
+                if key in notes_by_question
+            ),
+            "",
+        )
         if not answer_values and raw_text and not has_structured_answer_payload:
-            prompt = _coerce_text(question.get("prompt"))
             next_prompt = None
             if index + 1 < len(questions) and isinstance(questions[index + 1], dict):
                 next_prompt = _coerce_text(questions[index + 1].get("prompt"))
@@ -3844,12 +3894,15 @@ def build_question_response(
                     for candidate in candidates
                 ):
                     selected.append(option_id or label)
-        if answer_values or selected:
-            answers.append({
+        if answer_values or selected or notes:
+            answer = {
                 "question_id": question_id,
                 "text": combined,
                 "selected_option_ids": selected,
-            })
+            }
+            if notes:
+                answer["notes"] = notes
+            answers.append(answer)
 
     lowered = raw_text.casefold()
     status = (
@@ -4377,9 +4430,12 @@ def _iter_claude_conversation_messages(
 
             if message.tool_call_id and message.tool_call_id in pending_questions:
                 interaction = pending_questions.pop(message.tool_call_id)
+                source_mapping = _as_mapping(source_object)
                 message.interaction_response = build_question_response(
                     interaction,
-                    message.content,
+                    source_mapping.get("toolUseResult")
+                    or source_mapping.get("tool_use_result")
+                    or message.content,
                 )
                 message.tool_name = "Question response"
 

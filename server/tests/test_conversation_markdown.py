@@ -213,6 +213,7 @@ class MarkdownRenderingTests(unittest.TestCase):
                 "question_id": "deploy",
                 "selected_option_ids": ["prod"],
                 "text": "Production",
+                "notes": "Run the smoke test immediately after deploy.",
             }],
         }
         items = [
@@ -232,6 +233,7 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertIn("<summary><strong>Tool</strong> · Shell</summary>", text)
         self.assertIn("- [x] Production — Live users", text)
         self.assertIn("**Response:** Production", text)
+        self.assertIn("**Notes:** Run the smoke test immediately after deploy.", text)
         self.assertEqual(text.count("Production"), 2)
 
     def test_optional_sections_can_be_removed(self) -> None:

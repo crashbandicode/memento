@@ -266,6 +266,72 @@ export const resolvedPermissionWithoutRecordedChoice = {
   latestAgentLine: 2,
 };
 
+/** Claude persists note-only answers separately from radio selections. */
+export const claudeQuestionWithNotesOnly = {
+  docId: "conv-claude-question-notes-only",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-claude-question-notes-only",
+    tool_id: "claude_code",
+    title: "Claude question with notes",
+    relative_path: "claude/sessions/question-notes.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    pending_question_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "tool",
+      content: "[AskUserQuestion]",
+      interaction: /** @type {QuestionInteraction} */ ({
+        kind: "question",
+        id: "toolu-notes-only",
+        source: "claude_code",
+        tool_name: "AskUserQuestion",
+        questions: [{
+          id: "Next step",
+          header: "Next step",
+          prompt: "How do you want to proceed to the remote / in-cluster e2e?",
+          type: "single_select",
+          allow_custom: true,
+          options: [
+            { id: "Push + MR + e2e", label: "Push + MR + e2e" },
+            { id: "Push + MR, skip e2e", label: "Push + MR, skip e2e" },
+            { id: "Hold — review locally first", label: "Hold — review locally first" },
+          ],
+        }],
+      }),
+      timestamp: T1,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "tool",
+      content: "Question response",
+      interaction_response: {
+        kind: "question_response",
+        interaction_id: "toolu-notes-only",
+        status: "answered",
+        answers: [{
+          question_id: "Next step",
+          text: "",
+          selected_option_ids: [],
+          notes: "push straight to fastapi and then test e2e no Mr",
+        }],
+        raw_text: "structured Claude toolUseResult",
+      },
+      timestamp: T2,
+    },
+  ]),
+  prompts: [],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
 /**
  * Regression #2 — missing live prompt on metadata-only ingest (no SSE).
  *
@@ -1361,6 +1427,7 @@ export const urlNavigationCanvasThread = {
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
   [resolvedPermissionWithoutRecordedChoice.docId]: resolvedPermissionWithoutRecordedChoice,
+  [claudeQuestionWithNotesOnly.docId]: claudeQuestionWithNotesOnly,
   [metadataOnlyPrompts.docId]: metadataOnlyPrompts,
   [runningSubagent.docId]: runningSubagent,
   [subagentLifecycleMatrix.docId]: subagentLifecycleMatrix,

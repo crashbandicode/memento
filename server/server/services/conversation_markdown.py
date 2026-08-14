@@ -318,6 +318,13 @@ def _write_interaction(
             _write(writer, f"> **Response:** {answer_lines[0]}")
             for line in answer_lines[1:]:
                 _write(writer, f"> {line}")
+        notes = str(answer.get("notes") or "").strip() if isinstance(answer, dict) else ""
+        if notes:
+            note_lines = notes.splitlines() or [notes]
+            _write(writer, ">")
+            _write(writer, f"> **Notes:** {note_lines[0]}")
+            for line in note_lines[1:]:
+                _write(writer, f"> {line}")
     _write(writer)
 
 

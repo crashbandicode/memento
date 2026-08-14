@@ -379,6 +379,7 @@ export interface QuestionAnswer {
   question_id: string;
   text: string;
   selected_option_ids: string[];
+  notes?: string;
 }
 
 export interface QuestionInteractionResponse {
