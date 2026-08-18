@@ -14,6 +14,7 @@ import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import ConversationLocation from "@/components/conversations/ConversationLocation";
+import ResumeConversationCommand from "@/components/conversations/ResumeConversationCommand";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
 import { MarkdownExportDialog } from "@/components/conversations/MarkdownExportForm";
 
@@ -34,15 +35,22 @@ interface ConversationMetaWithPlans extends ConversationMeta {
 
 export default function ConversationPage() {
   const params = useParams();
-  const docId = params.id as string;
+  const routeParts = Array.isArray(params.ref) ? params.ref : [params.ref].filter(Boolean);
+  const docId = routeParts.length === 1
+    ? String(routeParts[0])
+    : routeParts.length === 2
+      ? `${String(routeParts[0])}~${String(routeParts[1])}`
+      : "invalid-conversation-reference";
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
+  const [metaRef, setMetaRef] = useState<string | null>(null);
   const [showExport, setShowExport] = useState(false);
   const metaRequestRef = useRef(0);
   const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
+  const currentMeta = metaRef === docId ? meta : null;
   const { prompts, syncVersions } = useConversationPrompts(docId, {
-    toolId: meta?.tool_id,
-    relativePath: meta?.relative_path,
+    toolId: currentMeta?.tool_id,
+    relativePath: currentMeta?.relative_path,
   });
 
   const refreshMeta = useCallback(() => {
@@ -50,7 +58,10 @@ export default function ConversationPage() {
     invalidateConversationMetadata(docId);
     return api.getConversation(docId)
       .then((nextMeta) => {
-        if (request === metaRequestRef.current) setMeta(nextMeta);
+        if (request === metaRequestRef.current) {
+          setMeta(nextMeta);
+          setMetaRef(docId);
+        }
       })
       .catch((error: unknown) => {
         if (request === metaRequestRef.current) console.error(error);
@@ -70,9 +81,8 @@ export default function ConversationPage() {
     }, 500);
   }, [refreshMeta, syncVersions.metadata]);
 
-  const pendingSubagentCount = meta?.id === docId
-    ? (meta.subagents || []).filter((subagent) => subagent.document_ready === false).length
-    : 0;
+  const pendingSubagentCount = (currentMeta?.subagents || [])
+    .filter((subagent) => subagent.document_ready === false).length;
   useEffect(() => {
     if (pendingSubagentCount === 0) return;
     const timer = window.setInterval(() => void refreshMeta(), 3_000);
@@ -85,7 +95,18 @@ export default function ConversationPage() {
     }
   }, [docId]);
 
-  const currentMeta = meta?.id === docId ? meta : null;
+  useEffect(() => {
+    const canonicalUrl = currentMeta?.canonical_url;
+    if (!canonicalUrl || typeof window === "undefined") return;
+    const currentPath = window.location.pathname.replace(/\/$/, "");
+    if (currentPath === canonicalUrl) return;
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${canonicalUrl}${window.location.search}${window.location.hash}`,
+    );
+  }, [currentMeta?.canonical_url]);
+
   const plans = currentMeta?.related_plans || [];
   const diagnostics = (currentMeta?.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
   const currentAgentPath = typeof currentMeta?.metadata?.agent_path === "string"
@@ -168,7 +189,17 @@ export default function ConversationPage() {
               </span>
             </div>
             {currentMeta.location && (
-              <ConversationLocation location={currentMeta.location} />
+              <>
+                <ConversationLocation location={currentMeta.location} />
+                {currentMeta.resume_id && (
+                  <ResumeConversationCommand
+                    key={`${currentMeta.tool_id}:${currentMeta.resume_id}:${currentMeta.location.path}`}
+                    location={currentMeta.location}
+                    resumeId={currentMeta.resume_id}
+                    toolId={currentMeta.tool_id}
+                  />
+                )}
+              </>
             )}
           </>
         )}
@@ -240,7 +271,7 @@ export default function ConversationPage() {
         </div>
       )}
       <ConversationViewer
-        documentId={docId}
+        documentId={currentMeta?.id || docId}
         prompts={prompts}
         messageSyncVersion={syncVersions.messages}
         pendingInteractionsSyncVersion={syncVersions.pendingInteractions}
@@ -252,7 +283,7 @@ export default function ConversationPage() {
         artifacts={plans}
       />
       {showExport && (
-        <MarkdownExportDialog documentId={docId} onClose={() => setShowExport(false)} />
+        <MarkdownExportDialog documentId={currentMeta?.id || docId} onClose={() => setShowExport(false)} />
       )}
     </div>
   );

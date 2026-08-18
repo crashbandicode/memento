@@ -390,10 +390,137 @@ body {
   text-overflow: ellipsis;
 }
 
+.conversation-resume {
+  width: min(100%, 680px);
+  min-width: 0;
+  margin-top: 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--aurora-accent) 15%, var(--aurora-border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--aurora-surface-solid) 88%, transparent);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.4) inset;
+  backdrop-filter: var(--aurora-blur);
+  -webkit-backdrop-filter: var(--aurora-blur);
+}
+.conversation-resume-heading {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 6px 5px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--aurora-border) 75%, transparent);
+}
+.conversation-resume-title {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--aurora-fg2);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .01em;
+}
+.conversation-resume-title svg {
+  color: var(--aurora-accent);
+}
+.conversation-resume-tabs {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--aurora-border);
+  border-radius: 8px;
+  background: var(--aurora-surface);
+}
+.conversation-resume-tab {
+  min-height: 22px;
+  padding: 2px 8px;
+  appearance: none;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--aurora-fg4);
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background-color .14s ease, color .14s ease, box-shadow .14s ease;
+}
+.conversation-resume-tab[aria-selected="true"] {
+  background: var(--aurora-surface-solid);
+  box-shadow: 0 1px 4px rgba(20, 16, 40, 0.08);
+  color: var(--aurora-accent);
+}
+.conversation-resume-tab:focus-visible,
+.conversation-resume-copy:focus-visible {
+  outline: 2px solid var(--aurora-accent);
+  outline-offset: 1px;
+}
+.conversation-resume-command {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+}
+.conversation-resume-command code {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  padding: 9px 10px;
+  color: var(--aurora-fg3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10.5px;
+  line-height: 1.35;
+  scrollbar-width: thin;
+  white-space: nowrap;
+}
+.conversation-resume-copy {
+  display: inline-flex;
+  width: 38px;
+  flex: 0 0 38px;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, var(--aurora-border) 75%, transparent);
+  background: color-mix(in srgb, var(--aurora-surface) 78%, transparent);
+  color: var(--aurora-fg4);
+  cursor: pointer;
+  transition: background-color .14s ease, color .14s ease;
+}
+.conversation-resume-copy:hover {
+  background: var(--aurora-accent-soft);
+  color: var(--aurora-accent);
+}
+.conversation-resume-copy[data-copy-status="copied"] {
+  color: #10B981;
+}
+.conversation-resume-copy[data-copy-status="error"] {
+  color: #EF4444;
+}
+
 @media (max-width: 640px) {
   .conversation-location {
     display: flex;
     width: 100%;
+  }
+  .conversation-resume {
+    width: 100%;
+  }
+  .conversation-resume-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+  }
+  .conversation-resume-tabs {
+    width: 100%;
+  }
+  .conversation-resume-tab {
+    flex: 1 1 50%;
+  }
+  .conversation-resume-command code {
+    font-size: 10px;
   }
 }
 

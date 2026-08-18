@@ -4,25 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import type { ConversationLocation as ConversationLocationValue } from "@/lib/api-client";
 import { fmt, useI18n } from "@/lib/i18n";
 import { Icon } from "@/components/aurora/Icon";
+import { copyText } from "@/lib/copy-text";
 
 type CopyStatus = "idle" | "copied" | "error";
-
-async function copyText(value: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
-  }
-
-  const input = document.createElement("textarea");
-  input.value = value;
-  input.style.position = "fixed";
-  input.style.opacity = "0";
-  document.body.appendChild(input);
-  input.select();
-  const copied = document.execCommand("copy");
-  input.remove();
-  if (!copied) throw new Error("Clipboard unavailable");
-}
 
 export default function ConversationLocation({
   location,

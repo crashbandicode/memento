@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,7 @@ from server.api.conversations import (  # noqa: E402
     get_conversation_prompts,
     get_latest_agent_message,
     get_pending_conversation_interactions,
+    resolve_conversation_reference,
     search_conversation_messages,
 )
 from server.services.claude_lineage import (  # noqa: E402
@@ -142,6 +144,110 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    async def test_legacy_conversation_reference_parses_without_duplicate_query(self) -> None:
+        db = _Db([])
+
+        resolved = await resolve_conversation_reference(
+            str(self.doc_id),
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(resolved, self.doc_id)
+        self.assertEqual(db.statements, [])
+
+    async def test_native_reference_selects_canonical_cursor_copy(self) -> None:
+        native_id = str(uuid.uuid4())
+        placeholder = SimpleNamespace(
+            id=uuid.uuid4(),
+            tool_id="cursor",
+            relative_path=(
+                f"projects/empty-window/agent-transcripts/{native_id}/"
+                f"{native_id}.jsonl"
+            ),
+            metadata_={"session_id": native_id},
+            source_modified_at=self.now,
+            activity_at=self.now,
+            synced_at=self.now,
+            file_size_bytes=1_000,
+        )
+        canonical = SimpleNamespace(
+            id=uuid.uuid4(),
+            tool_id="cursor",
+            relative_path=(
+                f"projects/c-Users-intpa-app/agent-transcripts/{native_id}/"
+                f"{native_id}.jsonl"
+            ),
+            metadata_={"session_id": native_id},
+            source_modified_at=self.now - timedelta(days=1),
+            activity_at=self.now - timedelta(days=1),
+            synced_at=self.now - timedelta(days=1),
+            file_size_bytes=100,
+        )
+        db = _Db([_Result(rows=[placeholder, canonical])])
+
+        resolved = await resolve_conversation_reference(
+            f"cursor~{native_id}",
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(resolved, canonical.id)
+        compiled = db.statements[0].compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        self.assertIn("documents.tool_id =", sql)
+        self.assertIn("session_id", compiled.params.values())
+        self.assertIn(native_id, compiled.params.values())
+
+    async def test_native_reference_is_scoped_to_non_admin_machines(self) -> None:
+        native_id = str(uuid.uuid4())
+        machine_id = uuid.uuid4()
+        user = SimpleNamespace(id=uuid.uuid4(), role="member")
+        candidate = SimpleNamespace(
+            id=uuid.uuid4(),
+            tool_id="codex",
+            relative_path=f"sessions/{native_id}.jsonl",
+            metadata_={"session_id": native_id},
+            source_modified_at=self.now,
+            activity_at=self.now,
+            synced_at=self.now,
+            file_size_bytes=100,
+        )
+        db = _Db([
+            _Result(rows=[(machine_id,)]),
+            _Result(rows=[candidate]),
+        ])
+
+        resolved = await resolve_conversation_reference(
+            f"codex~{native_id}",
+            db=db,
+            _user=user,
+        )
+
+        self.assertEqual(resolved, candidate.id)
+        self.assertEqual(len(db.statements), 2)
+        compiled = db.statements[1].compile(dialect=postgresql.dialect())
+        self.assertIn("documents.machine_id IN", str(compiled))
+        self.assertTrue(any(
+            isinstance(value, list) and machine_id in value
+            for value in compiled.params.values()
+        ))
+
+    async def test_invalid_or_missing_conversation_reference_returns_404(self) -> None:
+        for conversation_ref, results in (
+            ("codex~not-a-uuid", []),
+            (f"codex~{uuid.uuid4()}", [_Result(rows=[])]),
+        ):
+            with self.subTest(conversation_ref=conversation_ref):
+                db = _Db(results)
+                with self.assertRaises(HTTPException) as caught:
+                    await resolve_conversation_reference(
+                        conversation_ref,
+                        db=db,
+                        _user=self.owner,
+                    )
+                self.assertEqual(caught.exception.status_code, 404)
 
     async def test_projected_tail_is_count_and_offset_free(self) -> None:
         projection = self.read_model()
@@ -1834,6 +1940,12 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 1)
+        self.assertEqual(payload["native_id"], root_thread_id)
+        self.assertEqual(payload["resume_id"], root_thread_id)
+        self.assertEqual(
+            payload["canonical_url"],
+            f"/conversations/codex/{root_thread_id}",
+        )
         self.assertEqual(
             payload["location"],
             {

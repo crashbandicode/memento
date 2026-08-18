@@ -44,6 +44,13 @@ from ..services.conversation_hierarchy import (
     is_conversation_subagent,
     merge_subagent_event_summaries,
 )
+from ..services.conversation_identity import (
+    conversation_native_id,
+    conversation_resume_id,
+    native_conversation_tool_id,
+    native_conversation_url,
+    select_canonical_conversation_document,
+)
 from ..services.conversation_markdown import (
     is_meaningful_human_prompt,
     is_meaningful_human_turn,
@@ -93,6 +100,12 @@ from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
+_NATIVE_CONVERSATION_REF = re.compile(
+    r"^(?P<tool>claude|codex|cursor)~"
+    r"(?P<native>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+
 _SHELL_TOOL_NAMES = {
     "bash",
     "execcommand",
@@ -103,6 +116,61 @@ _SHELL_TOOL_NAMES = {
     "shellcommand",
     "terminal",
 }
+
+
+async def resolve_conversation_reference(
+    conversation_ref: str,
+    db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> uuid.UUID:
+    """Resolve a legacy document UUID or a scoped tool-native URL alias."""
+    native_match = _NATIVE_CONVERSATION_REF.fullmatch(str(conversation_ref or ""))
+    if native_match is not None:
+        mids = await user_machine_ids(db, _user)
+        tool_id = native_conversation_tool_id(native_match.group("tool"))
+        try:
+            native_id = str(uuid.UUID(native_match.group("native")))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=404) from None
+        if tool_id is None:
+            raise HTTPException(status_code=404)
+
+        statement = (
+            select(Document)
+            .options(
+                load_only(
+                    Document.id,
+                    Document.tool_id,
+                    Document.relative_path,
+                    Document.metadata_,
+                    Document.source_modified_at,
+                    Document.activity_at,
+                    Document.synced_at,
+                    Document.file_size_bytes,
+                )
+            )
+            .where(
+                Document.category == "conversation",
+                Document.tool_id == tool_id,
+                Document.metadata_["session_id"].astext == native_id,
+            )
+        )
+        if mids is not None:
+            statement = statement.where(Document.machine_id.in_(mids))
+        candidates = list((await db.execute(statement)).scalars().all())
+        selected = select_canonical_conversation_document(
+            candidates,
+            tool_id=tool_id,
+            session_id=native_id,
+        )
+        if selected is None:
+            raise HTTPException(status_code=404)
+        return selected.id
+
+    try:
+        return uuid.UUID(str(conversation_ref))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404) from None
 
 
 def _is_shell_tool_name(value: object) -> bool:
@@ -571,9 +639,9 @@ def _message_question_interactions(metadata: object) -> list[dict]:
     return interactions
 
 
-@router.get("/{doc_id}")
+@router.get("/{conversation_ref}")
 async def get_conversation(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -912,6 +980,21 @@ async def get_conversation(
     return {
         "id": str(doc.id),
         "tool_id": doc.tool_id,
+        "native_id": conversation_native_id(
+            doc.tool_id,
+            "conversation",
+            doc.metadata_,
+        ),
+        "resume_id": conversation_resume_id(
+            doc.tool_id,
+            "conversation",
+            doc.metadata_,
+        ),
+        "canonical_url": native_conversation_url(
+            doc.tool_id,
+            "conversation",
+            doc.metadata_,
+        ),
         "title": conversation_display_title(
             doc.tool_id,
             doc.relative_path,
@@ -944,9 +1027,9 @@ async def get_conversation(
     }
 
 
-@router.get("/{doc_id}/messages")
+@router.get("/{conversation_ref}/messages")
 async def get_conversation_messages(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     tail: bool = Query(False),
@@ -1431,9 +1514,9 @@ async def _projected_pending_interactions(
     }
 
 
-@router.get("/{doc_id}/pending-interactions")
+@router.get("/{conversation_ref}/pending-interactions")
 async def get_pending_conversation_interactions(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -1982,9 +2065,9 @@ async def get_pending_conversation_interactions(
     }
 
 
-@router.get("/{doc_id}/latest-agent-message")
+@router.get("/{conversation_ref}/latest-agent-message")
 async def get_latest_agent_message(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -2040,9 +2123,9 @@ async def get_latest_agent_message(
     return {"line_number": latest_line}
 
 
-@router.get("/{doc_id}/search")
+@router.get("/{conversation_ref}/search")
 async def search_conversation_messages(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     q: str = Query(..., min_length=1, max_length=500),
     after_line: int | None = Query(None, ge=0),
     limit: int = Query(50, ge=1, le=100),
@@ -2151,9 +2234,9 @@ async def search_conversation_messages(
     }
 
 
-@router.get("/{doc_id}/prompts")
+@router.get("/{conversation_ref}/prompts")
 async def get_conversation_prompts(
-    doc_id: uuid.UUID,
+    doc_id: uuid.UUID = Depends(resolve_conversation_reference),
     after_line: int | None = None,
     generation: int | None = None,
     db: AsyncSession = Depends(get_db),

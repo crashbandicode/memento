@@ -276,6 +276,9 @@ export interface ConversationLocation {
 export interface ConversationMeta {
   id: string;
   tool_id: string;
+  native_id?: string | null;
+  resume_id?: string | null;
+  canonical_url?: string | null;
   title: string | null;
   relative_path: string;
   metadata: Record<string, unknown>;

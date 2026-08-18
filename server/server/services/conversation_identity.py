@@ -25,6 +25,15 @@ CODEX_SESSION_UNIQUE_INDEX_SQL = f"""
       AND metadata->>'session_id' = metadata->>'thread_id'
 """
 
+NATIVE_CONVERSATION_TOOL_SLUGS = {
+    "claude": "claude_code",
+    "codex": "codex",
+    "cursor": "cursor",
+}
+NATIVE_CONVERSATION_TOOL_IDS = {
+    tool_id: slug for slug, tool_id in NATIVE_CONVERSATION_TOOL_SLUGS.items()
+}
+
 
 def _uuid_string(value: object) -> str | None:
     if not isinstance(value, str):
@@ -57,6 +66,61 @@ def conversation_session_id(
         thread_id = _uuid_string(metadata.get("thread_id"))
         return session_id if thread_id == session_id else None
     return None
+
+
+def native_conversation_tool_id(slug: str) -> str | None:
+    """Return the stored tool identifier for a public native-URL slug."""
+    return NATIVE_CONVERSATION_TOOL_SLUGS.get(str(slug or "").casefold())
+
+
+def native_conversation_tool_slug(tool_id: str) -> str | None:
+    """Return the stable public URL slug for a supported conversation tool."""
+    return NATIVE_CONVERSATION_TOOL_IDS.get(str(tool_id or "").casefold())
+
+
+def conversation_native_id(
+    tool_id: str,
+    category: str,
+    metadata: object,
+) -> str | None:
+    """Return the tool-native UUID used to identify one transcript.
+
+    Unlike ``conversation_session_id``, this includes Claude and child-agent
+    transcripts.  It is a URL alias only: Memento's document UUID remains the
+    relational identity used by messages, tasks, search, and embeddings.
+    """
+    if (
+        category != "conversation"
+        or native_conversation_tool_slug(tool_id) is None
+        or not isinstance(metadata, dict)
+    ):
+        return None
+    return _uuid_string(metadata.get("session_id"))
+
+
+def conversation_resume_id(
+    tool_id: str,
+    category: str,
+    metadata: object,
+) -> str | None:
+    """Return the root tool-native UUID suitable for resume affordances."""
+    native_id = conversation_native_id(tool_id, category, metadata)
+    if native_id is None or not isinstance(metadata, dict):
+        return None
+    return _uuid_string(metadata.get("root_session_id")) or native_id
+
+
+def native_conversation_url(
+    tool_id: str,
+    category: str,
+    metadata: object,
+) -> str | None:
+    """Build the canonical browser path without exposing document UUIDs."""
+    slug = native_conversation_tool_slug(tool_id)
+    native_id = conversation_native_id(tool_id, category, metadata)
+    if slug is None or native_id is None:
+        return None
+    return f"/conversations/{slug}/{native_id}"
 
 
 def cursor_session_id(
@@ -192,7 +256,7 @@ def select_canonical_conversation_document(
     """Select one canonical revision for a verified movable conversation."""
     if tool_id == "cursor":
         return select_canonical_cursor_document(documents, session_id)
-    if tool_id != "codex" or not documents:
+    if tool_id not in {"claude_code", "codex"} or not documents:
         return None
 
     def field(document: object, name: str, default=None):
@@ -203,14 +267,29 @@ def select_canonical_conversation_document(
         except (KeyError, TypeError):
             return getattr(document, name, default)
 
+    if tool_id == "codex":
+        return max(
+            documents,
+            key=lambda document: codex_document_preference(
+                relative_path=field(document, "relative_path", ""),
+                source_modified_at=field(document, "source_modified_at"),
+                file_size_bytes=field(document, "file_size_bytes", 0),
+                synced_at=field(document, "synced_at"),
+                document_id=field(document, "id", ""),
+            ),
+        )
+
+    # Claude sessions are normally unique.  If the same source is collected
+    # through two host identities, prefer its freshest/largest complete copy
+    # rather than making native links nondeterministic.
     return max(
         documents,
-        key=lambda document: codex_document_preference(
-            relative_path=field(document, "relative_path", ""),
-            source_modified_at=field(document, "source_modified_at"),
-            file_size_bytes=field(document, "file_size_bytes", 0),
-            synced_at=field(document, "synced_at"),
-            document_id=field(document, "id", ""),
+        key=lambda document: (
+            _timestamp_rank(field(document, "activity_at")),
+            _timestamp_rank(field(document, "source_modified_at")),
+            int(field(document, "file_size_bytes", 0) or 0),
+            _timestamp_rank(field(document, "synced_at")),
+            str(field(document, "id", "")),
         ),
     )
 
