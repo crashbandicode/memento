@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from server.api.conversations import _conversation_canvas_summaries
 from server.db.models import (
     Base,
     CanvasArtifact,
@@ -43,6 +45,7 @@ export default function Report() { return <Card><Text>Safe</Text></Card>; }
 """
 COMPILED = b"const Report=()=>React.createElement(Card,null);export default Report;"
 RUNTIME = b"function mountCanvas(value){return value}export{mountCanvas};"
+UPDATED_SOURCE = SOURCE.replace(b"Safe", b"Updated")
 
 
 def _sha(payload: bytes) -> str:
@@ -336,3 +339,208 @@ async def test_inventory_locks_messages_against_concurrent_ingest_replacement(
                         )
                     )
                 await ingest_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_captured_canvas_is_rechecked_and_updates_every_path_reference(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="source-refresh",
+            collector_token_hash=uuid4().hex,
+            user_id=user.id,
+        )
+        session.add_all([user, machine])
+        await session.flush()
+        path = "/home/me/.cursor/projects/ws/canvases/live.canvas.tsx"
+        document, _messages = await _conversation(
+            session,
+            user=user,
+            machine=machine,
+            tool_id="cursor",
+            paths=[path, path],
+        )
+        await inventory_machine_canvases(session, machine.id)
+        request = (await pending_machine_canvases(session, machine.id))[0]
+        metadata = {
+            "reference_ids": request["reference_ids"],
+            "path_hash": request["path_hash"],
+            "name": "live",
+            "source_hash": _sha(SOURCE),
+            "compiled_hash": _sha(COMPILED),
+            "runtime_hash": _sha(RUNTIME),
+            "render_mode": "interactive",
+        }
+        original, status, linked = await store_captured_canvas(
+            session,
+            user=user,
+            machine=machine,
+            metadata=metadata,
+            source=SOURCE,
+            compiled=COMPILED,
+            runtime=RUNTIME,
+        )
+        assert status == "renderable"
+        assert linked == 2
+        summary = await _conversation_canvas_summaries(session, document.id)
+        assert len(summary) == 1
+        assert summary[0]["artifact_id"] == str(original.id)
+        assert summary[0]["source_kind"] == "interactive"
+        assert await pending_machine_canvases(session, machine.id) == []
+
+        refresh = await pending_machine_canvases(
+            session,
+            machine.id,
+            refresh_before=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        assert len(refresh) == 1
+        assert refresh[0]["current_source_hash"] == _sha(SOURCE)
+        assert refresh[0]["current_render_mode"] == "interactive"
+        unchanged = await record_canvas_outcome(
+            session,
+            machine_id=machine.id,
+            reference_ids=[UUID(value) for value in refresh[0]["reference_ids"]],
+            path_hash=refresh[0]["path_hash"],
+            status="unchanged",
+            reason="source_hash_match",
+        )
+        assert unchanged == 2
+
+        updated, updated_status, updated_links = await store_captured_canvas(
+            session,
+            user=user,
+            machine=machine,
+            metadata={**metadata, "source_hash": _sha(UPDATED_SOURCE)},
+            source=UPDATED_SOURCE,
+            compiled=COMPILED,
+            runtime=RUNTIME,
+        )
+        assert updated_status == "renderable"
+        assert updated_links == 2
+        assert updated.id != original.id
+        refreshed_summary = await _conversation_canvas_summaries(session, document.id)
+        assert len(refreshed_summary) == 1
+        assert refreshed_summary[0]["artifact_id"] == str(updated.id)
+        linked_artifacts = (
+            await session.execute(
+                select(CanvasArtifactReference.artifact_id).where(
+                    CanvasArtifactReference.machine_id == machine.id,
+                    CanvasArtifactReference.path_hash == request["path_hash"],
+                )
+            )
+        ).scalars().all()
+        assert linked_artifacts == [updated.id, updated.id]
+        assert (
+            await session.scalar(select(func.count()).select_from(CanvasArtifact))
+        ) == 2
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_pending_repairs_legacy_json_escaped_windows_reference(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="escaped-source",
+            collector_token_hash=uuid4().hex,
+            user_id=user.id,
+        )
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="cursor"))
+        session.add_all([user, machine])
+        await session.flush()
+        document = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"sessions/{uuid4()}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            content_hash=uuid4().hex + uuid4().hex,
+            file_size_bytes=1,
+            metadata_={},
+        )
+        session.add(document)
+        await session.flush()
+        escaped = (
+            r"C:\\Users\\intpa\\.cursor\\projects\\workspace\\canvases"
+            r"\\incident.canvas.tsx"
+        )
+        message = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            role="tool",
+            content='{"result":"Opened canvas: ' + escaped + '"}',
+        )
+        ordinary_path = r"C:\temp\outside.canvas.tsx"
+        ordinary_message = ConversationMessage(
+            document_id=document.id,
+            line_number=2,
+            role="tool",
+            content=f"Opened canvas: {ordinary_path}",
+        )
+        session.add_all([message, ordinary_message])
+        await session.flush()
+        ordinary_reference = CanvasArtifactReference(
+            document_id=document.id,
+            message_id=ordinary_message.id,
+            machine_id=machine.id,
+            recorded_path=ordinary_path,
+            path_hash=normalized_path_hash(ordinary_path),
+            name="outside",
+            status="unsupported",
+            reason="non_local_or_unsupported_path",
+        )
+        session.add_all([
+            CanvasArtifactReference(
+                document_id=document.id,
+                message_id=message.id,
+                machine_id=machine.id,
+                recorded_path=escaped,
+                path_hash=normalized_path_hash(escaped),
+                name="incident",
+                status="unsupported",
+                reason="non_local_or_unsupported_path",
+            ),
+            ordinary_reference,
+        ])
+        await session.flush()
+        ordinary_reference_id = ordinary_reference.id
+
+        pending = await pending_machine_canvases(session, machine.id)
+
+        assert len(pending) == 1
+        assert pending[0]["path"] == (
+            r"C:\Users\intpa\.cursor\projects\workspace\canvases"
+            r"\incident.canvas.tsx"
+        )
+        references = (
+            await session.execute(
+                select(CanvasArtifactReference).where(
+                    CanvasArtifactReference.document_id == document.id
+                )
+            )
+        ).scalars().all()
+        assert len(references) == 2
+        repaired = next(reference for reference in references if reference.name == "incident")
+        untouched = next(reference for reference in references if reference.name == "outside")
+        assert repaired.status == "discovered"
+        assert untouched.id == ordinary_reference_id
+        assert untouched.status == "unsupported"
+        await session.rollback()

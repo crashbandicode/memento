@@ -12,6 +12,7 @@ import {
   isSafeCanvasEmbedUrl,
   isSafeCanvasPath,
   looksLikeCanvasArtifact,
+  normalizeCanvasTarget,
   resolveCanvasView,
   sanitizeCanvasName,
 } from "../src/lib/canvas-artifact.mjs";
@@ -27,6 +28,13 @@ test("detects .canvas.tsx artifacts and ignores plain tsx", () => {
 test("display name strips the .canvas.tsx suffix and the directory", () => {
   assert.equal(canvasDisplayName("/a/b/billing-review.canvas.tsx"), "billing-review");
   assert.equal(canvasDisplayName("report.canvas.tsx?x=1#y"), "report");
+});
+
+test("normalizes JSON-escaped absolute Windows canvas paths", () => {
+  assert.equal(
+    normalizeCanvasTarget(String.raw`C:\\Users\\intpa\\.cursor\\projects\\work\\canvases\\report.canvas.tsx`),
+    String.raw`C:\Users\intpa\.cursor\projects\work\canvases\report.canvas.tsx`,
+  );
 });
 
 test("names are sanitized against control characters", () => {

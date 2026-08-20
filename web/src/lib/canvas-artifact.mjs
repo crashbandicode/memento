@@ -53,10 +53,16 @@ function decode(value) {
 
 /** Strip a `file://` prefix, surrounding punctuation, and whitespace. */
 export function normalizeCanvasTarget(value) {
-  return decode(String(value ?? ""))
+  const normalized = decode(String(value ?? ""))
     .trim()
     .replace(/^file:\/\//i, "")
     .replace(/[),.;:]+$/, "");
+  // Cursor tool results can carry a nested JSON string, leaving Windows path
+  // separators escaped in the visible message. Match the server's bounded
+  // normalization so an inline chip resolves to the captured artifact.
+  return /^[a-z]:\\{2,}/i.test(normalized)
+    ? normalized.replace(/\\{2,}/g, "\\")
+    : normalized;
 }
 
 function pathPart(value) {

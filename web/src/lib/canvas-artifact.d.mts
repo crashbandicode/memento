@@ -25,6 +25,10 @@ export interface CanvasArtifact {
   source_url?: string | null;
   /** Explicit collector backfill state. */
   capture_status?: string | null;
+  /** Message line that introduced the conversation-level reference. */
+  line_number?: number | null;
+  /** Last server-side reference/artifact refresh time. */
+  updated_at?: string | null;
 }
 
 export type CanvasView =

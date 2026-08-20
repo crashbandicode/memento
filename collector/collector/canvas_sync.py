@@ -13,6 +13,7 @@ from .canvas_artifacts import (
     CanvasCaptureError,
     capture_canvas,
     locate_canvas_toolchain,
+    probe_canvas_source,
 )
 from .config import CollectorConfig
 from .tls import SSL_CONTEXT
@@ -40,6 +41,14 @@ def _valid_request(value: Any) -> bool:
         and isinstance(value.get("reference_ids"), list)
         and 0 < len(value["reference_ids"]) <= 128
         and all(isinstance(item, str) and len(item) <= 64 for item in value["reference_ids"])
+        and (
+            value.get("current_source_hash") is None
+            or (
+                isinstance(value.get("current_source_hash"), str)
+                and bool(_HASH.fullmatch(value["current_source_hash"]))
+            )
+        )
+        and value.get("current_render_mode") in {None, "interactive", "static"}
     )
 
 
@@ -73,6 +82,8 @@ def sync_pending_canvases(
         "static_only": 0,
         "missing": 0,
         "rejected": 0,
+        "unchanged": 0,
+        "updated": 0,
         "failed": 0,
     }
     with httpx.Client(
@@ -91,13 +102,30 @@ def sync_pending_canvases(
         if not isinstance(requests, list):
             return counts
 
-        toolchain = locate_canvas_toolchain()
+        toolchain = None
+        toolchain_loaded = False
         for request in requests[:MAX_BATCH]:
             if not _valid_request(request):
                 counts["failed"] += 1
                 continue
             counts["requested"] += 1
             try:
+                probe = probe_canvas_source(request["path"])
+                if (
+                    request.get("current_source_hash") == probe.source_hash
+                    and request.get("current_render_mode") != "static"
+                ):
+                    _submit_outcome(
+                        client,
+                        request,
+                        status="unchanged",
+                        reason="source_hash_match",
+                    )
+                    counts["unchanged"] += 1
+                    continue
+                if not toolchain_loaded:
+                    toolchain = locate_canvas_toolchain()
+                    toolchain_loaded = True
                 captured = capture_canvas(
                     request["path"],
                     toolchain=toolchain,
@@ -162,6 +190,8 @@ def sync_pending_canvases(
                     counts["renderable"] += 1
                 else:
                     counts["static_only"] += 1
+                if request.get("current_source_hash"):
+                    counts["updated"] += 1
             except httpx.HTTPError:
                 counts["failed"] += 1
                 logger.exception(

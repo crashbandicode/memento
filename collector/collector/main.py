@@ -263,6 +263,8 @@ def _poll_canvas_artifacts(
         "static_only": 0,
         "missing": 0,
         "rejected": 0,
+        "unchanged": 0,
+        "updated": 0,
         "failed": 0,
     }
     try:
@@ -270,12 +272,14 @@ def _poll_canvas_artifacts(
         if counts["requested"]:
             logger.info(
                 "Canvas backfill batch: requested=%d renderable=%d static=%d "
-                "missing=%d rejected=%d failed=%d",
+                "missing=%d rejected=%d unchanged=%d updated=%d failed=%d",
                 counts["requested"],
                 counts["renderable"],
                 counts["static_only"],
                 counts["missing"],
                 counts["rejected"],
+                counts["unchanged"],
+                counts["updated"],
                 counts["failed"],
             )
     except Exception:

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +33,7 @@ MAX_RUNTIME_BYTES = 2 * 1024 * 1024
 MAX_INVENTORY_MESSAGES = 500
 MAX_PENDING_GROUPS = 16
 MAX_REFERENCE_IDS = 128
+MAX_ESCAPED_PATH_REPAIRS = 256
 ALLOWED_TOOLS = ("cursor", "claude_code", "codex")
 TERMINAL_OUTCOMES = {
     "renderable",
@@ -43,6 +43,8 @@ TERMINAL_OUTCOMES = {
     "unsupported",
     "already_current",
 }
+REFRESHABLE_OUTCOMES = {"renderable", "static_only", "already_current"}
+CANVAS_REFRESH_INTERVAL = timedelta(minutes=5)
 
 _LOCAL_ABSOLUTE_CANVAS = re.compile(
     r"^(?:[A-Za-z]:[\\/]|/).+\.cursor[\\/]projects[\\/]"
@@ -187,6 +189,7 @@ async def inventory_machine_canvases(
     machine_id: uuid.UUID,
 ) -> dict[str, int]:
     """Discover a bounded set of exact references without reading source paths."""
+    await _repair_serialized_canvas_references(db, machine_id)
     await db.execute(
         pg_insert(CanvasArtifactInventoryState)
         .values(machine_id=machine_id, last_message_id=0)
@@ -274,27 +277,85 @@ async def inventory_machine_canvases(
     return {"discovered": discovered, "unsupported": unsupported}
 
 
+async def _repair_serialized_canvas_references(
+    db: AsyncSession,
+    machine_id: uuid.UUID,
+) -> int:
+    """Reproject legacy Cursor rows whose local path remained JSON escaped."""
+    rows = (
+        await db.execute(
+            select(ConversationMessage, Document)
+            .join(
+                CanvasArtifactReference,
+                CanvasArtifactReference.message_id == ConversationMessage.id,
+            )
+            .join(Document, Document.id == ConversationMessage.document_id)
+            .where(
+                CanvasArtifactReference.machine_id == machine_id,
+                CanvasArtifactReference.status == "unsupported",
+                CanvasArtifactReference.reason == "non_local_or_unsupported_path",
+                func.strpos(CanvasArtifactReference.recorded_path, "\\\\") > 0,
+            )
+            .order_by(CanvasArtifactReference.id)
+            .limit(MAX_ESCAPED_PATH_REPAIRS)
+        )
+    ).all()
+    by_document: dict[uuid.UUID, tuple[Document, list[ConversationMessage]]] = {}
+    seen_messages: set[int] = set()
+    for message, document in rows:
+        if message.id in seen_messages:
+            continue
+        seen_messages.add(message.id)
+        current = by_document.setdefault(document.id, (document, []))
+        current[1].append(message)
+    repaired = 0
+    for document, messages in by_document.values():
+        repaired += await reconcile_message_canvases(db, document, messages)
+    return repaired
+
+
 async def pending_machine_canvases(
     db: AsyncSession,
     machine_id: uuid.UUID,
+    *,
+    refresh_before: datetime | None = None,
 ) -> list[dict[str, Any]]:
     await inventory_machine_canvases(db, machine_id)
+    refresh_before = refresh_before or (
+        datetime.now(timezone.utc) - CANVAS_REFRESH_INTERVAL
+    )
     rows = (
         await db.execute(
-            select(CanvasArtifactReference)
+            select(
+                CanvasArtifactReference,
+                CanvasArtifact.source_hash,
+                CanvasArtifact.render_mode,
+            )
+            .outerjoin(
+                CanvasArtifact,
+                CanvasArtifact.id == CanvasArtifactReference.artifact_id,
+            )
             .where(
                 CanvasArtifactReference.machine_id == machine_id,
-                CanvasArtifactReference.status == "discovered",
+                or_(
+                    CanvasArtifactReference.status == "discovered",
+                    and_(
+                        CanvasArtifactReference.status.in_(REFRESHABLE_OUTCOMES),
+                        CanvasArtifactReference.last_attempt_at <= refresh_before,
+                    ),
+                ),
             )
             .order_by(
+                (CanvasArtifactReference.status != "discovered"),
+                CanvasArtifactReference.last_attempt_at.asc().nullsfirst(),
                 CanvasArtifactReference.path_hash,
                 CanvasArtifactReference.created_at,
             )
             .limit(MAX_PENDING_GROUPS * MAX_REFERENCE_IDS)
         )
-    ).scalars().all()
+    ).all()
     groups: dict[str, dict[str, Any]] = {}
-    for reference in rows:
+    for reference, source_hash, render_mode in rows:
         group = groups.get(reference.path_hash)
         if group is None:
             if len(groups) >= MAX_PENDING_GROUPS:
@@ -304,8 +365,13 @@ async def pending_machine_canvases(
                 "path_hash": reference.path_hash,
                 "name": reference.name,
                 "reference_ids": [],
+                "current_source_hash": source_hash,
+                "current_render_mode": render_mode,
             }
             groups[reference.path_hash] = group
+        elif not group.get("current_source_hash") and source_hash:
+            group["current_source_hash"] = source_hash
+            group["current_render_mode"] = render_mode
         if len(group["reference_ids"]) < MAX_REFERENCE_IDS:
             group["reference_ids"].append(str(reference.id))
     return list(groups.values())
@@ -438,7 +504,26 @@ async def store_captured_canvas(
     path_hash = str(metadata.get("path_hash") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", path_hash):
         raise HTTPException(status_code=400, detail="invalid path hash")
-    references = await _owned_references(db, machine.id, reference_ids, path_hash)
+    requested_references = await _owned_references(
+        db,
+        machine.id,
+        reference_ids,
+        path_hash,
+    )
+    references = (
+        (
+            await db.execute(
+                select(CanvasArtifactReference).where(
+                    CanvasArtifactReference.machine_id == machine.id,
+                    CanvasArtifactReference.path_hash == path_hash,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not references:
+        references = requested_references
 
     source_hash = str(metadata.get("source_hash") or "")
     validate_source(source, source_hash)
@@ -498,7 +583,7 @@ async def store_captured_canvas(
             source_hash=source_hash,
             compiled_hash=compiled_hash,
             runtime_hash=runtime_hash,
-            name=str(metadata.get("name") or references[0].name)[:120],
+            name=str(metadata.get("name") or requested_references[0].name)[:120],
             render_mode=(
                 "interactive" if compiled_hash and runtime_hash else "static"
             ),
@@ -540,6 +625,19 @@ async def store_captured_canvas(
         reference.reason = None
         reference.attempt_count += 1
         reference.last_attempt_at = now
+    from ..db.session import queue_realtime_event
+
+    for document_id in {reference.document_id for reference in references}:
+        queue_realtime_event(
+            db,
+            "file_synced",
+            {
+                "document_id": str(document_id),
+                "category": "conversation",
+                "changes": ["conversation.metadata"],
+            },
+            user_id=str(user.id),
+        )
     await db.flush()
     return artifact, status, len(references)
 
@@ -553,15 +651,20 @@ async def record_canvas_outcome(
     status: str,
     reason: str,
 ) -> int:
-    if status not in {"missing", "rejected", "unsupported"}:
+    if status not in {"missing", "rejected", "unsupported", "unchanged"}:
         raise HTTPException(status_code=400, detail="invalid Canvas outcome")
     if reason and not _SAFE_REASON.fullmatch(reason):
         reason = "collector_rejected"
     references = await _owned_references(db, machine_id, reference_ids, path_hash)
     now = datetime.now(timezone.utc)
     for reference in references:
-        reference.status = status
-        reference.reason = reason or status
+        if status == "unchanged":
+            if reference.artifact_id is None or reference.status not in REFRESHABLE_OUTCOMES:
+                raise HTTPException(status_code=409, detail="canvas has no current artifact")
+            reference.reason = None
+        else:
+            reference.status = status
+            reference.reason = reason or status
         reference.attempt_count += 1
         reference.last_attempt_at = now
     await db.flush()

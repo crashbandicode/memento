@@ -15,6 +15,7 @@ import { Btn, Chip } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import ConversationLocation from "@/components/conversations/ConversationLocation";
 import ResumeConversationCommand from "@/components/conversations/ResumeConversationCommand";
+import ConversationCanvasShelf from "@/components/conversations/ConversationCanvasShelf";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
 import { MarkdownExportDialog } from "@/components/conversations/MarkdownExportForm";
 
@@ -201,6 +202,7 @@ export default function ConversationPage() {
                 )}
               </>
             )}
+            <ConversationCanvasShelf canvases={currentMeta.canvases} />
           </>
         )}
       </div>

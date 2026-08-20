@@ -279,6 +279,7 @@ export interface ConversationMeta {
   native_id?: string | null;
   resume_id?: string | null;
   canonical_url?: string | null;
+  canvases?: CanvasArtifact[];
   title: string | null;
   relative_path: string;
   metadata: Record<string, unknown>;

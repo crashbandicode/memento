@@ -41,7 +41,7 @@ router = APIRouter(prefix="/api/canvas-artifacts", tags=["canvas-artifacts"])
 class CanvasOutcomeRequest(BaseModel):
     reference_ids: list[uuid.UUID] = Field(min_length=1, max_length=128)
     path_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    status: str = Field(pattern=r"^(missing|rejected|unsupported)$")
+    status: str = Field(pattern=r"^(missing|rejected|unsupported|unchanged)$")
     reason: str = Field(default="", max_length=128)
 
 

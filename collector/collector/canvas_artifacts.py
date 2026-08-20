@@ -91,6 +91,13 @@ class CapturedCanvas:
     static_reason: str | None
 
 
+@dataclass(frozen=True)
+class CanvasSourceProbe:
+    recorded_path: str
+    canonical_path: str
+    source_hash: str
+
+
 def _walk_strings(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -502,6 +509,22 @@ def capture_canvas(
         render_mode="source_only",
         compiler_version=None,
         static_reason=static_reason,
+    )
+
+
+def probe_canvas_source(
+    recorded_path: str,
+    *,
+    home: Path | None = None,
+) -> CanvasSourceProbe:
+    """Validate and hash a Canvas without invoking its compiler toolchain."""
+    path = canonicalize_canvas_path(recorded_path, home=home)
+    source = read_canvas_source(path)
+    validate_canvas_source(source)
+    return CanvasSourceProbe(
+        recorded_path=recorded_path,
+        canonical_path=str(path),
+        source_hash=hashlib.sha256(source).hexdigest(),
     )
 
 

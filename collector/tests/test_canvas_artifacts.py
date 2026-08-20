@@ -11,6 +11,7 @@ from collector.canvas_artifacts import (
     capture_canvas,
     canonicalize_canvas_path,
     extract_canvas_references,
+    probe_canvas_source,
     validate_canvas_source,
 )
 
@@ -53,6 +54,22 @@ def test_capture_source_only_under_exact_allowlisted_root(
     assert captured.static_reason == "toolchain_unavailable"
     assert captured.source_hash == hashlib.sha256(SAFE_SOURCE).hexdigest()
     assert captured.canonical_path == str(path.resolve())
+
+
+def test_probe_hashes_valid_source_without_compiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, path = _canvas(tmp_path)
+    monkeypatch.setattr(
+        "collector.canvas_artifacts.compile_canvas_source",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("compiled")),
+    )
+
+    probed = probe_canvas_source(str(path), home=home)
+
+    assert probed.canonical_path == str(path.resolve())
+    assert probed.source_hash == hashlib.sha256(SAFE_SOURCE).hexdigest()
 
 
 def test_rejects_outside_root_and_nested_canvas_path(tmp_path: Path) -> None:

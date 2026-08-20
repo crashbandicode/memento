@@ -46,6 +46,20 @@ def test_detects_bare_inline_canvas_path():
     assert canvases[0]["path"] == CANVAS_PATH
 
 
+def test_normalizes_json_escaped_windows_canvas_path():
+    escaped = (
+        r"C:\\Users\\intpa\\.cursor\\projects\\workspace\\canvases"
+        r"\\incident.canvas.tsx"
+    )
+    content = '{"result":"Opened canvas: ' + escaped + '"}'
+    canvases = detect_message_canvases(content)
+    assert len(canvases) == 1
+    assert canvases[0]["path"] == (
+        r"C:\Users\intpa\.cursor\projects\workspace\canvases"
+        r"\incident.canvas.tsx"
+    )
+
+
 def test_associates_adjacent_tsx_source():
     content = (
         f"Built the canvas at [billing-review]({CANVAS_PATH}).\n\n"

@@ -1990,11 +1990,12 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 0)
-        self.assertEqual(len(db.statements), 3)
+        self.assertEqual(len(db.statements), 4)
         for statement in db.statements:
             sql = str(statement.compile(dialect=postgresql.dialect())).upper()
             self.assertNotIn("COUNT(", sql)
-            self.assertNotIn("CONVERSATION_MESSAGES", sql)
+            if "CANVAS_ARTIFACT_REFERENCES" not in sql:
+                self.assertNotIn("CONVERSATION_MESSAGES", sql)
             self.assertNotIn("JSONB_EXTRACT_PATH_TEXT", sql)
         hierarchy_sql = str(
             db.statements[2].compile(dialect=postgresql.dialect())

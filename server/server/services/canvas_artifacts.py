@@ -64,6 +64,13 @@ def _path_part(value: str) -> str:
     value = _strip_target(value)
     value = value.split("#", 1)[0]
     value = value.split("?", 1)[0]
+    # Cursor sometimes nests a JSON-encoded tool result inside the normalized
+    # message text. In that representation a real Windows path is visible as
+    # ``C:\\\\Users\\\\...`` rather than ``C:\\Users\\...``. Collapse only
+    # repeated separators on an absolute drive path; doing this globally would
+    # corrupt UNC paths and arbitrary prose.
+    if re.match(r"^[A-Za-z]:\\{2,}", value):
+        value = re.sub(r"\\{2,}", r"\\", value)
     return value
 
 

@@ -255,6 +255,83 @@ async def _canvas_links_for_messages(
         }
     return links
 
+
+async def _conversation_canvas_summaries(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+) -> list[dict]:
+    """Return one current, authoritative Canvas descriptor per recorded path."""
+    rows = (
+        await db.execute(
+            select(
+                CanvasArtifactReference.path_hash,
+                CanvasArtifactReference.recorded_path,
+                CanvasArtifactReference.name,
+                CanvasArtifactReference.status,
+                CanvasArtifactReference.artifact_id,
+                CanvasArtifactReference.updated_at,
+                CanvasArtifact.render_mode,
+                ConversationMessage.line_number,
+            )
+            .join(
+                ConversationMessage,
+                ConversationMessage.id == CanvasArtifactReference.message_id,
+            )
+            .outerjoin(
+                CanvasArtifact,
+                CanvasArtifact.id == CanvasArtifactReference.artifact_id,
+            )
+            .where(CanvasArtifactReference.document_id == document_id)
+            .order_by(
+                CanvasArtifactReference.updated_at.desc(),
+                ConversationMessage.line_number.desc(),
+            )
+        )
+    ).all()
+    summaries: list[dict] = []
+    seen: set[str] = set()
+    for (
+        path_hash,
+        recorded_path,
+        name,
+        status,
+        artifact_id,
+        updated_at,
+        render_mode,
+        line_number,
+    ) in rows:
+        if path_hash in seen:
+            continue
+        seen.add(path_hash)
+        descriptor = {
+            "name": name,
+            "path": recorded_path,
+            "href": recorded_path,
+            "source_kind": "unsupported",
+            "capture_status": status,
+            "line_number": line_number,
+            "updated_at": updated_at.isoformat() if updated_at else None,
+        }
+        if artifact_id:
+            artifact_ref = str(artifact_id)
+            descriptor.update(
+                {
+                    "artifact_id": artifact_ref,
+                    "source_url": f"/api/canvas-artifacts/{artifact_ref}/source",
+                    "source_kind": (
+                        "interactive"
+                        if render_mode == "interactive"
+                        else "captured_source"
+                    ),
+                }
+            )
+            if render_mode == "interactive":
+                descriptor["render_url"] = (
+                    f"/api/canvas-artifacts/{artifact_ref}/render"
+                )
+        summaries.append(descriptor)
+    return summaries
+
 _MACHINE_PLATFORM_SUFFIX_RE = re.compile(
     r"\s+\((?:darwin|linux|windows)\)\s*$",
     re.IGNORECASE,
@@ -965,6 +1042,7 @@ async def get_conversation(
                 }
             )
 
+    conversation_canvases = await _conversation_canvas_summaries(db, doc.id)
     activity_at = logical_activity.get(doc.id) or effective_conversation_timestamp(
         ConversationRef(
             document_id=doc.id,
@@ -995,6 +1073,7 @@ async def get_conversation(
             "conversation",
             doc.metadata_,
         ),
+        "canvases": conversation_canvases,
         "title": conversation_display_title(
             doc.tool_id,
             doc.relative_path,

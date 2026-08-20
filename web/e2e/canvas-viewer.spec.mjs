@@ -16,7 +16,7 @@ mkdirSync(ART_DIR, { recursive: true });
 
 // The hermetic mock aborts the SSE stream on purpose; ignore that benign noise.
 const BENIGN =
-  /(events\/stream|EventSource|ERR_ABORTED|Failed to load resource|net::|favicon)/i;
+  /(events\/(?:stream|session)|EventSource|ERR_ABORTED|Failed to load resource|net::|favicon)/i;
 
 /** @param {import('@playwright/test').Page} page */
 function trackErrors(page) {
@@ -103,6 +103,26 @@ test.describe("canvas viewer", () => {
     expect(errors).toEqual([]);
   });
 
+  test("conversation-level Canvas shelf keeps the current artifact accessible", async ({ page }) => {
+    const errors = trackErrors(page);
+    await openConversation(page, cursorCanvas);
+
+    const shelf = page.locator("[data-conversation-canvases]");
+    await expect(shelf).toBeVisible();
+    await expect(shelf).toContainText("Canvases (1)");
+    await expect(shelf).toContainText("Current from source device");
+    const item = shelf.locator('[data-conversation-canvas="billing-review"]');
+    await expect(item).toBeVisible();
+    await item.click();
+    await expect(page.getByTestId("canvas-viewer")).toHaveAttribute(
+      "data-canvas-mode",
+      "interactive",
+    );
+    await page.getByTestId("canvas-viewer-close").click();
+    await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
   test("Codex canvas embeds a self-contained artifact in a locked-down iframe", async ({ page }) => {
     const errors = trackErrors(page);
     await openConversation(page, codexCanvas);
@@ -162,6 +182,11 @@ test.describe("canvas viewer", () => {
     const errors = trackErrors(page);
     await page.setViewportSize({ width: 390, height: 844 });
     await openConversation(page, cursorCanvas);
+
+    const shelf = page.locator("[data-conversation-canvases]");
+    await expect(shelf).toBeVisible();
+    const shelfBox = await shelf.boundingBox();
+    expect(shelfBox?.width ?? 0).toBeLessThanOrEqual(390);
 
     await page.getByTestId("smart-link-canvas").click();
     const dialog = page.getByTestId("canvas-viewer");

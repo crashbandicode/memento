@@ -205,6 +205,11 @@ const enUS: Translations = {
       unavailableTitle: "This canvas can't be previewed",
       unavailableBody:
         "The source device has not uploaded a supported Canvas representation. The recorded location is shown below.",
+      shelfTitle: "Canvases",
+      shelfHint: "Current artifacts from this conversation",
+      openCanvas: "Open canvas",
+      current: "Current from source device",
+      awaitingCapture: "Waiting for source device",
     },
     expandAll: "Expand All",
     subagentDispatch: "Subagent dispatch",

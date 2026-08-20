@@ -9,6 +9,7 @@ import { I18nContext, locales, type Locale } from "@/lib/i18n";
 import Sidebar from "@/components/layout/Sidebar";
 import Header from "@/components/layout/Header";
 import { AuroraBackdrop } from "@/components/aurora/AuroraBackdrop";
+import { installEmbeddedNavigationReporter } from "@/lib/embedded-navigation.mjs";
 
 /** Detect the best initial locale: user's saved choice → browser preference → en-US default. */
 function detectInitialLocale(): Locale {
@@ -35,6 +36,7 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   const [locale, setLocale] = useState<Locale>("en-US");
   const t = locales[locale].translations;
   const pathname = usePathname();
+  const isEmbeddedHandoff = pathname === "/auth/handoff";
 
   useEffect(() => {
     const initialLocale = detectInitialLocale();
@@ -58,15 +60,13 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
   }, [locale, t.app.title, t.app.subtitle, pathname]);
 
   // The desktop shell cannot inspect a cross-origin iframe's current URL.
-  // Report route changes explicitly so its Reload button can mint a fresh
-  // session without dropping the user back at /app.
+  // Observe the History API as well as Back/Forward: canonical conversation
+  // URLs and in-thread anchors deliberately use replaceState/pushState and do
+  // not reliably change Next's usePathname() value.
   useEffect(() => {
-    if (window.parent === window || pathname === "/auth/handoff") return;
-    window.parent.postMessage({
-      type: "memento:navigation",
-      path: `${window.location.pathname}${window.location.search}`,
-    }, "*");
-  }, [pathname]);
+    if (isEmbeddedHandoff) return;
+    return installEmbeddedNavigationReporter(window);
+  }, [isEmbeddedHandoff]);
 
   return (
     <ThemeProvider>

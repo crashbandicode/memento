@@ -210,6 +210,11 @@ const zhCN = {
       unavailableTitle: "无法预览此画布",
       unavailableBody:
         "源设备尚未上传受支持的画布表示。下方显示了对话中记录的位置。",
+      shelfTitle: "画布",
+      shelfHint: "此对话中的最新画布",
+      openCanvas: "打开画布",
+      current: "已与源设备同步",
+      awaitingCapture: "等待源设备上传",
     },
     expandAll: "展开全部",
     subagentDispatch: "子任务派发",
