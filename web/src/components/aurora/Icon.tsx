@@ -105,7 +105,7 @@ export function Icon({ name, size = 16, strokeWidth = 1.6, style, ...rest }: Ico
 export const TOOL_HUE: Record<string, { h: number; bg: string }> = {
   claude_code: { h: 18,  bg: "linear-gradient(135deg,#E89576,#C96442)" },
   openclaw:    { h: 280, bg: "linear-gradient(135deg,#C084FC,#7C3AED)" },
-  codex:       { h: 162, bg: "linear-gradient(135deg,#27343A,#10A37F)" },
+  codex:       { h: 238, bg: "linear-gradient(145deg,#8B8CF8 0%,#5168F6 52%,#3438F3 100%)" },
   antigravity: { h: 220, bg: "linear-gradient(135deg,#60A5FA,#2563EB)" },
   obsidian:    { h: 260, bg: "linear-gradient(135deg,#A78BFA,#7C3AED)" },
   cursor:      { h: 220, bg: "linear-gradient(135deg,#4B5563,#111827)" },
@@ -115,7 +115,7 @@ export const TOOL_HUE: Record<string, { h: number; bg: string }> = {
 };
 
 export const TOOL_ICON_NAME: Record<string, IconName> = {
-  claude_code: "sparkles", openclaw: "octopus", codex: "box",
+  claude_code: "sparkles", openclaw: "octopus", codex: "terminal",
   antigravity: "rocket", obsidian: "diamond", cursor: "lightning",
   windsurf: "surf", vscode: "code", hermes: "zap",
 };

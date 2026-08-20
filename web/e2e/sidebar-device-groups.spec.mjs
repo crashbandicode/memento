@@ -180,7 +180,7 @@ test("desktop groups hosts, aggregates filters, and preserves child access", asy
   expectNoPageErrors(errors);
 });
 
-test("Codex tool tiles keep the OpenAI mark white outside Aurora skin", async ({ page }) => {
+test("Codex tool tiles use the white cloud-terminal product mark", async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("dr_skin", "arc"));
   await openShell(page, { width: 390, height: 844 });
 
@@ -195,7 +195,9 @@ test("Codex tool tiles keep the OpenAI mark white outside Aurora skin", async ({
   const glyph = windowsIdentity.locator('[data-tool-glyph="codex"]').first();
   const mark = glyph.locator('[data-brand-mark="codex"]');
   await expect(glyph).toHaveAttribute("data-tool-mark-tone", "white");
-  await expect(mark).toHaveAttribute("color", "#fff");
+  await expect(mark).toHaveAttribute("data-brand-source", "codex-product");
+  await expect(mark.locator('[data-codex-product-mark="cloud-terminal"]')).toHaveCount(1);
+  await expect(mark.locator("path")).toHaveCount(2);
   await expect(glyph).toHaveCSS("background-image", /linear-gradient/);
 });
 

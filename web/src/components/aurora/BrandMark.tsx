@@ -8,13 +8,12 @@
  */
 import type { CSSProperties } from "react";
 import type { IconType } from "react-icons";
-import { AiFillOpenAI } from "react-icons/ai";
 import { SiClaude, SiObsidian, SiWindsurf } from "react-icons/si";
 import { VscVscode } from "react-icons/vsc";
 
 export const BRAND_COLORS: Record<string, string> = {
   claude_code: "#D97757",
-  codex:       "#10A37F",
+  codex:       "#5362F5",
   obsidian:    "#7C3AED",
   cursor:      "#0F0F0F",
   windsurf:    "#0FB68A",
@@ -35,9 +34,16 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
     />
   ),
   codex: (fill) => (
-    <g fill="none" stroke={fill} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 3.2l7.6 4.4v8.8L12 20.8l-7.6-4.4V7.6z" />
-      <path d="M12 3.2v8.8M12 12l7.6 4.4M12 12l-7.6 4.4" />
+    <g
+      data-codex-product-mark="cloud-terminal"
+      fill="none"
+      stroke={fill}
+      strokeWidth="1.9"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M7.1 18.6h10.5a4 4 0 0 0 .8-7.9A6.1 6.1 0 0 0 7 8.6a5.1 5.1 0 0 0 .1 10z" />
+      <path d="m8.4 10.4 2.2 2.2-2.2 2.2M13.2 15h3.2" />
     </g>
   ),
   obsidian: (fill) => (
@@ -101,7 +107,6 @@ const BRAND_PATHS: Record<BrandId, (fill: string) => React.ReactElement> = {
 /** Official vector marks available in the bundled react-icons set. */
 const OFFICIAL_MARKS: Partial<Record<BrandId, IconType>> = {
   claude_code: SiClaude,
-  codex: AiFillOpenAI,
   obsidian: SiObsidian,
   windsurf: SiWindsurf,
   vscode: VscVscode,
@@ -146,7 +151,13 @@ export function BrandMark({
     <svg
       aria-hidden="true"
       data-brand-mark={brandId}
-      data-brand-source={brandId === "cursor" ? "cursor-brand-kit" : "memento-custom"}
+      data-brand-source={
+        brandId === "cursor"
+          ? "cursor-brand-kit"
+          : brandId === "codex"
+            ? "codex-product"
+            : "memento-custom"
+      }
       width={size}
       height={size}
       viewBox="0 0 24 24"
