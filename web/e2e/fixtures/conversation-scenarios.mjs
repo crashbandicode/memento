@@ -1155,6 +1155,9 @@ const CURSOR_CANVAS_SOURCE = [
   "}",
 ].join("\n");
 const CURSOR_CANVAS_ARTIFACT_ID = "11111111-1111-4111-8111-111111111111";
+const CURSOR_STATIC_CANVAS_ARTIFACT_ID = "22222222-2222-4222-8222-222222222222";
+const CURSOR_STATIC_CANVAS_PATH =
+  "C:/Users/intpa/.cursor/projects/work/canvases/static-review.canvas.tsx";
 const CURSOR_CANVAS_SHELL = [
   "<!doctype html><html><head>",
   '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; connect-src \'none\'; frame-src \'none\'; script-src \'unsafe-inline\'">',
@@ -1182,6 +1185,17 @@ export const cursorCanvas = {
         render_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/render`,
         source_url: `/api/canvas-artifacts/${CURSOR_CANVAS_ARTIFACT_ID}/source`,
         capture_status: "renderable",
+        line_number: 2,
+        updated_at: T2,
+      },
+      {
+        name: "static-review",
+        path: CURSOR_STATIC_CANVAS_PATH,
+        href: CURSOR_STATIC_CANVAS_PATH,
+        source_kind: "captured_source",
+        artifact_id: CURSOR_STATIC_CANVAS_ARTIFACT_ID,
+        source_url: `/api/canvas-artifacts/${CURSOR_STATIC_CANVAS_ARTIFACT_ID}/source`,
+        capture_status: "static_only",
         line_number: 2,
         updated_at: T2,
       },
@@ -1228,6 +1242,9 @@ export const cursorCanvas = {
     [CURSOR_CANVAS_ARTIFACT_ID]: {
       render: CURSOR_CANVAS_SHELL,
       source: CURSOR_CANVAS_SOURCE,
+    },
+    [CURSOR_STATIC_CANVAS_ARTIFACT_ID]: {
+      source: CURSOR_CANVAS_SOURCE.replaceAll("BillingReview", "StaticReview"),
     },
   },
 };

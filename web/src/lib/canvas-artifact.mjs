@@ -137,6 +137,7 @@ export function canvasArtifactFromLink(href, label) {
  *   | { mode: "embed", variant: "srcdoc", html: string }
  *   | { mode: "embed", variant: "src", url: string }
  *   | { mode: "source", source: string, language: string }
+ *   | { mode: "stored_source", sourceUrl: string }
  *   | { mode: "unsupported" }
  * )}
  */
@@ -162,6 +163,12 @@ export function resolveCanvasView(artifact) {
       source,
       language: sanitizeCanvasName(a.source_language || CANVAS_SOURCE_LANGUAGE),
     };
+  }
+  if (
+    typeof a.source_url === "string"
+    && /^\/api\/canvas-artifacts\/[0-9a-f-]{36}\/source$/.test(a.source_url)
+  ) {
+    return { mode: "stored_source", sourceUrl: a.source_url };
   }
   return { mode: "unsupported" };
 }

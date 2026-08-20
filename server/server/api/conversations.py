@@ -26,7 +26,10 @@ from ..db.models import (
 from ..db.session import get_db, get_search_db
 from ..middleware.auth import get_current_user
 from ..services.canvas_artifact_store import normalized_path_hash
-from ..services.canvas_artifacts import detect_message_canvases
+from ..services.canvas_artifacts import (
+    canvas_message_can_have_reference,
+    detect_message_canvases,
+)
 from ..services.conversation_activity import conversation_activity_is_fresh
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
@@ -201,8 +204,16 @@ def _shell_command_text(value: object) -> str:
     return text
 
 
-def _canvas_field(content: str | None, links: dict[str, dict] | None = None) -> dict:
+def _canvas_field(
+    content: str | None,
+    links: dict[str, dict] | None = None,
+    *,
+    role: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
     """Attach validated Cursor Canvas descriptors only when a message has any."""
+    if role is not None and not canvas_message_can_have_reference(role, metadata):
+        return {}
     canvases = detect_message_canvases(content)
     if links:
         for canvas in canvases:
@@ -271,6 +282,7 @@ async def _conversation_canvas_summaries(
                 CanvasArtifactReference.artifact_id,
                 CanvasArtifactReference.updated_at,
                 CanvasArtifact.render_mode,
+                CanvasArtifact.name,
                 ConversationMessage.line_number,
             )
             .join(
@@ -281,7 +293,13 @@ async def _conversation_canvas_summaries(
                 CanvasArtifact,
                 CanvasArtifact.id == CanvasArtifactReference.artifact_id,
             )
-            .where(CanvasArtifactReference.document_id == document_id)
+            .where(
+                CanvasArtifactReference.document_id == document_id,
+                or_(
+                    CanvasArtifactReference.artifact_id.is_not(None),
+                    CanvasArtifactReference.status == "discovered",
+                ),
+            )
             .order_by(
                 CanvasArtifactReference.updated_at.desc(),
                 ConversationMessage.line_number.desc(),
@@ -298,13 +316,14 @@ async def _conversation_canvas_summaries(
         artifact_id,
         updated_at,
         render_mode,
+        artifact_name,
         line_number,
     ) in rows:
         if path_hash in seen:
             continue
         seen.add(path_hash)
         descriptor = {
-            "name": name,
+            "name": artifact_name or name,
             "path": recorded_path,
             "href": recorded_path,
             "source_kind": "unsupported",
@@ -1258,7 +1277,12 @@ async def get_conversation_messages(
                     ),
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None,
                     "raw_type": m.message_type or "",
-                    **_canvas_field(m.content, canvas_links.get(m.id)),
+                    **_canvas_field(
+                        m.content,
+                        canvas_links.get(m.id),
+                        role=m.role,
+                        metadata=m.metadata_,
+                    ),
                 }
                 for m in messages
             ],
@@ -1305,7 +1329,11 @@ async def get_conversation_messages(
                     "agent_event": m.agent_event,
                     "timestamp": m.timestamp or None,
                     "raw_type": m.raw_type,
-                    **_canvas_field(m.content),
+                    **_canvas_field(
+                        m.content,
+                        role=m.role,
+                        metadata={"tool_name": m.tool_name},
+                    ),
                 }
                 for i, m in enumerate(page)
             ],

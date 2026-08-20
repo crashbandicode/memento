@@ -78,6 +78,7 @@ export function CanvasViewer({
     error: boolean;
   } | null>(null);
   const [storedSource, setStoredSource] = useState<string | null>(null);
+  const [sourceLoadError, setSourceLoadError] = useState(false);
   const [showSource, setShowSource] = useState(false);
 
   const view = useMemo(() => resolveCanvasView(artifact), [artifact]);
@@ -99,6 +100,27 @@ export function CanvasViewer({
       .catch((error: unknown) => {
         if ((error as { name?: string })?.name !== "AbortError") {
           setRenderResult({ url: view.renderUrl, shell: null, error: true });
+        }
+      });
+    return () => controller.abort();
+  }, [open, view]);
+
+  useEffect(() => {
+    if (!open || view.mode !== "stored_source") return undefined;
+    const controller = new AbortController();
+    void authFetch(`${getApiBase()}${view.sourceUrl}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Canvas source HTTP ${response.status}`);
+        const source = await response.text();
+        if (!source || source.length > 200_000) throw new Error("Invalid Canvas source");
+        setStoredSource(source);
+      })
+      .catch((error: unknown) => {
+        if ((error as { name?: string })?.name !== "AbortError") {
+          setSourceLoadError(true);
         }
       });
     return () => controller.abort();
@@ -228,7 +250,7 @@ export function CanvasViewer({
             {view.mode === "interactive" ? copy.interactive : copy.static}
           </span>
           <span className={styles.spacer} />
-          {view.mode === "source" && (
+          {(view.mode === "source" || view.mode === "stored_source") && (
             <button
               type="button"
               className={styles.toolbarBtn}
@@ -239,7 +261,10 @@ export function CanvasViewer({
               <span>{copy.copySource}</span>
             </button>
           )}
-          {canShowStoredSource && view.mode !== "source" && (
+          {canShowStoredSource
+            && view.mode !== "source"
+            && view.mode !== "stored_source"
+            && (
             <button
               type="button"
               className={styles.toolbarBtn}
@@ -249,7 +274,7 @@ export function CanvasViewer({
               <Icon name="file_text" size={14} />
               <span>{showSource ? copy.viewVisual : copy.viewSource}</span>
             </button>
-          )}
+            )}
           {cursorUrl && (
             <a
               className={styles.toolbarBtn}
@@ -285,7 +310,21 @@ export function CanvasViewer({
         </header>
 
         <div className={styles.body}>
-          {showSource && (storedSource || view.mode === "source") ? (
+          {view.mode === "stored_source" ? (
+            sourceLoadError ? (
+              <div className={styles.fallback} data-testid="canvas-load-error">
+                <p className={styles.fallbackTitle}>{copy.loadError}</p>
+              </div>
+            ) : storedSource ? (
+              <pre className={styles.source} data-testid="canvas-source" tabIndex={0}>
+                {storedSource}
+              </pre>
+            ) : (
+              <div className={styles.fallback} data-testid="canvas-loading" role="status">
+                <p className={styles.fallbackText}>{copy.loading}</p>
+              </div>
+            )
+          ) : showSource && (storedSource || view.mode === "source") ? (
             <div className={styles.sourceWrap}>
               <button
                 type="button"

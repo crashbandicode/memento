@@ -25,7 +25,10 @@ from ..db.models import (
     Machine,
     User,
 )
-from .canvas_artifacts import detect_message_canvases
+from .canvas_artifacts import (
+    canvas_message_can_have_reference,
+    detect_message_canvases,
+)
 
 MAX_SOURCE_BYTES = 200_000
 MAX_COMPILED_BYTES = 500_000
@@ -34,6 +37,7 @@ MAX_INVENTORY_MESSAGES = 500
 MAX_PENDING_GROUPS = 16
 MAX_REFERENCE_IDS = 128
 MAX_ESCAPED_PATH_REPAIRS = 256
+MAX_NON_REFERENCE_REPAIRS = 512
 ALLOWED_TOOLS = ("cursor", "claude_code", "codex")
 TERMINAL_OUTCOMES = {
     "renderable",
@@ -149,7 +153,10 @@ async def reconcile_message_canvases(
         if message.id is None:
             continue
         desired: dict[str, dict[str, Any]] = {}
-        if ".canvas.tsx" in message.content.casefold():
+        if (
+            canvas_message_can_have_reference(message.role, message.metadata_)
+            and ".canvas.tsx" in message.content.casefold()
+        ):
             for descriptor in detect_message_canvases(message.content):
                 path = str(descriptor.get("path") or "")
                 if path:
@@ -190,6 +197,7 @@ async def inventory_machine_canvases(
 ) -> dict[str, int]:
     """Discover a bounded set of exact references without reading source paths."""
     await _repair_serialized_canvas_references(db, machine_id)
+    await _remove_non_reference_canvas_rows(db, machine_id)
     await db.execute(
         pg_insert(CanvasArtifactInventoryState)
         .values(machine_id=machine_id, last_message_id=0)
@@ -241,6 +249,8 @@ async def inventory_machine_canvases(
     discovered = 0
     unsupported = 0
     for message, _tool_id in rows:
+        if not canvas_message_can_have_reference(message.role, message.metadata_):
+            continue
         for descriptor in detect_message_canvases(message.content):
             path = str(descriptor.get("path") or "")
             if not path:
@@ -275,6 +285,72 @@ async def inventory_machine_canvases(
         state.last_message_id = max(message.id for message, _tool_id in rows)
     await db.flush()
     return {"discovered": discovered, "unsupported": unsupported}
+
+
+async def _remove_non_reference_canvas_rows(
+    db: AsyncSession,
+    machine_id: uuid.UUID,
+) -> int:
+    """Boundedly remove legacy references projected from quoted tool output."""
+    rows = (
+        await db.execute(
+            select(CanvasArtifactReference, ConversationMessage)
+            .join(
+                ConversationMessage,
+                ConversationMessage.id == CanvasArtifactReference.message_id,
+            )
+            .where(
+                CanvasArtifactReference.machine_id == machine_id,
+                or_(
+                    ConversationMessage.role.notin_(("assistant", "user", "tool")),
+                    and_(
+                        ConversationMessage.role == "tool",
+                        or_(
+                            func.lower(
+                                func.coalesce(
+                                    ConversationMessage.metadata_["tool_name"].astext,
+                                    "",
+                                )
+                            ).in_(
+                                (
+                                    "grep",
+                                    "glob",
+                                    "glob_file_search",
+                                    "read",
+                                    "read_file",
+                                    "read_lints",
+                                    "search",
+                                )
+                            ),
+                            func.lower(
+                                func.coalesce(
+                                    ConversationMessage.metadata_["tool_name"].astext,
+                                    "",
+                                )
+                            ).like("mcp-memento-memory-%"),
+                            func.lower(
+                                func.coalesce(
+                                    ConversationMessage.metadata_["tool_name"].astext,
+                                    "",
+                                )
+                            ).like("mcp__memento-memory__%"),
+                        ),
+                    ),
+                ),
+            )
+            .order_by(CanvasArtifactReference.id)
+            .limit(MAX_NON_REFERENCE_REPAIRS)
+        )
+    ).all()
+    removed = 0
+    for reference, message in rows:
+        if canvas_message_can_have_reference(message.role, message.metadata_):
+            continue
+        await db.delete(reference)
+        removed += 1
+    if removed:
+        await db.flush()
+    return removed
 
 
 async def _repair_serialized_canvas_references(

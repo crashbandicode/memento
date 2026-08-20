@@ -3,6 +3,7 @@ from __future__ import annotations
 from server.services.canvas_artifacts import (
     MAX_CANVAS_HTML_LENGTH,
     MAX_CANVAS_SOURCE_LENGTH,
+    canvas_message_can_have_reference,
     conversation_has_canvas,
     detect_message_canvases,
     is_safe_canvas_embed_url,
@@ -18,6 +19,22 @@ def test_no_canvas_returns_empty():
     assert detect_message_canvases(None) == []
     assert detect_message_canvases("") == []
     assert detect_message_canvases(123) == []  # type: ignore[arg-type]
+
+
+def test_read_search_and_memory_tool_payloads_do_not_introduce_canvases():
+    assert canvas_message_can_have_reference("assistant", {}) is True
+    assert canvas_message_can_have_reference("user", {}) is True
+    assert canvas_message_can_have_reference("tool", {"tool_name": "PowerShell"}) is True
+    assert canvas_message_can_have_reference("tool", {"tool_name": "Read"}) is False
+    assert canvas_message_can_have_reference("tool", {"tool_name": "read_lints"}) is False
+    assert (
+        canvas_message_can_have_reference(
+            "tool",
+            {"tool_name": "mcp-memento-memory-memory_conversation"},
+        )
+        is False
+    )
+    assert canvas_message_can_have_reference("system", {}) is False
 
 
 def test_detects_markdown_link_without_source_is_unsupported():

@@ -79,6 +79,15 @@ test("resolveCanvasView prefers captured output, then legacy views", () => {
     source: "export default 1",
     language: "tsx",
   });
+  assert.deepEqual(
+    resolveCanvasView({
+      source_url: "/api/canvas-artifacts/11111111-1111-4111-8111-111111111111/source",
+    }),
+    {
+      mode: "stored_source",
+      sourceUrl: "/api/canvas-artifacts/11111111-1111-4111-8111-111111111111/source",
+    },
+  );
   assert.deepEqual(resolveCanvasView({ name: "x", path: "x.canvas.tsx", href: "x.canvas.tsx" }), {
     mode: "unsupported",
   });
@@ -87,6 +96,9 @@ test("resolveCanvasView prefers captured output, then legacy views", () => {
 test("resolveCanvasView rejects unsafe embed URLs (falls back)", () => {
   assert.deepEqual(resolveCanvasView({ url: "javascript:alert(1)" }), { mode: "unsupported" });
   assert.deepEqual(resolveCanvasView({ render_url: "https://evil.test/render" }), {
+    mode: "unsupported",
+  });
+  assert.deepEqual(resolveCanvasView({ source_url: "https://evil.test/source" }), {
     mode: "unsupported",
   });
 });

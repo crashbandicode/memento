@@ -392,6 +392,7 @@ async def test_captured_canvas_is_rechecked_and_updates_every_path_reference(
         assert linked == 2
         summary = await _conversation_canvas_summaries(session, document.id)
         assert len(summary) == 1
+        assert summary[0]["name"] == "live"
         assert summary[0]["artifact_id"] == str(original.id)
         assert summary[0]["source_kind"] == "interactive"
         assert await pending_machine_canvases(session, machine.id) == []
@@ -441,6 +442,83 @@ async def test_captured_canvas_is_rechecked_and_updates_every_path_reference(
         assert (
             await session.scalar(select(func.count()).select_from(CanvasArtifact))
         ) == 2
+        await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_read_tool_documentation_is_not_projected_or_shown(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="documentation-source",
+            collector_token_hash=uuid4().hex,
+            user_id=user.id,
+        )
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="cursor"))
+        session.add_all([user, machine])
+        await session.flush()
+        document = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"sessions/{uuid4()}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            content_hash=uuid4().hex + uuid4().hex,
+            file_size_bytes=1,
+            metadata_={},
+        )
+        session.add(document)
+        await session.flush()
+        placeholder = "/Users/<user>/.cursor/projects/<workspace>/canvases/billing-review.canvas.tsx"
+        message = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            role="tool",
+            content=f"Canvas skill location example: {placeholder}",
+            metadata_={"tool_name": "Read"},
+        )
+        session.add(message)
+        await session.flush()
+
+        assert await project_message_canvases(session, document, [message]) == 0
+        assert await _conversation_canvas_summaries(session, document.id) == []
+
+        # A pre-fix row is removed by the bounded compatibility cleanup on the
+        # next collector inventory poll.
+        session.add(
+            CanvasArtifactReference(
+                document_id=document.id,
+                message_id=message.id,
+                machine_id=machine.id,
+                recorded_path=placeholder,
+                path_hash=normalized_path_hash(placeholder),
+                name="billing-review",
+                status="rejected",
+                reason="outside_allowlisted_root",
+            )
+        )
+        await session.flush()
+        assert await inventory_machine_canvases(session, machine.id) == {
+            "discovered": 0,
+            "unsupported": 0,
+        }
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(CanvasArtifactReference)
+                .where(CanvasArtifactReference.document_id == document.id)
+            )
+        ) == 0
         await session.rollback()
 
 

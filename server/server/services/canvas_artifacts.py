@@ -52,12 +52,53 @@ _FENCED_BLOCK = re.compile(
 _SOURCE_LANGS = {"tsx", "typescript", "ts", "jsx"}
 _HTML_LANGS = {"html", "htm"}
 
+# Tool output is useful only when it reports the creation/opening of an actual
+# Canvas path. Read/search/memory results routinely contain documentation,
+# source code, and earlier conversation text with illustrative ``.canvas.tsx``
+# paths; treating those blobs as new artifacts creates phantom shelf entries.
+_NON_REFERENCE_TOOL_NAMES = {
+    "grep",
+    "glob",
+    "glob_file_search",
+    "read",
+    "read_file",
+    "read_lints",
+    "search",
+}
+_NON_REFERENCE_TOOL_PREFIXES = (
+    "mcp-memento-memory-",
+    "mcp__memento-memory__",
+)
+
 
 def _strip_target(value: str | None) -> str:
     value = unquote(str(value or "")).strip()
     value = re.sub(r"^file://", "", value, flags=re.IGNORECASE)
     value = re.sub(r"[),.;:]+$", "", value)
     return value
+
+
+def canvas_message_can_have_reference(
+    role: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a normalized message may introduce a Canvas reference.
+
+    User and assistant prose can intentionally link a Canvas. Tool messages are
+    accepted by default because write/terminal/open-resource results are how
+    some Cursor versions report the created file, but read/search/memory tools
+    are excluded: their payload is quoted material, not a new reference.
+    """
+    normalized_role = str(role or "").strip().casefold()
+    if normalized_role in {"assistant", "user"}:
+        return True
+    if normalized_role != "tool":
+        return False
+    details = metadata if isinstance(metadata, dict) else {}
+    tool_name = str(details.get("tool_name") or "").strip().casefold()
+    if tool_name in _NON_REFERENCE_TOOL_NAMES:
+        return False
+    return not any(tool_name.startswith(prefix) for prefix in _NON_REFERENCE_TOOL_PREFIXES)
 
 
 def _path_part(value: str) -> str:

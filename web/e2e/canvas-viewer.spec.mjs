@@ -109,7 +109,7 @@ test.describe("canvas viewer", () => {
 
     const shelf = page.locator("[data-conversation-canvases]");
     await expect(shelf).toBeVisible();
-    await expect(shelf).toContainText("Canvases (1)");
+    await expect(shelf).toContainText("Canvases (2)");
     await expect(shelf).toContainText("Current from source device");
     const item = shelf.locator('[data-conversation-canvas="billing-review"]');
     await expect(item).toBeVisible();
@@ -120,6 +120,23 @@ test.describe("canvas viewer", () => {
     );
     await page.getByTestId("canvas-viewer-close").click();
     await expect(page.getByTestId("canvas-viewer")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
+  test("captured static Canvas opens its stored source immediately", async ({ page }) => {
+    const errors = trackErrors(page);
+    await openConversation(page, cursorCanvas);
+
+    const item = page.locator('[data-conversation-canvas="static-review"]');
+    await expect(item).toBeVisible();
+    await item.click();
+    const dialog = page.getByTestId("canvas-viewer");
+    await expect(dialog).toHaveAttribute("data-canvas-mode", "stored_source");
+    await expect(dialog.locator("h2")).toHaveText("static-review");
+    await expect(page.getByTestId("canvas-source")).toContainText(
+      "export default function StaticReview",
+    );
+    await expect(page.getByTestId("canvas-unsupported")).toHaveCount(0);
     expect(errors).toEqual([]);
   });
 

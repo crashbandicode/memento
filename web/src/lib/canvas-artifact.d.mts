@@ -36,6 +36,7 @@ export type CanvasView =
   | { mode: "embed"; variant: "srcdoc"; html: string }
   | { mode: "embed"; variant: "src"; url: string }
   | { mode: "source"; source: string; language: string }
+  | { mode: "stored_source"; sourceUrl: string }
   | { mode: "unsupported" };
 
 export const MAX_CANVAS_TARGET_LENGTH: number;
