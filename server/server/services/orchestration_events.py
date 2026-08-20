@@ -27,7 +27,8 @@ from .document_delivery import document_metadata, store_document_metadata
 
 _RUN_KEY_PATTERN = re.compile(
     r"(?:orchestrationRunId|orchestration_run_id)"
-    r"(?:\\?[\"'])?\s*[:=]\s*(?:\\?[\"'])"
+    r"(?:\\?[\"'])?(?:\*{1,2})?\s*[:=]\s*"
+    r"(?:\*{1,2})?\s*(?:\\?[\"'`])?\s*"
     r"([A-Za-z0-9][A-Za-z0-9_.:-]{7,255})",
     re.IGNORECASE,
 )

@@ -1,4 +1,3 @@
-import json
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -66,6 +65,19 @@ def test_extracts_nested_and_json_escaped_correlation_fields() -> None:
     assert extract_orchestration_run_ids(payload) == {
         "council-e28fdb11-3abf-431e-b1f4-3c509369dfe4",
     }
+
+
+def test_extracts_cursor_markdown_correlation_field_without_matching_prompt() -> None:
+    payload = {
+        "prompt": "Wait, stop the session, and report orchestrationRunId plus native id.",
+        "result": (
+            "Session completed and stopped.\n\n"
+            "- **orchestrationRunId:** `session-180f7970-199`\n"
+            "- **native child session id:** `7af8ed9b-1889-4fed-bf57-ecd7252f8de9`"
+        ),
+    }
+
+    assert extract_orchestration_run_ids(payload) == {"session-180f7970-199"}
 
 
 def test_cursor_legacy_wrapper_id_is_resolved_without_weak_matching() -> None:
@@ -142,8 +154,11 @@ async def test_event_retry_and_arrival_order_converge_to_exact_documents(
             ConversationMessage(
                 document_id=parent.id,
                 line_number=1,
-                role="tool",
-                content=json.dumps({"orchestrationRunId": run_id}),
+                role="assistant",
+                content=(
+                    "Session completed and stopped.\n\n"
+                    f"- **orchestrationRunId:** `{run_id}`"
+                ),
             )
         )
         await db.flush()
