@@ -89,8 +89,18 @@ export default function SubagentBadge({
         Math.max(24, rect.right - width),
         window.innerWidth - width - 24,
       );
-      const top = Math.min(rect.bottom + 8, window.innerHeight - 48);
-      const maxHeight = Math.min(520, window.innerHeight - top - 24);
+      // The badge lives in the conversation header, which can be above the
+      // viewport after following a deep link or restoring a long thread. A
+      // raw anchor coordinate would place the portalled dialog off-screen and
+      // leave its otherwise-visible rows impossible to focus or click.
+      const top = Math.min(
+        Math.max(24, rect.bottom + 8),
+        Math.max(24, window.innerHeight - 48),
+      );
+      const maxHeight = Math.min(
+        520,
+        Math.max(120, window.innerHeight - top - 24),
+      );
       setPanelStyle({
         position: "fixed",
         top,
