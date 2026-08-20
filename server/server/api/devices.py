@@ -7,6 +7,7 @@ import json
 import time
 import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -37,6 +38,30 @@ _pypi_version_cache: dict[str, tuple[str | None, float]] = {}
 _REPAIR_ACTION = "repair-conversations"
 _REPAIR_BATCH_SIZE = 2
 _STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
+_STALE_EMPTY_DEVICE_AGE = timedelta(hours=24)
+
+
+def _is_visible_device(
+    machine: Machine,
+    document_count: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Hide abandoned registrations without hiding a real collector.
+
+    Setup/reinstall attempts can register and heartbeat before discovering a
+    single transcript. Those zero-content rows used to remain on the Devices
+    page forever. A collector that has ever reported its version or delivered
+    content remains visible; an unversioned empty registration expires after a
+    day, while a fresh first-run registration keeps its setup window.
+    """
+    if document_count > 0 or machine.collector_version:
+        return True
+    current = now or datetime.now(timezone.utc)
+    last_seen = machine.last_heartbeat or machine.created_at
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    return last_seen >= current - _STALE_EMPTY_DEVICE_AGE
 
 
 def _enqueue_command(
@@ -88,6 +113,9 @@ async def list_devices(
 
     items = []
     for m in machines:
+        document_count = totals_by_machine.get(m.id, 0)
+        if not _is_visible_device(m, document_count):
+            continue
         items.append({
             "id": str(m.id),
             "name": m.name,
@@ -95,7 +123,7 @@ async def list_devices(
             "collector_version": m.collector_version,
             "last_heartbeat": m.last_heartbeat.isoformat() if m.last_heartbeat else None,
             "created_at": m.created_at.isoformat(),
-            "document_count": totals_by_machine.get(m.id, 0),
+            "document_count": document_count,
             "tools": tools_by_machine.get(m.id, []),
         })
 
