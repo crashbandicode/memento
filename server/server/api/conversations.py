@@ -20,6 +20,8 @@ from ..db.models import (
     ConversationTaskState,
     Document,
     Machine,
+    OrchestrationAgent,
+    OrchestrationRun,
     Project,
     User,
 )
@@ -896,6 +898,60 @@ async def get_conversation(
             if mids is not None:
                 hierarchy_q = hierarchy_q.where(Document.machine_id.in_(mids))
             hierarchy_docs = (await db.execute(hierarchy_q)).scalars().all()
+        orchestration_rows = (
+            await db.execute(
+                select(
+                    OrchestrationRun.parent_document_id,
+                    OrchestrationAgent.document_id,
+                )
+                .join(
+                    OrchestrationAgent,
+                    OrchestrationAgent.run_id == OrchestrationRun.id,
+                )
+                .where(
+                    OrchestrationRun.machine_id == doc.machine_id,
+                    or_(
+                        OrchestrationRun.parent_document_id == doc.id,
+                        OrchestrationAgent.document_id == doc.id,
+                    ),
+                )
+            )
+        ).all()
+        orchestration_document_ids = {
+            document_id
+            for row in orchestration_rows
+            for document_id in row
+            if document_id is not None
+        }
+        existing_hierarchy_ids = {item.id for item in hierarchy_docs}
+        missing_orchestration_ids = (
+            orchestration_document_ids - existing_hierarchy_ids
+        )
+        if missing_orchestration_ids:
+            orchestration_docs = (
+                await db.execute(
+                    select(Document)
+                    .options(
+                        load_only(
+                            Document.id,
+                            Document.machine_id,
+                            Document.tool_id,
+                            Document.title,
+                            Document.relative_path,
+                            Document.metadata_,
+                            Document.source_modified_at,
+                            Document.activity_at,
+                            Document.synced_at,
+                            Document.file_size_bytes,
+                        )
+                    )
+                    .where(
+                        Document.id.in_(missing_orchestration_ids),
+                        Document.category == "conversation",
+                    )
+                )
+            ).scalars().all()
+            hierarchy_docs.extend(orchestration_docs)
         hierarchy_refs = [
             ConversationRef(
                 document_id=item.id,

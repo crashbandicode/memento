@@ -124,6 +124,8 @@ def is_conversation_subagent(
     if tool_id not in FOLDABLE_CONVERSATION_TOOLS:
         return False
     values = metadata or {}
+    if values.get("orchestration_parent_document_id"):
+        return True
     if (
         tool_id == "codex"
         and str(values.get("thread_source") or "").strip().lower()
@@ -176,6 +178,8 @@ def conversation_user_role_origin(
     metadata: Mapping[str, Any] | None,
 ) -> str | None:
     """Identify child-thread user turns that were dispatched by a parent agent."""
+    if (metadata or {}).get("orchestration_parent_document_id"):
+        return "parent_agent"
     if (
         tool_id in {"claude_code", "cursor"}
         and (
@@ -364,6 +368,44 @@ def fold_conversation_subagents(
             child.document_id for child in canonical_children
         )
 
+    # Cross-tool orchestrators cannot share a native thread/root ID. Their
+    # normalized relation uses exact document UUIDs and is applied only when
+    # both documents are present in this read set. A child whose normalized
+    # relation is known to be resolved can still be suppressed in a tool-scoped
+    # list where its cross-tool parent is intentionally outside the query. A
+    # delayed or malformed relation remains visible and is marked orphaned.
+    refs_by_string_id = {str(ref.document_id): ref for ref in refs}
+    for child in refs:
+        parent_id = str(
+            (child.metadata or {}).get("orchestration_parent_document_id") or ""
+        ).strip()
+        if not parent_id:
+            continue
+        parent = refs_by_string_id.get(parent_id)
+        if parent is None or parent.document_id == child.document_id:
+            if (
+                parent is None
+                and (child.metadata or {}).get(
+                    "orchestration_relation_resolved"
+                ) is True
+            ):
+                visible_ids.discard(child.document_id)
+                canonical_document_ids[child.document_id] = parent_id
+                continue
+            orphan_ids.add(child.document_id)
+            continue
+        canonical_parent_id = canonical_document_ids.get(
+            parent.document_id,
+            parent.document_id,
+        )
+        visible_ids.discard(child.document_id)
+        canonical_document_ids[child.document_id] = canonical_parent_id
+        existing_children = list(subagent_document_ids.get(canonical_parent_id, ()))
+        if child.document_id not in existing_children:
+            existing_children.append(child.document_id)
+        subagent_document_ids[canonical_parent_id] = tuple(existing_children)
+        subagent_counts[canonical_parent_id] = len(existing_children)
+
     return ConversationHierarchy(
         visible_document_ids=frozenset(visible_ids),
         subagent_counts=subagent_counts,
@@ -396,11 +438,20 @@ def build_subagent_summaries(
                 continue
             metadata = child.metadata or {}
             thread_id = current_thread_id(metadata)
+            orchestration = str(metadata.get("orchestration") or "").strip() or None
+            orchestration_name = (
+                str(metadata.get("orchestration_agent_name") or "").strip()
+                or None
+            )
+            orchestration_codename = (
+                str(metadata.get("orchestration_agent_codename") or "").strip()
+                or None
+            )
             agent_id = str(metadata.get("agent_id") or "").strip() or None
             agent_tool_use_id = (
                 str(metadata.get("agent_tool_use_id") or "").strip() or None
             )
-            nickname = metadata.get("agent_nickname")
+            nickname = orchestration_codename or metadata.get("agent_nickname")
             launch_description = (
                 str(metadata.get("agent_launch_description") or "").strip()
                 if child.tool_id == "claude_code"
@@ -436,13 +487,20 @@ def build_subagent_summaries(
                 "agent_id": agent_id,
                 "agent_tool_use_id": agent_tool_use_id,
                 "title": (
-                    launch_description
+                    orchestration_name
+                    or orchestration_codename
+                    or launch_description
                     or agent_path_label
                     or (str(nickname) if nickname else None)
                     or child.title
                     or (f"Subagent {thread_id[:8]}" if thread_id else "Subagent")
                 ),
                 "agent_nickname": str(nickname) if nickname else None,
+                "orchestration": orchestration,
+                "orchestration_run_id": metadata.get("orchestration_run_id"),
+                "orchestration_run_kind": metadata.get("orchestration_run_kind"),
+                "orchestration_agent_key": metadata.get("orchestration_agent_key"),
+                "tool_id": child.tool_id,
                 "agent_path": str(agent_path) if agent_path else None,
                 "agent_depth": agent_depth,
                 "parent_thread_id": (

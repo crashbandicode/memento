@@ -52,6 +52,7 @@ from ..services.large_content_store import (
     multipart_content_job_id,
     store_large_content,
 )
+from ..services.orchestration_events import ingest_orchestration_events
 from ..services.thread_metadata_service import (
     apply_codex_thread_title_update,
     apply_conversation_activity_update,
@@ -162,6 +163,63 @@ class IngestMetadataResponse(BaseModel):
     matched: int
     updated: int
     ignored: int
+
+
+class OrchestrationLifecycleEventRequest(BaseModel):
+    """Bounded, content-free lifecycle record emitted by Claw."""
+
+    schema_version: Literal[1]
+    event_id: str = Field(min_length=1, max_length=128)
+    occurred_at: datetime
+    installation_id: str = Field(min_length=1, max_length=128)
+    orchestrator: Literal["claw-orchestrator"]
+    orchestrator_version: str = Field(min_length=1, max_length=64)
+    event: Literal[
+        "run.started",
+        "run.status",
+        "agent.declared",
+        "agent.identity_bound",
+        "agent.status",
+    ]
+    run_id: str = Field(min_length=8, max_length=256)
+    run_kind: Literal[
+        "session",
+        "fanout",
+        "council",
+        "autoloop",
+        "ultraplan",
+        "ultrareview",
+    ]
+    run_status: Literal["running", "completed", "failed", "aborted"] | None = None
+    agent_key: str | None = Field(default=None, max_length=256)
+    agent_name: str | None = Field(default=None, max_length=256)
+    codename: str | None = Field(default=None, max_length=256)
+    engine: Literal["claude", "codex", "codex-app", "cursor"] | None = None
+    model: str | None = Field(default=None, max_length=256)
+    effort: str | None = Field(default=None, max_length=64)
+    cwd: str | None = Field(default=None, max_length=4096)
+    native_session_id: str | None = Field(default=None, max_length=512)
+    agent_status: Literal[
+        "declared",
+        "idle",
+        "running",
+        "completed",
+        "failed",
+        "aborted",
+    ] | None = None
+
+
+class OrchestrationEventBatchRequest(BaseModel):
+    events: list[OrchestrationLifecycleEventRequest] = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+
+class OrchestrationEventBatchResponse(BaseModel):
+    accepted: int
+    duplicates: int
+    linked: int
 
 
 async def _completed_upload_needs_reprocessing(
@@ -544,6 +602,36 @@ async def ingest_metadata_endpoint(
         updated=result.updated,
         ignored=result.ignored,
     )
+
+
+@router.post(
+    "/orchestration-events",
+    response_model=OrchestrationEventBatchResponse,
+)
+async def ingest_orchestration_event_batch(
+    req: OrchestrationEventBatchRequest,
+    collector_user: User = Depends(verify_collector_token),
+    _throttle: None = Depends(throttle_ingest),
+    db: AsyncSession = Depends(get_db),
+    x_device_id: str = Header("unknown"),
+    x_device_name: str = Header("unknown"),
+    x_device_platform: str = Header("unknown"),
+) -> OrchestrationEventBatchResponse:
+    """Durably ingest Claw lifecycle metadata for this collector machine."""
+    machine = await ensure_device(
+        db,
+        x_device_id,
+        x_device_name,
+        x_device_platform,
+        user_id=collector_user.id,
+    )
+    result = await ingest_orchestration_events(
+        db,
+        machine_id=machine.id,
+        user_id=collector_user.id,
+        events=(event.model_dump() for event in req.events),
+    )
+    return OrchestrationEventBatchResponse(**result)
 
 
 @router.post("/file", response_model=IngestResponse)

@@ -48,7 +48,10 @@ export default function SubagentBadge({
   const panelRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const total = count || subagents.length;
-  const agentsLabel = `${total} ${total === 1 ? "subagent" : "subagents"}`;
+  const hasClawAgents = subagents.some((subagent) => subagent.orchestration === "claw");
+  const agentsLabel = hasClawAgents
+    ? `Claw · ${total} ${total === 1 ? "delegated agent" : "delegated agents"}`
+    : `${total} ${total === 1 ? "subagent" : "subagents"}`;
   const showSearch = subagents.length > 8;
 
   useLayoutEffect(() => {
@@ -136,7 +139,7 @@ export default function SubagentBadge({
     const normalizedQuery = query.trim().toLocaleLowerCase();
     if (!normalizedQuery) return orderedSubagents;
     return orderedSubagents.filter((subagent) => (
-      `${subagent.title} ${subagent.agent_nickname || ""} ${subagent.agent_path || ""} ${subagent.model || ""}`
+      `${subagent.title} ${subagent.agent_nickname || ""} ${subagent.agent_path || ""} ${subagent.model || ""} ${subagent.tool_id || ""}`
         .toLocaleLowerCase()
         .includes(normalizedQuery)
     ));
@@ -183,7 +186,7 @@ export default function SubagentBadge({
   if (subagents.length === 0) {
     return (
       <span className={styles.staticPill} title={orphan ? `${agentsLabel}; root thread has not synced yet` : agentsLabel}>
-        <Icon name="layers" size={11} />
+        <Icon name={hasClawAgents ? "command" : "layers"} size={11} />
         {agentsLabel}
         {orphan && <span className={styles.muted}>· root pending</span>}
       </span>
@@ -201,7 +204,7 @@ export default function SubagentBadge({
         onClick={() => setOpen((value) => !value)}
         title={`Browse ${agentsLabel}`}
       >
-        <Icon name="layers" size={11} />
+        <Icon name={hasClawAgents ? "command" : "layers"} size={11} />
         <span>{agentsLabel}</span>
         {orphan && <span className={styles.muted}>· root pending</span>}
         {matchedSubagentId && <span className={styles.muted}>· child match</span>}
@@ -226,10 +229,10 @@ export default function SubagentBadge({
             style={panelStyle}
           >
             <div className={styles.header}>
-              <span className={styles.headerIcon}><Icon name="layers" size={15} /></span>
+              <span className={styles.headerIcon}><Icon name={hasClawAgents ? "command" : "layers"} size={15} /></span>
               <span className={styles.headerText}>
-                <strong>Subagents</strong>
-                <span>Task name first; generated codename second</span>
+                <strong>{hasClawAgents ? "Claw delegated agents" : "Subagents"}</strong>
+                <span>Task name first; generated codename and native tool second</span>
               </span>
               <button type="button" className={styles.closeButton} aria-label="Close subagent browser" onClick={() => setOpen(false)}>
                 <Icon name="close" size={15} />
@@ -282,7 +285,7 @@ export default function SubagentBadge({
                       aria-expanded={expanded}
                       onClick={() => void togglePreview(subagent)}
                     >
-                      <span className={styles.agentIcon}><Icon name="layers" size={13} /></span>
+                      <span className={styles.agentIcon}><Icon name={subagent.orchestration === "claw" ? "command" : "layers"} size={13} /></span>
                       <span className={styles.agentText}>
                         <span className={styles.agentTitle}>{subagent.title}</span>
                         <span
@@ -295,6 +298,7 @@ export default function SubagentBadge({
                             aria-hidden="true"
                           />
                           <span className={styles.statusText}>{statusLabel}</span>
+                          {subagent.orchestration === "claw" ? ` · Claw · ${formatToolName(subagent.tool_id)}` : ""}
                           {typeof subagent.agent_depth === "number" ? ` · depth ${subagent.agent_depth}` : ""}
                           {hasDistinctNickname ? ` · codename ${subagent.agent_nickname}` : ""}
                           {subagent.document_ready === false ? " · transcript syncing" : ""}
@@ -373,6 +377,14 @@ function formatSubagentTime(value?: string | null): { short: string; full: strin
     }),
     full: parsed.toLocaleString(),
   };
+}
+
+function formatToolName(toolId?: string | null): string {
+  return {
+    claude_code: "Claude Code",
+    codex: "Codex",
+    cursor: "Cursor",
+  }[toolId || ""] || "Agent CLI";
 }
 
 function formatSubagentStatus(

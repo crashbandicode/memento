@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, case, func, literal, or_, select
+from sqlalchemy import String, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import ConversationMessage, Document, User
@@ -70,6 +70,64 @@ def _conversation_document_columns():
         delivery_activity_expression().label("activity_at"),
         delivery_metadata_expression().label("metadata"),
     )
+
+
+def _search_document_columns():
+    return (
+        Document.id.label("id"),
+        Document.tool_id.label("tool_id"),
+        Document.relative_path.label("relative_path"),
+        Document.category.label("category"),
+        Document.title.label("title"),
+        delivery_file_size_expression().label("file_size_bytes"),
+        delivery_synced_expression().label("synced_at"),
+        delivery_source_modified_expression().label("source_modified_at"),
+        delivery_activity_expression().label("activity_at"),
+        delivery_metadata_expression().label("metadata"),
+    )
+
+
+async def _orchestration_companion_rows(
+    db: AsyncSession,
+    *,
+    rows,
+    columns,
+    id_key: str,
+    machine_ids,
+    selected_machine_ids,
+):
+    """Load exact cross-tool parents and children for a bounded read set."""
+
+    represented_ids = {str(row[id_key]) for row in rows}
+    parent_ids = {
+        str(parent_id)
+        for row in rows
+        if (
+            parent_id := (row["metadata"] or {}).get(
+                "orchestration_parent_document_id"
+            )
+        )
+    }
+    filters = []
+    if parent_ids:
+        filters.append(cast(Document.id, String).in_(parent_ids))
+    if represented_ids:
+        filters.append(
+            delivery_metadata_expression()[
+                "orchestration_parent_document_id"
+            ].astext.in_(represented_ids)
+        )
+    if not filters:
+        return []
+
+    query = select(*columns).where(
+        Document.category == "conversation",
+        or_(*filters),
+    )
+    if selected_machine_ids is not None:
+        query = query.where(Document.machine_id.in_(selected_machine_ids))
+    query = apply_user_filter(query, machine_ids, Document.machine_id)
+    return (await db.execute(query)).mappings().all()
 
 
 @router.get("/messages")
@@ -247,6 +305,18 @@ async def search_messages(
             {row["document_id"]: row for row in companion_rows}
         )
 
+    orchestration_rows = await _orchestration_companion_rows(
+        db,
+        rows=hierarchy_rows.values(),
+        columns=_conversation_document_columns(),
+        id_key="document_id",
+        machine_ids=mids,
+        selected_machine_ids=selected_machine_ids,
+    )
+    hierarchy_rows.update(
+        {row["document_id"]: row for row in orchestration_rows}
+    )
+
     refs = [_conversation_ref(row) for row in hierarchy_rows.values()]
     hierarchy = fold_conversation_subagents(refs)
     subagents_by_document = build_subagent_summaries(hierarchy, refs)
@@ -398,18 +468,7 @@ async def search(
         ),
         else_="",
     ).label("content_snippet")
-    query = select(
-        Document.id.label("id"),
-        Document.tool_id.label("tool_id"),
-        Document.relative_path.label("relative_path"),
-        Document.category.label("category"),
-        Document.title.label("title"),
-        delivery_file_size_expression().label("file_size_bytes"),
-        delivery_synced_expression().label("synced_at"),
-        delivery_source_modified_expression().label("source_modified_at"),
-        delivery_activity_expression().label("activity_at"),
-        delivery_metadata_expression().label("metadata"),
-    ).where(or_(*conds))
+    query = select(*_search_document_columns()).where(or_(*conds))
 
     if tool:
         query = query.where(Document.tool_id == tool)
@@ -471,18 +530,7 @@ async def search(
 
     hierarchy_rows = {row["id"]: row for row in all_rows}
     if roots_by_tool:
-        companions_q = select(
-            Document.id.label("id"),
-            Document.tool_id.label("tool_id"),
-            Document.relative_path.label("relative_path"),
-            Document.category.label("category"),
-            Document.title.label("title"),
-            delivery_file_size_expression().label("file_size_bytes"),
-            delivery_synced_expression().label("synced_at"),
-            delivery_source_modified_expression().label("source_modified_at"),
-            delivery_activity_expression().label("activity_at"),
-            delivery_metadata_expression().label("metadata"),
-        ).where(
+        companions_q = select(*_search_document_columns()).where(
             Document.category == "conversation",
             build_conversation_companion_filter(
                 Document.tool_id,
@@ -502,6 +550,16 @@ async def search(
         )
         companion_rows = (await db.execute(companions_q)).mappings().all()
         hierarchy_rows.update({row["id"]: row for row in companion_rows})
+
+    orchestration_rows = await _orchestration_companion_rows(
+        db,
+        rows=hierarchy_rows.values(),
+        columns=_search_document_columns(),
+        id_key="id",
+        machine_ids=mids,
+        selected_machine_ids=selected_machine_ids,
+    )
+    hierarchy_rows.update({row["id"]: row for row in orchestration_rows})
 
     conversation_refs = [
         ConversationRef(

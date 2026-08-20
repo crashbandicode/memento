@@ -248,6 +248,11 @@ export interface ConversationSubagentSummary {
   reasoning_effort?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
+  orchestration?: "claw" | string | null;
+  orchestration_run_id?: string | null;
+  orchestration_run_kind?: string | null;
+  orchestration_agent_key?: string | null;
+  tool_id?: string | null;
 }
 
 export interface ConversationTask {

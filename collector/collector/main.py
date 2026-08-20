@@ -25,6 +25,7 @@ from .cursor_state_export import (
     CursorStateExporter,
     enqueue_cursor_state_snapshots,
 )
+from .orchestration_sync import OrchestrationSync
 from .queue import SyncQueue
 from .sync_client import SyncClient
 from .tools.antigravity import AntigravityTool
@@ -838,6 +839,7 @@ def main() -> None:
         delta_catchup_callback=watcher.request_delta_catchup,
         upload_synced_callback=canvas_schedule.notify_upload,
     )
+    orchestration_sync = OrchestrationSync(config)
 
     def _invalidate_source_pollers() -> None:
         _invalidate_cursor_state(cursor_exporter)
@@ -899,6 +901,7 @@ def main() -> None:
 
     # 4. Start uploader only after the startup reconciliation pass.
     sync_client.start()
+    orchestration_sync.start()
 
     logger.info("Collector running. Watching for file changes...")
 
@@ -1034,6 +1037,7 @@ def main() -> None:
     finally:
         logger.info("Shutting down...")
         watcher.stop()
+        orchestration_sync.stop()
         sync_client.stop()
         queue.close()
         logger.info("Collector stopped.")

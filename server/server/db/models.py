@@ -358,6 +358,117 @@ class ConversationMetadataInbox(Base):
 
 
 # ---------------------------------------------------------------------------
+# Cross-tool orchestrator identity and lifecycle
+# ---------------------------------------------------------------------------
+class OrchestrationRun(Base):
+    """One durable external-orchestrator run scoped to a collector machine."""
+
+    __tablename__ = "orchestration_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    installation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_run_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    orchestrator: Mapped[str] = mapped_column(String(64), nullable=False)
+    orchestrator_version: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
+    run_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    parent_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL")
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    agents: Mapped[list["OrchestrationAgent"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "machine_id", "installation_id", "external_run_id",
+            name="uq_orchestration_run_external",
+        ),
+        Index("idx_orchestration_run_parent", "parent_document_id"),
+        Index("idx_orchestration_run_status", "machine_id", "status"),
+    )
+
+
+class OrchestrationAgent(Base):
+    """One named Claw child and its exact native conversation binding."""
+
+    __tablename__ = "orchestration_agents"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("orchestration_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    agent_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    codename: Mapped[str | None] = mapped_column(String(256))
+    engine: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(256))
+    effort: Mapped[str | None] = mapped_column(String(64))
+    cwd: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="declared")
+    native_session_id: Mapped[str | None] = mapped_column(String(512))
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL")
+    )
+    last_event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    run: Mapped[OrchestrationRun] = relationship(back_populates="agents")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "agent_key", name="uq_orchestration_agent_key"),
+        Index("idx_orchestration_agent_native", "engine", "native_session_id"),
+        Index("idx_orchestration_agent_document", "document_id"),
+    )
+
+
+class OrchestrationEventReceipt(Base):
+    """Idempotency fence for collector outbox retries."""
+
+    __tablename__ = "orchestration_event_receipts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("machine_id", "event_id", name="uq_orchestration_event_receipt"),
+        Index("idx_orchestration_receipt_created", "created_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Claude transcript branch lineage
 # ---------------------------------------------------------------------------
 class ClaudeConversationLineageRecord(Base):

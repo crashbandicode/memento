@@ -171,6 +171,75 @@ def _run_migrations(conn) -> None:
             "UPDATE claude_conversation_lineage_records "
             "SET is_subagent = is_sidechain OR agent_id IS NOT NULL"
         ))
+
+    # Claw and other external orchestrators can launch a native transcript in
+    # a different AI tool. Keep that relation normalized and idempotent rather
+    # than overloading each tool's native thread hierarchy.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS orchestration_runs ("
+        "id UUID PRIMARY KEY, "
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "installation_id VARCHAR(128) NOT NULL, "
+        "external_run_id VARCHAR(256) NOT NULL, "
+        "orchestrator VARCHAR(64) NOT NULL, "
+        "orchestrator_version VARCHAR(64) NOT NULL DEFAULT 'unknown', "
+        "run_kind VARCHAR(64) NOT NULL, "
+        "status VARCHAR(32) NOT NULL DEFAULT 'running', "
+        "parent_document_id UUID REFERENCES documents(id) ON DELETE SET NULL, "
+        "started_at TIMESTAMPTZ, ended_at TIMESTAMPTZ, "
+        "last_event_at TIMESTAMPTZ NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "CONSTRAINT uq_orchestration_run_external UNIQUE "
+        "(machine_id, installation_id, external_run_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_orchestration_run_parent "
+        "ON orchestration_runs (parent_document_id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_orchestration_run_status "
+        "ON orchestration_runs (machine_id, status)"
+    ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS orchestration_agents ("
+        "id UUID PRIMARY KEY, "
+        "run_id UUID NOT NULL REFERENCES orchestration_runs(id) ON DELETE CASCADE, "
+        "agent_key VARCHAR(256) NOT NULL, agent_name VARCHAR(256) NOT NULL, "
+        "codename VARCHAR(256), engine VARCHAR(64) NOT NULL, "
+        "model VARCHAR(256), effort VARCHAR(64), cwd TEXT, "
+        "status VARCHAR(32) NOT NULL DEFAULT 'declared', "
+        "native_session_id VARCHAR(512), "
+        "document_id UUID REFERENCES documents(id) ON DELETE SET NULL, "
+        "last_event_at TIMESTAMPTZ NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "CONSTRAINT uq_orchestration_agent_key UNIQUE (run_id, agent_key)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_orchestration_agent_native "
+        "ON orchestration_agents (engine, native_session_id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_orchestration_agent_document "
+        "ON orchestration_agents (document_id)"
+    ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS orchestration_event_receipts ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "event_id VARCHAR(128) NOT NULL, occurred_at TIMESTAMPTZ NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "CONSTRAINT uq_orchestration_event_receipt UNIQUE (machine_id, event_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_orchestration_receipt_created "
+        "ON orchestration_event_receipts (created_at)"
+    ))
     if "embedding_status" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN embedding_status VARCHAR(20) "

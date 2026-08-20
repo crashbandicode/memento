@@ -39,6 +39,7 @@ def _ref(
     source_timestamp: str | None = None,
     activity_timestamp: str | None = None,
     file_size_bytes: int = 100,
+    extra_metadata: dict | None = None,
 ) -> ConversationRef:
     metadata = {
         key: value
@@ -54,6 +55,7 @@ def _ref(
         }.items()
         if value is not None
     }
+    metadata.update(extra_metadata or {})
     return ConversationRef(
         document_id=document_id,
         tool_id=tool_id,
@@ -75,6 +77,82 @@ def _ref(
 
 
 class ConversationHierarchyTests(unittest.TestCase):
+    def test_cross_tool_orchestration_child_folds_into_proven_parent(self) -> None:
+        root = _ref("root-doc", session_id="codex-root", source="root")
+        child = _ref(
+            "child-doc",
+            session_id="claude-child",
+            tool_id="claude_code",
+            extra_metadata={
+                "orchestration": "claw",
+                "orchestration_parent_document_id": "root-doc",
+                "orchestration_run_id": "fanout-12345678",
+                "orchestration_run_kind": "fanout",
+                "orchestration_agent_key": "reviewer",
+                "orchestration_agent_name": "Security review",
+                "orchestration_agent_codename": "Sentinel",
+                "subagent_model": "claude-opus-4-1",
+                "subagent_reasoning_effort": "high",
+            },
+        )
+
+        result = fold_conversation_subagents([root, child])
+        summaries = build_subagent_summaries(result, [root, child])
+
+        self.assertEqual(result.visible_document_ids, {"root-doc"})
+        self.assertEqual(result.subagent_counts, {"root-doc": 1})
+        self.assertEqual(result.canonical_document_ids["child-doc"], "root-doc")
+        self.assertEqual(summaries["root-doc"][0]["title"], "Security review")
+        self.assertEqual(summaries["root-doc"][0]["agent_nickname"], "Sentinel")
+        self.assertEqual(summaries["root-doc"][0]["tool_id"], "claude_code")
+        self.assertEqual(summaries["root-doc"][0]["orchestration"], "claw")
+        self.assertEqual(
+            conversation_user_role_origin(
+                child.tool_id,
+                child.relative_path,
+                child.metadata,
+            ),
+            "parent_agent",
+        )
+
+    def test_unresolved_orchestration_child_remains_visible(self) -> None:
+        child = _ref(
+            "child-doc",
+            session_id="cursor-child",
+            tool_id="cursor",
+            extra_metadata={
+                "orchestration": "claw",
+                "orchestration_parent_document_id": "missing-root-doc",
+            },
+        )
+
+        result = fold_conversation_subagents([child])
+
+        self.assertEqual(result.visible_document_ids, {"child-doc"})
+        self.assertEqual(result.orphan_document_ids, {"child-doc"})
+        self.assertNotIn("child-doc", result.subagent_counts)
+
+    def test_resolved_cross_tool_child_is_hidden_in_tool_scoped_list(self) -> None:
+        child = _ref(
+            "child-doc",
+            session_id="claude-child",
+            tool_id="claude_code",
+            extra_metadata={
+                "orchestration": "claw",
+                "orchestration_parent_document_id": "codex-parent-doc",
+                "orchestration_relation_resolved": True,
+            },
+        )
+
+        result = fold_conversation_subagents([child])
+
+        self.assertEqual(result.visible_document_ids, set())
+        self.assertEqual(result.orphan_document_ids, set())
+        self.assertEqual(
+            result.canonical_document_ids["child-doc"],
+            "codex-parent-doc",
+        )
+
     def test_root_remains_visible_and_counts_distinct_descendants(self) -> None:
         root = _ref("root-doc", session_id="root-thread", source="root")
         child_a = _ref(

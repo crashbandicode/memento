@@ -3322,6 +3322,13 @@ async def ingest_file(
                 MAX_SEARCH_TEXT_CHARS,
             )
 
+        # Claw lifecycle metadata and native transcripts arrive independently.
+        # Retry the normalized join on every advancing conversation revision so
+        # either arrival order converges without reparsing unrelated documents.
+        from .orchestration_events import reconcile_orchestration_for_document
+
+        await reconcile_orchestration_for_document(db, doc)
+
     if category in _EMBEDDING_CATEGORIES:
         from .embedding_service import document_embedding_input
 

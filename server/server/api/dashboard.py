@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import (
     Date,
     Integer,
+    String,
     and_,
     case,
     cast,
@@ -348,6 +349,37 @@ async def get_dashboard(
             )
         )
         for row in (await db.execute(scoped(companions_q))).all():
+            all_convo_rows_by_id[row.id] = row
+
+    represented_document_ids = {
+        str(document_id) for document_id in all_convo_rows_by_id
+    }
+    explicit_orchestration_parent_ids = {
+        str(parent_id)
+        for row in all_convo_rows_by_id.values()
+        if (
+            parent_id := _row_metadata(row).get(
+                "orchestration_parent_document_id"
+            )
+        )
+    }
+    orchestration_companions_q = (
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
+        .where(
+            source.c.category == "conversation",
+            or_(
+                cast(source.c.id, String).in_(explicit_orchestration_parent_ids),
+                source.c.hierarchy_metadata[
+                    "orchestration_parent_document_id"
+                ].astext.in_(represented_document_ids),
+            ),
+        )
+    )
+    if explicit_orchestration_parent_ids or represented_document_ids:
+        for row in (
+            await db.execute(scoped(orchestration_companions_q))
+        ).all():
             all_convo_rows_by_id[row.id] = row
 
     all_convo_rows = list(all_convo_rows_by_id.values())
