@@ -22,6 +22,7 @@ const scenario = {
     location: {
       host: "dreamland-yoga",
       path: windowsProjectPath,
+      platform: "Windows",
     },
   },
 };
@@ -76,8 +77,8 @@ for (const viewport of [
     const powerShellCommand = `Set-Location -LiteralPath '${windowsProjectPath}' && codex resume '${nativeId}'`;
     await expect(command).toHaveAttribute("data-resume-command-value", powerShellCommand);
 
-    await resume.getByRole("tab", { name: "Bash" }).click();
-    const bashCommand = `cd 'C:/Users/intpa/lsf-data-api-simplified' && codex resume '${nativeId}'`;
+    await resume.getByRole("tab", { name: "WSL2 Bash" }).click();
+    const bashCommand = `cd '/mnt/c/Users/intpa/lsf-data-api-simplified' && codex resume '${nativeId}'`;
     await expect(command).toHaveAttribute("data-resume-command-value", bashCommand);
     await resume.getByRole("button", { name: "Copy resume command" }).click();
     await expect(resume.locator("[data-copy-status]"))
@@ -91,3 +92,31 @@ for (const viewport of [
     });
   });
 }
+
+test("native Linux resume commands keep POSIX paths and a Bash default", async ({ page }) => {
+  const linuxProjectPath = "/home/intpa/lsf-data-api-simplified";
+  const linuxScenario = {
+    ...scenario,
+    meta: {
+      ...scenario.meta,
+      location: {
+        host: "dreamland-yoga",
+        path: linuxProjectPath,
+        platform: "Linux",
+      },
+    },
+  };
+  await seedAuth(page);
+  await installConversationMocks(page, linuxScenario);
+  await page.goto(`/conversations/${scenario.docId}`);
+
+  const resume = page.locator("[data-resume-command]");
+  await expect(resume).toBeVisible();
+  await expect(resume.getByRole("tab", { name: "Bash", exact: true }))
+    .toHaveAttribute("aria-selected", "true");
+  await expect(resume.getByRole("tab", { name: "WSL2 Bash" })).toHaveCount(0);
+  await expect(resume.locator("[data-resume-command-value]")).toHaveAttribute(
+    "data-resume-command-value",
+    `cd '${linuxProjectPath}' && codex resume '${nativeId}'`,
+  );
+});

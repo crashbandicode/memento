@@ -121,7 +121,7 @@ export const TOOL_ICON_NAME: Record<string, IconName> = {
 };
 
 export const PLATFORM_ICON_NAME: Record<string, IconName> = {
-  Darwin: "apple", Linux: "linux", Windows: "windows",
+  Darwin: "apple", Linux: "linux", WSL: "linux", WSL2: "linux", Windows: "windows",
 };
 
 export const CATEGORY_ICON_NAME: Record<string, IconName> = {

@@ -6,6 +6,7 @@ import os
 import platform
 import socket
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
 from pydantic import Field
@@ -13,6 +14,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 HOME = Path.home()
 SYSTEM = platform.system()  # "Darwin", "Linux", "Windows"
+
+
+def _runtime_platform(
+    *,
+    system: str | None = None,
+    release: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Return the user-facing runtime, distinguishing WSL from native Linux."""
+    runtime_system = system or platform.system()
+    if runtime_system != "Linux":
+        return runtime_system
+
+    runtime_release = platform.release() if release is None else release
+    runtime_environ = os.environ if environ is None else environ
+    release_folded = runtime_release.casefold()
+    is_wsl = bool(
+        runtime_environ.get("WSL_DISTRO_NAME")
+        or runtime_environ.get("WSL_INTEROP")
+        or "microsoft" in release_folded
+    )
+    if not is_wsl:
+        return "Linux"
+    if "wsl2" in release_folded or "microsoft-standard" in release_folded:
+        return "WSL2"
+    return "WSL"
+
+
+RUNTIME_PLATFORM = _runtime_platform()
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +152,7 @@ def _get_device_id() -> str:
 
 def _get_device_name() -> str:
     """Human-readable device name: hostname + OS."""
-    return f"{socket.gethostname()} ({SYSTEM})"
+    return f"{socket.gethostname()} ({RUNTIME_PLATFORM})"
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +177,7 @@ class CollectorConfig(BaseSettings):
     # Device
     device_id: str = Field(default_factory=_get_device_id)
     device_name: str = Field(default_factory=_get_device_name)
-    platform: str = SYSTEM
+    platform: str = RUNTIME_PLATFORM
 
     # Local queue
     queue_db_path: Path = Field(default_factory=lambda: _default_data_dir() / "sync_queue.db")

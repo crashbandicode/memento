@@ -79,6 +79,7 @@ from ..services.document_delivery import (
     delivery_synced_expression,
     document_metadata,
 )
+from ..services.device_grouping import split_device_name
 from ..services.ingest_service import (
     INTERACTION_HISTORY_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
@@ -351,10 +352,6 @@ async def _conversation_canvas_summaries(
         summaries.append(descriptor)
     return summaries
 
-_MACHINE_PLATFORM_SUFFIX_RE = re.compile(
-    r"\s+\((?:darwin|linux|windows)\)\s*$",
-    re.IGNORECASE,
-)
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
@@ -379,10 +376,10 @@ def _absolute_project_path(value: object) -> str | None:
 
 
 def _conversation_location(document: Document) -> dict[str, str] | None:
-    """Build the compact, authorized host/path pair for one document."""
+    """Build the compact, authorized host/path/runtime for one document."""
     machine = getattr(document, "machine", None)
     raw_host = str(getattr(machine, "name", "") or "").strip()
-    host = _MACHINE_PLATFORM_SUFFIX_RE.sub("", raw_host).strip()
+    host, runtime_platform = split_device_name(raw_host)
     if not host or re.search(r"[\x00-\x1f\x7f-\x9f]", host):
         return None
 
@@ -404,7 +401,11 @@ def _conversation_location(document: Document) -> dict[str, str] | None:
         ),
         None,
     )
-    return {"host": host[:255], "path": path} if path else None
+    return {
+        "host": host[:255],
+        "path": path,
+        "platform": runtime_platform,
+    } if path else None
 
 
 def _parsed_tool_calls(message: object) -> list[dict[str, object]]:

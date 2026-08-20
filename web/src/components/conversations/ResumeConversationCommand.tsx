@@ -20,6 +20,11 @@ function isWindowsPath(path: string): boolean {
   return /^[a-z]:[\\/]/i.test(path) || path.startsWith("\\\\");
 }
 
+function isWindowsLocation(location: ConversationLocation): boolean {
+  return location.platform?.toLowerCase() === "windows"
+    || isWindowsPath(location.path);
+}
+
 function quoteBash(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
 }
@@ -28,8 +33,26 @@ function quotePowerShell(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
-function bashPath(path: string): string {
-  return /^[a-z]:[\\/]/i.test(path) ? path.replaceAll("\\", "/") : path;
+/** Translate a Windows project path into the path visible inside WSL. */
+export function bashPath(path: string): string {
+  const drivePath = /^([a-z]):[\\/](.*)$/i.exec(path);
+  if (drivePath) {
+    const suffix = drivePath[2].replaceAll("\\", "/").replace(/^\/+/, "");
+    return `/mnt/${drivePath[1].toLowerCase()}/${suffix}`;
+  }
+
+  const wslUncPath = /^\\\\(?:wsl\.localhost|wsl\$)[\\/]([^\\/]+)[\\/](.*)$/i.exec(path);
+  if (wslUncPath) {
+    const suffix = wslUncPath[2].replaceAll("\\", "/").replace(/^\/+/, "");
+    return `/${suffix}`;
+  }
+
+  return path.replaceAll("\\", "/");
+}
+
+function shellLabel(shell: Shell, location: ConversationLocation): string {
+  if (shell === "powershell") return "PowerShell";
+  return isWindowsLocation(location) ? "WSL2 Bash" : "Bash";
 }
 
 export function buildResumeCommand({
@@ -70,7 +93,7 @@ export default function ResumeConversationCommand({
   toolId: string;
 }) {
   const { t } = useI18n();
-  const [shell, setShell] = useState<Shell>(() => isWindowsPath(location.path) ? "powershell" : "bash");
+  const [shell, setShell] = useState<Shell>(() => isWindowsLocation(location) ? "powershell" : "bash");
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
   const resetTimer = useRef<number | null>(null);
   const command = useMemo(() => buildResumeCommand({
@@ -124,7 +147,7 @@ export default function ResumeConversationCommand({
               onClick={() => selectShell(candidate)}
               data-resume-shell={candidate}
             >
-              {candidate === "powershell" ? "PowerShell" : "Bash"}
+              {shellLabel(candidate, location)}
             </button>
           ))}
         </div>

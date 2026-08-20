@@ -271,6 +271,7 @@ export interface ConversationTaskState {
 export interface ConversationLocation {
   host: string;
   path: string;
+  platform?: string | null;
 }
 
 export interface ConversationMeta {

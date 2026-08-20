@@ -75,7 +75,7 @@ class DeviceGroupingTests(unittest.IsolatedAsyncioTestCase):
         ]
         machines.append(
             _machine(
-                name="butterbridge (Linux)",
+                name="butterbridge (WSL2)",
                 owner=owner,
                 collector="linux-wsl",
             )
@@ -106,9 +106,24 @@ class DeviceGroupingTests(unittest.IsolatedAsyncioTestCase):
             sum(identity["total_files"] for identity in group["identities"]),
             3,
         )
-        self.assertIn("Linux · linux-ws", {
+        self.assertIn("WSL2 · linux-ws", {
             identity["label"] for identity in group["identities"]
         })
+
+    def test_wsl2_suffix_keeps_the_same_physical_host_identity(self):
+        owner = uuid.uuid4()
+        historical = _machine(
+            name="butterbridge (Linux)",
+            owner=owner,
+            collector="wsl-before-runtime-detection",
+        )
+        current = _machine(
+            name="butterbridge (WSL2)",
+            owner=owner,
+            collector="wsl-after-runtime-detection",
+        )
+
+        self.assertEqual(host_group_id(historical), host_group_id(current))
 
     def test_same_hostname_never_crosses_ownership_boundary(self):
         machine_a = _machine(

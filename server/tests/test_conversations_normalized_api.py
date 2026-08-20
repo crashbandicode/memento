@@ -1951,6 +1951,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             {
                 "host": "dreamland-yoga",
                 "path": r"C:\Users\intpa\memento",
+                "platform": "Windows",
             },
         )
         self.assertNotIn("documents.content", str(db.statements[0].compile()))
@@ -2082,7 +2083,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_location_falls_back_to_absolute_project_source_path(self) -> None:
         document = SimpleNamespace(
-            machine=SimpleNamespace(name="butterbridge (Linux)"),
+            machine=SimpleNamespace(name="butterbridge (WSL2)"),
             metadata_={"project_path": "home-patrick-services-memento"},
             project=SimpleNamespace(source_path="/home/patrick/services/memento"),
         )
@@ -2092,6 +2093,23 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             {
                 "host": "butterbridge",
                 "path": "/home/patrick/services/memento",
+                "platform": "WSL2",
+            },
+        )
+
+    def test_location_reports_windows_platform_for_native_paths(self) -> None:
+        document = SimpleNamespace(
+            machine=SimpleNamespace(name="dreamland-yoga (Windows)"),
+            metadata_={"cwd": r"C:\Users\intpa\project"},
+            project=None,
+        )
+
+        self.assertEqual(
+            _conversation_location(document),
+            {
+                "host": "dreamland-yoga",
+                "path": r"C:\Users\intpa\project",
+                "platform": "Windows",
             },
         )
 

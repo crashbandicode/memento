@@ -27,12 +27,14 @@ from ..db.models import Machine, User
 
 HOST_GROUP_PREFIX = "host_"
 _PLATFORM_SUFFIX = re.compile(
-    r"\s+\((windows|linux|darwin|macos)\)\s*$",
+    r"\s+\((windows|linux|wsl2?|darwin|macos)\)\s*$",
     re.IGNORECASE,
 )
 _PLATFORM_NAMES = {
     "windows": "Windows",
     "linux": "Linux",
+    "wsl": "WSL",
+    "wsl2": "WSL2",
     "darwin": "Darwin",
     "macos": "Darwin",
 }
