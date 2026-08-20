@@ -99,7 +99,7 @@ def test_failed_orchestration_agent_summary_is_visible_without_transcript() -> N
         user_id=uuid4(),
         installation_id="install-yoga",
         external_run_id="session-596e88ad-720",
-        orchestrator="claw",
+        orchestrator="claw-orchestrator",
         orchestrator_version="5.0.0-memento.4",
         run_kind="session",
         status="failed",
@@ -123,6 +123,7 @@ def test_failed_orchestration_agent_summary_is_visible_without_transcript() -> N
 
     assert summary["id"] is None
     assert summary["document_ready"] is False
+    assert summary["orchestration"] == "claw"
     assert summary["status"] == "failed"
     assert summary["tool_id"] == "cursor"
     assert summary["model"] == "gemini-3.7-flash-high"

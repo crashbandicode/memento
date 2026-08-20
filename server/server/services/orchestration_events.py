@@ -141,6 +141,11 @@ def orchestration_agent_summary(
     """Project one authoritative orchestration agent into the shared card shape."""
     status = _normalized_agent_status(agent.status)
     terminal = status in {"completed", "failed", "interrupted"}
+    orchestration = (
+        "claw"
+        if run.orchestrator in {"claw", "claw-orchestrator"}
+        else run.orchestrator
+    )
     return {
         "id": str(agent.document_id) if agent.document_id else None,
         "session_id": agent.native_session_id,
@@ -148,12 +153,12 @@ def orchestration_agent_summary(
         "agent_tool_use_id": f"{run.external_run_id}:{agent.agent_key}",
         "title": agent.agent_name or agent.codename or "Delegated agent",
         "agent_nickname": agent.codename,
-        "orchestration": run.orchestrator,
+        "orchestration": orchestration,
         "orchestration_run_id": run.external_run_id,
         "orchestration_run_kind": run.run_kind,
         "orchestration_agent_key": agent.agent_key,
         "tool_id": _ENGINE_TOOL_IDS.get(agent.engine),
-        "agent_path": f"{run.orchestrator}/{run.run_kind}/{agent.agent_key}",
+        "agent_path": f"{orchestration}/{run.run_kind}/{agent.agent_key}",
         "agent_depth": 1,
         "parent_thread_id": None,
         "relative_path": None,
@@ -166,7 +171,7 @@ def orchestration_agent_summary(
         "model_family": None,
         "reasoning_effort": agent.effort,
         "status": status,
-        "status_source": f"{run.orchestrator}_orchestrator",
+        "status_source": f"{orchestration}_orchestrator",
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": (
             (run.ended_at or agent.last_event_at).isoformat()
