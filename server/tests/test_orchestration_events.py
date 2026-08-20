@@ -22,6 +22,7 @@ from server.services.orchestration_events import (
     _normalized_agent_status,
     extract_orchestration_run_ids,
     ingest_orchestration_events,
+    orchestration_agent_summary,
 )
 
 TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
@@ -88,6 +89,43 @@ def test_cursor_legacy_wrapper_id_is_resolved_without_weak_matching() -> None:
     assert _native_id_candidates("codex", "cursor-live-9a91d874") == {
         "cursor-live-9a91d874",
     }
+
+
+def test_failed_orchestration_agent_summary_is_visible_without_transcript() -> None:
+    now = datetime(2026, 8, 20, 20, 46, tzinfo=timezone.utc)
+    run = OrchestrationRun(
+        id=uuid4(),
+        machine_id=uuid4(),
+        user_id=uuid4(),
+        installation_id="install-yoga",
+        external_run_id="session-596e88ad-720",
+        orchestrator="claw",
+        orchestrator_version="5.0.0-memento.4",
+        run_kind="session",
+        status="failed",
+        started_at=now,
+        ended_at=now,
+        last_event_at=now,
+    )
+    agent = OrchestrationAgent(
+        id=uuid4(),
+        run_id=run.id,
+        agent_key="agent-main",
+        agent_name="MEMENTO-CLAW-TEST-YOGA-CLAUDE-TO-CURSOR-F3",
+        engine="cursor",
+        model="gemini-3.7-flash-high",
+        effort="auto",
+        status="failed",
+        last_event_at=now,
+    )
+
+    summary = orchestration_agent_summary(run, agent)
+
+    assert summary["id"] is None
+    assert summary["document_ready"] is False
+    assert summary["status"] == "failed"
+    assert summary["tool_id"] == "cursor"
+    assert summary["model"] == "gemini-3.7-flash-high"
 
 
 def test_external_statuses_map_to_existing_subagent_lifecycle_vocabulary() -> None:

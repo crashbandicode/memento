@@ -719,6 +719,39 @@ def merge_subagent_event_summaries(
     return merged
 
 
+def merge_authoritative_subagent_summaries(
+    summaries: Iterable[dict[str, Any]],
+    authoritative: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Overlay durable orchestrator identity/status and retain native details."""
+    merged = [dict(summary) for summary in summaries]
+    by_tool_use = {
+        str(summary.get("agent_tool_use_id")): index
+        for index, summary in enumerate(merged)
+        if summary.get("agent_tool_use_id")
+    }
+    for overlay in authoritative:
+        projected = dict(overlay)
+        tool_use_id = str(projected.get("agent_tool_use_id") or "")
+        index = by_tool_use.get(tool_use_id) if tool_use_id else None
+        if index is None:
+            merged.append(projected)
+            if tool_use_id:
+                by_tool_use[tool_use_id] = len(merged) - 1
+            continue
+        combined = dict(merged[index])
+        combined.update(
+            {
+                key: value
+                for key, value in projected.items()
+                if value is not None
+            }
+        )
+        combined["document_ready"] = bool(combined.get("id"))
+        merged[index] = combined
+    return merged
+
+
 def build_logical_activity_map(
     hierarchy: ConversationHierarchy,
     conversations: Iterable[ConversationRef],

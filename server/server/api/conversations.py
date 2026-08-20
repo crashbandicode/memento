@@ -47,6 +47,7 @@ from ..services.conversation_hierarchy import (
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
     is_conversation_subagent,
+    merge_authoritative_subagent_summaries,
     merge_subagent_event_summaries,
 )
 from ..services.conversation_identity import (
@@ -81,6 +82,7 @@ from ..services.document_delivery import (
     delivery_synced_expression,
     document_metadata,
 )
+from ..services.orchestration_events import orchestration_agent_summary
 from ..services.device_grouping import split_device_name
 from ..services.ingest_service import (
     INTERACTION_HISTORY_KEY,
@@ -901,8 +903,8 @@ async def get_conversation(
         orchestration_rows = (
             await db.execute(
                 select(
-                    OrchestrationRun.parent_document_id,
-                    OrchestrationAgent.document_id,
+                    OrchestrationRun,
+                    OrchestrationAgent,
                 )
                 .join(
                     OrchestrationAgent,
@@ -919,8 +921,8 @@ async def get_conversation(
         ).all()
         orchestration_document_ids = {
             document_id
-            for row in orchestration_rows
-            for document_id in row
+            for run, agent in orchestration_rows
+            for document_id in (run.parent_document_id, agent.document_id)
             if document_id is not None
         }
         existing_hierarchy_ids = {item.id for item in hierarchy_docs}
@@ -977,6 +979,14 @@ async def get_conversation(
         )
         summary_parent_id = hierarchy.canonical_document_ids.get(doc.id, doc.id)
         subagents = subagents_by_parent.get(summary_parent_id, [])
+        subagents = merge_authoritative_subagent_summaries(
+            subagents,
+            (
+                orchestration_agent_summary(run, agent)
+                for run, agent in orchestration_rows
+                if run.parent_document_id == summary_parent_id
+            ),
+        )
         current_is_subagent = is_conversation_subagent(
             doc.tool_id,
             doc.relative_path,

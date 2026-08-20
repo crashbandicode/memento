@@ -17,6 +17,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     effective_conversation_timestamp,
     fold_codex_subagents,
     fold_conversation_subagents,
+    merge_authoritative_subagent_summaries,
     merge_subagent_event_summaries,
     path_linked_subagent_identity,
 )
@@ -777,6 +778,45 @@ class ConversationHierarchyTests(unittest.TestCase):
         )
         self.assertEqual(summaries[0]["status"], "completed")
         self.assertTrue(summaries[0]["document_ready"])
+
+    def test_authoritative_orchestrator_adds_failed_agent_without_document(self) -> None:
+        summaries = merge_authoritative_subagent_summaries([], [{
+            "id": None,
+            "agent_tool_use_id": "session-run:agent-main",
+            "title": "Unavailable Cursor model probe",
+            "orchestration": "claw",
+            "tool_id": "cursor",
+            "model": "gemini-3.7-flash-high",
+            "status": "failed",
+            "document_ready": False,
+        }])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["status"], "failed")
+        self.assertEqual(summaries[0]["orchestration"], "claw")
+        self.assertFalse(summaries[0]["document_ready"])
+
+    def test_authoritative_orchestrator_overlays_matching_native_child(self) -> None:
+        summaries = merge_authoritative_subagent_summaries([{
+            "id": "child-document",
+            "agent_tool_use_id": "session-run:agent-main",
+            "title": "Native fallback title",
+            "status": "unknown",
+            "document_ready": True,
+            "relative_path": "sessions/child.jsonl",
+        }], [{
+            "id": "child-document",
+            "agent_tool_use_id": "session-run:agent-main",
+            "title": "Named Claw task",
+            "orchestration": "claw",
+            "status": "completed",
+            "document_ready": True,
+        }])
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["title"], "Named Claw task")
+        self.assertEqual(summaries[0]["status"], "completed")
+        self.assertEqual(summaries[0]["relative_path"], "sessions/child.jsonl")
 
     def test_path_linked_identity_counts_nested_depth(self) -> None:
         identity = path_linked_subagent_identity(

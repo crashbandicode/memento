@@ -48,10 +48,17 @@ export default function SubagentBadge({
   const panelRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const total = count || subagents.length;
-  const hasClawAgents = subagents.some((subagent) => subagent.orchestration === "claw");
-  const agentsLabel = hasClawAgents
-    ? `Claw · ${total} ${total === 1 ? "delegated agent" : "delegated agents"}`
+  const clawAgentCount = subagents.filter(
+    (subagent) => subagent.orchestration === "claw",
+  ).length;
+  const hasClawAgents = clawAgentCount > 0;
+  const nativeAgentCount = Math.max(0, total - clawAgentCount);
+  const primaryAgentsLabel = hasClawAgents
+    ? `Claw · ${clawAgentCount} ${clawAgentCount === 1 ? "delegated agent" : "delegated agents"}`
     : `${total} ${total === 1 ? "subagent" : "subagents"}`;
+  const agentsLabel = hasClawAgents && nativeAgentCount > 0
+    ? `${primaryAgentsLabel}; ${nativeAgentCount} native ${nativeAgentCount === 1 ? "subagent" : "subagents"}`
+    : primaryAgentsLabel;
   const showSearch = subagents.length > 8;
 
   useLayoutEffect(() => {
@@ -127,11 +134,14 @@ export default function SubagentBadge({
   }, [expandedKey, open, previews]);
 
   const orderedSubagents = useMemo(() => {
-    if (!matchedSubagentId) return subagents;
+    const byOrchestrator = [...subagents].sort((left, right) => (
+      Number(right.orchestration === "claw") - Number(left.orchestration === "claw")
+    ));
+    if (!matchedSubagentId) return byOrchestrator;
     const matched = matchedSubagentId
-      ? subagents.find((subagent) => subagent.id === matchedSubagentId)
+      ? byOrchestrator.find((subagent) => subagent.id === matchedSubagentId)
       : undefined;
-    const remaining = subagents.filter((subagent) => subagent.id !== matchedSubagentId);
+    const remaining = byOrchestrator.filter((subagent) => subagent.id !== matchedSubagentId);
     return matched ? [matched, ...remaining] : remaining;
   }, [matchedSubagentId, subagents]);
 
@@ -205,7 +215,12 @@ export default function SubagentBadge({
         title={`Browse ${agentsLabel}`}
       >
         <Icon name={hasClawAgents ? "command" : "layers"} size={11} />
-        <span>{agentsLabel}</span>
+        <span>{primaryAgentsLabel}</span>
+        {hasClawAgents && nativeAgentCount > 0 && (
+          <span className={styles.muted}>
+            · {nativeAgentCount} native
+          </span>
+        )}
         {orphan && <span className={styles.muted}>· root pending</span>}
         {matchedSubagentId && <span className={styles.muted}>· child match</span>}
         <Icon name={open ? "chevron_up" : "chevron_down"} size={10} />
@@ -231,8 +246,12 @@ export default function SubagentBadge({
             <div className={styles.header}>
               <span className={styles.headerIcon}><Icon name={hasClawAgents ? "command" : "layers"} size={15} /></span>
               <span className={styles.headerText}>
-                <strong>{hasClawAgents ? "Claw delegated agents" : "Subagents"}</strong>
-                <span>Task name first; generated codename and native tool second</span>
+                <strong>{hasClawAgents && nativeAgentCount === 0 ? "Claw delegated agents" : "Delegated agents"}</strong>
+                <span>
+                  {hasClawAgents && nativeAgentCount > 0
+                    ? `${clawAgentCount} Claw ${clawAgentCount === 1 ? "delegate" : "delegates"} first · ${nativeAgentCount} native ${nativeAgentCount === 1 ? "subagent" : "subagents"}`
+                    : "Task name first; generated codename and native tool second"}
+                </span>
               </span>
               <button type="button" className={styles.closeButton} aria-label="Close subagent browser" onClick={() => setOpen(false)}>
                 <Icon name="close" size={15} />
