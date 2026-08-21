@@ -25,6 +25,7 @@ export default function ProfilePage() {
   const [totpCode, setTotpCode] = useState("");
   const [totpSetup, setTotpSetup] = useState<{ secret: string; provisioning_uri: string } | null>(null);
   const [totpBusy, setTotpBusy] = useState(false);
+  const [totpError, setTotpError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (!user) {
@@ -80,34 +81,34 @@ export default function ProfilePage() {
 
   const beginTotpSetup = async () => {
     if (!token || !totpPassword) return;
-    setErrMsg("");
+    setTotpError("");
     setTotpBusy(true);
     try {
       setTotpSetup(await api.setupTotp(token, totpPassword));
       setTotpCode("");
-    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setTotpError(e instanceof Error ? e.message : String(e)); }
     finally { setTotpBusy(false); }
   };
 
   const confirmTotp = async () => {
     if (!token || !totpPassword || !totpCode) return;
-    setErrMsg("");
+    setTotpError("");
     setTotpBusy(true);
     try {
       setUser(await api.confirmTotp(token, totpPassword, totpCode));
       setTotpSetup(null); setTotpCode(""); setTotpPassword("");
-    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setTotpError(e instanceof Error ? e.message : String(e)); }
     finally { setTotpBusy(false); }
   };
 
   const disableTotp = async () => {
     if (!token || !totpPassword || !totpCode) return;
-    setErrMsg("");
+    setTotpError("");
     setTotpBusy(true);
     try {
       setUser(await api.disableTotp(token, totpPassword, totpCode));
       setTotpCode(""); setTotpPassword("");
-    } catch (e: unknown) { setErrMsg(e instanceof Error ? e.message : String(e)); }
+    } catch (e: unknown) { setTotpError(e instanceof Error ? e.message : String(e)); }
     finally { setTotpBusy(false); }
   };
 
@@ -127,12 +128,23 @@ export default function ProfilePage() {
       </Glass>
 
       <SectionLabel>Security</SectionLabel>
+      <section aria-label="Security">
       <Glass padding={22} radius={20} style={{ marginBottom: 20 }}>
         <Row label="Authenticator app (TOTP)" valueNode={<Chip tone={user.totp_enabled ? "success" : "warn"}>{user.totp_enabled ? "Enabled" : "Not enabled"}</Chip>} />
         <p style={{ fontSize: 13, color: "var(--aurora-fg3)", margin: "14px 0" }}>
           Add this account to an authenticator app, then enter its six-digit code whenever you sign in.
         </p>
-        <input type="password" value={totpPassword} onChange={(e) => setTotpPassword(e.target.value)} placeholder="Current password" style={{ width: "100%", marginBottom: 10 }} />
+        <label htmlFor="totp-password" style={{ display: "block", fontSize: 12, color: "var(--aurora-fg3)", marginBottom: 6 }}>
+          Current password
+        </label>
+        <input
+          id="totp-password"
+          type="password"
+          autoComplete="current-password"
+          value={totpPassword}
+          onChange={(e) => setTotpPassword(e.target.value)}
+          style={{ width: "100%", marginBottom: 10 }}
+        />
         {totpSetup && (
           <div style={{ marginBottom: 12, padding: 12, borderRadius: 10, background: "rgba(124,58,237,.08)", fontSize: 12 }}>
             <strong>Add this setup key to your authenticator:</strong>
@@ -142,11 +154,36 @@ export default function ProfilePage() {
         )}
         {totpSetup || user.totp_enabled ? (
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <input inputMode="numeric" value={totpCode} onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit code" style={{ flex: "1 1 140px" }} />
+            <label htmlFor="totp-code" className="sr-only">6-digit authenticator code</label>
+            <input
+              id="totp-code"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={totpCode}
+              onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              placeholder="6-digit code"
+              style={{ flex: "1 1 140px" }}
+            />
             <Btn size="sm" onClick={user.totp_enabled ? disableTotp : confirmTotp} disabled={totpBusy || !totpPassword || totpCode.length !== 6}>{user.totp_enabled ? "Disable TOTP" : "Confirm TOTP"}</Btn>
           </div>
         ) : <Btn size="sm" icon="lock" onClick={beginTotpSetup} disabled={totpBusy || !totpPassword}>Set up TOTP</Btn>}
+        {totpError && (
+          <div
+            role="alert"
+            style={{
+              marginTop: 12,
+              padding: "10px 12px",
+              borderRadius: 10,
+              background: "rgba(239,68,68,0.10)",
+              color: "#B91C1C",
+              fontSize: 12,
+            }}
+          >
+            {totpError}
+          </div>
+        )}
       </Glass>
+      </section>
 
       <SectionLabel>{t.profile.backup}</SectionLabel>
       <Glass padding={22} radius={20} style={{ marginBottom: 20 }}>

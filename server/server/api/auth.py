@@ -79,6 +79,17 @@ class TotpSetupResponse(BaseModel):
     provisioning_uri: str
 
 
+def _require_current_password(user: User, password: str) -> None:
+    """Re-authenticate a signed-in user without invalidating their bearer token.
+
+    A rejected current password is an authorization failure for this sensitive
+    action, not a failure of the already-validated JWT. Keeping those semantics
+    distinct prevents clients from discarding a valid login session.
+    """
+    if not user.hashed_password or not verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=403, detail="Current password is incorrect")
+
+
 @router.get("/registration-mode", response_model=RegistrationModeResponse)
 async def registration_mode(db: AsyncSession = Depends(get_db)) -> RegistrationModeResponse:
     """Public: so the register page can show the right UI (invite input / closed banner)."""
@@ -461,8 +472,7 @@ async def setup_totp(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TotpSetupResponse:
-    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    _require_current_password(user, req.password)
     secret = new_secret()
     user.totp_secret = encrypt_secret(secret)
     user.totp_enabled = False
@@ -476,8 +486,7 @@ async def confirm_totp(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    _require_current_password(user, req.password)
     if not verify_code(user.totp_secret, req.code):
         raise HTTPException(status_code=400, detail="Invalid authenticator code")
     user.totp_enabled = True
@@ -492,8 +501,7 @@ async def disable_totp(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    if not user.hashed_password or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    _require_current_password(user, req.password)
     if not user.totp_enabled or not verify_code(user.totp_secret, req.code):
         raise HTTPException(status_code=400, detail="Invalid authenticator code")
     user.totp_secret = None
