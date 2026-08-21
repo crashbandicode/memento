@@ -3422,6 +3422,12 @@ async def ingest_file(
             first_user_message=first_user_message,
             conversation_source=conversation_source,
             cursor_projection_order=cursor_projection_order,
+            # A targeted collector repair intentionally replays the complete
+            # authoritative transcript even when its source hash is unchanged.
+            # Rebuild the bounded read projection from those normalized rows as
+            # part of the same transaction; retaining the incremental model can
+            # otherwise preserve stale lifecycle/task state corrected above.
+            force_projection_rebuild=authoritative_rebase,
         )
         from .conversation_activity import refresh_document_activity_at
 
@@ -4053,6 +4059,7 @@ async def _extract_messages(
     first_user_message: str = "",
     conversation_source: ConversationFileSource | None = None,
     cursor_projection_order: object | None = None,
+    force_projection_rebuild: bool = False,
 ) -> str:
     """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
@@ -5005,7 +5012,7 @@ async def _extract_messages(
         doc,
         mode=projection_mode,
         dirty_line_numbers=dirty_projection_lines,
-        force_full=recovered_history_changed,
+        force_full=(force_projection_rebuild or recovered_history_changed),
     )
     await upsert_search_terms(db, search_terms)
     setattr(doc, "_memento_interactions_changed", interactions_changed)

@@ -1490,6 +1490,50 @@ async def test_full_rebase_preserves_unchanged_message_prefix(
 
 
 @pytest.mark.asyncio
+async def test_forced_full_rebase_rebuilds_stale_read_projection(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session)
+        source = _claude_tool_row(
+            "Read",
+            {"file_path": "one.py"},
+            source_id="stable-first",
+        )
+        await _extract_messages(session, document, source, "full")
+        await session.commit()
+
+        projection = await session.get(ConversationReadModel, document.id)
+        assert projection is not None
+        projection.agent_events = [{
+            "event": {
+                "kind": "started",
+                "status": "running",
+                "activity_type": "subagent",
+                "agent_thread_id": "stale-agent",
+                "label": "Stale repair projection",
+            },
+            "line_number": 999,
+            "timestamp": "2026-08-07T12:00:05Z",
+        }]
+        await session.commit()
+
+        await _extract_messages(
+            session,
+            document,
+            source,
+            "full",
+            force_projection_rebuild=True,
+        )
+        await session.commit()
+        await session.refresh(projection)
+
+        assert projection.agent_events == []
+        assert projection.message_count == 1
+        assert projection.projected_through_line == 1
+
+
+@pytest.mark.asyncio
 async def test_metadata_inbox_replays_across_cursor_path_promotion(
     session_factory,
 ) -> None:
