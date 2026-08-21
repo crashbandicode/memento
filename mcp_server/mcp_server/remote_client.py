@@ -177,6 +177,28 @@ class RemoteClient:
     async def get_conversation(self, doc_id: str) -> dict:
         return await self._get(f"/api/conversations/{doc_id}")
 
+    async def get_usage_cycle(
+        self,
+        *,
+        since: str,
+        until: str,
+        tool: str = "all",
+        include_threads: bool = False,
+    ) -> dict:
+        """Fetch an indexed, user-scoped conversation usage cycle."""
+        result = await self._get(
+            "/api/conversations/usage-cycle",
+            {
+                "since": since,
+                "until": until,
+                "tool": tool,
+                "include_threads": include_threads,
+            },
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Usage-cycle endpoint did not return an object")
+        return result
+
     async def get_tasks(
         self,
         *,

@@ -26,7 +26,11 @@ from .subagent_lifecycle import (
     normalized_subagent_runtime,
 )
 from .conversation_usage import (
-    observe_token_usage,
+    add_token_usage,
+    claude_message_token_usage,
+    codex_total_token_usage,
+    normalize_token_usage,
+    subtract_token_usage,
 )
 
 
@@ -92,8 +96,28 @@ class AssistantIdentityState:
     reasoning_effort: str = ""
     service_tier: str = ""
     agent_mode: str = ""
+    started_at: str = ""
+    last_activity_at: str = ""
     token_usage: dict[str, object] = field(default_factory=dict)
     token_usage_source_ids: set[str] = field(default_factory=set, repr=False)
+    usage_observations: list[AssistantUsageObservation] = field(
+        default_factory=list,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True)
+class AssistantUsageObservation:
+    """One native usage record ready for transactional persistence."""
+
+    source_id: str
+    timestamp: str
+    source: str
+    model: str
+    reasoning_effort: str
+    service_tier: str
+    attribution_status: str
+    token_usage: dict[str, object]
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -744,6 +768,54 @@ def _has_claude_thinking_block(content: object) -> bool:
     )
 
 
+def _usage_observation_source_id(obj: dict, tool_id: str) -> str:
+    """Return a stable bounded identity for one native usage observation."""
+    message = _as_mapping(obj.get("message"))
+    payload = _as_mapping(obj.get("payload"))
+    for value in (
+        message.get("id"),
+        obj.get("uuid"),
+        obj.get("id"),
+        payload.get("id"),
+    ):
+        candidate = _coerce_text(value).strip()
+        if candidate:
+            return f"{tool_id}:{candidate}"[:512]
+    serialized = orjson.dumps(obj, option=orjson.OPT_SORT_KEYS)
+    return f"{tool_id}:sha256:{hashlib.sha256(serialized).hexdigest()}"
+
+
+def _append_usage_observation(
+    state: AssistantIdentityState,
+    obj: dict,
+    tool_id: str,
+    usage: object,
+    *,
+    attribution_status: str = "attributed",
+) -> None:
+    normalized = normalize_token_usage(usage)
+    timestamp = _coerce_text(
+        obj.get("timestamp") or _as_mapping(obj.get("payload")).get("timestamp")
+    ).strip()
+    status = attribution_status
+    if status == "attributed" and not timestamp:
+        status = "missing_timestamp"
+    if status == "attributed" and not state.model:
+        status = "missing_model"
+    state.usage_observations.append(
+        AssistantUsageObservation(
+            source_id=_usage_observation_source_id(obj, tool_id),
+            timestamp=timestamp[:128],
+            source=str(normalized.get("source") or tool_id)[:32],
+            model=state.model[:200],
+            reasoning_effort=state.reasoning_effort[:50],
+            service_tier=state.service_tier[:50],
+            attribution_status=status,
+            token_usage=normalized,
+        )
+    )
+
+
 def _update_assistant_identity(
     state: AssistantIdentityState,
     obj: object,
@@ -753,16 +825,36 @@ def _update_assistant_identity(
     if not isinstance(obj, dict):
         return
 
-    msg_type = _coerce_text(obj.get("type"))
-    state.token_usage = observe_token_usage(
-        state.token_usage,
-        state.token_usage_source_ids,
-        obj,
-        tool_id,
+    observed_at = _message_timestamp(
+        obj.get("timestamp") or _as_mapping(obj.get("payload")).get("timestamp")
     )
+    if observed_at is not None:
+        started_at = _message_timestamp(state.started_at)
+        last_activity_at = _message_timestamp(state.last_activity_at)
+        if started_at is None or observed_at < started_at:
+            state.started_at = observed_at.isoformat()
+        if last_activity_at is None or observed_at > last_activity_at:
+            state.last_activity_at = observed_at.isoformat()
+
+    msg_type = _coerce_text(obj.get("type"))
     if tool_id == "codex":
         payload = _as_mapping(obj.get("payload"))
         if msg_type == "event_msg" and payload.get("type") == "token_count":
+            previous = normalize_token_usage(state.token_usage)
+            current = codex_total_token_usage(payload)
+            if current:
+                delta = subtract_token_usage(current, previous)
+                state.token_usage = current
+                if delta:
+                    _append_usage_observation(state, obj, tool_id, delta)
+                elif previous and current != previous:
+                    _append_usage_observation(
+                        state,
+                        obj,
+                        tool_id,
+                        {},
+                        attribution_status="counter_reset",
+                    )
             return
         if msg_type == "turn_context":
             _set_identity_field(state, payload, ("model",), "model")
@@ -836,6 +928,12 @@ def _update_assistant_identity(
             and _has_claude_thinking_block(message.get("content"))
         ):
             state.reasoning_effort = "extended"
+        usage = claude_message_token_usage(message)
+        source_id = _usage_observation_source_id(obj, tool_id)
+        if usage and source_id not in state.token_usage_source_ids:
+            state.token_usage_source_ids.add(source_id)
+            state.token_usage = add_token_usage(state.token_usage, usage)
+            _append_usage_observation(state, obj, tool_id, usage)
         return
 
     # Cursor exports and OpenClaw sessions vary by release. Only consume
@@ -857,6 +955,15 @@ def _update_assistant_identity(
         ),
         "reasoning_effort",
     )
+
+
+def observe_assistant_identity_record(
+    state: AssistantIdentityState,
+    record: object,
+    tool_id: str,
+) -> None:
+    """Advance the shared live/backfill assistant telemetry state."""
+    _update_assistant_identity(state, record, tool_id)
 
 
 def _attach_assistant_identity(

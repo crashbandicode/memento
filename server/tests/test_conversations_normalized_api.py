@@ -17,8 +17,10 @@ sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.conversations import (  # noqa: E402
     _conversation_location,
+    _parse_usage_cycle_timestamp,
     get_conversation,
     get_conversation_messages,
+    get_conversation_usage_cycle,
     get_conversation_prompts,
     get_latest_agent_message,
     get_pending_conversation_interactions,
@@ -45,6 +47,13 @@ class _Result:
         if self._rows:
             return self._rows[0]
         return self._scalar_value
+
+    def one(self):
+        if self._rows:
+            return self._rows[0]
+        if self._scalar_value is not None:
+            return self._scalar_value
+        return SimpleNamespace(started_at=None, message_last_at=None)
 
     def scalars(self):
         return self
@@ -90,6 +99,47 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             synced_at=self.now,
             file_size_bytes=64 * 1024 * 1024,
         )
+
+    async def test_usage_cycle_validates_and_scopes_the_aggregate(self) -> None:
+        expected = {"schema_version": 1, "conversation_count": 1}
+        machine_ids = {self.doc.machine_id}
+        with (
+            patch(
+                "server.api.conversations.user_machine_ids",
+                new=AsyncMock(return_value=machine_ids),
+            ),
+            patch(
+                "server.api.conversations.aggregate_usage_cycle",
+                new=AsyncMock(return_value=expected),
+            ) as aggregate,
+        ):
+            payload = await get_conversation_usage_cycle(
+                since="2026-08-01T00:00:00Z",
+                until="2026-09-01T00:00:00-04:00",
+                tool="claude",
+                include_threads=True,
+                db=SimpleNamespace(),
+                user=self.owner,
+            )
+
+        self.assertEqual(payload, expected)
+        aggregate.assert_awaited_once()
+        kwargs = aggregate.await_args.kwargs
+        self.assertEqual(kwargs["machine_ids"], machine_ids)
+        self.assertEqual(kwargs["tool"], "claude")
+        self.assertTrue(kwargs["include_threads"])
+        self.assertEqual(
+            kwargs["since"], datetime(2026, 8, 1, tzinfo=timezone.utc)
+        )
+        self.assertEqual(
+            kwargs["until"], datetime(2026, 9, 1, 4, tzinfo=timezone.utc)
+        )
+
+    def test_usage_cycle_rejects_naive_iso_timestamp(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            _parse_usage_cycle_timestamp("2026-08-01T00:00:00", "since")
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("timezone", str(raised.exception.detail))
 
     def message(
         self,
@@ -1991,7 +2041,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 0)
-        self.assertEqual(len(db.statements), 5)
+        self.assertEqual(len(db.statements), 6)
         for statement in db.statements:
             sql = str(statement.compile(dialect=postgresql.dialect())).upper()
             self.assertNotIn("COUNT(", sql)
@@ -2009,6 +2059,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
             "source": "codex",
             "input_tokens": 31_051,
             "cached_input_tokens": 19_712,
+            "cache_read_tokens": 19_712,
             "output_tokens": 421,
             "total_tokens": 31_472,
         }
@@ -2027,6 +2078,8 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
                 "reasoning_effort": "xhigh",
                 "service_tier": "priority",
                 "token_usage": token_usage,
+                "started_at": "2026-07-01T08:00:00+00:00",
+                "last_activity_at": "2026-07-01T09:00:00+00:00",
             }
         )
         db = _Db(
@@ -2048,6 +2101,12 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["reasoning_effort"], "xhigh")
         self.assertEqual(payload["service_tier"], "priority")
         self.assertEqual(payload["token_usage"], token_usage)
+        self.assertEqual(payload["models"], [])
+        self.assertEqual(payload["started_at"], "2026-07-01T08:00:00+00:00")
+        self.assertEqual(
+            payload["last_activity_at"],
+            "2026-07-01T09:00:00+00:00",
+        )
 
     async def test_direct_claude_child_api_uses_launch_description_title(self) -> None:
         root_thread_id = "root-thread"

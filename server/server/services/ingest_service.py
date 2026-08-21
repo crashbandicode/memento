@@ -11,10 +11,12 @@ from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
     ConversationMessage,
+    ConversationUsageEvent,
     Document,
     DocumentVersion,
     Machine,
@@ -30,9 +32,13 @@ from .conversation_identity import (
 )
 from .conversation_stream import ConversationFileSource
 from .conversation_usage import (
+    LAST_ACTIVITY_AT_METADATA_KEY,
+    STARTED_AT_METADATA_KEY,
     TOKEN_USAGE_METADATA_KEY,
     normalize_token_usage,
+    subtract_token_usage,
     token_usage_from_metadata,
+    usage_observation_values,
 )
 from .document_delivery import (
     attach_document_delivery,
@@ -149,6 +155,8 @@ _ESSENTIAL_METADATA_KEYS = {
     CURRENT_ASSISTANT_MODE_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    STARTED_AT_METADATA_KEY,
+    LAST_ACTIVITY_AT_METADATA_KEY,
     CURRENT_PENDING_QUESTIONS_KEY,
     INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
@@ -197,6 +205,8 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     CURRENT_ASSISTANT_MODEL_KEY,
     CURRENT_ASSISTANT_REASONING_KEY,
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
+    STARTED_AT_METADATA_KEY,
+    LAST_ACTIVITY_AT_METADATA_KEY,
     INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
@@ -950,6 +960,8 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
             "agent_mode",
         ),
         token_usage=token_usage_from_metadata(metadata),
+        started_at=stored_value(STARTED_AT_METADATA_KEY),
+        last_activity_at=stored_value(LAST_ACTIVITY_AT_METADATA_KEY),
     )
 
 
@@ -961,6 +973,8 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
         (CURRENT_ASSISTANT_REASONING_KEY, assistant_identity.reasoning_effort),
         (CURRENT_ASSISTANT_SERVICE_TIER_KEY, assistant_identity.service_tier),
         (CURRENT_ASSISTANT_MODE_KEY, assistant_identity.agent_mode),
+        (STARTED_AT_METADATA_KEY, assistant_identity.started_at),
+        (LAST_ACTIVITY_AT_METADATA_KEY, assistant_identity.last_activity_at),
     ):
         if value:
             metadata[key] = _bounded_message_text(
@@ -975,6 +989,102 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
     else:
         metadata.pop(TOKEN_USAGE_METADATA_KEY, None)
     store_document_metadata(doc, metadata)
+
+
+def _drain_assistant_usage_rows(
+    doc: Document,
+    tool_id: str,
+    assistant_identity,
+) -> list[dict[str, object]]:
+    """Drain parser observations into bounded relational event rows."""
+    observations = list(assistant_identity.usage_observations)
+    assistant_identity.usage_observations.clear()
+    rows: list[dict[str, object]] = []
+    for observation in observations:
+        rows.append(
+            {
+                "document_id": doc.id,
+                "machine_id": doc.machine_id,
+                "tool_id": tool_id,
+                **usage_observation_values(observation),
+            }
+        )
+    return rows
+
+
+async def _upsert_assistant_usage_rows(
+    db: AsyncSession,
+    rows: list[dict[str, object]],
+    *,
+    detect_replacements: bool = False,
+) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    replaced_usage: list[dict[str, object]] = []
+    if detect_replacements:
+        document_id = rows[0]["document_id"]
+        source_ids = [str(row["source_id"]) for row in rows]
+        existing_rows = (
+            await db.execute(
+                select(ConversationUsageEvent).where(
+                    ConversationUsageEvent.document_id == document_id,
+                    ConversationUsageEvent.source_id.in_(source_ids),
+                )
+            )
+        ).scalars()
+        replaced_usage = [
+            {
+                "input_tokens": row.input_tokens,
+                "uncached_input_tokens": row.uncached_input_tokens,
+                "cached_input_tokens": row.cached_input_tokens,
+                "cache_write_input_tokens": row.cache_write_input_tokens,
+                "output_tokens": row.output_tokens,
+                "reasoning_output_tokens": row.reasoning_output_tokens,
+                "total_tokens": row.total_tokens,
+                "source": row.source,
+            }
+            for row in existing_rows
+        ]
+    statement = pg_insert(ConversationUsageEvent).values(rows)
+    excluded = statement.excluded
+    await db.execute(
+        statement.on_conflict_do_update(
+            constraint="uq_conversation_usage_document_source",
+            set_={
+                "machine_id": excluded.machine_id,
+                "tool_id": excluded.tool_id,
+                "source": excluded.source,
+                "occurred_at": excluded.occurred_at,
+                "model": excluded.model,
+                "reasoning_effort": excluded.reasoning_effort,
+                "service_tier": excluded.service_tier,
+                "attribution_status": excluded.attribution_status,
+                "input_tokens": excluded.input_tokens,
+                "uncached_input_tokens": excluded.uncached_input_tokens,
+                "cached_input_tokens": excluded.cached_input_tokens,
+                "cache_write_input_tokens": excluded.cache_write_input_tokens,
+                "output_tokens": excluded.output_tokens,
+                "reasoning_output_tokens": excluded.reasoning_output_tokens,
+                "total_tokens": excluded.total_tokens,
+            },
+        )
+    )
+    return replaced_usage
+
+
+def _remove_replaced_usage(assistant_identity, replaced_usage: Iterable[object]) -> None:
+    """Remove prior Claude event values after parsing replacement records.
+
+    Claude may append an updated record with the same native message ID in a
+    later collector delta. The parser has already added the replacement's
+    counters, so removing the persisted prior value keeps the lifetime total
+    exact while the relational event is updated idempotently.
+    """
+    for usage in replaced_usage:
+        assistant_identity.token_usage = subtract_token_usage(
+            assistant_identity.token_usage,
+            usage,
+        )
 
 
 def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
@@ -4109,6 +4219,13 @@ async def _extract_messages(
         )
         start_line = 1
 
+    if mode != "delta":
+        await db.execute(
+            delete(ConversationUsageEvent).where(
+                ConversationUsageEvent.document_id == doc.id
+            )
+        )
+
     assistant_identity = _assistant_identity_for_ingest(doc, mode)
     from .conversation_tasks import canonical_task_state
     from ..db.models import ConversationTaskState
@@ -4132,6 +4249,7 @@ async def _extract_messages(
     line_num = start_line
     batch: list[ConversationMessage] = []
     batch_bytes = 0
+    usage_event_rows: list[dict[str, object]] = []
     delta_tail = None
     queued_claude_users: dict[str, list[ConversationMessage]] = {}
     recent_lifecycle_rows: dict[
@@ -4284,6 +4402,19 @@ async def _extract_messages(
         stored_messages = iter(incoming_projection)
 
     for normalized, clean_content, meta, ts in stored_messages:
+        usage_event_rows.extend(
+            _drain_assistant_usage_rows(doc, tool_id, assistant_identity)
+        )
+        if len(usage_event_rows) >= 250:
+            replaced_usage = await _upsert_assistant_usage_rows(
+                db,
+                usage_event_rows,
+                detect_replacements=(
+                    mode == "delta" and tool_id == "claude_code"
+                ),
+            )
+            _remove_replaced_usage(assistant_identity, replaced_usage)
+            usage_event_rows = []
         lifecycle_key = lifecycle_event_identity(normalized.agent_event)
         prior_lifecycle_row = (
             recent_lifecycle_rows.get(lifecycle_key)
@@ -4610,6 +4741,16 @@ async def _extract_messages(
     _reconcile_live_shell_activities(doc, terminal_tool_call_ids)
     _store_pending_question_ids(doc, pending_question_ids)
     _store_latest_human_timestamp(doc, latest_human_timestamp)
+
+    usage_event_rows.extend(
+        _drain_assistant_usage_rows(doc, tool_id, assistant_identity)
+    )
+    replaced_usage = await _upsert_assistant_usage_rows(
+        db,
+        usage_event_rows,
+        detect_replacements=(mode == "delta" and tool_id == "claude_code"),
+    )
+    _remove_replaced_usage(assistant_identity, replaced_usage)
     _store_assistant_identity(doc, assistant_identity)
 
     if batch:

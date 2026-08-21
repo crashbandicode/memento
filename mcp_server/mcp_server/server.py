@@ -586,6 +586,9 @@ async def memory_conversation_info(doc_id: str) -> str:
             "reasoning_effort": doc.get("reasoning_effort"),
             "service_tier": doc.get("service_tier"),
             "token_usage": doc.get("token_usage"),
+            "models": doc.get("models") or [],
+            "started_at": doc.get("started_at"),
+            "last_activity_at": doc.get("last_activity_at"),
         }
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
@@ -610,6 +613,14 @@ async def memory_conversation_info(doc_id: str) -> str:
                 separators=(",", ":"),
             )
         metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+        from .usage import direct_conversation_details, normalize_usage
+
+        details = await direct_conversation_details(
+            db,
+            doc.id,
+            metadata=metadata,
+            fallback_last=doc.activity_at,
+        )
         result = {
             "schema_version": 1,
             "document_id": str(doc.id),
@@ -628,9 +639,68 @@ async def memory_conversation_info(doc_id: str) -> str:
                 metadata.get("_assistant_service_tier")
                 or metadata.get("service_tier")
             ),
-            "token_usage": metadata.get("_assistant_token_usage"),
+            "token_usage": normalize_usage(
+                metadata.get("_assistant_token_usage")
+            ) or None,
+            "models": details["models"],
+            "started_at": details["started_at"],
+            "last_activity_at": details["last_activity_at"],
         }
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+@mcp.tool()
+async def memory_usage_cycle(
+    since: str,
+    until: str,
+    tool: str = "all",
+    include_threads: bool = False,
+) -> str:
+    """Get exact recorded token usage for a billing or reporting cycle.
+
+    Usage is grouped by model and reasoning effort. Claude includes separate
+    uncached-input, cache-read, and cache-write counters. Codex usage is the
+    positive delta between its cumulative native snapshots. Cursor is reported
+    explicitly as unattributed because its local transcript has no exact token
+    accounting. No provider pricing assumptions are applied.
+
+    Args:
+        since: Inclusive timezone-aware ISO-8601 cycle start
+        until: Exclusive timezone-aware ISO-8601 cycle end
+        tool: claude, codex, cursor, or all (default all)
+        include_threads: Include per-thread rows when true (default false)
+    """
+    from .usage import aggregate_usage_cycle, normalize_tool, parse_cycle_timestamp
+
+    try:
+        since_at = parse_cycle_timestamp(since, "since")
+        until_at = parse_cycle_timestamp(until, "until")
+        normalize_tool(tool)
+        if since_at >= until_at:
+            raise ValueError("since must be before until")
+        if _remote:
+            result = await _remote.get_usage_cycle(
+                since=since_at.isoformat(),
+                until=until_at.isoformat(),
+                tool=tool,
+                include_threads=include_threads,
+            )
+        else:
+            async with _session_factory() as db:
+                result = await aggregate_usage_cycle(
+                    db,
+                    since=since_at,
+                    until=until_at,
+                    tool=tool,
+                    include_threads=include_threads,
+                )
+    except Exception as exc:
+        return json.dumps(
+            {"schema_version": 1, "error": str(exc)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 @mcp.tool()

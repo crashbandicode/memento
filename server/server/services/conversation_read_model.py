@@ -28,7 +28,11 @@ from .conversation_parser import (
     build_cursor_question_response,
     normalize_tool_calls,
 )
-from .conversation_usage import token_usage_from_metadata
+from .conversation_usage import (
+    LAST_ACTIVITY_AT_METADATA_KEY,
+    STARTED_AT_METADATA_KEY,
+    token_usage_from_metadata,
+)
 from .subagent_lifecycle import (
     lifecycle_event_identity,
     merge_duplicate_lifecycle_events,
@@ -403,6 +407,13 @@ def _identity_values(document: Document) -> dict:
     token_usage = token_usage_from_metadata(metadata)
     if token_usage:
         runtime["token_usage"] = token_usage
+    for runtime_key, metadata_key in (
+        ("started_at", STARTED_AT_METADATA_KEY),
+        ("last_activity_at", LAST_ACTIVITY_AT_METADATA_KEY),
+    ):
+        value = _bounded(metadata.get(metadata_key), 128)
+        if value:
+            runtime[runtime_key] = value
     return {
         "machine_id": document.machine_id,
         "tool_id": document.tool_id,

@@ -5,12 +5,18 @@ from __future__ import annotations
 import os
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer,
-    String, Text, UniqueConstraint, func,
+    BigInteger,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 import uuid
 from datetime import date, datetime
 
@@ -74,6 +80,10 @@ class Document(Base):
     ai_summary: Mapped[str | None] = mapped_column(Text)
     embedding_status: Mapped[str] = mapped_column(String(20))
     embedding_tier: Mapped[str] = mapped_column(String(20))
+    source_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -87,6 +97,37 @@ class ConversationMessage(Base):
     content: Mapped[str | None] = mapped_column(Text)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
     timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DocumentDeliveryState(Base):
+    __tablename__ = "document_delivery_state"
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id"), primary_key=True
+    )
+    activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_metadata: Mapped[dict] = mapped_column(JSONB)
+
+
+class ConversationUsageEvent(Base):
+    __tablename__ = "conversation_usage_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id"))
+    machine_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("machines.id"))
+    tool_id: Mapped[str] = mapped_column(String(50))
+    source_id: Mapped[str] = mapped_column(String(512))
+    source: Mapped[str] = mapped_column(String(32))
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model: Mapped[str | None] = mapped_column(String(200))
+    reasoning_effort: Mapped[str | None] = mapped_column(String(50))
+    service_tier: Mapped[str | None] = mapped_column(String(50))
+    attribution_status: Mapped[str] = mapped_column(String(32))
+    input_tokens: Mapped[int] = mapped_column(BigInteger)
+    uncached_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_write_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    output_tokens: Mapped[int] = mapped_column(BigInteger)
+    reasoning_output_tokens: Mapped[int] = mapped_column(BigInteger)
+    total_tokens: Mapped[int] = mapped_column(BigInteger)
 
 
 class DailySummary(Base):

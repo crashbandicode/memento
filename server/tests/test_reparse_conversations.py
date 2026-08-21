@@ -24,6 +24,8 @@ from server.services.ingest_service import (
     STORED_SOURCE_HASH_KEY,
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
+    LAST_ACTIVITY_AT_METADATA_KEY,
+    STARTED_AT_METADATA_KEY,
     _advance_stored_pending_questions,
     _assistant_identity_for_ingest,
     _set_stored_source_identity,
@@ -257,6 +259,8 @@ def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
     identity.reasoning_effort = "high"
     identity.service_tier = "priority"
     identity.agent_mode = "plan"
+    identity.started_at = "2026-08-01T12:00:00+00:00"
+    identity.last_activity_at = "2026-08-01T12:05:00+00:00"
 
     _store_assistant_identity(document, identity)
     next_delta = _assistant_identity_for_ingest(document, "delta")
@@ -265,11 +269,15 @@ def test_delta_ingest_carries_assistant_identity_between_chunks() -> None:
     assert next_delta.reasoning_effort == "high"
     assert next_delta.service_tier == "priority"
     assert next_delta.agent_mode == "plan"
+    assert next_delta.started_at == "2026-08-01T12:00:00+00:00"
+    assert next_delta.last_activity_at == "2026-08-01T12:05:00+00:00"
     assert document.metadata_["unrelated"] == "preserved"
     assert document.metadata_[CURRENT_ASSISTANT_MODEL_KEY] == "gpt-5.6-sol"
     assert document.metadata_[CURRENT_ASSISTANT_REASONING_KEY] == "high"
     assert document.metadata_[CURRENT_ASSISTANT_SERVICE_TIER_KEY] == "priority"
     assert document.metadata_[CURRENT_ASSISTANT_MODE_KEY] == "plan"
+    assert document.metadata_[STARTED_AT_METADATA_KEY] == identity.started_at
+    assert document.metadata_[LAST_ACTIVITY_AT_METADATA_KEY] == identity.last_activity_at
     assert _assistant_identity_for_ingest(document, "full").model == ""
 
 

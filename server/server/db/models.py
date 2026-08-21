@@ -174,6 +174,10 @@ class Document(Base):
     project: Mapped[Project | None] = relationship(back_populates="documents")
     machine: Mapped[Machine | None] = relationship(back_populates="documents")
     messages: Mapped[list[ConversationMessage]] = relationship(back_populates="document", cascade="all, delete-orphan")
+    usage_events: Mapped[list[ConversationUsageEvent]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
     versions: Mapped[list[DocumentVersion]] = relationship(back_populates="document", cascade="all, delete-orphan")
     delivery_state: Mapped[DocumentDeliveryState | None] = relationship(
         back_populates="document",
@@ -294,6 +298,74 @@ class ConversationMessage(Base):
             "idx_conv_msg_doc_source_id",
             "document_id",
             text("(metadata ->> 'source_id')"),
+        ),
+    )
+
+
+class ConversationUsageEvent(Base):
+    """One exact native usage observation attributed to a model selection."""
+
+    __tablename__ = "conversation_usage_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    machine_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE")
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model: Mapped[str | None] = mapped_column(String(200))
+    reasoning_effort: Mapped[str | None] = mapped_column(String(50))
+    service_tier: Mapped[str | None] = mapped_column(String(50))
+    attribution_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="attributed"
+    )
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    uncached_input_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    cached_input_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    cache_write_input_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    reasoning_output_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    total_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    document: Mapped[Document] = relationship(back_populates="usage_events")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "source_id",
+            name="uq_conversation_usage_document_source",
+        ),
+        Index("idx_conversation_usage_occurred", "occurred_at"),
+        Index(
+            "idx_conversation_usage_tool_occurred",
+            "tool_id",
+            "occurred_at",
+        ),
+        Index(
+            "idx_conversation_usage_machine_occurred",
+            "machine_id",
+            "occurred_at",
+        ),
+        Index(
+            "idx_conversation_usage_document_occurred",
+            "document_id",
+            "occurred_at",
         ),
     )
 

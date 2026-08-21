@@ -72,6 +72,10 @@ from ..services.conversation_parser import (
 )
 from ..services.conversation_read_model import conversation_prompt_rows_statement
 from ..services.conversation_usage import token_usage_from_metadata
+from ..services.conversation_usage_cycle import (
+    aggregate_usage_cycle,
+    conversation_usage_models,
+)
 from ..services.claude_lineage import (
     INTERACTION_ORIGIN_KEY,
     history_entry_is_visible,
@@ -741,6 +745,53 @@ def _message_question_interactions(metadata: object) -> list[dict]:
     return interactions
 
 
+def _parse_usage_cycle_timestamp(value: str, field_name: str) -> datetime:
+    """Parse one timezone-aware ISO timestamp for a usage-cycle boundary."""
+    candidate = str(value or "").strip()
+    if candidate.endswith(("Z", "z")):
+        candidate = f"{candidate[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must be an ISO-8601 timestamp",
+        ) from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must include a timezone",
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+@router.get("/usage-cycle")
+async def get_conversation_usage_cycle(
+    since: str = Query(...),
+    until: str = Query(...),
+    tool: str = Query("all"),
+    include_threads: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Return indexed token usage for the half-open ``[since, until)`` cycle."""
+    since_at = _parse_usage_cycle_timestamp(since, "since")
+    until_at = _parse_usage_cycle_timestamp(until, "until")
+    if since_at >= until_at:
+        raise HTTPException(status_code=422, detail="since must be before until")
+    try:
+        return await aggregate_usage_cycle(
+            db,
+            since=since_at,
+            until=until_at,
+            tool=tool,
+            machine_ids=await user_machine_ids(db, user),
+            include_threads=include_threads,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.get("/{conversation_ref}")
 async def get_conversation(
     doc_id: uuid.UUID = Depends(resolve_conversation_reference),
@@ -1157,6 +1208,7 @@ async def get_conversation(
         runtime["service_tier"] = service_tier
     if token_usage:
         runtime["token_usage"] = token_usage
+    usage_models = await conversation_usage_models(db, doc.id)
 
     return {
         "id": str(doc.id),
@@ -1203,6 +1255,12 @@ async def get_conversation(
         "reasoning_effort": runtime.get("reasoning_effort"),
         "service_tier": runtime.get("service_tier"),
         "token_usage": runtime.get("token_usage") or None,
+        "models": usage_models,
+        "started_at": runtime.get("started_at") or None,
+        "last_activity_at": (
+            runtime.get("last_activity_at")
+            or (activity_at.isoformat() if activity_at else None)
+        ),
         "message_count": message_count,
         "subagent_count": len(subagents),
         "subagents_truncated": subagents_truncated,
