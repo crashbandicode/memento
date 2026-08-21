@@ -174,6 +174,9 @@ class RemoteClient:
             {"limit": limit, "offset": offset},
         )
 
+    async def get_conversation(self, doc_id: str) -> dict:
+        return await self._get(f"/api/conversations/{doc_id}")
+
     async def get_tasks(
         self,
         *,

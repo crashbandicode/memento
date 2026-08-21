@@ -71,6 +71,7 @@ from ..services.conversation_parser import (
     parse_conversation,
 )
 from ..services.conversation_read_model import conversation_prompt_rows_statement
+from ..services.conversation_usage import token_usage_from_metadata
 from ..services.claude_lineage import (
     INTERACTION_ORIGIN_KEY,
     history_entry_is_visible,
@@ -1140,6 +1141,22 @@ async def get_conversation(
             synced_at=doc.synced_at,
         )
     )
+    runtime = (
+        dict(read_model.runtime or {})
+        if read_model is not None
+        else subagent_runtime_from_metadata(doc.metadata_)
+    )
+    token_usage = token_usage_from_metadata(doc.metadata_)
+    service_tier = str(
+        (doc.metadata_ or {}).get("_assistant_service_tier")
+        or (doc.metadata_ or {}).get("service_tier")
+        or runtime.get("service_tier")
+        or ""
+    )
+    if service_tier:
+        runtime["service_tier"] = service_tier
+    if token_usage:
+        runtime["token_usage"] = token_usage
 
     return {
         "id": str(doc.id),
@@ -1181,6 +1198,11 @@ async def get_conversation(
             if isinstance(doc.metadata_, dict)
             else ""
         ),
+        "model": runtime.get("model"),
+        "model_family": runtime.get("model_family"),
+        "reasoning_effort": runtime.get("reasoning_effort"),
+        "service_tier": runtime.get("service_tier"),
+        "token_usage": runtime.get("token_usage") or None,
         "message_count": message_count,
         "subagent_count": len(subagents),
         "subagents_truncated": subagents_truncated,

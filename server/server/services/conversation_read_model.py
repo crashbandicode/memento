@@ -28,6 +28,7 @@ from .conversation_parser import (
     build_cursor_question_response,
     normalize_tool_calls,
 )
+from .conversation_usage import token_usage_from_metadata
 from .subagent_lifecycle import (
     lifecycle_event_identity,
     merge_duplicate_lifecycle_events,
@@ -391,6 +392,17 @@ def _identity_values(document: Document) -> dict:
     )
     if is_subagent:
         depth = max(1, depth)
+    runtime = subagent_runtime_from_metadata(metadata)
+    service_tier = _bounded(
+        metadata.get("_assistant_service_tier")
+        or metadata.get("service_tier"),
+        128,
+    )
+    if service_tier:
+        runtime["service_tier"] = service_tier
+    token_usage = token_usage_from_metadata(metadata)
+    if token_usage:
+        runtime["token_usage"] = token_usage
     return {
         "machine_id": document.machine_id,
         "tool_id": document.tool_id,
@@ -403,7 +415,7 @@ def _identity_values(document: Document) -> dict:
         ),
         "agent_depth": depth,
         "is_subagent": is_subagent,
-        "runtime": subagent_runtime_from_metadata(metadata),
+        "runtime": runtime,
         "lifecycle": persisted_child_lifecycle(metadata),
     }
 

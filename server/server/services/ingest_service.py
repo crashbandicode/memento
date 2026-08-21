@@ -29,6 +29,11 @@ from .conversation_identity import (
     should_relocate_conversation_document,
 )
 from .conversation_stream import ConversationFileSource
+from .conversation_usage import (
+    TOKEN_USAGE_METADATA_KEY,
+    normalize_token_usage,
+    token_usage_from_metadata,
+)
 from .document_delivery import (
     attach_document_delivery,
     delivery_metadata_expression,
@@ -944,6 +949,7 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
             CURRENT_ASSISTANT_MODE_KEY,
             "agent_mode",
         ),
+        token_usage=token_usage_from_metadata(metadata),
     )
 
 
@@ -963,6 +969,11 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
             )
         else:
             metadata.pop(key, None)
+    token_usage = normalize_token_usage(assistant_identity.token_usage)
+    if token_usage:
+        metadata[TOKEN_USAGE_METADATA_KEY] = token_usage
+    else:
+        metadata.pop(TOKEN_USAGE_METADATA_KEY, None)
     store_document_metadata(doc, metadata)
 
 

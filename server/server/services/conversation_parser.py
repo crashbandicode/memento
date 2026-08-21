@@ -25,6 +25,9 @@ from .subagent_lifecycle import (
     merge_duplicate_lifecycle_events,
     normalized_subagent_runtime,
 )
+from .conversation_usage import (
+    observe_token_usage,
+)
 
 
 @dataclass
@@ -89,6 +92,8 @@ class AssistantIdentityState:
     reasoning_effort: str = ""
     service_tier: str = ""
     agent_mode: str = ""
+    token_usage: dict[str, object] = field(default_factory=dict)
+    token_usage_source_ids: set[str] = field(default_factory=set, repr=False)
 
 
 # Terminal programs commonly decorate matches and status text with ANSI CSI
@@ -749,8 +754,16 @@ def _update_assistant_identity(
         return
 
     msg_type = _coerce_text(obj.get("type"))
+    state.token_usage = observe_token_usage(
+        state.token_usage,
+        state.token_usage_source_ids,
+        obj,
+        tool_id,
+    )
     if tool_id == "codex":
         payload = _as_mapping(obj.get("payload"))
+        if msg_type == "event_msg" and payload.get("type") == "token_count":
+            return
         if msg_type == "turn_context":
             _set_identity_field(state, payload, ("model",), "model")
             _set_identity_field(

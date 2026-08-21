@@ -279,6 +279,17 @@ export interface ConversationLocation {
   platform?: string | null;
 }
 
+export interface ConversationTokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  uncached_input_tokens?: number;
+  cached_input_tokens?: number;
+  cache_write_input_tokens?: number;
+  reasoning_output_tokens?: number;
+  source?: "codex" | "claude" | string;
+}
+
 export interface ConversationMeta {
   id: string;
   tool_id: string;
@@ -294,6 +305,11 @@ export interface ConversationMeta {
   active_task_state?: ConversationTaskState | null;
   pending_question_count?: number;
   agent_mode?: string | null;
+  model?: string | null;
+  model_family?: string | null;
+  reasoning_effort?: string | null;
+  service_tier?: string | null;
+  token_usage?: ConversationTokenUsage | null;
   message_count: number;
   subagent_count?: number;
   is_subagent_orphan?: boolean;

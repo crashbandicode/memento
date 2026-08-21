@@ -16,6 +16,8 @@ import SubagentBadge from "@/components/conversations/SubagentBadge";
 import ConversationLocation from "@/components/conversations/ConversationLocation";
 import ResumeConversationCommand from "@/components/conversations/ResumeConversationCommand";
 import ConversationCanvasShelf from "@/components/conversations/ConversationCanvasShelf";
+import TokenUsageBadge from "@/components/conversations/TokenUsageBadge";
+import AssistantIdentityBadge from "@/components/viewers/AssistantIdentityBadge";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
 import { MarkdownExportDialog } from "@/components/conversations/MarkdownExportForm";
 
@@ -155,6 +157,14 @@ export default function ConversationPage() {
                 <Chip tone="accent">{t.conversation.planMode}</Chip>
               )}
               <span>{currentMeta.message_count} {t.conversation.messages}</span>
+              {(currentMeta.model || currentMeta.reasoning_effort || currentMeta.service_tier) && (
+                <AssistantIdentityBadge
+                  model={currentMeta.model}
+                  reasoningEffort={currentMeta.reasoning_effort}
+                  serviceTier={currentMeta.service_tier}
+                />
+              )}
+              <TokenUsageBadge usage={currentMeta.token_usage} />
               {currentAgentLabel && (
                 <span
                   title={currentAgentPath || currentAgentLaunchDescription}

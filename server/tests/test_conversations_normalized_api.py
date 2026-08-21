@@ -1991,7 +1991,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 0)
-        self.assertEqual(len(db.statements), 4)
+        self.assertEqual(len(db.statements), 5)
         for statement in db.statements:
             sql = str(statement.compile(dialect=postgresql.dialect())).upper()
             self.assertNotIn("COUNT(", sql)
@@ -2003,6 +2003,51 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         ).upper()
         self.assertIn("CONVERSATION_READ_MODELS.ROOT_THREAD_ID", hierarchy_sql)
         self.assertIn(" LIMIT ", hierarchy_sql)
+
+    async def test_metadata_exposes_thread_identity_and_token_usage(self) -> None:
+        token_usage = {
+            "source": "codex",
+            "input_tokens": 31_051,
+            "cached_input_tokens": 19_712,
+            "output_tokens": 421,
+            "total_tokens": 31_472,
+        }
+        self.doc.metadata_.update(
+            {
+                "_assistant_model": "gpt-5.6-sol",
+                "_assistant_reasoning_effort": "xhigh",
+                "_assistant_service_tier": "priority",
+                "_assistant_token_usage": token_usage,
+            }
+        )
+        projection = self.read_model(
+            runtime={
+                "model": "gpt-5.6-sol",
+                "model_family": "gpt",
+                "reasoning_effort": "xhigh",
+                "service_tier": "priority",
+                "token_usage": token_usage,
+            }
+        )
+        db = _Db(
+            [
+                _Result(rows=[(self.doc, projection)]),
+                _Result(scalar_value=None),
+                _Result(rows=[(self.doc, projection)]),
+            ]
+        )
+
+        payload = await get_conversation(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        self.assertEqual(payload["model_family"], "gpt")
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
+        self.assertEqual(payload["service_tier"], "priority")
+        self.assertEqual(payload["token_usage"], token_usage)
 
     async def test_direct_claude_child_api_uses_launch_description_title(self) -> None:
         root_thread_id = "root-thread"

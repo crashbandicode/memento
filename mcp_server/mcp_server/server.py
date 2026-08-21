@@ -467,7 +467,7 @@ async def daily_summary(date_str: str | None = None) -> str:
             return f"Could not load daily summary for {target}: {e}"
 
     # Direct DB mode
-    from sqlalchemy import select, func, cast, Date as SqlDate
+    from sqlalchemy import func, select
     from .db import DailySummary, ConversationMessage, Document
     target_date = date.fromisoformat(target)
     async with _session_factory() as db:
@@ -553,6 +553,84 @@ async def memory_open(doc_id: str) -> str:
         if doc.ai_summary:
             header += f"\n**AI summary**: {doc.ai_summary}\n"
         return f"{header}\n---\n{doc.content or '(empty)'}"
+
+
+@mcp.tool()
+async def memory_conversation_info(doc_id: str) -> str:
+    """Get the current model, effort, service tier, and token totals for a thread.
+
+    Token totals are included only when the native tool records them. Codex
+    totals are cumulative snapshots; Claude totals sum unique API responses;
+    Cursor currently does not expose exact token accounting in its transcript.
+
+    Args:
+        doc_id: Conversation document UUID or native Memento conversation ID
+    """
+    if _remote:
+        try:
+            doc = await _remote.get_conversation(doc_id)
+        except Exception as exc:
+            return json.dumps(
+                {"schema_version": 1, "error": str(exc)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        result = {
+            "schema_version": 1,
+            "document_id": doc.get("id"),
+            "native_id": doc.get("native_id"),
+            "tool": doc.get("tool_id"),
+            "title": doc.get("title"),
+            "model": doc.get("model"),
+            "model_family": doc.get("model_family"),
+            "reasoning_effort": doc.get("reasoning_effort"),
+            "service_tier": doc.get("service_tier"),
+            "token_usage": doc.get("token_usage"),
+        }
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    from sqlalchemy import select
+    from .db import Document
+    import uuid as _uuid
+
+    try:
+        did = _uuid.UUID(doc_id)
+    except ValueError:
+        return json.dumps(
+            {"schema_version": 1, "error": f"Invalid doc_id: {doc_id}"},
+            separators=(",", ":"),
+        )
+    async with _session_factory() as db:
+        doc = (
+            await db.execute(select(Document).where(Document.id == did))
+        ).scalar_one_or_none()
+        if not doc:
+            return json.dumps(
+                {"schema_version": 1, "error": f"Document {doc_id} not found"},
+                separators=(",", ":"),
+            )
+        metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+        result = {
+            "schema_version": 1,
+            "document_id": str(doc.id),
+            "native_id": metadata.get("root_session_id")
+            or metadata.get("session_id")
+            or metadata.get("thread_id"),
+            "tool": doc.tool_id,
+            "title": doc.title,
+            "model": metadata.get("_assistant_model") or metadata.get("model"),
+            "model_family": metadata.get("model_family"),
+            "reasoning_effort": (
+                metadata.get("_assistant_reasoning_effort")
+                or metadata.get("reasoning_effort")
+            ),
+            "service_tier": (
+                metadata.get("_assistant_service_tier")
+                or metadata.get("service_tier")
+            ),
+            "token_usage": metadata.get("_assistant_token_usage"),
+        }
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 @mcp.tool()
