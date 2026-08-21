@@ -13,6 +13,7 @@ import { Icon, ToolGlyph, PlatformGlyph, TOOL_HUE } from "@/components/aurora/Ic
 import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora/primitives";
 import LowActivitySection from "@/components/conversations/LowActivitySection";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
+import SpendDashboard from "@/components/dashboard/SpendDashboard";
 
 interface DashboardData {
   tools: {
@@ -244,6 +245,8 @@ export default function Dashboard() {
         <StatCard label={t.nav.projects} value={stats.total_projects} />
         <StatCard label={t.nav.devices} value={stats.total_devices} />
       </div>
+
+      <SpendDashboard />
 
       {/* Main grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">

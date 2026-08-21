@@ -196,7 +196,7 @@ def _state_from_metadata(metadata: object) -> dict[str, Any] | None:
         for character in str(values.get("tool_name") or "").casefold()
         if character.isalnum()
     )
-    if compact_name.endswith(("taskupdate", "taskstop")):
+    if compact_name.endswith("taskupdate"):
         state["quality"] = "partial"
         state["is_current"] = False
     return state

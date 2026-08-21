@@ -115,7 +115,7 @@ async def _candidate_rows(
                 lower(regexp_replace(
                   COALESCE(cm.metadata->>'tool_name', ''),
                   '[^a-zA-Z0-9]', '', 'g'
-                )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskstop|taskprogress)$'
+                )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskprogress)$'
                 OR (
                   lower(regexp_replace(
                     COALESCE(cm.metadata->>'tool_name', ''),
@@ -138,7 +138,7 @@ async def _candidate_rows(
             lower(regexp_replace(
               COALESCE(cm.metadata->>'tool_name', ''),
               '[^a-zA-Z0-9]', '', 'g'
-            )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskstop|taskprogress)$'
+            )) ~ '(updateplan|todowrite|tasklist|taskcreate|taskupdate|taskprogress)$'
             OR (
               lower(regexp_replace(
                 COALESCE(cm.metadata->>'tool_name', ''),

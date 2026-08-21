@@ -88,6 +88,72 @@ _TERMINAL_ACTIVITY_TOOL_STATUSES = {
 cache_delete_prefix = None
 
 
+def _bounded_interaction_response(
+    value: object,
+    *,
+    interaction_id: str,
+    status: str,
+) -> dict | None:
+    """Validate the collector's optional, source-backed answer projection."""
+    if not isinstance(value, dict):
+        return None
+    response_id = _bounded_message_text(
+        str(value.get("interaction_id") or ""),
+        512,
+    )
+    response_status = str(value.get("status") or "").strip().casefold()
+    if (
+        value.get("kind") != "question_response"
+        or response_id != interaction_id
+        or response_status != status
+    ):
+        return None
+    answers: list[dict[str, object]] = []
+    raw_answers = value.get("answers")
+    if isinstance(raw_answers, list):
+        for raw_answer in raw_answers[:16]:
+            if not isinstance(raw_answer, dict):
+                continue
+            selected = raw_answer.get("selected_option_ids")
+            selected_ids = (
+                [
+                    _bounded_message_text(str(option_id), 512)
+                    for option_id in selected[:32]
+                    if _bounded_message_text(str(option_id), 512)
+                ]
+                if isinstance(selected, list)
+                else []
+            )
+            answer: dict[str, object] = {
+                "question_id": _bounded_message_text(
+                    str(raw_answer.get("question_id") or ""),
+                    512,
+                ),
+                "text": _bounded_message_text(
+                    str(raw_answer.get("text") or ""),
+                    4_096,
+                ),
+                "selected_option_ids": selected_ids,
+            }
+            notes = _bounded_message_text(
+                str(raw_answer.get("notes") or ""),
+                4_096,
+            )
+            if notes:
+                answer["notes"] = notes
+            answers.append(answer)
+    return {
+        "kind": "question_response",
+        "interaction_id": response_id,
+        "status": response_status,
+        "answers": answers,
+        "raw_text": _bounded_message_text(
+            str(value.get("raw_text") or ""),
+            16_384,
+        ),
+    }
+
+
 async def _interaction_anchor_line(
     db: AsyncSession,
     document_id: uuid.UUID,
@@ -511,6 +577,7 @@ async def apply_conversation_interaction_update(
     interaction_status: str,
     question_tool: str,
     interaction_input: object,
+    interaction_response: object = None,
     interaction_origin: object = None,
     timestamp: str = "",
 ) -> ThreadTitleUpdateResult:
@@ -576,6 +643,11 @@ async def apply_conversation_interaction_update(
         )
         if isinstance(previous_history, dict)
         else None
+    )
+    normalized_response = _bounded_interaction_response(
+        interaction_response,
+        interaction_id=interaction_id,
+        status=status,
     )
     origin = (
         normalize_interaction_origin(interaction_origin)
@@ -788,7 +860,7 @@ async def apply_conversation_interaction_update(
                         128,
                     ),
                     "status": status,
-                    "response": {
+                    "response": normalized_response or {
                         "kind": "question_response",
                         "interaction_id": interaction_id,
                         "status": status,

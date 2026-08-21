@@ -2147,7 +2147,44 @@ class ConversationParserTests(unittest.TestCase):
             ["queued_user_message", "queued_user_message"],
         )
 
-    def test_claude_queue_transport_notifications_remain_hidden(self) -> None:
+    def test_claude_task_notification_closes_exact_subagent_without_user_prompt(
+        self,
+    ) -> None:
+        raw = json.dumps({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "sessionId": "session-1",
+            "timestamp": "2026-07-15T21:24:00.000Z",
+            "content": (
+                "<task-notification>\n"
+                "<task-id>agent-native-1</task-id>\n"
+                "<tool-use-id>toolu-launch-1</tool-use-id>\n"
+                "<status>killed</status>\n"
+                '<summary>Agent "Survey parser" was stopped by Claude</summary>\n'
+                "<result>Found the relevant lifecycle rows.</result>\n"
+                "</task-notification>"
+            ),
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].role, "tool")
+        self.assertEqual(messages[0].tool_name, "Agent activity")
+        self.assertEqual(messages[0].raw_type, "agent_event")
+        self.assertEqual(messages[0].agent_event["kind"], "interrupted")
+        self.assertEqual(messages[0].agent_event["status"], "cancelled")
+        self.assertEqual(
+            messages[0].agent_event["agent_tool_use_id"],
+            "toolu-launch-1",
+        )
+        self.assertEqual(
+            messages[0].agent_event["agent_thread_id"],
+            "agent-native-1",
+        )
+        self.assertEqual(messages[0].agent_event["label"], "Survey parser")
+
+    def test_claude_unstructured_task_notification_remains_hidden(self) -> None:
         raw = json.dumps({
             "type": "queue-operation",
             "operation": "enqueue",
@@ -2422,6 +2459,76 @@ class ConversationParserTests(unittest.TestCase):
             messages[-1].agent_event["started_at"],
             "2026-07-30T10:00:00Z",
         )
+
+    def test_claude_agent_task_notification_reconciles_background_terminal(
+        self,
+    ) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "background-launch",
+                "timestamp": "2026-07-30T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-background",
+                        "name": "Agent",
+                        "input": {
+                            "description": "Run background audit",
+                            "run_in_background": True,
+                        },
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "user",
+                "uuid": "background-enqueued",
+                "timestamp": "2026-07-30T10:00:01Z",
+                "toolUseResult": {
+                    "agentId": "background-agent",
+                    "isBackground": True,
+                },
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-background",
+                        "content": "Agent started in the background.",
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": "session-1",
+                "timestamp": "2026-07-30T10:02:00Z",
+                "content": (
+                    "<task-notification>\n"
+                    "<task-id>background-agent</task-id>\n"
+                    "<tool-use-id>toolu-background</tool-use-id>\n"
+                    "<status>killed</status>\n"
+                    '<summary>Agent "Run background audit" was stopped by Claude'
+                    "</summary>\n"
+                    "<result>Stopped after collecting evidence.</result>\n"
+                    "</task-notification>"
+                ),
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].agent_event["kind"], "started")
+        event = messages[-1].agent_event
+        self.assertIsNotNone(event)
+        self.assertEqual(event["kind"], "interrupted")
+        self.assertEqual(event["status"], "cancelled")
+        self.assertEqual(event["label"], "Run background audit")
+        self.assertEqual(event["agent_thread_id"], "background-agent")
+        self.assertEqual(event["agent_tool_use_id"], "toolu-background")
+        self.assertEqual(event["started_at"], "2026-07-30T10:00:01Z")
+        self.assertEqual(event["completed_at"], "2026-07-30T10:02:00Z")
 
     def test_claude_agent_duplicate_descriptions_do_not_cross_correlate(self) -> None:
         rows = []

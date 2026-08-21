@@ -143,6 +143,7 @@ class IngestMetadataRequest(BaseModel):
     interaction_status: Literal["pending", "answered", "cancelled"] | None = None
     question_tool: str = Field(default="", max_length=256)
     interaction_input: object = Field(default_factory=dict)
+    interaction_response: dict | None = None
     # Optional v1 Claude hook provenance. It remains opaque at the request
     # boundary; the metadata service validates and stores its bounded shape.
     interaction_origin: dict | None = None
@@ -550,6 +551,7 @@ async def ingest_metadata_endpoint(
             interaction_status=req.interaction_status,
             question_tool=req.question_tool,
             interaction_input=req.interaction_input,
+            interaction_response=req.interaction_response,
             interaction_origin=req.interaction_origin,
             timestamp=req.timestamp,
         )

@@ -1722,6 +1722,20 @@ async def test_full_and_delta_ingest_keep_authoritative_current_state(
         assert stopped is not None
         assert [(task["id"], task["status"]) for task in stopped["tasks"]] == [
             ("1", "completed"),
+            ("2", "pending"),
+        ]
+
+        cancel = _claude_tool_row(
+            "TaskUpdate",
+            {"taskId": "2", "status": "cancelled"},
+            source_id="delta-cancel",
+        )
+        await _extract_messages(session, document, cancel, "delta")
+        await session.commit()
+        cancelled = await current_projected_task_state(session, document.id)
+        assert cancelled is not None
+        assert [(task["id"], task["status"]) for task in cancelled["tasks"]] == [
+            ("1", "completed"),
             ("2", "cancelled"),
         ]
 

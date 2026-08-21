@@ -616,6 +616,9 @@ def _resolved_interactions(
             ),
             "resolved_at": resolved_at,
         }
+        existing_response = existing.get("interaction_response")
+        if isinstance(existing_response, dict):
+            resolved_record["interaction_response"] = existing_response
         existing_origin = existing.get("interaction_origin")
         if isinstance(existing_origin, dict):
             resolved_record["interaction_origin"] = existing_origin
@@ -776,6 +779,47 @@ def _process_payload_unlocked(payload: object) -> None:
             "cwd": str(payload.get("cwd") or existing.get("cwd") or ""),
             "shell_activities": dict(list(activities.items())[-32:]),
         })
+        existing_permission = existing.get("interaction_input")
+        requested_tool = (
+            str(existing_permission.get("requested_tool") or "")
+            if isinstance(existing_permission, dict)
+            else ""
+        )
+        requested_input = (
+            existing_permission.get("tool_input")
+            if isinstance(existing_permission, dict)
+            else None
+        )
+        if (
+            str(existing.get("interaction_status") or "").casefold()
+            == "pending"
+            and _normalized_tool_name(existing.get("question_tool"))
+            == "permissionrequest"
+            and requested_tool == tool_name
+            and isinstance(requested_input, dict)
+            and _canonical_json(
+                requested_input,
+                max_bytes=_CANONICAL_MATCH_INPUT_BYTES,
+            )
+            == _canonical_json(
+                payload.get("tool_input"),
+                max_bytes=_CANONICAL_MATCH_INPUT_BYTES,
+            )
+        ):
+            interaction_id = str(existing.get("interaction_id") or "").strip()
+            if interaction_id:
+                record["interaction_status"] = "answered"
+                record["interaction_response"] = {
+                    "kind": "question_response",
+                    "interaction_id": interaction_id,
+                    "status": "answered",
+                    "answers": [{
+                        "question_id": "permission-decision",
+                        "text": "Yes",
+                        "selected_option_ids": ["allow"],
+                    }],
+                    "raw_text": "Yes",
+                }
         _write_atomic(path, record)
         return
 

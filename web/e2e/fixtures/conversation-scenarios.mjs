@@ -266,6 +266,33 @@ export const resolvedPermissionWithoutRecordedChoice = {
   latestAgentLine: 2,
 };
 
+/** Exact matching tool execution proves the one-time allow option was used. */
+export const resolvedPermissionWithRecordedChoice = {
+  ...resolvedPermissionWithoutRecordedChoice,
+  docId: "conv-permission-choice-recorded",
+  meta: {
+    ...resolvedPermissionWithoutRecordedChoice.meta,
+    id: "conv-permission-choice-recorded",
+    title: "Allowed Bash permission",
+  },
+  messages: resolvedPermissionWithoutRecordedChoice.messages.map((message) => (
+    message.interaction_response
+      ? {
+        ...message,
+        interaction_response: {
+          ...message.interaction_response,
+          answers: [{
+            question_id: "permission-decision",
+            text: "Yes",
+            selected_option_ids: ["allow"],
+          }],
+          raw_text: "Yes",
+        },
+      }
+      : message
+  )),
+};
+
 /** Claude persists note-only answers separately from radio selections. */
 export const claudeQuestionWithNotesOnly = {
   docId: "conv-claude-question-notes-only",

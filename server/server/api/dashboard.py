@@ -53,11 +53,21 @@ from ..services.document_delivery import (
     delivery_source_modified_expression,
     delivery_synced_expression,
 )
+from ..services.spend_dashboard_proxy import spend_dashboard_proxy
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
+
+
+@router.get("/spend")
+async def get_spend_dashboard(
+    refresh: bool = False,
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Return the cached read-only spend-dashboard MCP snapshot."""
+    return await spend_dashboard_proxy.get_snapshot(force_refresh=refresh)
 
 
 def _apply_device_filter(query, machine_ids, machine_column):

@@ -449,6 +449,17 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 interaction_status="answered",
                 question_tool="PermissionRequest",
                 interaction_input={},
+                interaction_response={
+                    "kind": "question_response",
+                    "interaction_id": "permission-1",
+                    "status": "answered",
+                    "answers": [{
+                        "question_id": "permission-decision",
+                        "text": "Yes",
+                        "selected_option_ids": ["allow"],
+                    }],
+                    "raw_text": "Yes",
+                },
             )
 
         self.assertEqual((answered.matched, answered.updated), (1, 1))
@@ -461,8 +472,12 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
                 "kind": "question_response",
                 "interaction_id": "permission-1",
                 "status": "answered",
-                "answers": [],
-                "raw_text": "",
+                "answers": [{
+                    "question_id": "permission-decision",
+                    "text": "Yes",
+                    "selected_option_ids": ["allow"],
+                }],
+                "raw_text": "Yes",
             },
         )
 
@@ -1497,6 +1512,64 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         deferred_payload = defer.await_args.kwargs["payload"]
         self.assertEqual(deferred_payload["relative_path"], relative_path)
         self.assertEqual(deferred_payload["session_id"], str(session_id))
+
+    async def test_interaction_endpoint_forwards_source_backed_response(self) -> None:
+        user_id = uuid.uuid4()
+        machine = SimpleNamespace(id=uuid.uuid4())
+        response_payload = {
+            "kind": "question_response",
+            "interaction_id": "permission-1",
+            "status": "answered",
+            "answers": [{
+                "question_id": "permission-decision",
+                "text": "Yes",
+                "selected_option_ids": ["allow"],
+            }],
+            "raw_text": "Yes",
+        }
+        request = IngestMetadataRequest(
+            metadata_type="conversation_interaction",
+            tool="claude_code",
+            relative_path="projects/demo/session.jsonl",
+            interaction_id="permission-1",
+            interaction_status="answered",
+            question_tool="PermissionRequest",
+            interaction_input={},
+            interaction_response=response_payload,
+            timestamp="2026-08-21T17:43:18Z",
+        )
+
+        with (
+            patch(
+                "server.api.ingest.ensure_device",
+                new=AsyncMock(return_value=machine),
+            ),
+            patch(
+                "server.api.ingest.resolve_metadata_relative_path",
+                new=AsyncMock(
+                    return_value="projects/demo/session.jsonl"
+                ),
+            ),
+            patch(
+                "server.api.ingest.apply_conversation_interaction_update",
+                new=AsyncMock(return_value=ThreadTitleUpdateResult(1, 1, 0)),
+            ) as apply_interaction,
+        ):
+            result = await ingest_metadata_endpoint(
+                request,
+                _collector_user=SimpleNamespace(id=user_id),
+                _throttle=None,
+                db=_Session(),
+                x_device_id="device",
+                x_device_name="Device",
+                x_device_platform="Windows",
+            )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(
+            apply_interaction.await_args.kwargs["interaction_response"],
+            response_payload,
+        )
 
     async def test_missing_transcript_is_durably_deferred_once(self) -> None:
         user_id = uuid.uuid4()

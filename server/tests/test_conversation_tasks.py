@@ -83,7 +83,7 @@ def test_seeded_task_update_retains_unchanged_tasks_and_revision() -> None:
     ]
 
 
-def test_seeded_task_stop_retains_other_tasks() -> None:
+def test_task_stop_is_subagent_control_not_a_planner_task_mutation() -> None:
     tracker = TaskStateTracker(
         "claude_code",
         _state(
@@ -97,11 +97,7 @@ def test_seeded_task_stop_retains_other_tasks() -> None:
 
     tracker.apply(message)
 
-    assert message.task_state is not None
-    assert [(task["id"], task["status"]) for task in message.task_state["tasks"]] == [
-        ("same", "cancelled"),
-        ("other", "blocked"),
-    ]
+    assert message.task_state is None
 
 
 def test_unseeded_incremental_update_is_partial_not_authoritative() -> None:
@@ -114,12 +110,8 @@ def test_unseeded_incremental_update_is_partial_not_authoritative() -> None:
 
     assert update.task_state is not None
     assert update.task_state["quality"] == "partial"
-    assert stop.task_state is not None
-    assert stop.task_state["quality"] == "partial"
-    assert {task["id"] for task in stop.task_state["tasks"]} == {
-        "missing",
-        "also-missing",
-    }
+    assert stop.task_state is None
+    assert {task["id"] for task in update.task_state["tasks"]} == {"missing"}
 
 
 def test_full_todowrite_repairs_partial_and_preserves_explicit_empty() -> None:

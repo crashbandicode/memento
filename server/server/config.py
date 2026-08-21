@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     summary_model: str = "claude-sonnet-4-20250514"
 
+    # Optional read-only spend-dashboard integration. The external dashboard
+    # remains authoritative for upstream auth, pricing, billing periods,
+    # projections, and graph-ready stacking. Memento only caches and renders
+    # its canonical /api/snapshot payload.
+    spend_dashboard_url: str = ""
+    spend_dashboard_access_token: str = ""
+    spend_dashboard_timeout_seconds: float = 45.0
+    spend_dashboard_cache_ttl_seconds: int = 300
+    spend_dashboard_max_stale_seconds: int = 86_400
+
     # Large file threshold (bytes) — files bigger go to S3
     large_file_threshold: int = 1_048_576  # 1 MB
 

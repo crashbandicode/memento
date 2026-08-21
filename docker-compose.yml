@@ -231,6 +231,13 @@ services:
       MEMENTO_AI_BASE_URL: ${MEMENTO_AI_BASE_URL:-https://coding.dashscope.aliyuncs.com/v1}
       MEMENTO_AI_API_KEY: ${MEMENTO_AI_API_KEY:-}
       MEMENTO_AI_MODEL: ${MEMENTO_AI_MODEL:-kimi-k2.5}
+      # Optional read-only billing visualization source. The external spend
+      # dashboard owns telemetry, pricing, and graph-ready aggregation.
+      MEMENTO_SPEND_DASHBOARD_URL: ${MEMENTO_SPEND_DASHBOARD_URL:-}
+      MEMENTO_SPEND_DASHBOARD_ACCESS_TOKEN: ${MEMENTO_SPEND_DASHBOARD_ACCESS_TOKEN:-}
+      MEMENTO_SPEND_DASHBOARD_TIMEOUT_SECONDS: ${MEMENTO_SPEND_DASHBOARD_TIMEOUT_SECONDS:-45}
+      MEMENTO_SPEND_DASHBOARD_CACHE_TTL_SECONDS: ${MEMENTO_SPEND_DASHBOARD_CACHE_TTL_SECONDS:-300}
+      MEMENTO_SPEND_DASHBOARD_MAX_STALE_SECONDS: ${MEMENTO_SPEND_DASHBOARD_MAX_STALE_SECONDS:-86400}
       MEMENTO_INGEST_SPOOL_DIR: /data/ingest-spool
       # Default points at the in-compose embedding container (`embedding`
       # service, activated via `--profile embedding`). Users running the

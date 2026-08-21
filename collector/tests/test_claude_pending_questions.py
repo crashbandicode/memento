@@ -836,6 +836,50 @@ def test_shell_hooks_emit_running_then_completed_activity(
     assert completed[key]["command"] == "Start-Sleep -Seconds 30"
 
 
+def test_exact_shell_start_records_permission_allow_response(
+    tmp_path: Path,
+    pending_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_root = tmp_path / ".claude"
+    transcript = (
+        claude_root / "projects" / "demo-project" / "session-permission.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("", encoding="utf-8")
+    monkeypatch.setattr(hook_module, "_pending_directory", lambda: pending_directory)
+    common = {
+        "session_id": "session-permission",
+        "transcript_path": str(transcript),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+    }
+
+    hook_module.process_payload({"hook_event_name": "PermissionRequest", **common})
+    hook_module.process_payload({
+        "hook_event_name": "PreToolUse",
+        "tool_use_id": "toolu-shell-allowed",
+        **common,
+    })
+
+    side_record = json.loads(
+        (pending_directory / "session-permission.json").read_text(encoding="utf-8")
+    )
+    assert side_record["interaction_status"] == "answered"
+    assert side_record["interaction_response"]["answers"] == [{
+        "question_id": "permission-decision",
+        "text": "Yes",
+        "selected_option_ids": ["allow"],
+    }]
+    signal = next(
+        iter(extract_claude_pending_interaction_updates(claude_root).values())
+    )
+    assert signal["interaction_status"] == "answered"
+    assert signal["interaction_response"]["answers"][0][
+        "selected_option_ids"
+    ] == ["allow"]
+
+
 def test_shell_activity_does_not_refresh_pending_permission_timestamp(
     tmp_path: Path,
     pending_directory: Path,

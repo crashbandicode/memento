@@ -1054,6 +1054,7 @@ def _normalized_agent_activity_kind(value: object) -> str:
         "finished": "completed",
         "complete": "completed",
         "stopped": "interrupted",
+        "killed": "interrupted",
         "cancelled": "interrupted",
         "canceled": "interrupted",
         "error": "failed",
@@ -1273,6 +1274,95 @@ def normalize_claude_agent_result_event(
         result_details[0] if result_details is not None else "",
         4_000,
     ).strip()
+    if result_summary:
+        event["result_summary"] = result_summary
+    return event
+
+
+def normalize_claude_task_notification_event(
+    value: object,
+) -> dict[str, object] | None:
+    """Normalize Claude's exact background-agent terminal notification.
+
+    ``TaskStop`` is a process-control tool, not a planner task mutation.  The
+    later queue notification is the authoritative bridge between Claude's
+    Agent tool-use id and the spawned agent/task id, so only this narrowly
+    validated envelope is allowed to close a delegated-agent lifecycle.
+    """
+    text = strip_terminal_sequences(_coerce_text(value)).strip()
+    outer = re.fullmatch(
+        r"<task-notification>\s*(?P<body>.*?)\s*</task-notification>",
+        text,
+        flags=re.DOTALL,
+    )
+    if outer is None:
+        return None
+    body = outer.group("body")
+
+    def field(name: str, limit: int) -> str:
+        match = re.search(
+            rf"<{re.escape(name)}>\s*(?P<value>.*?)\s*</{re.escape(name)}>",
+            body,
+            flags=re.DOTALL,
+        )
+        return _bounded_interaction_text(
+            match.group("value") if match is not None else "",
+            limit,
+        ).strip()
+
+    task_id = field("task-id", 512)
+    tool_use_id = field("tool-use-id", 512)
+    raw_status = field("status", 80).casefold().replace("-", "_")
+    supported_statuses = {
+        "running",
+        "started",
+        "pending",
+        "in_progress",
+        "completed",
+        "complete",
+        "finished",
+        "success",
+        "succeeded",
+        "done",
+        "interrupted",
+        "cancelled",
+        "canceled",
+        "stopped",
+        "aborted",
+        "killed",
+        "failed",
+        "error",
+        "errored",
+    }
+    if not task_id or not tool_use_id or raw_status not in supported_statuses:
+        return None
+
+    kind = _normalized_agent_activity_kind(raw_status)
+    status = {
+        "started": "running",
+        "completed": "completed",
+        "interrupted": "cancelled",
+        "failed": "failed",
+    }.get(kind, raw_status)
+    summary = field("summary", 1_024)
+    label_match = re.search(r'Agent\s+["\u201c](?P<label>.*?)["\u201d]', summary)
+    label = _bounded_interaction_text(
+        label_match.group("label") if label_match is not None else summary,
+        256,
+    ).strip() or "Subagent"
+    event: dict[str, object] = {
+        "version": 2,
+        "source": "claude_agent",
+        "agent_tool_use_id": tool_use_id,
+        "agent_thread_id": task_id,
+        "label": label,
+        "kind": kind,
+        "activity_type": "subagent",
+        "task_kind": "subagent",
+        "task_id": task_id,
+        "status": status,
+    }
+    result_summary = field("result", 4_000)
     if result_summary:
         event["result_summary"] = result_summary
     return event
@@ -1764,7 +1854,44 @@ def parse_conversation_object(
             ).lower()
             if operation != "enqueue":
                 return None
-            content = _strip_system_tags(_coerce_text(obj.get("content")))
+            raw_content = _coerce_text(obj.get("content"))
+            task_notification = normalize_claude_task_notification_event(
+                raw_content,
+            )
+            if task_notification is not None:
+                if timestamp:
+                    event_time_key = (
+                        "completed_at"
+                        if task_notification.get("kind") in {
+                            "completed",
+                            "interrupted",
+                            "failed",
+                        }
+                        else "started_at"
+                    )
+                    task_notification[event_time_key] = timestamp
+                label = _coerce_text(task_notification.get("label")) or "Subagent"
+                kind = _coerce_text(task_notification.get("kind")) or "updated"
+                queue_identity = "\x1f".join((
+                    _coerce_text(obj.get("sessionId") or obj.get("session_id")),
+                    timestamp,
+                    raw_content,
+                ))
+                return NormalizedMessage(
+                    role="tool",
+                    content=f"{label} {kind}",
+                    tool_name="Agent activity",
+                    timestamp=timestamp,
+                    raw_type="agent_event",
+                    source_id=_coerce_text(obj.get("uuid")) or (
+                        "claude-task-notification:"
+                        + hashlib.sha256(
+                            queue_identity.encode("utf-8")
+                        ).hexdigest()
+                    ),
+                    agent_event=task_notification,
+                )
+            content = _strip_system_tags(raw_content)
             if not content:
                 return None
             queue_identity = "\x1f".join((
@@ -3056,7 +3183,6 @@ class TaskStateTracker:
             "tasklist",
             "taskcreate",
             "taskupdate",
-            "taskstop",
         ):
             if compact.endswith(canonical):
                 return canonical
@@ -3167,24 +3293,6 @@ class TaskStateTracker:
                 if active_form:
                     updated["active_form"] = active_form
                 self.tasks[task_id] = updated
-                return True
-        elif name == "taskstop":
-            task_id = _bounded_interaction_text(
-                payload.get("taskId") or payload.get("task_id") or payload.get("id"),
-                256,
-            )
-            if task_id:
-                existing = self.tasks.get(task_id)
-                if existing is None:
-                    self.partial = True
-                    existing = {
-                        "id": task_id,
-                        "content": f"Task #{task_id}",
-                        "status": "pending",
-                        "active_form": "",
-                    }
-                    self.order.append(task_id)
-                self.tasks[task_id] = {**existing, "status": "cancelled"}
                 return True
         return False
 

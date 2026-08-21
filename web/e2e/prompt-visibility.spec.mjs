@@ -4,6 +4,7 @@ import {
   claudeQuestionWithNotesOnly,
   metadataOnlyPrompts,
   permissionWrappedQuestion,
+  resolvedPermissionWithRecordedChoice,
   resolvedPermissionWithoutRecordedChoice,
   sameRowQuestionResponse,
 } from "./fixtures/conversation-scenarios.mjs";
@@ -68,6 +69,20 @@ test.describe("prompt visibility & question wrapper unwrap", () => {
       "Claude Code did not record which option was selected.",
     );
     await expect(card.locator('[data-question-option][data-selected="true"]')).toHaveCount(0);
+  });
+
+  test("source-backed Claude permission execution selects Yes", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, resolvedPermissionWithRecordedChoice);
+
+    const card = transcript(page).locator(
+      '[data-question-interaction="permission-bash-resolved"]',
+    );
+    await expect(card).toContainText("Answered");
+    await expect(
+      card.locator('[data-question-option="allow"]'),
+    ).toHaveAttribute("data-selected", "true");
+    await expect(card.locator("[data-question-response-unavailable]")).toHaveCount(0);
   });
 
   test("Claude note-only answer renders the note without inventing a selected option", async ({ page }) => {

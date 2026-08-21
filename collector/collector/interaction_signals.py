@@ -200,6 +200,7 @@ def _signal_record(
     timestamp: object,
     status: str,
     interaction_origin: object = None,
+    interaction_response: object = None,
 ) -> dict[str, Any]:
     signal = {
         "metadata_type": "conversation_interaction",
@@ -217,6 +218,8 @@ def _signal_record(
     )
     if origin is not None:
         signal["interaction_origin"] = origin
+    if isinstance(interaction_response, dict):
+        signal["interaction_response"] = interaction_response
     return signal
 
 

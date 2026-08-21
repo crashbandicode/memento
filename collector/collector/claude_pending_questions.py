@@ -334,6 +334,9 @@ def extract_claude_pending_interaction_updates(
                 ),
                 status=status,
                 interaction_origin=interaction_record.get("interaction_origin"),
+                interaction_response=interaction_record.get(
+                    "interaction_response"
+                ),
             )
             key = f"claude_code:{relative_path}:{interaction_id}"
             records[key] = signal
