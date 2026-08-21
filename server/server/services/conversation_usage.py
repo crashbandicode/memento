@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 TOKEN_USAGE_METADATA_KEY = "_assistant_token_usage"
 STARTED_AT_METADATA_KEY = "_assistant_started_at"
 LAST_ACTIVITY_AT_METADATA_KEY = "_assistant_last_activity_at"
+USAGE_SEGMENT_METADATA_KEY = "_assistant_usage_segment_id"
 
 _COUNT_FIELDS = (
     "input_tokens",

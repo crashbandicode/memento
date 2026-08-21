@@ -98,6 +98,7 @@ class AssistantIdentityState:
     agent_mode: str = ""
     started_at: str = ""
     last_activity_at: str = ""
+    usage_segment_id: str = ""
     token_usage: dict[str, object] = field(default_factory=dict)
     token_usage_source_ids: set[str] = field(default_factory=set, repr=False)
     usage_observations: list[AssistantUsageObservation] = field(
@@ -792,6 +793,7 @@ def _append_usage_observation(
     usage: object,
     *,
     attribution_status: str = "attributed",
+    source_id: str | None = None,
 ) -> None:
     normalized = normalize_token_usage(usage)
     timestamp = _coerce_text(
@@ -802,18 +804,40 @@ def _append_usage_observation(
         status = "missing_timestamp"
     if status == "attributed" and not state.model:
         status = "missing_model"
-    state.usage_observations.append(
-        AssistantUsageObservation(
-            source_id=_usage_observation_source_id(obj, tool_id),
-            timestamp=timestamp[:128],
-            source=str(normalized.get("source") or tool_id)[:32],
-            model=state.model[:200],
-            reasoning_effort=state.reasoning_effort[:50],
-            service_tier=state.service_tier[:50],
-            attribution_status=status,
-            token_usage=normalized,
-        )
+    observation = AssistantUsageObservation(
+        source_id=(source_id or _usage_observation_source_id(obj, tool_id))[:512],
+        timestamp=timestamp[:128],
+        source=str(normalized.get("source") or tool_id)[:32],
+        model=state.model[:200],
+        reasoning_effort=state.reasoning_effort[:50],
+        service_tier=state.service_tier[:50],
+        attribution_status=status,
+        token_usage=normalized,
     )
+    if source_id and state.usage_observations:
+        previous = state.usage_observations[-1]
+        if (
+            previous.source_id == observation.source_id
+            and previous.model == observation.model
+            and previous.reasoning_effort == observation.reasoning_effort
+            and previous.service_tier == observation.service_tier
+            and previous.attribution_status == observation.attribution_status
+        ):
+            state.usage_observations[-1] = AssistantUsageObservation(
+                source_id=observation.source_id,
+                timestamp=observation.timestamp or previous.timestamp,
+                source=observation.source,
+                model=observation.model,
+                reasoning_effort=observation.reasoning_effort,
+                service_tier=observation.service_tier,
+                attribution_status=observation.attribution_status,
+                token_usage=add_token_usage(
+                    previous.token_usage,
+                    observation.token_usage,
+                ),
+            )
+            return
+    state.usage_observations.append(observation)
 
 
 def _update_assistant_identity(
@@ -846,7 +870,13 @@ def _update_assistant_identity(
                 delta = subtract_token_usage(current, previous)
                 state.token_usage = current
                 if delta:
-                    _append_usage_observation(state, obj, tool_id, delta)
+                    _append_usage_observation(
+                        state,
+                        obj,
+                        tool_id,
+                        delta,
+                        source_id=state.usage_segment_id or None,
+                    )
                 elif previous and current != previous:
                     _append_usage_observation(
                         state,
@@ -857,6 +887,17 @@ def _update_assistant_identity(
                     )
             return
         if msg_type == "turn_context":
+            turn_id = _bounded_identity_text(
+                payload.get("turn_id")
+                or payload.get("turnId")
+                or payload.get("id"),
+                420,
+            )
+            if not turn_id:
+                turn_id = _usage_observation_source_id(obj, tool_id).split(
+                    ":", 1
+                )[-1]
+            state.usage_segment_id = f"codex:turn:{turn_id}"[:512]
             _set_identity_field(state, payload, ("model",), "model")
             _set_identity_field(
                 state,

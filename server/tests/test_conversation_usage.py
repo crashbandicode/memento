@@ -256,7 +256,11 @@ def test_codex_observations_are_deltas_at_exact_model_and_effort() -> None:
         {
             "timestamp": "2026-08-01T12:00:00Z",
             "type": "turn_context",
-            "payload": {"model": "gpt-first", "effort": "medium"},
+            "payload": {
+                "turn_id": "turn-first",
+                "model": "gpt-first",
+                "effort": "medium",
+            },
         },
         {
             "timestamp": "2026-08-01T12:01:00Z",
@@ -274,7 +278,11 @@ def test_codex_observations_are_deltas_at_exact_model_and_effort() -> None:
         {
             "timestamp": "2026-08-01T12:02:00Z",
             "type": "turn_context",
-            "payload": {"model": "gpt-second", "effort": "xhigh"},
+            "payload": {
+                "turn_id": "turn-second",
+                "model": "gpt-second",
+                "effort": "xhigh",
+            },
         },
         {
             "timestamp": "2026-08-01T12:03:00Z",
@@ -307,6 +315,10 @@ def test_codex_observations_are_deltas_at_exact_model_and_effort() -> None:
         "medium",
         "xhigh",
     ]
+    assert [item.source_id for item in identity.usage_observations] == [
+        "codex:turn:turn-first",
+        "codex:turn:turn-second",
+    ]
     assert [item.token_usage["total_tokens"] for item in identity.usage_observations] == [
         12,
         25,
@@ -317,6 +329,62 @@ def test_codex_observations_are_deltas_at_exact_model_and_effort() -> None:
     )
     assert identity.started_at == "2026-08-01T12:00:00+00:00"
     assert identity.last_activity_at == "2026-08-01T12:03:00+00:00"
+
+
+def test_codex_token_snapshots_compact_to_one_observation_per_turn() -> None:
+    identity = AssistantIdentityState()
+    rows = [
+        {
+            "timestamp": "2026-08-01T12:00:00Z",
+            "type": "turn_context",
+            "payload": {
+                "turn_id": "turn-1",
+                "model": "gpt-5.6-sol",
+                "effort": "xhigh",
+            },
+        },
+        {
+            "timestamp": "2026-08-01T12:01:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-08-01T12:02:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 30,
+                        "output_tokens": 7,
+                    }
+                },
+            },
+        },
+    ]
+
+    list(
+        iter_conversation_messages(
+            "\n".join(json.dumps(row) for row in rows),
+            "codex",
+            assistant_identity=identity,
+        )
+    )
+
+    assert len(identity.usage_observations) == 1
+    observation = identity.usage_observations[0]
+    assert observation.source_id == "codex:turn:turn-1"
+    assert observation.timestamp == "2026-08-01T12:02:00Z"
+    assert observation.token_usage["total_tokens"] == 37
+    assert identity.usage_segment_id == "codex:turn:turn-1"
 
 
 def test_claude_observation_exposes_exact_cache_split() -> None:

@@ -35,6 +35,7 @@ from .conversation_usage import (
     LAST_ACTIVITY_AT_METADATA_KEY,
     STARTED_AT_METADATA_KEY,
     TOKEN_USAGE_METADATA_KEY,
+    USAGE_SEGMENT_METADATA_KEY,
     normalize_token_usage,
     subtract_token_usage,
     token_usage_from_metadata,
@@ -157,6 +158,7 @@ _ESSENTIAL_METADATA_KEYS = {
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     STARTED_AT_METADATA_KEY,
     LAST_ACTIVITY_AT_METADATA_KEY,
+    USAGE_SEGMENT_METADATA_KEY,
     CURRENT_PENDING_QUESTIONS_KEY,
     INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
@@ -207,6 +209,7 @@ _PROTECTED_DOCUMENT_METADATA_KEYS = {
     CURRENT_ASSISTANT_SERVICE_TIER_KEY,
     STARTED_AT_METADATA_KEY,
     LAST_ACTIVITY_AT_METADATA_KEY,
+    USAGE_SEGMENT_METADATA_KEY,
     INTERACTION_HISTORY_KEY,
     LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY,
     LIVE_INTERACTION_SIGNALS_KEY,
@@ -962,6 +965,7 @@ def _assistant_identity_for_ingest(doc: Document, mode: str):
         token_usage=token_usage_from_metadata(metadata),
         started_at=stored_value(STARTED_AT_METADATA_KEY),
         last_activity_at=stored_value(LAST_ACTIVITY_AT_METADATA_KEY),
+        usage_segment_id=stored_value(USAGE_SEGMENT_METADATA_KEY),
     )
 
 
@@ -975,6 +979,7 @@ def _store_assistant_identity(doc: Document, assistant_identity) -> None:
         (CURRENT_ASSISTANT_MODE_KEY, assistant_identity.agent_mode),
         (STARTED_AT_METADATA_KEY, assistant_identity.started_at),
         (LAST_ACTIVITY_AT_METADATA_KEY, assistant_identity.last_activity_at),
+        (USAGE_SEGMENT_METADATA_KEY, assistant_identity.usage_segment_id),
     ):
         if value:
             metadata[key] = _bounded_message_text(
@@ -1017,6 +1022,7 @@ async def _upsert_assistant_usage_rows(
     rows: list[dict[str, object]],
     *,
     detect_replacements: bool = False,
+    accumulate_existing: bool = False,
 ) -> list[dict[str, object]]:
     if not rows:
         return []
@@ -1047,6 +1053,22 @@ async def _upsert_assistant_usage_rows(
         ]
     statement = pg_insert(ConversationUsageEvent).values(rows)
     excluded = statement.excluded
+    count_updates = {
+        field: (
+            getattr(ConversationUsageEvent, field) + getattr(excluded, field)
+            if accumulate_existing
+            else getattr(excluded, field)
+        )
+        for field in (
+            "input_tokens",
+            "uncached_input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        )
+    }
     await db.execute(
         statement.on_conflict_do_update(
             constraint="uq_conversation_usage_document_source",
@@ -1054,18 +1076,19 @@ async def _upsert_assistant_usage_rows(
                 "machine_id": excluded.machine_id,
                 "tool_id": excluded.tool_id,
                 "source": excluded.source,
-                "occurred_at": excluded.occurred_at,
+                "occurred_at": (
+                    func.greatest(
+                        ConversationUsageEvent.occurred_at,
+                        excluded.occurred_at,
+                    )
+                    if accumulate_existing
+                    else excluded.occurred_at
+                ),
                 "model": excluded.model,
                 "reasoning_effort": excluded.reasoning_effort,
                 "service_tier": excluded.service_tier,
                 "attribution_status": excluded.attribution_status,
-                "input_tokens": excluded.input_tokens,
-                "uncached_input_tokens": excluded.uncached_input_tokens,
-                "cached_input_tokens": excluded.cached_input_tokens,
-                "cache_write_input_tokens": excluded.cache_write_input_tokens,
-                "output_tokens": excluded.output_tokens,
-                "reasoning_output_tokens": excluded.reasoning_output_tokens,
-                "total_tokens": excluded.total_tokens,
+                **count_updates,
             },
         )
     )
@@ -4412,6 +4435,7 @@ async def _extract_messages(
                 detect_replacements=(
                     mode == "delta" and tool_id == "claude_code"
                 ),
+                accumulate_existing=(tool_id == "codex"),
             )
             _remove_replaced_usage(assistant_identity, replaced_usage)
             usage_event_rows = []
@@ -4749,6 +4773,7 @@ async def _extract_messages(
         db,
         usage_event_rows,
         detect_replacements=(mode == "delta" and tool_id == "claude_code"),
+        accumulate_existing=(tool_id == "codex"),
     )
     _remove_replaced_usage(assistant_identity, replaced_usage)
     _store_assistant_identity(doc, assistant_identity)

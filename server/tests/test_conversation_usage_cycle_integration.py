@@ -249,6 +249,26 @@ async def test_backfill_upsert_is_idempotent_and_preserves_newer_live_total(
                 synced_at=current,
             )
         )
+        session.add(
+            ConversationUsageEvent(
+                document_id=document.id,
+                machine_id=machine.id,
+                tool_id=tool_id,
+                source_id="codex:legacy-snapshot",
+                source="codex",
+                occurred_at=current,
+                model="gpt-5.6-sol",
+                reasoning_effort="xhigh",
+                attribution_status="attributed",
+                input_tokens=900,
+                uncached_input_tokens=900,
+                cached_input_tokens=0,
+                cache_write_input_tokens=0,
+                output_tokens=100,
+                reasoning_output_tokens=0,
+                total_tokens=1_000,
+            )
+        )
         await session.commit()
 
     update = TokenUsageUpdate(
@@ -259,6 +279,7 @@ async def test_backfill_upsert_is_idempotent_and_preserves_newer_live_total(
         usage={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100},
         started_at=started.isoformat(),
         last_activity_at=started.isoformat(),
+        usage_segment_id="codex:turn:test-turn",
         observations=(
             AssistantUsageObservation(
                 source_id="codex:event-1",
@@ -298,6 +319,14 @@ async def test_backfill_upsert_is_idempotent_and_preserves_newer_live_total(
             """,
             document.id,
         )
+        event_source_id = await connection.fetchval(
+            """
+            SELECT source_id
+            FROM conversation_usage_events
+            WHERE document_id=$1
+            """,
+            document.id,
+        )
     finally:
         await connection.close()
 
@@ -308,6 +337,7 @@ async def test_backfill_upsert_is_idempotent_and_preserves_newer_live_total(
     assert delivery["_assistant_token_usage"]["total_tokens"] == 1_000
     assert delivery[STARTED_AT_METADATA_KEY] == started.isoformat()
     assert event_count == 1
+    assert event_source_id == "codex:event-1"
 
 
 @requires_postgres
@@ -419,3 +449,94 @@ async def test_claude_delta_replaces_prior_event_without_double_counting(
     assert stored.input_tokens == 20
     assert stored.output_tokens == 5
     assert stored.total_tokens == 25
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_codex_delta_accumulates_same_native_turn(
+    session_factory,
+) -> None:
+    first_at = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    second_at = datetime(2026, 8, 2, 12, 1, tzinfo=timezone.utc)
+    tool_id = f"codex-{uuid4()}"
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4()}@example.test",
+        role="viewer",
+        status="active",
+    )
+    machine = Machine(
+        id=uuid4(),
+        name="codex-usage-test",
+        collector_token_hash=str(uuid4()),
+        user_id=user.id,
+    )
+    document = Document(
+        id=uuid4(),
+        tool_id=tool_id,
+        machine_id=machine.id,
+        relative_path=f"sessions/{uuid4()}.jsonl",
+        category="conversation",
+        content_type="jsonl",
+        title="Codex native turn",
+        content_hash=str(uuid4()).replace("-", ""),
+        file_size_bytes=1,
+        metadata_={},
+    )
+    source_id = "codex:turn:native-turn-1"
+
+    def row(occurred_at: datetime, input_tokens: int, output_tokens: int):
+        return {
+            "document_id": document.id,
+            "machine_id": machine.id,
+            "tool_id": tool_id,
+            "source_id": source_id,
+            "source": "codex",
+            "occurred_at": occurred_at,
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "xhigh",
+            "service_tier": "fast",
+            "attribution_status": "attributed",
+            "input_tokens": input_tokens,
+            "uncached_input_tokens": input_tokens,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": 0,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
+    async with session_factory() as session:
+        session.add_all(
+            [
+                user,
+                machine,
+                Tool(id=tool_id, display_name="Codex"),
+                document,
+            ]
+        )
+        await session.commit()
+        await _upsert_assistant_usage_rows(
+            session,
+            [row(first_at, 10, 2)],
+            accumulate_existing=True,
+        )
+        await _upsert_assistant_usage_rows(
+            session,
+            [row(second_at, 20, 5)],
+            accumulate_existing=True,
+        )
+        await session.commit()
+        stored = (
+            await session.execute(
+                select(ConversationUsageEvent).where(
+                    ConversationUsageEvent.document_id == document.id,
+                    ConversationUsageEvent.source_id == source_id,
+                )
+            )
+        ).scalar_one()
+
+    assert stored.occurred_at == second_at
+    assert stored.input_tokens == 30
+    assert stored.output_tokens == 7
+    assert stored.total_tokens == 37

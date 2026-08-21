@@ -30,6 +30,7 @@ from server.services.conversation_usage import (
     LAST_ACTIVITY_AT_METADATA_KEY,
     STARTED_AT_METADATA_KEY,
     TOKEN_USAGE_METADATA_KEY,
+    USAGE_SEGMENT_METADATA_KEY,
     normalize_token_usage,
     usage_observation_values,
 )
@@ -45,6 +46,7 @@ class TokenUsageUpdate:
     usage: dict[str, object]
     started_at: str
     last_activity_at: str
+    usage_segment_id: str
     observations: tuple[AssistantUsageObservation, ...]
 
 
@@ -109,6 +111,7 @@ def _scan_document(row: asyncpg.Record) -> TokenUsageUpdate | None:
         usage=usage,
         started_at=identity.started_at,
         last_activity_at=identity.last_activity_at,
+        usage_segment_id=identity.usage_segment_id,
         observations=tuple(identity.usage_observations),
     )
 
@@ -174,6 +177,10 @@ async def _apply_updates(
             metadata_patch: dict[str, object] = {
                 TOKEN_USAGE_METADATA_KEY: preferred_usage,
             }
+            if update.usage_segment_id:
+                metadata_patch[USAGE_SEGMENT_METADATA_KEY] = (
+                    update.usage_segment_id
+                )
             runtime_patch: dict[str, object] = {"token_usage": preferred_usage}
             for metadata_key, runtime_key, value in (
                 (STARTED_AT_METADATA_KEY, "started_at", update.started_at),
@@ -266,6 +273,18 @@ async def _apply_updates(
                     values["reasoning_output_tokens"],
                     values["total_tokens"],
                 )
+        # The content hash was checked while each document row is locked, so
+        # this scan is the authoritative usage-event projection for that exact
+        # transcript revision. Replace the prior projection before inserting
+        # it; retaining legacy per-snapshot Codex rows would double count the
+        # compact native-turn rows introduced by this backfill.
+        await conn.execute(
+            """
+            DELETE FROM conversation_usage_events
+            WHERE document_id=ANY($1::uuid[])
+            """,
+            [update.document_id for update in valid_updates],
+        )
         if event_records:
             await conn.execute(
                 """
