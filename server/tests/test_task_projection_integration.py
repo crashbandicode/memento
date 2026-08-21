@@ -1787,6 +1787,44 @@ async def test_normalized_backfill_is_transactionally_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_normalized_backfill_retires_projection_after_parser_removes_source(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        document = await _conversation(session, tool_id="claude_code")
+        message = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            message_type="tool",
+            role="tool",
+            content="",
+            metadata_={
+                "task_state": _snapshot(
+                    "opaque",
+                    "Task #opaque",
+                    "cancelled",
+                    revision=1,
+                    current=False,
+                )
+            },
+        )
+        session.add(message)
+        await session.flush()
+        assert (await backfill_task_projections(session, [document.id])) == {
+            "documents": 1,
+            "created_or_updated": 1,
+        }
+        await session.delete(message)
+        await session.flush()
+
+        assert (await backfill_task_projections(session, [document.id])) == {
+            "documents": 1,
+            "created_or_updated": 1,
+        }
+        assert await current_projected_task_state(session, document.id) is None
+
+
+@pytest.mark.asyncio
 async def test_startup_migration_recreates_projection_table_and_indexes(
     session_factory,
 ) -> None:

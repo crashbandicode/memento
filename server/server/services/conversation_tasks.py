@@ -1117,16 +1117,27 @@ async def backfill_task_projections(
     db: AsyncSession,
     document_ids: Iterable[UUID] | None = None,
 ) -> dict[str, int]:
-    """Idempotently project already-normalized task-state message rows."""
+    """Idempotently project normalized task rows and retire stale projections.
+
+    A parser repair can legitimately remove every ``task_state`` message from a
+    document (for example, when a process-control event was previously mistaken
+    for a planner task).  Include documents that already own a projection so the
+    normal ``refresh_task_projection`` no-candidate path can delete that orphan.
+    """
+    message_document_ids = select(ConversationMessage.document_id).where(
+        ConversationMessage.metadata_.op("?")("task_state")
+    )
+    projected_document_ids = select(ConversationTaskState.document_id)
     statement = (
         select(Document)
         .options(load_only(*_TASK_DOCUMENT_COLUMNS))
-        .join(ConversationMessage, ConversationMessage.document_id == Document.id)
         .where(
             Document.category == "conversation",
-            ConversationMessage.metadata_.op("?")("task_state"),
+            or_(
+                Document.id.in_(message_document_ids),
+                Document.id.in_(projected_document_ids),
+            ),
         )
-        .distinct()
     )
     if document_ids is not None:
         statement = statement.where(Document.id.in_(list(document_ids)))
