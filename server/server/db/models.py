@@ -575,6 +575,10 @@ class AgentControlSession(Base):
     )
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="starting")
     state_reason: Mapped[str | None] = mapped_column(String(128))
+    active_native_turn_id: Mapped[str | None] = mapped_column(String(256))
+    # Bounded list of unanswered adapter escalations (questions/approvals),
+    # maintained from collector lifecycle events.
+    pending_interactions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     collector_revision: Mapped[str | None] = mapped_column(String(64))
     server_revision: Mapped[str | None] = mapped_column(String(64))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

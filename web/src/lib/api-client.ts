@@ -805,6 +805,88 @@ export interface PublicStats {
   total_tools: number;
 }
 
+// --- Managed agent control sessions ---------------------------------------
+
+export interface ControlPendingInteraction {
+  interaction_id: string;
+  kind: "question" | "approval";
+  method: string;
+  native_turn_id: string;
+  request: {
+    isBlocking?: boolean;
+    questions?: Array<{
+      id: string;
+      header?: string;
+      question?: string;
+      options?: Array<{ label: string; description?: string }>;
+      isOther?: boolean;
+      isSecret?: boolean;
+    }>;
+    command?: string;
+    cwd?: string;
+    reason?: string;
+    [key: string]: unknown;
+  };
+  received_at: string;
+}
+
+export interface ControlSession {
+  id: string;
+  machine_id: string;
+  tool_id: string;
+  adapter: string;
+  adapter_version: string | null;
+  native_session_id: string | null;
+  document_id: string | null;
+  state: "starting" | "active" | "closed" | "failed";
+  state_reason: string | null;
+  active_native_turn_id: string | null;
+  pending_interactions: ControlPendingInteraction[];
+  started_at: string | null;
+  last_event_at: string | null;
+  closed_at: string | null;
+  created_at: string | null;
+}
+
+export interface ControlCommand {
+  id: string;
+  trace_id: string;
+  kind: string;
+  state: string;
+  error_code: string | null;
+  outcome: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
+export interface ControlEvent {
+  id: number;
+  event_type: string;
+  outcome: string | null;
+  error_code: string | null;
+  received_at_server: string | null;
+  [key: string]: unknown;
+}
+
+export type ControlApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+
+export interface ControlSessionCreateBody {
+  machine_id: string;
+  tool_id?: "codex";
+  cwd?: string;
+  model?: string;
+  effort?: string;
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  approval_policy?: string;
+  initial_message?: string;
+  native_session_id?: string;
+  document_id?: string;
+}
+
+export interface ControlSessionCreateResponse {
+  session: ControlSession;
+  command: ControlCommand;
+}
+
 export const api = {
   getPublicStats: () => apiFetch<PublicStats>("/api/public/stats"),
   getTools: () => apiFetch<ToolSummary[]>("/api/tools"),
@@ -1017,5 +1099,52 @@ export const api = {
     if (category) params.set("category", category);
     return apiFetch<TimelineResponse>(`/api/projects/${projectId}/timeline?${params}`);
   },
+
+  // --- Managed agent control sessions -----------------------------------
+  startControlSession: (body: ControlSessionCreateBody) =>
+    apiFetch<ControlSessionCreateResponse>("/api/control/sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listControlSessions: (params: { machine_id?: string; document_id?: string; state?: string } = {}) => {
+    const search = new URLSearchParams();
+    if (params.machine_id) search.set("machine_id", params.machine_id);
+    if (params.document_id) search.set("document_id", params.document_id);
+    if (params.state) search.set("state", params.state);
+    const suffix = search.size ? `?${search}` : "";
+    return apiFetch<ControlSession[]>(`/api/control/sessions${suffix}`, { cache: "no-store" });
+  },
+  getControlSession: (id: string) =>
+    apiFetch<{ session: ControlSession }>(`/api/control/sessions/${id}`, { cache: "no-store" }),
+  sendControlMessage: (id: string, body: { text: string; model?: string; effort?: string }) =>
+    apiFetch<{ command: ControlCommand }>(`/api/control/sessions/${id}/messages`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  answerControlInteraction: (id: string, interactionId: string, answers: Record<string, { answers: string[] }>) =>
+    apiFetch<{ command: ControlCommand }>(
+      `/api/control/sessions/${id}/interactions/${encodeURIComponent(interactionId)}/answer`,
+      { method: "POST", body: JSON.stringify({ answers }) },
+    ),
+  respondControlApproval: (id: string, interactionId: string, decision: ControlApprovalDecision) =>
+    apiFetch<{ command: ControlCommand }>(
+      `/api/control/sessions/${id}/interactions/${encodeURIComponent(interactionId)}/approval`,
+      { method: "POST", body: JSON.stringify({ decision }) },
+    ),
+  interruptControlSession: (id: string, turnId?: string) =>
+    apiFetch<{ command: ControlCommand }>(`/api/control/sessions/${id}/interrupt`, {
+      method: "POST",
+      body: JSON.stringify({ turn_id: turnId ?? null }),
+    }),
+  closeControlSession: (id: string) =>
+    apiFetch<{ command: ControlCommand }>(`/api/control/sessions/${id}/close`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  getControlCommand: (id: string, includeEvents = false) =>
+    apiFetch<{ command: ControlCommand; events?: ControlEvent[] }>(
+      `/api/control/commands/${id}${includeEvents ? "?include_events=true" : ""}`,
+      { cache: "no-store" },
+    ),
 };
 import { clearStoredAuthToken, getStoredAuthToken } from "./auth-storage";

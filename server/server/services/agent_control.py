@@ -28,6 +28,7 @@ from ..db.models import (
     AgentControlCommand,
     AgentControlEvent,
     AgentControlSession,
+    ConversationReadModel,
     Document,
     Machine,
 )
@@ -67,16 +68,55 @@ LEGACY_ACTION_TO_KIND = {
 }
 KIND_TO_LEGACY_ACTION = {kind: action for action, kind in LEGACY_ACTION_TO_KIND.items()}
 
+KIND_AGENT_SESSION_START = "agent.session.start"
+KIND_AGENT_SESSION_RESUME = "agent.session.resume"
+KIND_AGENT_SESSION_CLOSE = "agent.session.close"
+KIND_AGENT_TURN_SEND = "agent.turn.send"
+KIND_AGENT_TURN_STEER = "agent.turn.steer"
+KIND_AGENT_TURN_INTERRUPT = "agent.turn.interrupt"
+KIND_AGENT_INTERACTION_ANSWER = "agent.interaction.answer"
+KIND_AGENT_APPROVAL_RESPOND = "agent.approval.respond"
+AGENT_KINDS = frozenset(
+    {
+        KIND_AGENT_SESSION_START,
+        KIND_AGENT_SESSION_RESUME,
+        KIND_AGENT_SESSION_CLOSE,
+        KIND_AGENT_TURN_SEND,
+        KIND_AGENT_TURN_STEER,
+        KIND_AGENT_TURN_INTERRUPT,
+        KIND_AGENT_INTERACTION_ANSWER,
+        KIND_AGENT_APPROVAL_RESPOND,
+    }
+)
+
 # device.resync clears the collector's durable queue and rescans everything;
-# never re-run it just because its outcome report was lost.
+# never re-run it just because its outcome report was lost. The same rule
+# guards every agent action that would double a side effect: a message,
+# steer, or answer must never be re-executed on a lost outcome report.
 _DEFAULT_REDELIVERY_POLICY = {
     KIND_DEVICE_RESYNC: POLICY_FAIL_ONCE_DELIVERED,
     KIND_CONVERSATION_REPAIR: POLICY_RETRY,
     KIND_COLLECTOR_UPDATE: POLICY_RETRY,
+    KIND_AGENT_SESSION_START: POLICY_FAIL_ONCE_DELIVERED,
+    KIND_AGENT_SESSION_RESUME: POLICY_FAIL_ONCE_DELIVERED,
+    KIND_AGENT_SESSION_CLOSE: POLICY_RETRY,
+    KIND_AGENT_TURN_SEND: POLICY_FAIL_ONCE_DELIVERED,
+    KIND_AGENT_TURN_STEER: POLICY_FAIL_ONCE_DELIVERED,
+    KIND_AGENT_TURN_INTERRUPT: POLICY_RETRY,
+    KIND_AGENT_INTERACTION_ANSWER: POLICY_FAIL_ONCE_DELIVERED,
+    KIND_AGENT_APPROVAL_RESPOND: POLICY_FAIL_ONCE_DELIVERED,
 }
 
 # Undelivered command time-to-live before it expires as collector-offline.
+# Agent commands expire fast — a human is waiting on the other end.
 _DEFAULT_QUEUED_TTL = timedelta(hours=1)
+_AGENT_QUEUED_TTL = timedelta(minutes=10)
+
+SESSION_STARTING = "starting"
+SESSION_ACTIVE = "active"
+SESSION_CLOSED = "closed"
+SESSION_FAILED = "failed"
+_MAX_PENDING_INTERACTIONS = 20
 DEFAULT_LEASE_SECONDS = 60
 MAX_LEASE_SECONDS = 300
 _REPAIR_BATCH_SIZE = 2
@@ -291,7 +331,9 @@ async def admit_command(
     execute ``kind`` — an honest admission-time rejection instead of a
     command that could never be delivered.
     """
-    if kind not in KNOWN_KINDS and kind not in _supported_kinds(machine):
+    # Legacy kinds are universally executable; everything else — including
+    # every agent.* kind — requires the machine's reported capabilities.
+    if kind not in LEGACY_KINDS and kind not in _supported_kinds(machine):
         raise UnsupportedCommandKind(kind)
 
     now = _now()
@@ -317,7 +359,10 @@ async def admit_command(
         ),
         "delivery_attempts": 0,
         "max_delivery_attempts": max_delivery_attempts or 5,
-        "expires_at": now + (queued_ttl or _DEFAULT_QUEUED_TTL),
+        "expires_at": now + (
+            queued_ttl
+            or (_AGENT_QUEUED_TTL if kind in AGENT_KINDS else _DEFAULT_QUEUED_TTL)
+        ),
     }
     inserted_id = (
         await db.execute(
@@ -412,6 +457,7 @@ async def reap_stale_commands(db: AsyncSession, *, machine_id: uuid.UUID) -> int
                 outcome="expired",
                 error_code=ControlErrorCodes.COLLECTOR_OFFLINE,
             )
+            await _apply_agent_command_effects(db, command)
             _publish_command_state(db, command)
             changed += 1
             continue
@@ -457,6 +503,7 @@ async def reap_stale_commands(db: AsyncSession, *, machine_id: uuid.UUID) -> int
                 outcome="failed",
                 error_code=command.error_code,
             )
+            await _apply_agent_command_effects(db, command)
         _publish_command_state(db, command)
         changed += 1
     return changed
@@ -625,6 +672,7 @@ async def complete_command(
         details=detail or {},
     )
     db.add(event)
+    await _apply_agent_command_effects(db, command)
     _publish_command_state(db, command)
     return command
 
@@ -709,6 +757,7 @@ async def ingest_control_events(
                 raise ControlEventScopeError("document_id")
 
     accepted = duplicates = 0
+    session_applications: list[tuple[uuid.UUID, dict]] = []
     for event in events:
         command = owned_commands.get(event.get("command_id"))
         inserted = (
@@ -769,9 +818,238 @@ async def ingest_control_events(
         ).scalar_one_or_none()
         if inserted is None:
             duplicates += 1
-        else:
-            accepted += 1
+            continue
+        accepted += 1
+        effective_session_id = (
+            command.control_session_id
+            if command is not None and command.control_session_id is not None
+            else event.get("control_session_id")
+        )
+        if effective_session_id is not None and str(event.get("event_type", "")).startswith(
+            "adapter."
+        ):
+            session_applications.append((effective_session_id, event))
+
+    if session_applications:
+        target_ids = {session_id for session_id, _ in session_applications}
+        sessions = {
+            session.id: session
+            for session in (
+                await db.execute(
+                    select(AgentControlSession)
+                    .where(AgentControlSession.id.in_(target_ids))
+                    .with_for_update()
+                )
+            ).scalars().all()
+        }
+        for session_id, event in session_applications:
+            session = sessions.get(session_id)
+            if session is not None:
+                _apply_session_lifecycle_event(db, session, event)
     return {"accepted": accepted, "duplicates": duplicates}
+
+
+# ---------------------------------------------------------------------------
+# Managed sessions
+# ---------------------------------------------------------------------------
+
+def session_public(session: AgentControlSession) -> dict:
+    return {
+        "id": str(session.id),
+        "machine_id": str(session.machine_id),
+        "tool_id": session.tool_id,
+        "adapter": session.adapter,
+        "adapter_version": session.adapter_version,
+        "native_session_id": session.native_session_id,
+        "document_id": str(session.document_id) if session.document_id else None,
+        "state": session.state,
+        "state_reason": session.state_reason,
+        "active_native_turn_id": session.active_native_turn_id,
+        "pending_interactions": list(session.pending_interactions or []),
+        "started_at": session.started_at.isoformat() if session.started_at else None,
+        "last_event_at": session.last_event_at.isoformat() if session.last_event_at else None,
+        "closed_at": session.closed_at.isoformat() if session.closed_at else None,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+    }
+
+
+def _publish_session_state(db: AsyncSession, session: AgentControlSession, user_id) -> None:
+    queue_realtime_event(
+        db,
+        "control_session",
+        {
+            "session_id": str(session.id),
+            "machine_id": str(session.machine_id),
+            "document_id": str(session.document_id) if session.document_id else None,
+            "state": session.state,
+            "active_native_turn_id": session.active_native_turn_id,
+            "pending_interaction_count": len(session.pending_interactions or []),
+        },
+        user_id=str(user_id),
+    )
+
+
+def create_control_session(
+    db: AsyncSession,
+    *,
+    machine: Machine,
+    user_id: uuid.UUID,
+    tool_id: str,
+    adapter: str,
+    native_session_id: str | None = None,
+    document_id: uuid.UUID | None = None,
+) -> AgentControlSession:
+    """Create the managed-session row before its start command is admitted."""
+    session = AgentControlSession(
+        machine_id=machine.id,
+        user_id=user_id,
+        tool_id=tool_id,
+        adapter=adapter,
+        capabilities={},
+        native_session_id=native_session_id,
+        document_id=document_id,
+        state=SESSION_STARTING,
+        server_revision=server_revision(),
+        pending_interactions=[],
+    )
+    db.add(session)
+    return session
+
+
+async def _apply_agent_command_effects(db: AsyncSession, command: AgentControlCommand) -> None:
+    """Project a terminal agent command onto its managed session row."""
+    if command.kind not in AGENT_KINDS or command.control_session_id is None:
+        return
+    session = await db.get(
+        AgentControlSession, command.control_session_id, with_for_update=True
+    )
+    if session is None:
+        return
+    outcome = command.outcome or {}
+    now = _now()
+    session.last_event_at = now
+    if command.state == STATE_COMPLETED:
+        if command.kind in (KIND_AGENT_SESSION_START, KIND_AGENT_SESSION_RESUME):
+            native = str(outcome.get("native_thread_id") or "") or session.native_session_id
+            session.native_session_id = native
+            session.state = SESSION_ACTIVE
+            session.state_reason = None
+            session.started_at = session.started_at or now
+            if outcome.get("native_turn_id"):
+                session.active_native_turn_id = str(outcome["native_turn_id"])
+        elif command.kind in (KIND_AGENT_TURN_SEND, KIND_AGENT_TURN_STEER):
+            if outcome.get("native_turn_id"):
+                session.active_native_turn_id = str(outcome["native_turn_id"])
+        elif command.kind == KIND_AGENT_SESSION_CLOSE:
+            session.state = SESSION_CLOSED
+            session.closed_at = now
+            session.active_native_turn_id = None
+            session.pending_interactions = []
+    elif command.state in (STATE_FAILED, STATE_EXPIRED):
+        if command.kind in (KIND_AGENT_SESSION_START, KIND_AGENT_SESSION_RESUME):
+            session.state = SESSION_FAILED
+            session.state_reason = command.error_code
+        elif command.error_code == ControlErrorCodes.ADAPTER_PROCESS_FAILED:
+            session.state = SESSION_FAILED
+            session.state_reason = command.error_code
+    _publish_session_state(db, session, session.user_id)
+
+
+def _apply_session_lifecycle_event(
+    db: AsyncSession, session: AgentControlSession, event: dict
+) -> None:
+    """Project one collector lifecycle event onto the session read state."""
+    event_type = str(event.get("event_type") or "")
+    details = event.get("details") or {}
+    session.last_event_at = _now()
+    if event_type == "adapter.native_bound":
+        session.native_session_id = (
+            str(event.get("native_session_id") or "") or session.native_session_id
+        )
+    elif event_type == "adapter.turn_started":
+        session.active_native_turn_id = (
+            str(event.get("native_turn_id") or "") or session.active_native_turn_id
+        )
+    elif event_type == "adapter.turn_completed":
+        turn_id = str(event.get("native_turn_id") or "")
+        if not turn_id or session.active_native_turn_id == turn_id:
+            session.active_native_turn_id = None
+        if turn_id:
+            session.pending_interactions = [
+                item
+                for item in (session.pending_interactions or [])
+                if item.get("native_turn_id") != turn_id
+            ]
+    elif event_type == "adapter.interaction_pending":
+        pending = [
+            item
+            for item in (session.pending_interactions or [])
+            if item.get("interaction_id") != event.get("interaction_id")
+        ]
+        pending.append(
+            {
+                "interaction_id": event.get("interaction_id"),
+                "kind": details.get("kind"),
+                "method": details.get("method"),
+                "native_turn_id": str(event.get("native_turn_id") or ""),
+                "request": details.get("request") or {},
+                "received_at": _now().isoformat(),
+            }
+        )
+        session.pending_interactions = pending[-_MAX_PENDING_INTERACTIONS:]
+    elif event_type == "adapter.interaction_resolved":
+        session.pending_interactions = [
+            item
+            for item in (session.pending_interactions or [])
+            if item.get("interaction_id") != event.get("interaction_id")
+        ]
+    elif event_type == "adapter.session_closed":
+        session.state = SESSION_CLOSED
+        session.closed_at = _now()
+        session.active_native_turn_id = None
+        session.pending_interactions = []
+    elif event_type == "adapter.process_failed":
+        session.state = SESSION_FAILED
+        session.state_reason = ControlErrorCodes.ADAPTER_PROCESS_FAILED
+        session.active_native_turn_id = None
+        session.pending_interactions = []
+    else:
+        return
+    _publish_session_state(db, session, session.user_id)
+
+
+async def bind_control_session_documents(
+    db: AsyncSession, *, machine_id: uuid.UUID
+) -> int:
+    """Attach ingested transcripts to managed sessions by exact native id."""
+    sessions = (
+        await db.execute(
+            select(AgentControlSession).where(
+                AgentControlSession.machine_id == machine_id,
+                AgentControlSession.document_id.is_(None),
+                AgentControlSession.native_session_id.isnot(None),
+            )
+        )
+    ).scalars().all()
+    bound = 0
+    for session in sessions:
+        document_id = (
+            await db.execute(
+                select(ConversationReadModel.document_id)
+                .where(
+                    ConversationReadModel.machine_id == machine_id,
+                    ConversationReadModel.tool_id == session.tool_id,
+                    ConversationReadModel.thread_id == session.native_session_id,
+                )
+                .order_by(ConversationReadModel.updated_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if document_id is not None:
+            session.document_id = document_id
+            _publish_session_state(db, session, session.user_id)
+            bound += 1
+    return bound
 
 
 # ---------------------------------------------------------------------------

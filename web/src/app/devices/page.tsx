@@ -6,6 +6,7 @@ import { useNow } from "@/lib/use-now";
 import { api, getApiBase, authFetch } from "@/lib/api-client";
 import { ToolGlyph, PlatformGlyph, Icon } from "@/components/aurora/Icon";
 import { Btn, Glass, TopBar } from "@/components/aurora/primitives";
+import StartControlSessionDialog from "@/components/conversations/StartControlSessionDialog";
 
 interface Device {
   id: string;
@@ -37,6 +38,7 @@ export default function DevicesPage() {
   const now = useNow();
 
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [sessionTarget, setSessionTarget] = useState<Device | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -192,6 +194,17 @@ memento-collector setup`}
                       </div>
                     ))}
                   </div>
+                  {d.tools.includes("codex") && isOnline && (
+                    <Btn
+                      size="sm"
+                      variant="ghost"
+                      data-start-codex-session
+                      onClick={() => setSessionTarget(d)}
+                      title="Start a managed Codex session on this machine"
+                    >
+                      New Codex session
+                    </Btn>
+                  )}
                   <Btn
                     size="sm"
                     variant="ghost"
@@ -246,6 +259,14 @@ memento-collector setup`}
             );
           })}
         </div>
+      )}
+      {sessionTarget && (
+        <StartControlSessionDialog
+          machineId={sessionTarget.id}
+          machineName={sessionTarget.name}
+          defaultCwd={discoveries[sessionTarget.id]?.codex?.root}
+          onClose={() => setSessionTarget(null)}
+        />
       )}
     </div>
   );

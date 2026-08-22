@@ -20,22 +20,42 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import AgentControlCommand, AgentControlEvent, Machine, User
+from ..db.models import (
+    AgentControlCommand,
+    AgentControlEvent,
+    AgentControlSession,
+    Machine,
+    User,
+)
 from ..db.session import get_db
 from ..middleware.auth import get_current_user, verify_collector_token
 from ..services.agent_control import (
+    KIND_AGENT_APPROVAL_RESPOND,
+    KIND_AGENT_INTERACTION_ANSWER,
+    KIND_AGENT_SESSION_CLOSE,
+    KIND_AGENT_SESSION_RESUME,
+    KIND_AGENT_SESSION_START,
+    KIND_AGENT_TURN_INTERRUPT,
+    KIND_AGENT_TURN_SEND,
+    SESSION_ACTIVE,
+    SESSION_STARTING,
     ControlCommandNotFound,
     ControlErrorCodes,
     ControlEventScopeError,
     StaleControlLease,
+    UnsupportedCommandKind,
     acknowledge_command,
+    admit_command,
+    bind_control_session_documents,
     command_public,
     complete_command,
+    create_control_session,
     event_public,
     hydrate_repair_payload,
     ingest_control_events,
     lease_commands,
     record_capabilities,
+    session_public,
 )
 from ..services.device_service import ensure_device
 
@@ -332,6 +352,362 @@ async def get_command_events(
         "trace_id": str(command.trace_id),
         "events": [event_public(event) for event in events],
     }
+
+
+# ---------------------------------------------------------------------------
+# Browser-facing managed sessions
+# ---------------------------------------------------------------------------
+
+class ControlSessionCreateRequest(BaseModel):
+    machine_id: uuid.UUID
+    tool_id: str = Field(default="codex", pattern="^codex$")
+    cwd: str | None = Field(default=None, max_length=1024)
+    model: str | None = Field(default=None, max_length=128)
+    effort: str | None = Field(default=None, max_length=32)
+    sandbox: str | None = Field(
+        default=None, pattern="^(read-only|workspace-write|danger-full-access)$"
+    )
+    approval_policy: str | None = Field(default=None, max_length=32)
+    initial_message: str | None = Field(default=None, max_length=32_768)
+    # Resume-under-Memento-control: the exact native thread id of an
+    # existing (view-only) conversation, plus its document for binding.
+    native_session_id: str | None = Field(default=None, max_length=512)
+    document_id: uuid.UUID | None = None
+
+
+class ControlMessageRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=32_768)
+    model: str | None = Field(default=None, max_length=128)
+    effort: str | None = Field(default=None, max_length=32)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class ControlAnswerRequest(BaseModel):
+    answers: dict
+
+    @field_validator("answers")
+    @classmethod
+    def _bounded_answers(cls, value: dict) -> dict:
+        return _bounded_json_dict(value, "answers") or {}
+
+
+class ControlApprovalRequest(BaseModel):
+    decision: str = Field(pattern="^(accept|acceptForSession|decline|cancel)$")
+
+
+class ControlInterruptRequest(BaseModel):
+    turn_id: str | None = Field(default=None, max_length=256)
+
+
+async def _load_visible_session(
+    db: AsyncSession, session_id: uuid.UUID, user: User
+) -> AgentControlSession:
+    session = await db.get(AgentControlSession, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if user.role not in ("admin", "owner") and session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+async def _session_machine(db: AsyncSession, session: AgentControlSession) -> Machine:
+    machine = await db.get(Machine, session.machine_id)
+    if machine is None:
+        raise HTTPException(status_code=409, detail="Session machine no longer exists")
+    return machine
+
+
+def _unsupported_response(error: UnsupportedCommandKind) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": ControlErrorCodes.UNSUPPORTED, "kind": error.kind},
+    )
+
+
+def _pending_interaction(
+    session: AgentControlSession, interaction_id: str, *, kind: str
+) -> dict:
+    for item in session.pending_interactions or []:
+        if item.get("interaction_id") == interaction_id:
+            if item.get("kind") != kind:
+                break
+            return item
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": ControlErrorCodes.STALE_TURN,
+            "reason": "interaction_not_pending",
+            "interaction_id": interaction_id,
+        },
+    )
+
+
+@router.post("/sessions")
+async def create_session(
+    req: ControlSessionCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Start (or resume, when ``native_session_id`` is given) a managed session.
+
+    The session row and its start command are created in one transaction:
+    durable admission before any side effect is acknowledged.
+    """
+    machine = await db.get(Machine, req.machine_id)
+    if machine is None or (
+        user.role not in ("admin", "owner") and machine.user_id != user.id
+    ):
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    resume = bool(req.native_session_id)
+    session = create_control_session(
+        db,
+        machine=machine,
+        user_id=user.id,
+        tool_id=req.tool_id,
+        adapter="codex_app_server",
+        native_session_id=req.native_session_id,
+        document_id=req.document_id,
+    )
+    await db.flush()
+
+    options = {
+        key: value
+        for key, value in (
+            ("cwd", req.cwd),
+            ("model", req.model),
+            ("effort", req.effort),
+            ("sandbox", req.sandbox),
+            ("approval_policy", req.approval_policy),
+        )
+        if value is not None
+    }
+    payload: dict = {"control_session_id": str(session.id), "options": options}
+    if resume:
+        kind = KIND_AGENT_SESSION_RESUME
+        payload["native_session_id"] = req.native_session_id
+    else:
+        kind = KIND_AGENT_SESSION_START
+        if req.initial_message:
+            payload["initial_message"] = req.initial_message
+            payload["client_message_id"] = f"memento-{session.id}"
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=kind,
+            payload=payload,
+            control_session_id=session.id,
+            document_id=req.document_id,
+            native_session_id=req.native_session_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"session": session_public(session), "command": command_public(command)}
+
+
+@router.get("/sessions")
+async def list_sessions(
+    machine_id: uuid.UUID | None = None,
+    document_id: uuid.UUID | None = None,
+    state: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    query = select(AgentControlSession).order_by(
+        AgentControlSession.created_at.desc()
+    ).limit(max(1, min(limit, 100)))
+    if user.role not in ("admin", "owner"):
+        query = query.where(AgentControlSession.user_id == user.id)
+    if machine_id is not None:
+        query = query.where(AgentControlSession.machine_id == machine_id)
+    if document_id is not None:
+        query = query.where(AgentControlSession.document_id == document_id)
+    if state:
+        query = query.where(AgentControlSession.state == state)
+    sessions = (await db.execute(query)).scalars().all()
+    for target_machine_id in {s.machine_id for s in sessions if s.document_id is None}:
+        await bind_control_session_documents(db, machine_id=target_machine_id)
+    return [session_public(session) for session in sessions]
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    if session.document_id is None and session.native_session_id:
+        await bind_control_session_documents(db, machine_id=session.machine_id)
+    return {"session": session_public(session)}
+
+
+@router.post("/sessions/{session_id}/messages")
+async def send_session_message(
+    session_id: uuid.UUID,
+    req: ControlMessageRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    if session.state not in (SESSION_ACTIVE, SESSION_STARTING):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": ControlErrorCodes.STALE_TURN, "state": session.state},
+        )
+    machine = await _session_machine(db, session)
+    idempotency_key = req.idempotency_key or f"send-{uuid.uuid4()}"
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_TURN_SEND,
+            payload={
+                "control_session_id": str(session.id),
+                "text": req.text,
+                "model": req.model,
+                "effort": req.effort,
+                "client_message_id": idempotency_key,
+            },
+            idempotency_key=idempotency_key,
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
+
+
+@router.post("/sessions/{session_id}/interactions/{interaction_id}/answer")
+async def answer_session_interaction(
+    session_id: uuid.UUID,
+    interaction_id: str,
+    req: ControlAnswerRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    pending = _pending_interaction(session, interaction_id, kind="question")
+    machine = await _session_machine(db, session)
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_INTERACTION_ANSWER,
+            payload={
+                "control_session_id": str(session.id),
+                "interaction_id": interaction_id,
+                "answers": req.answers,
+            },
+            # Duplicate taps and mobile reconnects replay the same command.
+            idempotency_key=f"answer-{interaction_id}",
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+            native_turn_id=pending.get("native_turn_id") or None,
+            interaction_id=interaction_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
+
+
+@router.post("/sessions/{session_id}/interactions/{interaction_id}/approval")
+async def respond_session_approval(
+    session_id: uuid.UUID,
+    interaction_id: str,
+    req: ControlApprovalRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    pending = _pending_interaction(session, interaction_id, kind="approval")
+    machine = await _session_machine(db, session)
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_APPROVAL_RESPOND,
+            payload={
+                "control_session_id": str(session.id),
+                "interaction_id": interaction_id,
+                "decision": req.decision,
+            },
+            idempotency_key=f"approval-{interaction_id}",
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+            native_turn_id=pending.get("native_turn_id") or None,
+            interaction_id=interaction_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
+
+
+@router.post("/sessions/{session_id}/interrupt")
+async def interrupt_session(
+    session_id: uuid.UUID,
+    req: ControlInterruptRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    turn_id = req.turn_id or session.active_native_turn_id
+    if not turn_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": ControlErrorCodes.STALE_TURN, "reason": "no_active_turn"},
+        )
+    machine = await _session_machine(db, session)
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_TURN_INTERRUPT,
+            payload={"control_session_id": str(session.id), "turn_id": turn_id},
+            idempotency_key=f"interrupt-{session.id}-{turn_id}",
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+            native_turn_id=turn_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
+
+
+@router.post("/sessions/{session_id}/close")
+async def close_session(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    session = await _load_visible_session(db, session_id, user)
+    machine = await _session_machine(db, session)
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_SESSION_CLOSE,
+            payload={"control_session_id": str(session.id)},
+            idempotency_key=f"close-{session.id}",
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
 
 
 @router.get("/commands")

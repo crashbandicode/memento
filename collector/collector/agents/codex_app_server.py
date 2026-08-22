@@ -119,9 +119,11 @@ class CodexAppServerAdapter:
         client_version: str = "dev",
         request_timeout: float = 60.0,
     ) -> None:
-        self._on_event = on_event
-        self._approval_handler = approval_handler
-        self._user_input_handler = user_input_handler
+        # Public and reassignable: the session manager rebinds these to
+        # session-scoped closures after construction.
+        self.on_event = on_event
+        self.approval_handler = approval_handler
+        self.user_input_handler = user_input_handler
         self._command = command
         self._cwd = cwd
         self._client_version = client_version
@@ -281,7 +283,7 @@ class CodexAppServerAdapter:
             self._count_delta(params)
             return
         if method in _ITEM_LIFECYCLE_EVENTS:
-            self._on_event(
+            self.on_event(
                 method,
                 {
                     "threadId": params.get("threadId"),
@@ -291,11 +293,11 @@ class CodexAppServerAdapter:
             )
             return
         if method in _FORWARDED_EVENTS:
-            self._on_event(method, params)
+            self.on_event(method, params)
             return
         # Unknown/low-value notifications become a type-only breadcrumb so
         # protocol drift is visible without storing unbounded payloads.
-        self._on_event("codex.unhandled_notification", {"method": method})
+        self.on_event("codex.unhandled_notification", {"method": method})
 
     def _count_delta(self, params: dict) -> None:
         turn_id = str(params.get("turnId") or "")
@@ -310,13 +312,13 @@ class CodexAppServerAdapter:
 
     def _handle_server_request(self, method: str, params: dict) -> Any:
         if method == "item/tool/requestUserInput":
-            return self._user_input_handler(params)
+            return self.user_input_handler(params)
         if method in (
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
             "item/permissions/requestApproval",
         ):
-            return self._approval_handler(method, params)
+            return self.approval_handler(method, params)
         logger.warning("Unsupported codex server request: %s", method)
         raise CodexAdapterError(f"unsupported server request: {method}")
 
@@ -324,4 +326,4 @@ class CodexAppServerAdapter:
         exit_code = None
         if self._process is not None:
             exit_code = self._process.poll()
-        self._on_event("codex.process_closed", {"exit_code": exit_code})
+        self.on_event("codex.process_closed", {"exit_code": exit_code})

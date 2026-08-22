@@ -20,8 +20,10 @@ from .claude_pending_hook import install_claude_pending_hooks
 from .claude_pending_questions import (
     ClaudePendingPoller,
 )
+from .agents.control_event_spool import ControlEventSpool, ControlEventUploader
+from .agents.session_manager import AgentSessionManager
 from .config import SYSTEM, CollectorConfig, _default_data_dir
-from .control_channel import ControlChannel
+from .control_channel import ControlChannel, capability_snapshot
 from .cursor_state_export import (
     CursorStateExporter,
     enqueue_cursor_state_snapshots,
@@ -817,7 +819,13 @@ def main() -> None:
         with _claude_pending_poll_lock:
             claude_pending_poller.invalidate()
 
+    control_spool = ControlEventSpool()
+    control_uploader = ControlEventUploader(config, control_spool)
+    agent_sessions = AgentSessionManager(config, control_spool)
+
     def _execute_control_command(kind: str, payload: dict) -> tuple[str, str | None, dict]:
+        if kind.startswith("agent."):
+            return agent_sessions.execute(kind, payload)
         return execute_control_command(
             kind,
             payload,
@@ -829,7 +837,18 @@ def main() -> None:
             on_resync=_invalidate_source_pollers,
         )
 
-    control_channel = ControlChannel(config, _execute_control_command)
+    def _control_capabilities() -> dict:
+        return capability_snapshot(
+            config,
+            extra_commands=agent_sessions.supported_commands(),
+            agents=agent_sessions.agents_capabilities(),
+        )
+
+    control_channel = ControlChannel(
+        config,
+        _execute_control_command,
+        capabilities_provider=_control_capabilities,
+    )
 
     # Graceful shutdown
     shutdown = False
@@ -885,6 +904,7 @@ def main() -> None:
     # 4. Start uploader only after the startup reconciliation pass.
     sync_client.start()
     orchestration_sync.start()
+    control_uploader.start()
     control_channel.start()
 
     logger.info("Collector running. Watching for file changes...")
@@ -1005,6 +1025,8 @@ def main() -> None:
         logger.info("Shutting down...")
         watcher.stop()
         control_channel.stop()
+        agent_sessions.shutdown()
+        control_uploader.stop()
         orchestration_sync.stop()
         sync_client.stop()
         queue.close()

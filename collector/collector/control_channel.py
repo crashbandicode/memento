@@ -58,7 +58,12 @@ def collector_version() -> str:
         return "dev"
 
 
-def capability_snapshot(config: CollectorConfig) -> dict:
+def capability_snapshot(
+    config: CollectorConfig,
+    *,
+    extra_commands: list[str] | None = None,
+    agents: dict | None = None,
+) -> dict:
     """Bounded, schema-versioned capability report for the server."""
     return {
         "schema_version": 1,
@@ -67,9 +72,9 @@ def capability_snapshot(config: CollectorConfig) -> dict:
         "control": {
             "long_poll": True,
             "outcome_reporting": True,
-            "commands": list(SUPPORTED_COMMANDS),
+            "commands": list(SUPPORTED_COMMANDS) + list(extra_commands or []),
         },
-        "agents": {},
+        "agents": agents or {},
     }
 
 
@@ -84,9 +89,11 @@ class ControlChannel:
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         max_commands: int = DEFAULT_MAX_COMMANDS,
+        capabilities_provider: Callable[[], dict] | None = None,
     ) -> None:
         self._config = config
         self._execute = execute
+        self._capabilities_provider = capabilities_provider
         self._wait_seconds = max(0, min(int(wait_seconds), 25))
         self._lease_seconds = max(5, min(int(lease_seconds), 300))
         self._max_commands = max(1, min(int(max_commands), 16))
@@ -128,6 +135,10 @@ class ControlChannel:
 
     def poll_once(self) -> int:
         """Long-poll once and process every delivered command. Returns count."""
+        if self._capabilities_provider is not None:
+            capabilities = self._capabilities_provider()
+        else:
+            capabilities = capability_snapshot(self._config)
         response = self._client.post(
             "/api/control/poll",
             json={
@@ -135,7 +146,7 @@ class ControlChannel:
                 "max_commands": self._max_commands,
                 "lease_seconds": self._lease_seconds,
                 "collector_version": self._version,
-                "capabilities": capability_snapshot(self._config),
+                "capabilities": capabilities,
             },
         )
         if response.status_code in (404, 405):

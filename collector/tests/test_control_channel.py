@@ -34,6 +34,7 @@ def _channel(client: _FakeClient, execute) -> ControlChannel:
     channel = object.__new__(ControlChannel)
     channel._client = client
     channel._execute = execute
+    channel._capabilities_provider = None
     channel._wait_seconds = 0
     channel._lease_seconds = 300
     channel._max_commands = 4

@@ -12,6 +12,7 @@ import { fmt, useI18n } from "@/lib/i18n";
 import ConversationViewer from "@/components/viewers/ConversationViewer";
 import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip } from "@/components/aurora/primitives";
+import ManagedSessionControls from "@/components/conversations/ManagedSessionControls";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import ConversationLocation from "@/components/conversations/ConversationLocation";
 import ResumeConversationCommand from "@/components/conversations/ResumeConversationCommand";
@@ -282,6 +283,7 @@ export default function ConversationPage() {
           </div>
         </div>
       )}
+      <ManagedSessionControls documentId={currentMeta?.id || docId} />
       <ConversationViewer
         documentId={currentMeta?.id || docId}
         prompts={prompts}

@@ -262,6 +262,8 @@ def _run_migrations(conn) -> None:
         "document_id UUID REFERENCES documents(id) ON DELETE SET NULL, "
         "state VARCHAR(32) NOT NULL DEFAULT 'starting', "
         "state_reason VARCHAR(128), "
+        "active_native_turn_id VARCHAR(256), "
+        "pending_interactions JSONB NOT NULL DEFAULT '[]'::jsonb, "
         "collector_revision VARCHAR(64), server_revision VARCHAR(64), "
         "started_at TIMESTAMPTZ, last_event_at TIMESTAMPTZ, closed_at TIMESTAMPTZ, "
         "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
@@ -280,6 +282,20 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_agent_control_session_native "
         "ON agent_control_sessions (tool_id, native_session_id)"
     ))
+    control_session_cols = {
+        column["name"]
+        for column in insp.get_columns("agent_control_sessions")
+    } if "agent_control_sessions" in insp.get_table_names() else set()
+    if control_session_cols and "active_native_turn_id" not in control_session_cols:
+        conn.execute(text(
+            "ALTER TABLE agent_control_sessions "
+            "ADD COLUMN active_native_turn_id VARCHAR(256)"
+        ))
+    if control_session_cols and "pending_interactions" not in control_session_cols:
+        conn.execute(text(
+            "ALTER TABLE agent_control_sessions "
+            "ADD COLUMN pending_interactions JSONB NOT NULL DEFAULT '[]'::jsonb"
+        ))
     conn.execute(text(
         "CREATE TABLE IF NOT EXISTS agent_control_commands ("
         "id UUID PRIMARY KEY, "

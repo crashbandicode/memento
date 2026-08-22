@@ -22,20 +22,33 @@ from server.db.models import (
     AgentControlCommand,
     AgentControlEvent,
     Base,
+    ConversationReadModel,
+    Document,
     Machine,
+    Tool,
     User,
 )
 from server.services.agent_control import (
+    AGENT_KINDS,
+    KIND_AGENT_INTERACTION_ANSWER,
+    KIND_AGENT_SESSION_CLOSE,
+    KIND_AGENT_SESSION_START,
+    KIND_AGENT_TURN_SEND,
     KIND_CONVERSATION_REPAIR,
     KIND_DEVICE_RESYNC,
     LEGACY_ACTION_TO_KIND,
     POLICY_FAIL_ONCE_DELIVERED,
+    POLICY_RETRY,
+    SESSION_ACTIVE,
+    SESSION_CLOSED,
+    SESSION_FAILED,
     STATE_COMPLETED,
     STATE_DELIVERED,
     STATE_EXPIRED,
     STATE_FAILED,
     STATE_LEASED,
     STATE_QUEUED,
+    _DEFAULT_REDELIVERY_POLICY,
     ControlErrorCodes,
     ControlEventScopeError,
     StaleControlLease,
@@ -44,8 +57,10 @@ from server.services.agent_control import (
     acknowledge_command,
     acknowledge_legacy_command,
     admit_command,
+    bind_control_session_documents,
     command_public,
     complete_command,
+    create_control_session,
     ingest_control_events,
     lease_commands,
     lease_legacy_commands,
@@ -452,3 +467,315 @@ async def test_legacy_shortpoll_serves_and_terminalizes_honestly(
 
         # Terminal command must never be served again.
         assert await lease_legacy_commands(db, machine=machine) == []
+
+
+# ---------------------------------------------------------------------------
+# Managed sessions (agent.* kinds)
+# ---------------------------------------------------------------------------
+
+def test_agent_kind_redelivery_policies_never_double_side_effects() -> None:
+    for kind in AGENT_KINDS:
+        expected = (
+            POLICY_RETRY
+            if kind in ("agent.session.close", "agent.turn.interrupt")
+            else POLICY_FAIL_ONCE_DELIVERED
+        )
+        assert _DEFAULT_REDELIVERY_POLICY[kind] == expected
+
+
+@pytest.mark.asyncio
+async def test_agent_kinds_require_machine_capability() -> None:
+    legacy_machine = SimpleNamespace(id=uuid.uuid4(), capabilities=None)
+    with pytest.raises(UnsupportedCommandKind):
+        await admit_command(
+            None,
+            machine=legacy_machine,
+            user_id=uuid.uuid4(),
+            kind=KIND_AGENT_TURN_SEND,
+        )
+
+
+def _agent_capabilities() -> dict:
+    return {
+        "schema_version": 1,
+        "control": {"commands": list(AGENT_KINDS)},
+        "agents": {"codex": {"adapter": "codex_app_server", "available": True}},
+    }
+
+
+async def _seed_agent_machine(db) -> tuple[User, Machine]:
+    user = User(
+        id=uuid.uuid4(),
+        email=f"{uuid.uuid4()}@example.test",
+        role="owner",
+        status="active",
+    )
+    machine = Machine(
+        id=uuid.uuid4(),
+        name="agent-control-test",
+        collector_token_hash=str(uuid.uuid4()),
+        user_id=user.id,
+        capabilities=_agent_capabilities(),
+    )
+    db.add_all([user, machine])
+    await db.flush()
+    return user, machine
+
+
+async def _run_command(db, machine, command, *, status, detail=None, error_code=None):
+    leased = await lease_commands(db, machine=machine)
+    target = next(item for item in leased if item.id == command.id)
+    await acknowledge_command(
+        db, machine=machine, command_id=command.id, lease_id=target.lease_id
+    )
+    return await complete_command(
+        db,
+        machine=machine,
+        command_id=command.id,
+        lease_id=target.lease_id,
+        status=status,
+        detail=detail,
+        error_code=error_code,
+    )
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_managed_session_lifecycle_via_commands_and_events(session_factory) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        session = create_control_session(
+            db, machine=machine, user_id=user.id, tool_id="codex", adapter="codex_app_server"
+        )
+        await db.flush()
+
+        start, _ = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_SESSION_START,
+            payload={"control_session_id": str(session.id)},
+            control_session_id=session.id,
+        )
+        await _run_command(
+            db, machine, start, status=STATE_COMPLETED, detail={"native_thread_id": "thr_x1"}
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.state == SESSION_ACTIVE
+        assert session.native_session_id == "thr_x1"
+
+        def _event(event_type: str, **extra) -> dict:
+            return {
+                "schema_version": 1,
+                "event_id": str(uuid.uuid4()),
+                "event_type": event_type,
+                "control_session_id": session.id,
+                **extra,
+            }
+
+        result = await ingest_control_events(
+            db,
+            machine=machine,
+            events=[
+                _event("adapter.turn_started", native_turn_id="turn_9"),
+                _event(
+                    "adapter.interaction_pending",
+                    native_turn_id="turn_9",
+                    interaction_id="int-1",
+                    details={
+                        "kind": "question",
+                        "method": "item/tool/requestUserInput",
+                        "request": {"questions": [{"id": "q1"}]},
+                    },
+                ),
+            ],
+        )
+        assert result == {"accepted": 2, "duplicates": 0}
+        await db.flush()
+        await db.refresh(session)
+        assert session.active_native_turn_id == "turn_9"
+        assert session.pending_interactions[0]["interaction_id"] == "int-1"
+        assert session.pending_interactions[0]["kind"] == "question"
+
+        await ingest_control_events(
+            db,
+            machine=machine,
+            events=[
+                _event(
+                    "adapter.interaction_resolved",
+                    interaction_id="int-1",
+                    outcome="answered",
+                ),
+                _event("adapter.turn_completed", native_turn_id="turn_9", outcome="completed"),
+            ],
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.pending_interactions == []
+        assert session.active_native_turn_id is None
+
+        close, _ = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_SESSION_CLOSE,
+            payload={"control_session_id": str(session.id)},
+            control_session_id=session.id,
+            idempotency_key=f"close-{session.id}",
+        )
+        await _run_command(db, machine, close, status=STATE_COMPLETED, detail={"closed": True})
+        await db.flush()
+        await db.refresh(session)
+        assert session.state == SESSION_CLOSED
+        assert session.closed_at is not None
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_failed_session_start_marks_session_failed(session_factory) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        session = create_control_session(
+            db, machine=machine, user_id=user.id, tool_id="codex", adapter="codex_app_server"
+        )
+        await db.flush()
+        start, _ = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_SESSION_START,
+            payload={"control_session_id": str(session.id)},
+            control_session_id=session.id,
+        )
+        await _run_command(
+            db,
+            machine,
+            start,
+            status=STATE_FAILED,
+            error_code=ControlErrorCodes.ADAPTER_PROCESS_FAILED,
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.state == SESSION_FAILED
+        assert session.state_reason == ControlErrorCodes.ADAPTER_PROCESS_FAILED
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_expired_session_start_fails_session_as_collector_offline(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        session = create_control_session(
+            db, machine=machine, user_id=user.id, tool_id="codex", adapter="codex_app_server"
+        )
+        await db.flush()
+        start, _ = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_SESSION_START,
+            payload={"control_session_id": str(session.id)},
+            control_session_id=session.id,
+        )
+        start.expires_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        await db.flush()
+        await reap_stale_commands(db, machine_id=machine.id)
+        await db.flush()
+        await db.refresh(session)
+        assert session.state == SESSION_FAILED
+        assert session.state_reason == ControlErrorCodes.COLLECTOR_OFFLINE
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_answer_command_carries_interaction_fences(session_factory) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        session = create_control_session(
+            db, machine=machine, user_id=user.id, tool_id="codex", adapter="codex_app_server"
+        )
+        await db.flush()
+        answer, created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_INTERACTION_ANSWER,
+            payload={
+                "control_session_id": str(session.id),
+                "interaction_id": "int-7",
+                "answers": {"q1": {"answers": ["left"]}},
+            },
+            idempotency_key="answer-int-7",
+            control_session_id=session.id,
+            native_turn_id="turn_7",
+            interaction_id="int-7",
+        )
+        assert created is True
+        assert answer.interaction_id == "int-7"
+        assert answer.native_turn_id == "turn_7"
+
+        # A duplicate tap replays the identical command.
+        replay, created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_INTERACTION_ANSWER,
+            payload={
+                "control_session_id": str(session.id),
+                "interaction_id": "int-7",
+                "answers": {"q1": {"answers": ["left"]}},
+            },
+            idempotency_key="answer-int-7",
+            control_session_id=session.id,
+            interaction_id="int-7",
+        )
+        assert created is False
+        assert replay.id == answer.id
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_bind_control_session_documents_by_exact_thread_id(session_factory) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        if await db.get(Tool, "codex") is None:
+            db.add(Tool(id="codex", display_name="Codex"))
+        session = create_control_session(
+            db,
+            machine=machine,
+            user_id=user.id,
+            tool_id="codex",
+            adapter="codex_app_server",
+            native_session_id="thr_bind_1",
+        )
+        document = Document(
+            id=uuid.uuid4(),
+            tool_id="codex",
+            machine_id=machine.id,
+            relative_path=f"sessions/{uuid.uuid4()}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Managed session transcript",
+            content_hash=uuid.uuid4().hex,
+            file_size_bytes=1,
+        )
+        db.add(document)
+        await db.flush()
+        db.add(
+            ConversationReadModel(
+                document_id=document.id,
+                machine_id=machine.id,
+                tool_id="codex",
+                thread_id="thr_bind_1",
+            )
+        )
+        await db.flush()
+
+        bound = await bind_control_session_documents(db, machine_id=machine.id)
+        assert bound == 1
+        await db.flush()
+        await db.refresh(session)
+        assert session.document_id == document.id
