@@ -15,7 +15,11 @@ from types import SimpleNamespace
 
 from collector.agents.codex_app_server import CodexAppServerAdapter
 from collector.agents.control_event_spool import ControlEventSpool
-from collector.agents.session_manager import AGENT_COMMANDS, AgentSessionManager
+from collector.agents.session_manager import (
+    AGENT_COMMANDS,
+    AgentSessionManager,
+    _PendingInteraction,
+)
 
 FAKE_SERVER = Path(__file__).resolve().parent / "fake_codex_app_server.py"
 
@@ -175,6 +179,33 @@ def test_approval_decline_round_trip(tmp_path: Path) -> None:
         manager.shutdown()
 
 
+def test_permission_grants_selected_subset_only(tmp_path: Path) -> None:
+    manager, spool = _manager(tmp_path)
+    try:
+        manager.execute("agent.session.start", {"control_session_id": "cs-perm"})
+        manager.execute(
+            "agent.turn.send", {"control_session_id": "cs-perm", "text": "PERMS please"}
+        )
+        pending = _wait_for_event(spool, "adapter.interaction_pending")
+        assert pending["details"]["kind"] == "approval"
+        assert pending["details"]["request"]["permissions"]["fileSystem"]["write"] == ["/a", "/b"]
+
+        status, error_code, _ = manager.execute(
+            "agent.approval.respond",
+            {
+                "control_session_id": "cs-perm",
+                "interaction_id": pending["interaction_id"],
+                "decision": "acceptForSession",
+                # Anything omitted from the subset is denied.
+                "granted_permissions": {"fileSystem": {"write": ["/a"]}},
+            },
+        )
+        assert (status, error_code) == ("completed", None)
+        _wait_for_event(spool, "adapter.turn_completed")
+    finally:
+        manager.shutdown()
+
+
 def test_interrupt_and_close(tmp_path: Path) -> None:
     manager, spool = _manager(tmp_path)
     try:
@@ -238,6 +269,39 @@ def test_unknown_session_and_resume_round_trip(tmp_path: Path) -> None:
         assert detail["native_thread_id"] == "thr_previous"
     finally:
         manager.shutdown()
+
+
+def test_approval_response_builds_exact_permission_subsets() -> None:
+    pending = _PendingInteraction(
+        interaction_id="i-1",
+        kind="approval",
+        method="item/permissions/requestApproval",
+        native_turn_id="turn-1",
+        params={"permissions": {"fileSystem": {"write": ["/a", "/b"]}}},
+    )
+
+    subset = AgentSessionManager._approval_response(
+        pending,
+        {
+            "decision": "acceptForSession",
+            "granted_permissions": {"fileSystem": {"write": ["/a"]}},
+        },
+    )
+    assert subset == {
+        "permissions": {"fileSystem": {"write": ["/a"]}},
+        "scope": "session",
+    }
+
+    # Omitting the subset grants exactly what was requested.
+    full = AgentSessionManager._approval_response(pending, {"decision": "accept"})
+    assert full == {"permissions": {"fileSystem": {"write": ["/a", "/b"]}}}
+
+    # Declining grants nothing regardless of any provided subset.
+    declined = AgentSessionManager._approval_response(
+        pending,
+        {"decision": "decline", "granted_permissions": {"fileSystem": {"write": ["/a"]}}},
+    )
+    assert declined == {"permissions": {}}
 
 
 def test_agent_capability_surface_is_stable() -> None:

@@ -825,6 +825,10 @@ export interface ControlPendingInteraction {
     command?: string;
     cwd?: string;
     reason?: string;
+    permissions?: {
+      fileSystem?: { write?: string[]; read?: string[] };
+      network?: { enabled?: boolean };
+    };
     [key: string]: unknown;
   };
   received_at: string;
@@ -1126,11 +1130,29 @@ export const api = {
       `/api/control/sessions/${id}/interactions/${encodeURIComponent(interactionId)}/answer`,
       { method: "POST", body: JSON.stringify({ answers }) },
     ),
-  respondControlApproval: (id: string, interactionId: string, decision: ControlApprovalDecision) =>
+  respondControlApproval: (
+    id: string,
+    interactionId: string,
+    decision: ControlApprovalDecision,
+    grantedPermissions?: Record<string, unknown>,
+  ) =>
     apiFetch<{ command: ControlCommand }>(
       `/api/control/sessions/${id}/interactions/${encodeURIComponent(interactionId)}/approval`,
-      { method: "POST", body: JSON.stringify({ decision }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          decision,
+          ...(grantedPermissions !== undefined
+            ? { granted_permissions: grantedPermissions }
+            : {}),
+        }),
+      },
     ),
+  steerControlSession: (id: string, body: { text: string; expected_turn_id?: string }) =>
+    apiFetch<{ command: ControlCommand }>(`/api/control/sessions/${id}/steer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   interruptControlSession: (id: string, turnId?: string) =>
     apiFetch<{ command: ControlCommand }>(`/api/control/sessions/${id}/interrupt`, {
       method: "POST",

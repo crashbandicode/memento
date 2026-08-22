@@ -65,6 +65,7 @@ from server.services.agent_control import (
     lease_commands,
     lease_legacy_commands,
     reap_stale_commands,
+    renew_command_lease,
 )
 
 TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
@@ -467,6 +468,56 @@ async def test_legacy_shortpoll_serves_and_terminalizes_honestly(
 
         # Terminal command must never be served again.
         assert await lease_legacy_commands(db, machine=machine) == []
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_lease_renewal_extends_live_leases_and_rejects_stale_fences(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed(db)
+        command, _ = await admit_command(
+            db, machine=machine, user_id=user.id, kind=KIND_CONVERSATION_REPAIR
+        )
+        leased = (await lease_commands(db, machine=machine, lease_seconds=30))[0]
+        before = leased.lease_expires_at
+
+        renewed = await renew_command_lease(
+            db,
+            machine=machine,
+            command_id=command.id,
+            lease_id=leased.lease_id,
+            lease_seconds=300,
+        )
+        assert renewed.lease_expires_at > before
+
+        with pytest.raises(StaleControlLease):
+            await renew_command_lease(
+                db,
+                machine=machine,
+                command_id=command.id,
+                lease_id=uuid.uuid4(),  # wrong fencing token
+            )
+
+        await complete_command(
+            db,
+            machine=machine,
+            command_id=command.id,
+            lease_id=leased.lease_id,
+            status=STATE_COMPLETED,
+        )
+        # Renewal can never resurrect a decided outcome.
+        with pytest.raises(StaleControlLease):
+            await renew_command_lease(
+                db,
+                machine=machine,
+                command_id=command.id,
+                lease_id=leased.lease_id,
+            )
+        await db.flush()
+        events = await _event_types(db, command.id)
+        assert "device.lease_renewed" in events
 
 
 # ---------------------------------------------------------------------------

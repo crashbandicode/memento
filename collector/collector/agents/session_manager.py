@@ -321,11 +321,17 @@ class AgentSessionManager:
     def _approval_response(pending: _PendingInteraction, payload: dict) -> dict:
         decision = str(payload.get("decision") or "decline")
         if pending.method == "item/permissions/requestApproval":
-            granted = (
-                (pending.params.get("permissions") or {})
-                if decision in ("accept", "acceptForSession")
-                else {}
-            )
+            granted: dict = {}
+            if decision in ("accept", "acceptForSession"):
+                # A user-selected subset wins; omitting one means grant the
+                # requested profile. Codex ignores anything not requested, so
+                # pass-through of the subset is safe by protocol contract.
+                subset = payload.get("granted_permissions")
+                granted = (
+                    subset
+                    if isinstance(subset, dict)
+                    else (pending.params.get("permissions") or {})
+                )
             response: dict = {"permissions": granted}
             if decision == "acceptForSession":
                 response["scope"] = "session"

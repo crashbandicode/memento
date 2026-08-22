@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { api } from "@/lib/api-client";
+import { useI18n } from "@/lib/i18n";
 
 const overlayStyle: React.CSSProperties = {
   position: "fixed",
@@ -57,6 +58,7 @@ export default function StartControlSessionDialog({
   onClose: () => void;
 }) {
   const router = useRouter();
+  const { t } = useI18n();
   const [cwd, setCwd] = useState(defaultCwd ?? "");
   const [model, setModel] = useState("");
   const [initialMessage, setInitialMessage] = useState("");
@@ -70,7 +72,7 @@ export default function StartControlSessionDialog({
 
   const submit = useCallback(async () => {
     setSubmitting(true);
-    setStatus("Starting managed session…");
+    setStatus(t.control.starting);
     try {
       const { session } = await api.startControlSession({
         machine_id: machineId,
@@ -79,13 +81,13 @@ export default function StartControlSessionDialog({
         model: model.trim() || undefined,
         initial_message: initialMessage.trim() || undefined,
       });
-      setStatus("Waiting for the agent to come up…");
+      setStatus(t.control.waitingAgent);
       const deadline = Date.now() + 45_000;
       while (Date.now() < deadline && !cancelled.current) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
         const { session: latest } = await api.getControlSession(session.id);
         if (latest.state === "failed") {
-          setStatus(`Session failed: ${latest.state_reason ?? "unknown reason"}`);
+          setStatus(`${t.control.sessionFailedPrefix} ${latest.state_reason ?? ""}`.trim());
           setSubmitting(false);
           return;
         }
@@ -95,25 +97,23 @@ export default function StartControlSessionDialog({
           return;
         }
         if (latest.state === "active") {
-          setStatus("Agent running — waiting for its transcript to sync…");
+          setStatus(t.control.waitingTranscript);
         }
       }
-      setStatus(
-        "Session is starting in the background; the conversation will appear in the list once its transcript syncs.",
-      );
+      setStatus(t.control.backgroundStart);
       setSubmitting(false);
     } catch (caught) {
-      setStatus(caught instanceof Error ? caught.message : "Failed to start session");
+      setStatus(caught instanceof Error ? caught.message : t.control.startFailed);
       setSubmitting(false);
     }
-  }, [machineId, cwd, model, initialMessage, router, onClose]);
+  }, [machineId, cwd, model, initialMessage, router, onClose, t]);
 
   return (
-    <div style={overlayStyle} role="dialog" aria-modal="true" aria-label={`Start Codex session on ${machineName}`}>
+    <div style={overlayStyle} role="dialog" aria-modal="true" aria-label={`${t.control.dialogTitle} · ${machineName}`}>
       <div data-start-control-session style={dialogStyle}>
-        <strong style={{ fontSize: 14 }}>New managed Codex session · {machineName}</strong>
+        <strong style={{ fontSize: 14 }}>{t.control.dialogTitle} · {machineName}</strong>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
-          Working directory (optional)
+          {t.control.cwdLabel}
           <input
             data-start-session-cwd
             style={inputStyle}
@@ -123,24 +123,24 @@ export default function StartControlSessionDialog({
           />
         </label>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
-          Model (optional)
+          {t.control.modelLabel}
           <input
             data-start-session-model
             style={inputStyle}
             value={model}
             onChange={(event) => setModel(event.target.value)}
-            placeholder="Use the machine's default"
+            placeholder={t.control.modelPlaceholder}
           />
         </label>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
-          First message (optional)
+          {t.control.firstMessageLabel}
           <textarea
             data-start-session-message
             style={{ ...inputStyle, resize: "vertical" }}
             rows={3}
             value={initialMessage}
             onChange={(event) => setInitialMessage(event.target.value)}
-            placeholder="What should the agent do first?"
+            placeholder={t.control.firstMessagePlaceholder}
           />
         </label>
         {status && (
@@ -162,7 +162,7 @@ export default function StartControlSessionDialog({
             }}
             onClick={onClose}
           >
-            Close
+            {t.control.close}
           </button>
           <button
             type="button"
@@ -181,7 +181,7 @@ export default function StartControlSessionDialog({
             disabled={submitting}
             onClick={() => void submit()}
           >
-            Start session
+            {t.control.start}
           </button>
         </div>
       </div>

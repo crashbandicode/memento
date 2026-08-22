@@ -610,6 +610,40 @@ async def acknowledge_command(
     return command
 
 
+async def renew_command_lease(
+    db: AsyncSession,
+    *,
+    machine: Machine,
+    command_id: uuid.UUID,
+    lease_id: uuid.UUID,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    collector_revision: str | None = None,
+) -> AgentControlCommand:
+    """Extend a live lease during long executions. Fenced by the lease id.
+
+    Keeps a slow command (a resync drain, a long adapter call) from being
+    redelivered or failed as unreported while the collector is demonstrably
+    still working on it. Terminal commands and stale fences are rejected —
+    renewal can never resurrect a decided outcome.
+    """
+    command = await _load_owned_command(db, machine_id=machine.id, command_id=command_id)
+    if command.state not in (STATE_LEASED, STATE_DELIVERED) or command.lease_id != lease_id:
+        raise StaleControlLease(command)
+    lease_seconds = max(5, min(int(lease_seconds), MAX_LEASE_SECONDS))
+    command.lease_expires_at = _now() + timedelta(seconds=lease_seconds)
+    append_event(
+        db,
+        machine_id=machine.id,
+        event_type="device.lease_renewed",
+        command=command,
+        origin="collector",
+        outcome="renewed",
+        collector_revision=collector_revision,
+        details={"lease_seconds": lease_seconds},
+    )
+    return command
+
+
 async def complete_command(
     db: AsyncSession,
     *,

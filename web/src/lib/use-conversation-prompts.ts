@@ -21,6 +21,7 @@ interface ConversationSyncVersions {
   metadata: number;
   pendingInteractions: number;
   search: number;
+  controlSessions: number;
 }
 
 /**
@@ -41,6 +42,7 @@ export function useConversationPrompts(
     metadata: 0,
     pendingInteractions: 0,
     search: 0,
+    controlSessions: 0,
   });
   const refreshTimer = useRef<number | null>(null);
   const projectionRef = useRef<{
@@ -122,6 +124,7 @@ export function useConversationPrompts(
       if (next.messages) invalidateConversationMessages(documentId);
       if (next.search) invalidateConversationSearch(documentId);
       setSyncVersions((versions) => ({
+        ...versions,
         messages: versions.messages + Number(next.messages),
         metadata: versions.metadata + Number(next.metadata),
         pendingInteractions: (
@@ -134,6 +137,18 @@ export function useConversationPrompts(
   }, [documentId, refresh]);
 
   useSSE((event) => {
+    // Managed-session state rides the page's single event stream; opening a
+    // second EventSource per component starves fixtures and server slots.
+    if (event.type === "control_session") {
+      const data = (event.data ?? {}) as unknown as Record<string, unknown>;
+      if (data.document_id === documentId) {
+        setSyncVersions((versions) => ({
+          ...versions,
+          controlSessions: versions.controlSessions + 1,
+        }));
+      }
+      return;
+    }
     scheduleCatchUp(
       conversationInvalidationForEvent(event, documentId, scope),
       event.type === "realtime_reset" ? 0 : 250,

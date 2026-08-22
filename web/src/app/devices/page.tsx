@@ -200,9 +200,9 @@ memento-collector setup`}
                       variant="ghost"
                       data-start-codex-session
                       onClick={() => setSessionTarget(d)}
-                      title="Start a managed Codex session on this machine"
+                      title={t.devices.newSessionHint}
                     >
-                      New Codex session
+                      {t.devices.newSession}
                     </Btn>
                   )}
                   <Btn

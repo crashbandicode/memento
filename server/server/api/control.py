@@ -37,6 +37,7 @@ from ..services.agent_control import (
     KIND_AGENT_SESSION_START,
     KIND_AGENT_TURN_INTERRUPT,
     KIND_AGENT_TURN_SEND,
+    KIND_AGENT_TURN_STEER,
     SESSION_ACTIVE,
     SESSION_STARTING,
     ControlCommandNotFound,
@@ -55,6 +56,7 @@ from ..services.agent_control import (
     ingest_control_events,
     lease_commands,
     record_capabilities,
+    renew_command_lease,
     session_public,
 )
 from ..services.device_service import ensure_device
@@ -266,6 +268,47 @@ async def finish_command(
     return {"status": command.state, "command": command_public(command)}
 
 
+class ControlHeartbeatRequest(BaseModel):
+    lease_id: uuid.UUID
+    lease_seconds: int = Field(default=300, ge=5, le=300)
+
+
+@router.post("/commands/{command_id}/heartbeat")
+async def heartbeat_command(
+    command_id: uuid.UUID,
+    req: ControlHeartbeatRequest,
+    collector_user: User = Depends(verify_collector_token),
+    db: AsyncSession = Depends(get_db),
+    x_device_id: str = Header("unknown", alias="X-Device-Id"),
+    x_device_name: str = Header("unknown", alias="X-Device-Name"),
+    x_device_platform: str = Header("unknown", alias="X-Device-Platform"),
+    x_collector_version: str = Header("", alias="X-Collector-Version"),
+) -> dict:
+    """Extend a live lease while a long command is still executing."""
+    machine = await ensure_device(
+        db, x_device_id, x_device_name, x_device_platform, user_id=collector_user.id
+    )
+    try:
+        command = await renew_command_lease(
+            db,
+            machine=machine,
+            command_id=command_id,
+            lease_id=req.lease_id,
+            lease_seconds=req.lease_seconds,
+            collector_revision=x_collector_version or None,
+        )
+    except ControlCommandNotFound as error:
+        raise HTTPException(status_code=404, detail="Command not found") from error
+    except StaleControlLease as error:
+        raise _stale_lease_response(error) from error
+    return {
+        "status": "renewed",
+        "lease_expires_at": (
+            command.lease_expires_at.isoformat() if command.lease_expires_at else None
+        ),
+    }
+
+
 @router.post("/events")
 async def ingest_events(
     req: ControlEventBatchRequest,
@@ -393,6 +436,13 @@ class ControlAnswerRequest(BaseModel):
 
 class ControlApprovalRequest(BaseModel):
     decision: str = Field(pattern="^(accept|acceptForSession|decline|cancel)$")
+    # Optional subset for permission requests; omitted = grant as requested.
+    granted_permissions: dict | None = None
+
+    @field_validator("granted_permissions")
+    @classmethod
+    def _bounded_granted(cls, value: dict | None) -> dict | None:
+        return _bounded_json_dict(value, "granted_permissions")
 
 
 class ControlInterruptRequest(BaseModel):
@@ -583,6 +633,52 @@ async def send_session_message(
     return {"command": command_public(command)}
 
 
+class ControlSteerRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=32_768)
+    expected_turn_id: str | None = Field(default=None, max_length=256)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/sessions/{session_id}/steer")
+async def steer_session_turn(
+    session_id: uuid.UUID,
+    req: ControlSteerRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Append input to the ACTIVE turn, fenced by the exact expected turn id."""
+    session = await _load_visible_session(db, session_id, user)
+    expected_turn_id = req.expected_turn_id or session.active_native_turn_id
+    if not expected_turn_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": ControlErrorCodes.STALE_TURN, "reason": "no_active_turn"},
+        )
+    machine = await _session_machine(db, session)
+    idempotency_key = req.idempotency_key or f"steer-{uuid.uuid4()}"
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_TURN_STEER,
+            payload={
+                "control_session_id": str(session.id),
+                "text": req.text,
+                "expected_turn_id": expected_turn_id,
+                "client_message_id": idempotency_key,
+            },
+            idempotency_key=idempotency_key,
+            control_session_id=session.id,
+            document_id=session.document_id,
+            native_session_id=session.native_session_id,
+            native_turn_id=expected_turn_id,
+        )
+    except UnsupportedCommandKind as error:
+        raise _unsupported_response(error) from error
+    return {"command": command_public(command)}
+
+
 @router.post("/sessions/{session_id}/interactions/{interaction_id}/answer")
 async def answer_session_interaction(
     session_id: uuid.UUID,
@@ -639,6 +735,11 @@ async def respond_session_approval(
                 "control_session_id": str(session.id),
                 "interaction_id": interaction_id,
                 "decision": req.decision,
+                **(
+                    {"granted_permissions": req.granted_permissions}
+                    if req.granted_permissions is not None
+                    else {}
+                ),
             },
             idempotency_key=f"approval-{interaction_id}",
             control_session_id=session.id,

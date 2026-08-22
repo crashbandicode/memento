@@ -180,6 +180,62 @@ test("approvals post the exact decision", async ({ page }) => {
   expect(capture[0].body.decision).toBe("decline");
 });
 
+test("an active turn switches the composer to steer with the exact turn fence", async ({ page }) => {
+  const capture = [];
+  await openManagedConversation(page, {
+    sessions: () => [managedSession({ active_native_turn_id: "turn_busy" })],
+    capture,
+  });
+
+  const send = page.locator("[data-control-send]");
+  await expect(send).toHaveAttribute("data-control-send-mode", "steer");
+  await page.locator("[data-control-composer]").fill("focus on the failing tests");
+  await send.click();
+
+  await expect.poll(() => capture.length).toBeGreaterThan(0);
+  expect(capture[0].path).toBe(`/api/control/sessions/${SESSION_ID}/steer`);
+  expect(capture[0].body.text).toBe("focus on the failing tests");
+  expect(capture[0].body.expected_turn_id).toBe("turn_busy");
+});
+
+test("permission requests grant only the selected subset", async ({ page }) => {
+  const capture = [];
+  const permissionInteraction = {
+    interaction_id: "int-p-1",
+    kind: "approval",
+    method: "item/permissions/requestApproval",
+    native_turn_id: "turn_p",
+    request: {
+      reason: "Need write access",
+      permissions: {
+        fileSystem: { write: ["/repo/a", "/repo/b"] },
+        network: { enabled: true },
+      },
+    },
+    received_at: "2026-08-22T12:04:45Z",
+  };
+  await openManagedConversation(page, {
+    sessions: () => [managedSession({ pending_interactions: [permissionInteraction] })],
+    capture,
+  });
+
+  const options = page.locator("[data-control-grant-option]");
+  await expect(options).toHaveCount(3);
+  // Deny the second write path; keep the first and network access.
+  await options.nth(1).locator("input").uncheck();
+  await page.locator("[data-control-approval-accept]").click();
+
+  await expect.poll(() => capture.length).toBeGreaterThan(0);
+  expect(capture[0].path).toBe(
+    `/api/control/sessions/${SESSION_ID}/interactions/int-p-1/approval`,
+  );
+  expect(capture[0].body.decision).toBe("accept");
+  expect(capture[0].body.granted_permissions).toEqual({
+    fileSystem: { write: ["/repo/a"] },
+    network: { enabled: true },
+  });
+});
+
 test("an active turn exposes interrupt and posts it", async ({ page }) => {
   const capture = [];
   await openManagedConversation(page, {

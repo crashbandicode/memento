@@ -7,6 +7,10 @@
  * input channel, so controls appear only when this document is attached to a
  * session Memento itself started or resumed. Every action admits a durable,
  * idempotent command server-side; this component never talks to agents.
+ *
+ * While a turn is active the composer steers (appends to the exact expected
+ * turn); when idle it sends a new turn. Permission requests grant a
+ * user-selected subset — anything unchecked is denied.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -16,7 +20,7 @@ import {
   type ControlPendingInteraction,
   type ControlSession,
 } from "@/lib/api-client";
-import { useSSE, type SSEEvent } from "@/lib/use-sse";
+import { useI18n } from "@/lib/i18n";
 
 const ACTIVE_STATES = new Set(["starting", "active"]);
 const POLL_INTERVAL_MS = 6000;
@@ -49,26 +53,15 @@ const subtleButtonStyle: React.CSSProperties = {
   color: "var(--aurora-fg2)",
 };
 
-function stateChip(session: ControlSession): { label: string; color: string } {
-  if (session.state === "failed") {
-    return {
-      label: `Managed · failed${session.state_reason ? ` (${session.state_reason})` : ""}`,
-      color: "var(--aurora-danger, #e5484d)",
-    };
-  }
-  if (session.state === "starting") {
-    return { label: "Managed · starting", color: "var(--aurora-fg2)" };
-  }
-  return { label: "Managed session", color: "var(--aurora-accent)" };
-}
-
-function approvalTitle(interaction: ControlPendingInteraction): string {
-  if (interaction.method.includes("fileChange")) return "File change approval";
-  if (interaction.method.includes("permissions")) return "Permission request";
-  return "Command approval";
-}
-
-export default function ManagedSessionControls({ documentId }: { documentId: string }) {
+export default function ManagedSessionControls({
+  documentId,
+  refreshSignal = 0,
+}: {
+  documentId: string;
+  /** Bumped by the page when a control_session SSE event targets this doc. */
+  refreshSignal?: number;
+}) {
+  const { t } = useI18n();
   const [session, setSession] = useState<ControlSession | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -88,24 +81,7 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
-
-  useSSE(
-    useCallback(
-      (event: SSEEvent) => {
-        if (event.type !== "control_session") return;
-        const data = (event.data ?? {}) as unknown as Record<string, unknown>;
-        const current = sessionRef.current;
-        if (
-          data.document_id === documentId ||
-          (current && data.session_id === current.id)
-        ) {
-          void refresh();
-        }
-      },
-      [documentId, refresh],
-    ),
-  );
+  }, [refresh, refreshSignal]);
 
   useEffect(() => {
     if (!session || !ACTIVE_STATES.has(session.state)) return;
@@ -122,25 +98,46 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
         await refresh();
         setTimeout(() => void refresh(), 1500);
       } catch (caught) {
-        setError(caught instanceof Error ? caught.message : "Command failed");
+        setError(caught instanceof Error ? caught.message : t.control.commandFailed);
       } finally {
         setBusy(false);
       }
     },
-    [refresh],
+    [refresh, t.control.commandFailed],
   );
 
-  const sendMessage = useCallback(() => {
+  const activeTurnId = session?.active_native_turn_id ?? null;
+
+  const submitComposer = useCallback(() => {
     const current = sessionRef.current;
     const text = message.trim();
     if (!current || !text) return;
     void act(async () => {
-      await api.sendControlMessage(current.id, { text });
+      if (current.active_native_turn_id) {
+        await api.steerControlSession(current.id, {
+          text,
+          expected_turn_id: current.active_native_turn_id,
+        });
+      } else {
+        await api.sendControlMessage(current.id, { text });
+      }
       setMessage("");
     });
   }, [act, message]);
 
-  const chip = useMemo(() => (session ? stateChip(session) : null), [session]);
+  const chip = useMemo(() => {
+    if (!session) return null;
+    if (session.state === "failed") {
+      return {
+        label: `${t.control.managedFailed}${session.state_reason ? ` (${session.state_reason})` : ""}`,
+        color: "var(--aurora-danger, #e5484d)",
+      };
+    }
+    if (session.state === "starting") {
+      return { label: t.control.managedStarting, color: "var(--aurora-fg2)" };
+    }
+    return { label: t.control.managed, color: "var(--aurora-accent)" };
+  }, [session, t]);
 
   if (!session || !chip) return null;
   const controllable = ACTIVE_STATES.has(session.state);
@@ -163,13 +160,13 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
         >
           {chip.label}
         </span>
-        {session.active_native_turn_id && (
+        {activeTurnId && (
           <span data-control-active-turn style={{ fontSize: 11, color: "var(--aurora-fg2)" }}>
-            Agent is working…
+            {t.control.agentWorking}
           </span>
         )}
         <span style={{ flex: 1 }} />
-        {session.active_native_turn_id && controllable && (
+        {activeTurnId && controllable && (
           <button
             type="button"
             data-control-interrupt
@@ -177,7 +174,7 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
             disabled={busy}
             onClick={() => void act(() => api.interruptControlSession(session.id))}
           >
-            Interrupt
+            {t.control.interrupt}
           </button>
         )}
         {controllable && (
@@ -188,7 +185,7 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
             disabled={busy}
             onClick={() => void act(() => api.closeControlSession(session.id))}
           >
-            End control
+            {t.control.endControl}
           </button>
         )}
       </div>
@@ -212,10 +209,12 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
             onKeyDown={(event) => {
               if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                 event.preventDefault();
-                sendMessage();
+                submitComposer();
               }
             }}
-            placeholder="Send a message to this agent…"
+            placeholder={
+              activeTurnId ? t.control.steerPlaceholder : t.control.composerPlaceholder
+            }
             rows={2}
             style={{
               flex: 1,
@@ -231,11 +230,12 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
           <button
             type="button"
             data-control-send
+            data-control-send-mode={activeTurnId ? "steer" : "send"}
             style={buttonStyle}
             disabled={busy || !message.trim()}
-            onClick={sendMessage}
+            onClick={submitComposer}
           >
-            Send
+            {activeTurnId ? t.control.steer : t.control.send}
           </button>
         </div>
       )}
@@ -249,6 +249,48 @@ export default function ManagedSessionControls({ documentId }: { documentId: str
   );
 }
 
+interface GrantChoice {
+  key: string;
+  label: string;
+  granted: boolean;
+}
+
+function grantChoicesFromRequest(
+  interaction: ControlPendingInteraction,
+  labels: { write: string; read: string; network: string },
+): GrantChoice[] {
+  const permissions = interaction.request.permissions;
+  if (!permissions) return [];
+  const choices: GrantChoice[] = [];
+  for (const path of permissions.fileSystem?.write ?? []) {
+    choices.push({ key: `write:${path}`, label: `${labels.write}: ${path}`, granted: true });
+  }
+  for (const path of permissions.fileSystem?.read ?? []) {
+    choices.push({ key: `read:${path}`, label: `${labels.read}: ${path}`, granted: true });
+  }
+  if (permissions.network?.enabled) {
+    choices.push({ key: "network", label: labels.network, granted: true });
+  }
+  return choices;
+}
+
+function grantedSubset(choices: GrantChoice[]): Record<string, unknown> {
+  const write = choices
+    .filter((choice) => choice.granted && choice.key.startsWith("write:"))
+    .map((choice) => choice.key.slice("write:".length));
+  const read = choices
+    .filter((choice) => choice.granted && choice.key.startsWith("read:"))
+    .map((choice) => choice.key.slice("read:".length));
+  const network = choices.some((choice) => choice.granted && choice.key === "network");
+  const fileSystem: Record<string, string[]> = {};
+  if (write.length) fileSystem.write = write;
+  if (read.length) fileSystem.read = read;
+  const subset: Record<string, unknown> = {};
+  if (Object.keys(fileSystem).length) subset.fileSystem = fileSystem;
+  if (network) subset.network = { enabled: true };
+  return subset;
+}
+
 function PendingInteractionCard({
   sessionId,
   interaction,
@@ -260,15 +302,35 @@ function PendingInteractionCard({
   busy: boolean;
   act: (action: () => Promise<unknown>) => Promise<void> | void;
 }) {
+  const { t } = useI18n();
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [custom, setCustom] = useState<Record<string, string>>({});
+  const [grants, setGrants] = useState<GrantChoice[]>(() =>
+    grantChoicesFromRequest(interaction, {
+      write: t.control.writeAccess,
+      read: t.control.readAccess,
+      network: t.control.networkAccess,
+    }),
+  );
   const questions = interaction.request.questions ?? [];
+  const isPermissionRequest = interaction.method.includes("permissions");
 
   if (interaction.kind === "approval") {
     const request = interaction.request;
+    const title = interaction.method.includes("fileChange")
+      ? t.control.fileChangeApproval
+      : isPermissionRequest
+        ? t.control.permissionRequest
+        : t.control.commandApproval;
+    const approve = (decision: "accept" | "acceptForSession") => {
+      const subset = isPermissionRequest ? grantedSubset(grants) : undefined;
+      void act(() =>
+        api.respondControlApproval(sessionId, interaction.interaction_id, decision, subset),
+      );
+    };
     return (
       <div data-control-pending data-control-pending-kind="approval" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        <strong style={{ fontSize: 12.5 }}>{approvalTitle(interaction)}</strong>
+        <strong style={{ fontSize: 12.5 }}>{title}</strong>
         {typeof request.command === "string" && (
           <code style={{ fontSize: 12, wordBreak: "break-all" }}>{request.command}</code>
         )}
@@ -278,20 +340,54 @@ function PendingInteractionCard({
         {typeof request.reason === "string" && request.reason && (
           <span style={{ fontSize: 11.5 }}>{request.reason}</span>
         )}
+        {isPermissionRequest && grants.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {grants.map((choice, index) => (
+              <label
+                key={choice.key}
+                data-control-grant-option
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={choice.granted}
+                  disabled={busy}
+                  onChange={(event) =>
+                    setGrants((prev) =>
+                      prev.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, granted: event.target.checked }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+                <code style={{ wordBreak: "break-all" }}>{choice.label}</code>
+              </label>
+            ))}
+          </div>
+        )}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button
             type="button"
             data-control-approval-accept
             style={buttonStyle}
             disabled={busy}
-            onClick={() =>
-              void act(() =>
-                api.respondControlApproval(sessionId, interaction.interaction_id, "accept"),
-              )
-            }
+            onClick={() => approve("accept")}
           >
-            Approve
+            {t.control.approve}
           </button>
+          {isPermissionRequest && (
+            <button
+              type="button"
+              data-control-approval-accept-session
+              style={subtleButtonStyle}
+              disabled={busy}
+              onClick={() => approve("acceptForSession")}
+            >
+              {t.control.approveForSession}
+            </button>
+          )}
           <button
             type="button"
             data-control-approval-decline
@@ -303,7 +399,7 @@ function PendingInteractionCard({
               )
             }
           >
-            Decline
+            {t.control.decline}
           </button>
         </div>
       </div>
@@ -333,7 +429,7 @@ function PendingInteractionCard({
         <div key={question.id} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
           <strong style={{ fontSize: 12.5 }}>
             {question.header ? `${question.header}: ` : ""}
-            {question.question ?? "The agent needs input"}
+            {question.question ?? t.control.needsInput}
           </strong>
           <div role="radiogroup" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {(question.options ?? []).map((option) => {
@@ -369,7 +465,7 @@ function PendingInteractionCard({
               onChange={(event) =>
                 setCustom((prev) => ({ ...prev, [question.id]: event.target.value }))
               }
-              placeholder="Custom answer…"
+              placeholder={t.control.customAnswerPlaceholder}
               style={{
                 borderRadius: 8,
                 border: "1px solid var(--aurora-border)",
@@ -390,7 +486,7 @@ function PendingInteractionCard({
           disabled={busy || !ready}
           onClick={submit}
         >
-          Answer
+          {t.control.answer}
         </button>
       </div>
     </div>

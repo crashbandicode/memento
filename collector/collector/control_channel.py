@@ -187,6 +187,13 @@ class ControlChannel:
             return False
 
         started = time.monotonic()
+        keeper = _LeaseKeeper(
+            self._client,
+            command_id,
+            lease_id,
+            lease_seconds=self._lease_seconds,
+        )
+        keeper.start()
         try:
             status, error_code, detail = self._execute(kind, dict(payload))
         except Exception as exc:  # noqa: BLE001 — report, never crash the channel
@@ -196,6 +203,8 @@ class ControlChannel:
                 "command.execution_failed",
                 {"error": str(exc)[:512]},
             )
+        finally:
+            keeper.stop()
         elapsed_ms = int((time.monotonic() - started) * 1000)
         self._report_outcome(
             command_id, lease_id, status, error_code, detail, elapsed_ms
@@ -287,3 +296,67 @@ class UnsupportedServerError(Exception):
     def __init__(self, status_code: int) -> None:
         super().__init__(f"control channel unsupported: HTTP {status_code}")
         self.status_code = status_code
+
+
+class _LeaseKeeper:
+    """Renews a command lease while its execution outlives the lease window.
+
+    Fast commands finish before the first renewal fires, so the keeper is
+    free in the common case. Renewal failures are logged only — the server's
+    lease-expiry policy remains the safety net, and a 409 means the outcome
+    race is already decided, so the keeper stops immediately.
+    """
+
+    def __init__(
+        self,
+        client: httpx.Client,
+        command_id: str,
+        lease_id: str,
+        *,
+        lease_seconds: int,
+        interval_seconds: float | None = None,
+    ) -> None:
+        self._client = client
+        self._command_id = command_id
+        self._lease_id = lease_id
+        self._lease_seconds = lease_seconds
+        self._interval = interval_seconds if interval_seconds is not None else max(
+            20.0, lease_seconds / 3.0
+        )
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.renewals = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="control-lease-keeper"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                response = self._client.post(
+                    f"/api/control/commands/{self._command_id}/heartbeat",
+                    json={
+                        "lease_id": self._lease_id,
+                        "lease_seconds": self._lease_seconds,
+                    },
+                )
+                if response.status_code == 409:
+                    logger.warning(
+                        "Lease for %s already superseded; stopping renewal",
+                        self._command_id,
+                    )
+                    return
+                response.raise_for_status()
+                self.renewals += 1
+            except Exception as exc:  # noqa: BLE001 — renewal is best-effort
+                logger.warning(
+                    "Lease renewal for %s failed: %s", self._command_id, exc
+                )

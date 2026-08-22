@@ -105,6 +105,38 @@ def _run_turn(turn_id: str, text: str) -> None:
             }
         )
 
+    if "PERMS" in text:
+        result = _server_request(
+            "item/permissions/requestApproval",
+            {
+                "threadId": "thr_fake",
+                "turnId": turn_id,
+                "itemId": "item_perm",
+                "environmentId": "local",
+                "cwd": "/tmp",
+                "reason": "Need write access",
+                "permissions": {
+                    "fileSystem": {"write": ["/a", "/b"]},
+                    "network": {"enabled": True},
+                },
+            },
+        )
+        _send(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_fake",
+                    "turnId": turn_id,
+                    "item": {
+                        "id": "item_perm",
+                        "type": "toolCall",
+                        "status": "completed",
+                        "grantedResponse": result,
+                    },
+                },
+            }
+        )
+
     if "APPROVE" in text:
         decision = _server_request(
             "item/commandExecution/requestApproval",

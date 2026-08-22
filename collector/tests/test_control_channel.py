@@ -169,6 +169,61 @@ def test_capability_snapshot_is_bounded_and_versioned() -> None:
     assert snapshot["agents"] == {}
 
 
+def test_lease_keeper_renews_while_execution_runs() -> None:
+    import time
+
+    from collector.control_channel import _LeaseKeeper
+
+    class _CountingClient:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict]] = []
+
+        def post(self, path: str, *, json: dict) -> httpx.Response:
+            self.requests.append((path, json))
+            request = httpx.Request("POST", f"https://memento.invalid{path}")
+            return httpx.Response(200, request=request, json={})
+
+    client = _CountingClient()
+    keeper = _LeaseKeeper(
+        client, "cmd-9", "lease-9", lease_seconds=300, interval_seconds=0.03
+    )
+    keeper.start()
+    time.sleep(0.2)
+    keeper.stop()
+
+    assert keeper.renewals >= 2
+    path, body = client.requests[0]
+    assert path == "/api/control/commands/cmd-9/heartbeat"
+    assert body == {"lease_id": "lease-9", "lease_seconds": 300}
+
+
+def test_lease_keeper_stops_after_superseded_lease() -> None:
+    import time
+
+    from collector.control_channel import _LeaseKeeper
+
+    class _SupersededClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, path: str, *, json: dict) -> httpx.Response:
+            self.calls += 1
+            request = httpx.Request("POST", f"https://memento.invalid{path}")
+            return httpx.Response(409, request=request, json={})
+
+    client = _SupersededClient()
+    keeper = _LeaseKeeper(
+        client, "cmd-10", "lease-10", lease_seconds=300, interval_seconds=0.03
+    )
+    keeper.start()
+    time.sleep(0.2)
+    keeper.stop()
+
+    # A 409 means the outcome race is decided; exactly one attempt is made.
+    assert client.calls == 1
+    assert keeper.renewals == 0
+
+
 def test_run_loop_survives_unexpected_exceptions(monkeypatch) -> None:
     """A dead channel thread silently kills the machine's heartbeat.
 
