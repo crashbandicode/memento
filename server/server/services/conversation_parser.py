@@ -742,6 +742,17 @@ def _set_identity_field(
     return False
 
 
+def _is_internal_model_sentinel(value: object) -> bool:
+    """Return whether a provider field is transport metadata, not a model.
+
+    Claude emits a literal ``<synthetic>`` model for locally-generated
+    no-op replies (for example the acknowledgement behind ``/model``).  It
+    is not a selectable model and must never replace the last real assistant
+    identity or escape into the UI/API telemetry surface.
+    """
+    return _bounded_identity_text(value).casefold() in {"<synthetic>"}
+
+
 def _set_agent_mode(state: AssistantIdentityState, payload: dict) -> bool:
     """Apply a native collaboration mode while preserving explicit clears."""
     for key in ("collaboration_mode", "collaborationMode"):
@@ -950,7 +961,8 @@ def _update_assistant_identity(
             return
 
         message = _as_mapping(obj.get("message"))
-        _set_identity_field(state, message, ("model",), "model")
+        if not _is_internal_model_sentinel(message.get("model")):
+            _set_identity_field(state, message, ("model",), "model")
         explicit_effort = _set_identity_field(
             state,
             obj,
@@ -1712,6 +1724,19 @@ def parse_conversation_object(
             message = _as_mapping(obj.get("message"))
             role = _coerce_text(message.get("role") or msg_type)
             raw_content = message.get("content", "")
+
+            # Claude inserts this provider-internal acknowledgement after
+            # certain local commands.  It carries no agent response and its
+            # ``<synthetic>`` model is a transport sentinel, so rendering it
+            # as an assistant message invents both content and model context.
+            if (
+                role == "assistant"
+                and _is_internal_model_sentinel(message.get("model"))
+                and _extract_content(raw_content).strip()
+                == "No response requested."
+                and not _extract_thinking_parts(raw_content).strip()
+            ):
+                return None
 
             # Claude Code records slash commands as synthetic user messages.
             # They are useful session context, but they are not human prompts;

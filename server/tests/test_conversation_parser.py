@@ -2823,6 +2823,65 @@ class ConversationParserTests(unittest.TestCase):
 
         self.assertIsNone(parse_conversation_line(raw, "claude_code"))
 
+    def test_claude_synthetic_local_command_noop_is_hidden(self) -> None:
+        raw = json.dumps({
+            "type": "assistant",
+            "uuid": "assistant-synthetic-noop",
+            "timestamp": "2026-08-21T17:34:35.415Z",
+            "message": {
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": [{
+                    "type": "text",
+                    "text": "No response requested.",
+                }],
+            },
+        })
+
+        self.assertIsNone(parse_conversation_line(raw, "claude_code"))
+        self.assertEqual(parse_conversation(raw, "claude_code"), [])
+
+    def test_claude_synthetic_model_never_replaces_real_identity(self) -> None:
+        raw = "\n".join([
+            json.dumps({
+                "type": "assistant",
+                "uuid": "assistant-real",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-fable-5",
+                    "content": [{"type": "text", "text": "Before"}],
+                },
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "assistant-synthetic-noop",
+                "message": {
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{
+                        "type": "text",
+                        "text": "No response requested.",
+                    }],
+                },
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "assistant-after",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "After"}],
+                },
+            }),
+        ])
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual([message.content for message in messages], ["Before", "After"])
+        self.assertEqual(
+            [message.model for message in messages],
+            ["claude-fable-5", "claude-fable-5"],
+        )
+
     def test_claude_meta_prompt_is_session_context_not_human_input(self) -> None:
         # Real Claude Code slash-command expansion records carry isMeta=true.
         raw = json.dumps({

@@ -37,6 +37,7 @@ from server.services.agent_control import (
     STATE_LEASED,
     STATE_QUEUED,
     ControlErrorCodes,
+    ControlEventScopeError,
     StaleControlLease,
     UnsupportedCommandKind,
     _supported_kinds,
@@ -381,6 +382,46 @@ async def test_collector_event_batch_is_idempotent(session_factory) -> None:
 
         assert first == {"accepted": 1, "duplicates": 0}
         assert replay == {"accepted": 0, "duplicates": 1}
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_collector_events_cannot_reference_another_machine_command(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        owner, owner_machine = await _seed(db)
+        other_owner, other_machine = await _seed(db)
+        other_command, _ = await admit_command(
+            db,
+            machine=other_machine,
+            user_id=other_owner.id,
+            kind=KIND_CONVERSATION_REPAIR,
+        )
+        event = {
+            "schema_version": 1,
+            "event_id": str(uuid.uuid4()),
+            "event_type": "collector.execution_started",
+            "command_id": other_command.id,
+            "trace_id": other_command.trace_id,
+            "details": {},
+        }
+
+        with pytest.raises(ControlEventScopeError) as caught:
+            await ingest_control_events(
+                db,
+                machine=owner_machine,
+                events=[event],
+            )
+
+        assert caught.value.field == "command_id"
+        rows = await db.execute(
+            select(AgentControlEvent).where(
+                AgentControlEvent.machine_id == owner_machine.id,
+                AgentControlEvent.event_id == event["event_id"],
+            )
+        )
+        assert rows.scalar_one_or_none() is None
 
 
 @requires_postgres

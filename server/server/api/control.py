@@ -26,6 +26,7 @@ from ..middleware.auth import get_current_user, verify_collector_token
 from ..services.agent_control import (
     ControlCommandNotFound,
     ControlErrorCodes,
+    ControlEventScopeError,
     StaleControlLease,
     acknowledge_command,
     command_public,
@@ -257,11 +258,20 @@ async def ingest_events(
     machine = await ensure_device(
         db, x_device_id, x_device_name, x_device_platform, user_id=collector_user.id
     )
-    result = await ingest_control_events(
-        db,
-        machine=machine,
-        events=[event.model_dump() for event in req.events],
-    )
+    try:
+        result = await ingest_control_events(
+            db,
+            machine=machine,
+            events=[event.model_dump() for event in req.events],
+        )
+    except ControlEventScopeError as error:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": ControlErrorCodes.AUTH_SCOPE_DENIED,
+                "field": error.field,
+            },
+        ) from error
     return result
 
 

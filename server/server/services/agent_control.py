@@ -24,7 +24,13 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import AgentControlCommand, AgentControlEvent, Document, Machine
+from ..db.models import (
+    AgentControlCommand,
+    AgentControlEvent,
+    AgentControlSession,
+    Document,
+    Machine,
+)
 from ..db.session import queue_realtime_event
 from .document_delivery import (
     delivery_file_size_expression,
@@ -112,6 +118,14 @@ class UnsupportedCommandKind(Exception):
     def __init__(self, kind: str) -> None:
         super().__init__(ControlErrorCodes.UNSUPPORTED)
         self.kind = kind
+
+
+class ControlEventScopeError(Exception):
+    """A collector event referenced state outside its authenticated machine."""
+
+    def __init__(self, field: str) -> None:
+        super().__init__(ControlErrorCodes.AUTH_SCOPE_DENIED)
+        self.field = field
 
 
 def _now() -> datetime:
@@ -627,8 +641,76 @@ async def ingest_control_events(
     ``(machine_id, event_id)`` uniqueness fence, mirroring the proven
     orchestration receipt pattern.
     """
+    command_ids = {
+        event.get("command_id") for event in events if event.get("command_id")
+    }
+    session_ids = {
+        event.get("control_session_id")
+        for event in events
+        if event.get("control_session_id")
+    }
+    document_ids = {
+        event.get("document_id") for event in events if event.get("document_id")
+    }
+    owned_commands = {
+        command.id: command
+        for command in (
+            await db.execute(
+                select(AgentControlCommand).where(
+                    AgentControlCommand.machine_id == machine.id,
+                    AgentControlCommand.id.in_(command_ids),
+                )
+            )
+        ).scalars().all()
+    } if command_ids else {}
+    owned_session_ids = set((
+        await db.execute(
+            select(AgentControlSession.id).where(
+                AgentControlSession.machine_id == machine.id,
+                AgentControlSession.id.in_(session_ids),
+            )
+        )
+    ).scalars().all()) if session_ids else set()
+    owned_document_ids = set((
+        await db.execute(
+            select(Document.id).where(
+                Document.machine_id == machine.id,
+                Document.id.in_(document_ids),
+            )
+        )
+    ).scalars().all()) if document_ids else set()
+
+    # Foreign keys alone do not express machine ownership. Validate the whole
+    # batch before inserting any row so a leaked collector token cannot forge
+    # trace links to another device's command, session, or document.
+    for event in events:
+        command_id = event.get("command_id")
+        control_session_id = event.get("control_session_id")
+        document_id = event.get("document_id")
+        if command_id and command_id not in owned_commands:
+            raise ControlEventScopeError("command_id")
+        if control_session_id and control_session_id not in owned_session_ids:
+            raise ControlEventScopeError("control_session_id")
+        if document_id and document_id not in owned_document_ids:
+            raise ControlEventScopeError("document_id")
+        command = owned_commands.get(command_id)
+        if command is not None:
+            if event.get("trace_id") not in (None, command.trace_id):
+                raise ControlEventScopeError("trace_id")
+            if (
+                command.control_session_id is not None
+                and control_session_id not in (None, command.control_session_id)
+            ):
+                raise ControlEventScopeError("control_session_id")
+            if (
+                command.document_id is not None
+                and document_id not in (None, command.document_id)
+            ):
+                raise ControlEventScopeError("document_id")
+
     accepted = duplicates = 0
     for event in events:
+        command = owned_commands.get(event.get("command_id"))
         inserted = (
             await db.execute(
                 pg_insert(AgentControlEvent)
@@ -637,15 +719,39 @@ async def ingest_control_events(
                     event_id=str(event["event_id"]),
                     machine_id=machine.id,
                     command_id=event.get("command_id"),
-                    control_session_id=event.get("control_session_id"),
-                    trace_id=event.get("trace_id"),
+                    control_session_id=(
+                        command.control_session_id
+                        if command is not None
+                        else event.get("control_session_id")
+                    ),
+                    trace_id=(
+                        command.trace_id
+                        if command is not None
+                        else event.get("trace_id")
+                    ),
                     parent_event_id=event.get("parent_event_id"),
                     event_type=str(event["event_type"]),
                     origin="collector",
-                    document_id=event.get("document_id"),
-                    native_session_id=event.get("native_session_id"),
-                    native_turn_id=event.get("native_turn_id"),
-                    interaction_id=event.get("interaction_id"),
+                    document_id=(
+                        command.document_id
+                        if command is not None and command.document_id is not None
+                        else event.get("document_id")
+                    ),
+                    native_session_id=(
+                        command.native_session_id
+                        if command is not None and command.native_session_id
+                        else event.get("native_session_id")
+                    ),
+                    native_turn_id=(
+                        command.native_turn_id
+                        if command is not None and command.native_turn_id
+                        else event.get("native_turn_id")
+                    ),
+                    interaction_id=(
+                        command.interaction_id
+                        if command is not None and command.interaction_id
+                        else event.get("interaction_id")
+                    ),
                     adapter=event.get("adapter"),
                     adapter_version=event.get("adapter_version"),
                     collector_revision=event.get("collector_revision"),

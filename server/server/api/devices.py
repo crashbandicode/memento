@@ -7,9 +7,10 @@ import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -253,7 +254,7 @@ async def send_command(
     device_db_id: uuid.UUID,
     action: str = "resync",
     document_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
+    idempotency_key: Annotated[str | None, Query(max_length=128)] = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -337,7 +338,7 @@ async def send_command(
 async def send_command_by_collector_id(
     collector_id: str,
     action: str = "resync",
-    idempotency_key: str | None = None,
+    idempotency_key: Annotated[str | None, Query(max_length=128)] = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
