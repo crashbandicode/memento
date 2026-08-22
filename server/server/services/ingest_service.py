@@ -25,6 +25,7 @@ from ..db.models import (
     Tool,
 )
 from ..tool_catalog import tool_display_name
+from .claude_lineage import EXACT_PERMISSION_RESPONSE_BACKFILL
 from .conversation_identity import (
     conversation_session_id,
     select_canonical_conversation_document,
@@ -631,6 +632,35 @@ def _preserve_interaction_entry_provenance(
         merged["interaction_origin_backfill"] = prior[
             "interaction_origin_backfill"
         ]
+    prior_response = prior.get("response")
+    incoming_response = incoming.get("response")
+    prior_answers = (
+        prior_response.get("answers")
+        if isinstance(prior_response, dict)
+        else None
+    )
+    incoming_answers = (
+        incoming_response.get("answers")
+        if isinstance(incoming_response, dict)
+        else None
+    )
+    if (
+        same_event
+        and prior.get("status") == "answered"
+        and incoming.get("status") == "answered"
+        and prior.get("response_backfill")
+        == EXACT_PERMISSION_RESPONSE_BACKFILL
+        and isinstance(prior_answers, list)
+        and bool(prior_answers)
+        and (not isinstance(incoming_answers, list) or not incoming_answers)
+    ):
+        # Historical exact-execution repairs are server-enriched metadata.
+        # An older collector cannot reproduce them from its side record, so a
+        # later authoritative replay must not erase the proven answer.  This
+        # deliberately does not carry responses across a new timestamp/state
+        # or over a newly recorded non-empty native response.
+        merged["response"] = json.loads(json.dumps(prior_response))
+        merged["response_backfill"] = EXACT_PERMISSION_RESPONSE_BACKFILL
     return merged
 
 

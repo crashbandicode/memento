@@ -251,6 +251,84 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("interaction_origin", history)
         self.assertNotIn("interaction_origin_backfill", history)
 
+    def test_old_collector_refresh_preserves_exact_permission_response(
+        self,
+    ) -> None:
+        interaction = {
+            "id": "permission-1",
+            "interaction_type": "permission_request",
+            "requested_tool": "Bash",
+            "tool_input": {"command": "git status"},
+        }
+        exact_response = {
+            "kind": "question_response",
+            "interaction_id": "permission-1",
+            "status": "answered",
+            "answers": [{
+                "question_id": "permission-decision",
+                "text": "Yes",
+                "selected_option_ids": ["allow"],
+            }],
+            "raw_text": "Yes",
+        }
+        existing = {
+            "_interaction_history": [{
+                "interaction": interaction,
+                "timestamp": "2026-08-14T10:00:00Z",
+                "status": "answered",
+                "response": exact_response,
+                "response_backfill": "exact_executed_tool_result_v1",
+            }]
+        }
+        incoming = {
+            "_interaction_history": [{
+                "interaction": interaction,
+                "timestamp": "2026-08-14T10:00:00Z",
+                "status": "answered",
+                "response": {"answers": []},
+            }]
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        history = merged["_interaction_history"][0]
+        self.assertEqual(history["response"], exact_response)
+        self.assertEqual(
+            history["response_backfill"],
+            "exact_executed_tool_result_v1",
+        )
+
+    def test_exact_permission_response_is_not_carried_to_new_state(self) -> None:
+        interaction = {
+            "id": "permission-1",
+            "interaction_type": "permission_request",
+            "requested_tool": "Bash",
+            "tool_input": {"command": "git status"},
+        }
+        existing = {
+            "_interaction_history": [{
+                "interaction": interaction,
+                "timestamp": "2026-08-14T10:00:00Z",
+                "status": "answered",
+                "response": {"answers": [{"selected_option_ids": ["allow"]}]},
+                "response_backfill": "exact_executed_tool_result_v1",
+            }]
+        }
+        incoming = {
+            "_interaction_history": [{
+                "interaction": interaction,
+                "timestamp": "2026-08-14T10:00:00Z",
+                "status": "pending",
+            }]
+        }
+
+        merged = _preserve_interaction_provenance(existing, incoming)
+
+        history = merged["_interaction_history"][0]
+        self.assertEqual(history["status"], "pending")
+        self.assertNotIn("response", history)
+        self.assertNotIn("response_backfill", history)
+
     def test_interaction_provenance_is_not_copied_to_a_different_id(self) -> None:
         existing = {
             "_interaction_history": {

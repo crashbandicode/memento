@@ -23,6 +23,7 @@ from ..db.models import ClaudeConversationLineageRecord, Document
 
 INTERACTION_ORIGIN_KEY = "interaction_origin"
 INTERACTION_ORIGIN_VERSION = 1
+EXACT_PERMISSION_RESPONSE_BACKFILL = "exact_executed_tool_result_v1"
 _ORIGIN_KINDS = {"claude_record", "claude_subagent_record", "hook_only"}
 _UUID_VALUE_LIMIT = 512
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)

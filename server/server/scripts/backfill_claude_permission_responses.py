@@ -24,7 +24,10 @@ from typing import Any, Iterable
 import asyncpg
 
 from server.scripts.reparse_conversations import _database_dsn
-from server.services.claude_lineage import canonical_permission_fingerprint
+from server.services.claude_lineage import (
+    EXACT_PERMISSION_RESPONSE_BACKFILL,
+    canonical_permission_fingerprint,
+)
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,7 @@ def plan_permission_response_repairs(
                 }],
                 "raw_text": "Yes",
             }
-            repaired["response_backfill"] = "exact_executed_tool_result_v1"
+            repaired["response_backfill"] = EXACT_PERMISSION_RESPONSE_BACKFILL
             repairs.append(PermissionRepair(
                 document_id=document.id,
                 history_index=index,
