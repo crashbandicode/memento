@@ -261,6 +261,13 @@ class ControlChannel:
                 logger.debug("Control poll failed: %s", exc)
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, _ERROR_BACKOFF_MAX)
+            except Exception:  # noqa: BLE001 — the channel must outlive any cycle
+                # This thread is the machine's only heartbeat/command path; a
+                # dead thread looks identical to a healthy idle one from the
+                # server side. Log loudly and keep polling.
+                logger.exception("Control poll cycle failed; channel continues")
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, _ERROR_BACKOFF_MAX)
 
 
 class UnsupportedServerError(Exception):

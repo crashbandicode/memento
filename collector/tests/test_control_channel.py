@@ -166,3 +166,33 @@ def test_capability_snapshot_is_bounded_and_versioned() -> None:
     assert snapshot["schema_version"] == 1
     assert snapshot["platform"] == "Windows"
     assert snapshot["agents"] == {}
+
+
+def test_run_loop_survives_unexpected_exceptions(monkeypatch) -> None:
+    """A dead channel thread silently kills the machine's heartbeat.
+
+    Any exception a poll cycle can raise — not just transport errors — must
+    leave the loop running (observed live 2026-08-22: a stalled heartbeat is
+    indistinguishable from a healthy idle collector server-side).
+    """
+    import collector.control_channel as module
+
+    monkeypatch.setattr(module, "_ERROR_BACKOFF_INITIAL", 0.01)
+    monkeypatch.setattr(module, "_ERROR_BACKOFF_MAX", 0.02)
+
+    calls: list[int] = []
+
+    class _ExplodingClient:
+        def post(self, path: str, *, json: dict):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("malformed body / unexpected bug")
+            channel._stop.set()
+            request = httpx.Request("POST", f"https://memento.invalid{path}")
+            return httpx.Response(200, request=request, json={"commands": []})
+
+    channel = _channel(_ExplodingClient(), lambda kind, payload: ("completed", None, {}))
+
+    channel._run()  # must return via stop event, not raise
+
+    assert len(calls) >= 2  # survived the RuntimeError and polled again
