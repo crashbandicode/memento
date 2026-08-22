@@ -153,6 +153,20 @@ const RANGES: Array<{ id: SpendRange; label: string; hours?: number }> = [
   { id: "mtd", label: "MTD" },
 ];
 
+function useNarrowSpendLayout(): boolean {
+  const [narrow, setNarrow] = useState(false);
+
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 760px)");
+    const update = () => setNarrow(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  return narrow;
+}
+
 function finite(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -276,6 +290,7 @@ function SpendHistoryChart({
   projection?: ProjectionView["projection"];
   projectionsVisible: boolean;
 }) {
+  const narrowLayout = useNarrowSpendLayout();
   const width = 600;
   const height = 300;
   const inset = { left: 46, right: 18, top: 22, bottom: 35 };
@@ -305,7 +320,24 @@ function SpendHistoryChart({
   const plotTop = inset.top;
   const usageBandTop = brokenScale ? 145 : plotTop;
   const projectionFloor = brokenScale ? 114 : plotTop;
-  const x = (value: Timestamp) => inset.left + ((timestamp(value) - minTime) / (maxTime - minTime)) * (width - inset.left - inset.right);
+  const resetTime = summary.resetsAt ? Date.parse(summary.resetsAt) : Number.NaN;
+  const showProjectionRays = projectionsVisible
+    && projectionValues.length > 0
+    && !narrowLayout
+    && Number.isFinite(resetTime)
+    && resetTime > maxTime;
+  const plotWidth = width - inset.left - inset.right;
+  const historyWidth = plotWidth * (showProjectionRays ? 0.72 : 1);
+  const futureWidth = plotWidth - historyWidth;
+  const historySpan = Math.max(1, maxTime - minTime);
+  const futureSpan = Math.max(1, resetTime - maxTime);
+  const x = (value: Timestamp) => {
+    const time = timestamp(value);
+    if (!showProjectionRays || time <= maxTime) {
+      return inset.left + ((time - minTime) / historySpan) * historyWidth;
+    }
+    return inset.left + historyWidth + ((time - maxTime) / futureSpan) * futureWidth;
+  };
   const y = (value: number) => {
     if (!brokenScale || value <= usageTop) {
       const top = brokenScale ? usageBandTop : plotTop;
@@ -321,7 +353,7 @@ function SpendHistoryChart({
     if (!hasChart) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const localX = ((event.clientX - rect.left) / rect.width) * width;
-    const target = minTime + ((localX - inset.left) / (width - inset.left - inset.right)) * (maxTime - minTime);
+    const target = minTime + ((localX - inset.left) / historyWidth) * historySpan;
     let best = 0;
     let distance = Number.POSITIVE_INFINITY;
     outline.forEach((point, index) => {
@@ -347,8 +379,7 @@ function SpendHistoryChart({
   const currentValue = finite(current.u) || finite(current.y1);
   const currentX = x(current.t);
   const currentY = y(currentValue);
-  const resetTime = summary.resetsAt ? Date.parse(summary.resetsAt) : Number.NaN;
-  const rayEndX = Number.isFinite(resetTime) && resetTime > maxTime ? width - inset.right - 90 : width - inset.right;
+  const rayEndX = showProjectionRays ? x(resetTime) : width - inset.right;
   const hoverPoint = hover == null ? null : outline[hover];
   const hoverValue = hoverPoint ? finite(hoverPoint.u) || finite(hoverPoint.y1) : 0;
   const tickValues = brokenScale ? [0, usageTop, highMax] : [0, highMax / 2, highMax];
@@ -390,7 +421,7 @@ function SpendHistoryChart({
               <text x={inset.left + 4} y={y(finite(summary.limitCents)) - 5} fill={PROJECTION_COLORS.realistic} fontSize="9">limit {summary.limit || centsLabel(finite(summary.limitCents))}</text>
             </g>
           )}
-          {projectionsVisible && projectionValues.length > 0 && (
+          {showProjectionRays && (
             <g className="spend-projection-rays">
               {(["worst", "realistic", "average"] as const).map((key) => {
                 const scenario = projection?.[key];
@@ -407,7 +438,10 @@ function SpendHistoryChart({
             </g>
           )}
           <text x={inset.left} y={height - 8} fill="var(--aurora-fg4)" fontSize="10">{new Date(minTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
-          <text x={width - inset.right} y={height - 8} textAnchor="end" fill="var(--aurora-fg4)" fontSize="10">{new Date(maxTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
+          {showProjectionRays && (
+            <text x={currentX} y={height - 8} textAnchor="middle" fill="var(--aurora-fg4)" fontSize="10">{new Date(maxTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
+          )}
+          <text x={width - inset.right} y={height - 8} textAnchor="end" fill="var(--aurora-fg4)" fontSize="10">{new Date(showProjectionRays ? resetTime : maxTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
         </svg>
         {hoverPoint && (
           <div className="spend-tooltip" style={{ left: `${Math.min(78, Math.max(8, (x(hoverPoint.t) / width) * 100))}%` }}>

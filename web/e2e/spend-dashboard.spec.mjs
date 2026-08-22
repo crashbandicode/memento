@@ -59,8 +59,8 @@ const snapshot = {
       ],
     },
     claude: { name: "Claude", email: "claude@example.test", used: "$90.00", limit: "$200.00", remaining: "$110.00", usedCents: 9000, limitCents: 20000, pctUsed: 45, billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000) },
-    cursor: { used: "$60.00", limit: "$200.00", remaining: "$140.00", usedCents: 6000, limitCents: 20000, pctUsed: 30 },
-    codex: { used: "$30.00", limit: "$100.00", remaining: "$70.00", usedCents: 3000, limitCents: 10000, pctUsed: 30 },
+    cursor: { used: "$60.00", limit: "$200.00", remaining: "$140.00", usedCents: 6000, limitCents: 20000, pctUsed: 30, billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000) },
+    codex: { used: "$30.00", limit: "$100.00", remaining: "$70.00", usedCents: 3000, limitCents: 10000, pctUsed: 30, billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000) },
   },
   models: {
     claude: {
@@ -93,7 +93,7 @@ const snapshot = {
       },
     },
     cursor: { points: [{ t: now - 86400000, u: 2000 }, { t: now, u: 6000 }] },
-    codex: { points: [] },
+    codex: { points: [{ t: at(-86400000), u: 1000 }, { t: at(0), u: 3000 }] },
   },
 };
 
@@ -148,13 +148,24 @@ async function assertSpendDashboard(page) {
   await expect(page.locator('svg[aria-label="claude month-to-date spend history"] path')).not.toHaveCount(0);
 
   await page.getByRole("tab", { name: "Codex" }).click();
-  await expect(page.getByText("Codex history will appear after its analytics cache has a session mix.")).toBeVisible();
+  await expect(page.getByRole("img", { name: "codex month-to-date spend history" })).toBeVisible();
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
 }
 
 test("spend snapshot paints supplied bands and remains coherent on desktop", async ({ page }) => {
   await installRoutes(page);
   await assertSpendDashboard(page);
+
+  for (const source of ["Claude", "Cursor", "Codex"]) {
+    await page.getByRole("tab", { name: source, exact: true }).click();
+    const projectionRays = page.locator(`svg[aria-label="${source.toLowerCase()} month-to-date spend history"] .spend-projection-rays line`);
+    await expect(projectionRays).toHaveCount(3);
+    const coordinates = await projectionRays.evaluateAll((lines) => lines.map((line) => ({
+      x1: Number(line.getAttribute("x1")),
+      x2: Number(line.getAttribute("x2")),
+    })));
+    expect(coordinates.every(({ x1, x2 }) => Number.isFinite(x1) && Number.isFinite(x2) && x1 < x2)).toBe(true);
+  }
 });
 
 test("spend snapshot remains usable at an Android viewport", async ({ browser }) => {
@@ -165,5 +176,7 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   const page = await context.newPage();
   await installRoutes(page);
   await assertSpendDashboard(page);
+  await page.getByRole("tab", { name: "Claude", exact: true }).click();
+  await expect(page.locator('svg[aria-label="claude month-to-date spend history"] .spend-projection-rays')).toHaveCount(0);
   await context.close();
 });
