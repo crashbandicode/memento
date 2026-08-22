@@ -4906,11 +4906,15 @@ function AgentActivityCard({
   event,
   timestamp,
   locale,
+  t,
 }: {
   event: ConversationAgentEvent;
   timestamp?: string | null;
   locale: string;
+  t: ReturnType<typeof useI18n>["t"];
 }) {
+  const [summaryExpanded, setSummaryExpanded] = useState(false);
+
   if (event.kind === "snapshot") {
     const agents = [...(event.agents || [])].sort((left, right) => {
       const rank = { running: 0, failed: 1, cancelled: 2, interrupted: 3, completed: 4, disconnected: 5, unknown: 6 };
@@ -5046,6 +5050,11 @@ function AgentActivityCard({
   const showResultSummary = Boolean(
     event.result_summary && event.status !== "async_launched",
   );
+  const resultSummary = showResultSummary ? event.result_summary?.trim() || "" : "";
+  const resultSummaryIsLong = resultSummary.length > 420;
+  const visibleResultSummary = resultSummaryIsLong && !summaryExpanded
+    ? truncateMarkdownPreview(resultSummary, 420)
+    : resultSummary;
   const hasDetails = Boolean(
     showResultSummary
       || event.output_path
@@ -5062,7 +5071,7 @@ function AgentActivityCard({
       data-agent-activity-type={event.activity_type || "subagent"}
       title={event.agent_path || event.output_path}
       style={{
-        width: "fit-content",
+        width: showResultSummary ? "min(100%, 820px)" : "fit-content",
         maxWidth: "100%",
         display: "grid",
         gap: hasDetails ? 7 : 0,
@@ -5155,16 +5164,31 @@ function AgentActivityCard({
         <div
           data-agent-result-summary
           style={{
-            maxWidth: 680,
-            paddingLeft: 30,
+            maxWidth: 760,
+            marginLeft: 30,
+            padding: "9px 11px",
+            border: "1px solid color-mix(in srgb, var(--aurora-accent) 12%, var(--aurora-border))",
+            borderRadius: 10,
+            background: "color-mix(in srgb, var(--aurora-chip) 55%, transparent)",
             color: "var(--aurora-fg3)",
             fontSize: 11,
             lineHeight: 1.45,
-            whiteSpace: "pre-wrap",
+            minWidth: 0,
             overflowWrap: "anywhere",
           }}
         >
-          {event.result_summary}
+          <div className="prose prose-sm max-w-none" data-agent-result-markdown>
+            <MarkdownViewer content={visibleResultSummary} />
+          </div>
+          {resultSummaryIsLong && (
+            <span data-agent-summary-toggle>
+              <MessageExpandButton
+                expanded={summaryExpanded}
+                onClick={() => setSummaryExpanded((current) => !current)}
+                t={t}
+              />
+            </span>
+          )}
         </div>
       )}
       {event.output_path && (
@@ -5256,7 +5280,7 @@ export const ChatBubble = memo(function ChatBubble({
   const agentEvent = msg.agent_event;
   if (role === "tool" && agentEvent) {
     if (isTaskActivityEvent(agentEvent) ? !showTasks : !showAgents) return null;
-    return <AgentActivityCard event={agentEvent} timestamp={msg.timestamp} locale={locale} />;
+    return <AgentActivityCard event={agentEvent} timestamp={msg.timestamp} locale={locale} t={t} />;
   }
   if (role === "tool" && taskState) {
     if (!showTasks) return null;

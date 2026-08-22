@@ -1480,6 +1480,76 @@ export const urlNavigationCanvasThread = {
   },
 };
 
+/** Completed parent-thread subagent result with rich Markdown. */
+export const subagentMarkdownSummary = {
+  docId: "conv-subagent-markdown-summary",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "conv-subagent-markdown-summary",
+    tool_id: "claude_code",
+    title: "Subagent Markdown result",
+    relative_path: "projects/demo/subagent-markdown-summary.jsonl",
+    metadata: { session_id: "subagent-markdown-summary" },
+    message_count: 2,
+    subagent_count: 1,
+    is_subagent_orphan: false,
+    synced_at: T3,
+    activity_at: T3,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 1,
+      line_number: 1,
+      role: "user",
+      content: "Inventory the MongoDB feature surface in parallel.",
+      timestamp: T0,
+    },
+    {
+      id: 2,
+      line_number: 2,
+      role: "tool",
+      content: "[Subagent completed]",
+      agent_event: {
+        version: 1,
+        kind: "completed",
+        activity_type: "subagent",
+        label: "API/SLO Mongo feature inventory",
+        agent_path: "root/mongo-inventory",
+        model: "claude-opus-4-1",
+        reasoning_effort: "high",
+        completed_at: T3,
+        result_summary: [
+          "# MongoDB feature inventory",
+          "",
+          "The **read path** uses a deliberately narrow feature set.",
+          "",
+          "| Operator | Location | Risk |",
+          "| --- | --- | --- |",
+          "| `$in` | `src/api/query.py:295` | Low |",
+          "| `$lookup` | diagnostics only | Medium |",
+          "",
+          "## Findings",
+          "",
+          "- Equality-list filters become `$in` queries.",
+          "- Sorting is repeated after fan-out merge to preserve null ordering.",
+          "- Pagination supports both keyset and bounded offset modes.",
+          "- Projections remain inclusion-only except for `_id` exclusion.",
+          "- Diagnostic tools exercise a wider surface than the request path.",
+          "",
+          "## Recommendation",
+          "",
+          "Keep the compatibility probe focused on production query shapes, then run the richer diagnostic suite separately so a tool-only feature does not block the primary migration decision.",
+        ].join("\n"),
+      },
+      timestamp: T3,
+    },
+  ]),
+  prompts: [
+    { id: 1, line_number: 1, content: "Inventory the MongoDB feature surface in parallel.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+};
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -1500,4 +1570,5 @@ export const scenarios = {
   [claudeCanvas.docId]: claudeCanvas,
   [urlNavigationLargeThread.docId]: urlNavigationLargeThread,
   [urlNavigationCanvasThread.docId]: urlNavigationCanvasThread,
+  [subagentMarkdownSummary.docId]: subagentMarkdownSummary,
 };
