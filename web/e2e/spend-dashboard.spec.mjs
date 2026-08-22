@@ -6,6 +6,7 @@ import { seedAuth } from "./support/conversation-page.mjs";
 
 const JSON_HEADERS = { "content-type": "application/json" };
 const now = Date.UTC(2026, 7, 21, 16);
+const at = (offset) => new Date(now + offset).toISOString();
 
 const dashboard = {
   tools: [],
@@ -25,9 +26,11 @@ const dashboard = {
 
 const projection = {
   daysLeft: 10,
-  worst: { dollars: "$420.00", pctOfLimit: 84 },
-  realistic: { dollars: "$330.00", pctOfLimit: 66 },
-  average: { dollars: "$290.00", pctOfLimit: 58 },
+  current: 18000,
+  limit: 50000,
+  worst: { cents: 62000, dollars: "$620.00", pctOfLimit: 124, hits100Pct: at(7 * 86400000) },
+  realistic: { cents: 54000, dollars: "$540.00", pctOfLimit: 108, hits100Pct: at(9 * 86400000) },
+  average: { cents: 42000, dollars: "$420.00", pctOfLimit: 84 },
 };
 
 const snapshot = {
@@ -35,6 +38,7 @@ const snapshot = {
   purpose: "Read-only dashboard view.",
   ui: {
     defaultSource: "all",
+    defaultRange: "mtd",
     sources: [
       { id: "all", label: "All", stacked: false },
       { id: "claude", label: "Claude", stacked: true },
@@ -47,13 +51,14 @@ const snapshot = {
     all: {
       used: "$180.00", limit: "$500.00", remaining: "$320.00",
       usedCents: 18000, limitCents: 50000, remainingCents: 32000, pctUsed: 36,
+      billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000),
       parts: [
         { source: "claude", name: "Claude", used: "$90.00", limit: "$200.00", pctUsed: 45 },
         { source: "cursor", name: "Cursor", used: "$60.00", limit: "$200.00", pctUsed: 30 },
         { source: "codex", name: "Codex", used: "$30.00", limit: "$100.00", pctUsed: 30 },
       ],
     },
-    claude: { used: "$90.00", limit: "$200.00", remaining: "$110.00", usedCents: 9000, limitCents: 20000, pctUsed: 45 },
+    claude: { name: "Claude", email: "claude@example.test", used: "$90.00", limit: "$200.00", remaining: "$110.00", usedCents: 9000, limitCents: 20000, pctUsed: 45, billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000) },
     cursor: { used: "$60.00", limit: "$200.00", remaining: "$140.00", usedCents: 6000, limitCents: 20000, pctUsed: 30 },
     codex: { used: "$30.00", limit: "$100.00", remaining: "$70.00", usedCents: 3000, limitCents: 10000, pctUsed: 30 },
   },
@@ -77,14 +82,14 @@ const snapshot = {
     all: { projection }, claude: { projection }, cursor: { projection }, codex: { projection },
   },
   history: {
-    all: { points: [{ t: now - 172800000, u: 3000, l: 50000 }, { t: now - 86400000, u: 10000, l: 50000 }, { t: now, u: 18000, l: 50000 }] },
+    all: { points: [{ t: at(-172800000), u: 3000, l: 50000 }, { t: at(-86400000), u: 10000, l: 50000 }, { t: at(0), u: 18000, l: 50000 }] },
     claude: {
       stack: {
         traces: [
-          { model: "opus", label: "Claude Opus 4.8", color: "#F97316", points: [{ t: now - 172800000, y0: 0, y1: 1000 }, { t: now - 86400000, y0: 0, y1: 4000 }, { t: now, y0: 0, y1: 6300 }] },
-          { model: "sonnet", label: "Claude Sonnet 4.6", color: "#8B5CF6", points: [{ t: now - 172800000, y0: 1000, y1: 1800 }, { t: now - 86400000, y0: 4000, y1: 6000 }, { t: now, y0: 6300, y1: 9000 }] },
+          { model: "opus", label: "Claude Opus 4.8", color: "#F97316", points: [{ t: at(-172800000), y0: 0, y1: 1000 }, { t: at(-86400000), y0: 0, y1: 4000 }, { t: at(0), y0: 0, y1: 6300 }] },
+          { model: "sonnet", label: "Claude Sonnet 4.6", color: "#8B5CF6", points: [{ t: at(-172800000), y0: 1000, y1: 1800 }, { t: at(-86400000), y0: 4000, y1: 6000 }, { t: at(0), y0: 6300, y1: 9000 }] },
         ],
-        outline: [{ t: now - 172800000, u: 1800 }, { t: now - 86400000, u: 6000 }, { t: now, u: 9000 }],
+        outline: [{ t: at(-172800000), u: 1800 }, { t: at(-86400000), u: 6000 }, { t: at(0), u: 9000 }],
       },
     },
     cursor: { points: [{ t: now - 86400000, u: 2000 }, { t: now, u: 6000 }] },
@@ -130,14 +135,17 @@ async function assertSpendDashboard(page) {
   await expect(page.getByRole("region", { name: "AI spend" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "All" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("img", { name: "all month-to-date spend history" })).toBeVisible();
-  await expect(page.getByText("Provider quotas")).toBeVisible();
+  await expect(page.getByText("AI quota left")).toBeVisible();
+  await expect(page.getByRole("button", { name: "MTD" })).toHaveClass(/active/);
+  await expect(page.getByRole("button", { name: "Projection" })).toHaveClass(/active/);
 
   await page.getByRole("tab", { name: "Claude" }).click();
   await expect(page.getByRole("img", { name: "claude month-to-date spend history" })).toBeVisible();
   await expect(page.getByText("Claude Opus 4.8").first()).toBeVisible();
-  await page.getByText("Model and tool detail").click();
+  await expect(page.getByText("Models this cycle")).toBeVisible();
   await expect(page.getByText("56/95 coverage", { exact: false })).toBeVisible();
-  await expect(page.getByText("125K tokens")).toBeVisible();
+  await expect(page.getByText("125K tok", { exact: false })).toBeVisible();
+  await expect(page.locator('svg[aria-label="claude month-to-date spend history"] path')).not.toHaveCount(0);
 
   await page.getByRole("tab", { name: "Codex" }).click();
   await expect(page.getByText("Codex history will appear after its analytics cache has a session mix.")).toBeVisible();
