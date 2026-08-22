@@ -1017,6 +1017,65 @@ def _drain_assistant_usage_rows(
     return rows
 
 
+_USAGE_COUNT_FIELDS = (
+    "input_tokens",
+    "uncached_input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _merge_usage_rows(
+    rows: list[dict[str, object]],
+    *,
+    accumulate: bool,
+) -> list[dict[str, object]]:
+    """Collapse same-key observations before a single multi-row upsert.
+
+    One collector delta can legitimately contain many usage snapshots for the
+    same native turn (a long turn bundled by any upload stall or restart).
+    PostgreSQL rejects ``ON CONFLICT DO UPDATE`` statements whose VALUES list
+    affects one row twice, so duplicates must merge in-batch: summed counts
+    with the newest identity when accumulating, otherwise last-writer-wins to
+    mirror the replacement semantics of the upsert itself.
+    """
+    merged: dict[tuple[object, object], dict[str, object]] = {}
+    order: list[tuple[object, object]] = []
+    for row in rows:
+        key = (row["document_id"], row["source_id"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(row)
+            order.append(key)
+            continue
+        if accumulate:
+            for field in _USAGE_COUNT_FIELDS:
+                existing[field] = int(existing.get(field) or 0) + int(row.get(field) or 0)
+            occurred_at = row.get("occurred_at")
+            if occurred_at is not None and (
+                existing.get("occurred_at") is None
+                or occurred_at >= existing["occurred_at"]
+            ):
+                existing["occurred_at"] = occurred_at
+            for field in (
+                "machine_id",
+                "tool_id",
+                "source",
+                "model",
+                "reasoning_effort",
+                "service_tier",
+                "attribution_status",
+            ):
+                if row.get(field) is not None:
+                    existing[field] = row[field]
+        else:
+            existing.update(row)
+    return [merged[key] for key in order]
+
+
 async def _upsert_assistant_usage_rows(
     db: AsyncSession,
     rows: list[dict[str, object]],
@@ -1026,6 +1085,7 @@ async def _upsert_assistant_usage_rows(
 ) -> list[dict[str, object]]:
     if not rows:
         return []
+    rows = _merge_usage_rows(rows, accumulate=accumulate_existing)
     replaced_usage: list[dict[str, object]] = []
     if detect_replacements:
         document_id = rows[0]["document_id"]
@@ -1059,15 +1119,7 @@ async def _upsert_assistant_usage_rows(
             if accumulate_existing
             else getattr(excluded, field)
         )
-        for field in (
-            "input_tokens",
-            "uncached_input_tokens",
-            "cached_input_tokens",
-            "cache_write_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-            "total_tokens",
-        )
+        for field in _USAGE_COUNT_FIELDS
     }
     await db.execute(
         statement.on_conflict_do_update(
