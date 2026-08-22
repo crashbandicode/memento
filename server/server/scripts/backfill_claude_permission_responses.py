@@ -157,16 +157,25 @@ async def _candidate_documents(
 ) -> list[PermissionDocument]:
     rows = await conn.fetch(
         """
-        SELECT id, machine_id, metadata,
-               COALESCE(NULLIF(metadata->>'root_session_id', ''),
-                        NULLIF(metadata->>'session_id', '')) AS root_session_id
-        FROM documents
-        WHERE tool_id='claude_code'
-          AND category='conversation'
-          AND jsonb_typeof(metadata->'_interaction_history')='array'
+        SELECT document.id, document.machine_id, effective.metadata,
+               COALESCE(NULLIF(effective.metadata->>'root_session_id', ''),
+                        NULLIF(effective.metadata->>'session_id', ''))
+                    AS root_session_id
+        FROM documents document
+        LEFT JOIN document_delivery_state delivery
+          ON delivery.document_id=document.id
+        CROSS JOIN LATERAL (
+          SELECT COALESCE(delivery.delivery_metadata, document.metadata)
+                    AS metadata
+        ) effective
+        WHERE document.tool_id='claude_code'
+          AND document.category='conversation'
+          AND jsonb_typeof(effective.metadata->'_interaction_history')='array'
           AND EXISTS (
             SELECT 1
-            FROM jsonb_array_elements(metadata->'_interaction_history') entry
+            FROM jsonb_array_elements(
+              effective.metadata->'_interaction_history'
+            ) entry
             WHERE entry->>'status'='answered'
               AND entry->'interaction'->>'interaction_type'='permission_request'
               AND CASE
@@ -175,8 +184,8 @@ async def _candidate_documents(
                     ELSE true
                   END
           )
-          AND ($1::uuid[] IS NULL OR id=ANY($1::uuid[]))
-        ORDER BY id
+          AND ($1::uuid[] IS NULL OR document.id=ANY($1::uuid[]))
+        ORDER BY document.id
         """,
         document_ids,
     )
@@ -203,16 +212,24 @@ async def _executed_tool_calls(
     rows = await conn.fetch(
         """
         WITH scoped_documents AS (
-          SELECT id, machine_id,
-                 COALESCE(NULLIF(metadata->>'root_session_id', ''),
-                          NULLIF(metadata->>'session_id', '')) AS root_session_id
-          FROM documents
-          WHERE tool_id='claude_code'
-            AND category='conversation'
-            AND machine_id=ANY($1::uuid[])
+          SELECT document.id, document.machine_id,
+                 COALESCE(
+                   NULLIF(effective.metadata->>'root_session_id', ''),
+                   NULLIF(effective.metadata->>'session_id', '')
+                 ) AS root_session_id
+          FROM documents document
+          LEFT JOIN document_delivery_state delivery
+            ON delivery.document_id=document.id
+          CROSS JOIN LATERAL (
+            SELECT COALESCE(delivery.delivery_metadata, document.metadata)
+                      AS metadata
+          ) effective
+          WHERE document.tool_id='claude_code'
+            AND document.category='conversation'
+            AND document.machine_id=ANY($1::uuid[])
             AND (
-              metadata->>'root_session_id'=ANY($2::text[])
-              OR metadata->>'session_id'=ANY($2::text[])
+              effective.metadata->>'root_session_id'=ANY($2::text[])
+              OR effective.metadata->>'session_id'=ANY($2::text[])
             )
         ), tool_rows AS (
           SELECT cm.document_id, sd.machine_id, sd.root_session_id,
@@ -267,19 +284,83 @@ async def _apply_repairs(
     async with conn.transaction():
         for repair in repairs:
             path = ["_interaction_history", str(repair.history_index)]
-            result = await conn.execute(
+            document_row = await conn.fetchrow(
                 """
-                UPDATE documents
-                SET metadata=jsonb_set(metadata, $2::text[], $3::jsonb, false)
+                SELECT metadata
+                FROM documents
                 WHERE id=$1
-                  AND metadata #> $2::text[] = $4::jsonb
+                FOR UPDATE
                 """,
                 repair.document_id,
-                path,
-                json.dumps(repair.repaired_entry),
-                json.dumps(repair.expected_entry),
             )
-            applied += int(result.rsplit(" ", 1)[-1])
+            if document_row is None:
+                continue
+            delivery_row = await conn.fetchrow(
+                """
+                SELECT delivery_metadata
+                FROM document_delivery_state
+                WHERE document_id=$1
+                FOR UPDATE
+                """,
+                repair.document_id,
+            )
+            effective_metadata = _mapping(
+                delivery_row["delivery_metadata"]
+                if delivery_row is not None
+                else document_row["metadata"]
+            )
+            history = effective_metadata.get("_interaction_history")
+            if (
+                not isinstance(history, list)
+                or repair.history_index >= len(history)
+                or history[repair.history_index] != repair.expected_entry
+            ):
+                continue
+            repaired_json = json.dumps(repair.repaired_entry)
+            expected_json = json.dumps(repair.expected_entry)
+            if delivery_row is not None:
+                await conn.execute(
+                    """
+                    UPDATE document_delivery_state
+                    SET delivery_metadata=jsonb_set(
+                          delivery_metadata,
+                          $2::text[],
+                          $3::jsonb,
+                          false
+                        ),
+                        updated_at=now()
+                    WHERE document_id=$1
+                    """,
+                    repair.document_id,
+                    path,
+                    repaired_json,
+                )
+                # Keep the canonical snapshot aligned when it still contains
+                # the same legacy entry. Runtime reads use delivery metadata.
+                await conn.execute(
+                    """
+                    UPDATE documents
+                    SET metadata=jsonb_set(metadata, $2::text[], $3::jsonb, false)
+                    WHERE id=$1
+                      AND metadata #> $2::text[] = $4::jsonb
+                    """,
+                    repair.document_id,
+                    path,
+                    repaired_json,
+                    expected_json,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE documents
+                    SET metadata=jsonb_set(metadata, $2::text[], $3::jsonb, false)
+                    WHERE id=$1
+                    """,
+                    repair.document_id,
+                    path,
+                    repaired_json,
+                )
+            applied += 1
     return applied
 
 

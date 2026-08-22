@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 import uuid
+
+import pytest
 
 from server.scripts.backfill_claude_permission_responses import (
     ExecutedToolCall,
     PermissionDocument,
+    PermissionRepair,
+    _apply_repairs,
     plan_permission_response_repairs,
 )
 
@@ -113,3 +118,56 @@ def test_execution_evidence_is_machine_and_root_session_scoped() -> None:
         [document],
         [wrong_machine, wrong_session],
     ) == []
+
+
+class _Transaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        return False
+
+
+class _DeliveryMetadataConnection:
+    def __init__(self, metadata: dict) -> None:
+        self.document_metadata = {"canonical": True, **metadata}
+        self.delivery_metadata = metadata
+        self.updated_delivery = None
+
+    def transaction(self):
+        return _Transaction()
+
+    async def fetchrow(self, statement: str, *_args):
+        if "FROM documents" in statement:
+            return {"metadata": self.document_metadata}
+        if "FROM document_delivery_state" in statement:
+            return {"delivery_metadata": self.delivery_metadata}
+        raise AssertionError(statement)
+
+    async def execute(self, statement: str, *_args):
+        if "UPDATE document_delivery_state" in statement:
+            self.updated_delivery = json.loads(_args[2])
+        return "UPDATE 1"
+
+
+@pytest.mark.asyncio
+async def test_apply_repairs_updates_effective_delivery_metadata() -> None:
+    document = _document()
+    repair = plan_permission_response_repairs(
+        [document],
+        [_executed(document)],
+    )[0]
+    connection = _DeliveryMetadataConnection(document.metadata)
+
+    applied = await _apply_repairs(
+        connection,
+        [PermissionRepair(
+            document_id=document.id,
+            history_index=repair.history_index,
+            expected_entry=repair.expected_entry,
+            repaired_entry=repair.repaired_entry,
+        )],
+    )
+
+    assert applied == 1
+    assert connection.updated_delivery == repair.repaired_entry
