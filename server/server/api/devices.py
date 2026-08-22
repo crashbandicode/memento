@@ -6,7 +6,6 @@ import asyncio
 import json
 import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -16,28 +15,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import AccessLog, ConversationMessage, Document, DocumentVersion, Machine, Project, SyncState, User
 from ..db.session import get_db
-from ..middleware.auth import get_current_user
-from ..services.document_delivery import (
-    delivery_file_size_expression,
-    delivery_metadata_expression,
-    delivery_revision_expression,
-    delivery_synced_expression,
+from ..middleware.auth import get_current_user, verify_collector_token
+from ..services.agent_control import (
+    LEGACY_ACTION_TO_KIND,
+    ControlCommandNotFound,
+    UnsupportedCommandKind,
+    acknowledge_legacy_command,
+    admit_command,
+    lease_legacy_commands,
+    record_capabilities,
 )
+from ..services.document_delivery import delivery_synced_expression
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
 
-# In-memory command queue per device_id (collector_token_hash)
-# Format: {device_id: [{id, action, created_at}, ...]}
-_command_queue: dict[str, list[dict]] = defaultdict(list)
-_cmd_counter = 0
+# Device commands are admitted into the durable agent-control store
+# (services/agent_control.py). The old process-local in-memory queue lost
+# every pending command on restart and was invisible across workers.
 
 # In-memory PyPI version cache: {package_name: (version_or_none, expires_monotonic)}
 # 5-minute TTL — uses time.monotonic() so clock changes can't break TTL math.
 _PYPI_CACHE_TTL = 300.0
 _pypi_version_cache: dict[str, tuple[str | None, float]] = {}
 _REPAIR_ACTION = "repair-conversations"
-_REPAIR_BATCH_SIZE = 2
-_STORED_SOURCE_REVISION_KEY = "_stored_source_revision_hash"
 _STALE_EMPTY_DEVICE_AGE = timedelta(hours=24)
 
 
@@ -62,26 +62,6 @@ def _is_visible_device(
     if last_seen.tzinfo is None:
         last_seen = last_seen.replace(tzinfo=timezone.utc)
     return last_seen >= current - _STALE_EMPTY_DEVICE_AGE
-
-
-def _enqueue_command(
-    device_collector_id: str,
-    action: str,
-    *,
-    payload: dict | None = None,
-) -> int:
-    """Add a command to the queue for a device."""
-    global _cmd_counter
-    _cmd_counter += 1
-    command = {
-        "id": _cmd_counter,
-        "action": action,
-        "created_at": time.time(),
-    }
-    if payload:
-        command.update(payload)
-    _command_queue[device_collector_id].append(command)
-    return _cmd_counter
 
 
 @router.get("")
@@ -273,6 +253,7 @@ async def send_command(
     device_db_id: uuid.UUID,
     action: str = "resync",
     document_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -301,6 +282,10 @@ async def send_command(
                 "WHERE machine_id = :mid"
             ), {"mid": device_db_id})
 
+    kind = LEGACY_ACTION_TO_KIND.get(action)
+    if kind is None:
+        raise HTTPException(status_code=400, detail=f"Unknown command action: {action}")
+
     payload: dict | None = None
     if action == _REPAIR_ACTION and document_id is not None:
         repair_document = (
@@ -324,18 +309,35 @@ async def send_command(
             ]
         }
 
-    cmd_id = _enqueue_command(
-        machine.collector_token_hash,
-        action,
-        payload=payload,
-    )
-    return {"status": "queued", "command_id": cmd_id, "action": action, "device": machine.name}
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=_user.id,
+            kind=kind,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            document_id=document_id if action == _REPAIR_ACTION else None,
+        )
+    except UnsupportedCommandKind as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": str(error), "kind": error.kind},
+        ) from error
+    return {
+        "status": "queued",
+        "command_id": str(command.id),
+        "trace_id": str(command.trace_id),
+        "action": action,
+        "device": machine.name,
+    }
 
 
 @router.post("/command-by-collector-id")
 async def send_command_by_collector_id(
     collector_id: str,
     action: str = "resync",
+    idempotency_key: str | None = None,
     db: AsyncSession = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
@@ -350,8 +352,32 @@ async def send_command_by_collector_id(
     if _user.role not in ("admin", "owner"):
         if not machine or machine.user_id != _user.id:
             raise HTTPException(status_code=404, detail="Device not found")
-    cmd_id = _enqueue_command(collector_id, action)
-    return {"status": "queued", "command_id": cmd_id, "action": action}
+    if machine is None:
+        # Durable commands are keyed to a registered machine row; an unknown
+        # collector id used to enqueue into a black hole no collector polled.
+        raise HTTPException(status_code=404, detail="Device not found")
+    kind = LEGACY_ACTION_TO_KIND.get(action)
+    if kind is None:
+        raise HTTPException(status_code=400, detail=f"Unknown command action: {action}")
+    try:
+        command, _created = await admit_command(
+            db,
+            machine=machine,
+            user_id=_user.id,
+            kind=kind,
+            idempotency_key=idempotency_key,
+        )
+    except UnsupportedCommandKind as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": str(error), "kind": error.kind},
+        ) from error
+    return {
+        "status": "queued",
+        "command_id": str(command.id),
+        "trace_id": str(command.trace_id),
+        "action": action,
+    }
 
 
 async def _fetch_pypi_version(client: httpx.AsyncClient, package: str) -> str | None:
@@ -403,64 +429,62 @@ async def get_collector_latest_version(
     }
 
 
+async def _legacy_collector_machine(
+    db: AsyncSession, device_id: str, collector_user: User
+) -> Machine | None:
+    """Resolve a legacy poll's machine, enforcing token/device ownership."""
+    result = await db.execute(
+        select(Machine).where(Machine.collector_token_hash == device_id)
+    )
+    machine = result.scalar_one_or_none()
+    if machine is None:
+        return None
+    if machine.user_id is not None and machine.user_id != collector_user.id:
+        raise HTTPException(status_code=403, detail="Device belongs to another user")
+    return machine
+
+
 @router.get("/commands")
 async def get_commands(
     x_device_id: str = Header(..., alias="X-Device-Id"),
     x_collector_version: str = Header("", alias="X-Collector-Version"),
+    collector_user: User = Depends(verify_collector_token),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
-    """Collector polls this to get pending commands. Also updates heartbeat + version."""
-    from datetime import datetime, timezone
-    result = await db.execute(
-        select(Machine).where(Machine.collector_token_hash == x_device_id)
-    )
-    machine = result.scalar_one_or_none()
-    if machine:
-        machine.last_heartbeat = datetime.now(timezone.utc)
-        if x_collector_version:
-            machine.collector_version = x_collector_version
+    """Legacy short-poll for collectors <= 0.0.40. Serves the durable store.
 
-    commands = _command_queue.get(x_device_id, [])
-    if machine and any(
-        cmd.get("action") == _REPAIR_ACTION and not cmd.get("paths")
-        for cmd in commands
-    ):
-        repair_result = await db.execute(
-            select(Document.tool_id, Document.relative_path)
-            .where(
-                Document.machine_id == machine.id,
-                Document.category == "conversation",
-                Document.tool_id.in_(("codex", "claude_code", "cursor")),
-                func.coalesce(
-                    delivery_metadata_expression()[
-                        _STORED_SOURCE_REVISION_KEY
-                    ].as_string(),
-                    "",
-                ) != delivery_revision_expression(),
-            )
-            .order_by(delivery_file_size_expression(), Document.id)
-            .limit(_REPAIR_BATCH_SIZE)
-        )
-        repair_paths = [
-            {"tool_name": tool_name, "relative_path": relative_path}
-            for tool_name, relative_path in repair_result.all()
-        ]
-        return [
-            {**command, "paths": repair_paths}
-            if command.get("action") == _REPAIR_ACTION
-            and not command.get("paths")
-            else command
-            for command in commands
-        ]
-    return commands
+    Newer collectors use ``POST /api/control/poll`` (long-poll, leases,
+    outcome reporting). This route stays wire-compatible — same command
+    shape, heartbeat/version refresh, serve-time repair-path hydration —
+    and now verifies the collector token those clients always sent.
+    """
+    machine = await _legacy_collector_machine(db, x_device_id, collector_user)
+    if machine is None:
+        return []
+    record_capabilities(machine, None, collector_version=x_collector_version or None)
+    return await lease_legacy_commands(
+        db, machine=machine, collector_version=x_collector_version or None
+    )
 
 
 @router.post("/commands/{cmd_id}/ack")
 async def ack_command(
-    cmd_id: int,
+    cmd_id: uuid.UUID,
     x_device_id: str = Header(..., alias="X-Device-Id"),
+    collector_user: User = Depends(verify_collector_token),
+    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Collector acknowledges a command — remove it from queue."""
-    queue = _command_queue.get(x_device_id, [])
-    _command_queue[x_device_id] = [c for c in queue if c["id"] != cmd_id]
-    return {"status": "acked", "command_id": cmd_id}
+    """Legacy ack (collectors <= 0.0.40 acknowledge before executing).
+
+    Terminalizes the durable command honestly: the outcome records that no
+    execution result was observed, because the legacy protocol never
+    reported one.
+    """
+    machine = await _legacy_collector_machine(db, x_device_id, collector_user)
+    if machine is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    try:
+        await acknowledge_legacy_command(db, machine=machine, command_id=cmd_id)
+    except ControlCommandNotFound as error:
+        raise HTTPException(status_code=404, detail="Command not found") from error
+    return {"status": "acked", "command_id": str(cmd_id)}

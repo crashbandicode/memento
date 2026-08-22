@@ -21,6 +21,7 @@ from .claude_pending_questions import (
     ClaudePendingPoller,
 )
 from .config import SYSTEM, CollectorConfig, _default_data_dir
+from .control_channel import ControlChannel
 from .cursor_state_export import (
     CursorStateExporter,
     enqueue_cursor_state_snapshots,
@@ -38,7 +39,6 @@ from .tools.openclaw import OpenClawTool
 from .watcher import FileWatcher
 
 HEARTBEAT_INTERVAL = 30       # Log heartbeat every 30s
-COMMAND_POLL_INTERVAL = 10    # Check server commands every 10s
 AUTO_UPDATE_INTERVAL = 3600   # Check for updates every 1 hour
 QUEUE_MAINTENANCE_INTERVAL = 3600
 LEGACY_RECONCILIATION_INTERVAL = 60
@@ -49,7 +49,6 @@ COLLECTOR_LOG_MAX_BYTES = 5 * 1024 * 1024
 COLLECTOR_LOG_BACKUP_COUNT = 3
 _COLLECTOR_LOG_HANDLER_MARKER = "_memento_collector_managed"
 _canvas_sync_lock = threading.Lock()
-_command_poll_lock = threading.Lock()
 _logging_setup_lock = threading.Lock()
 
 
@@ -292,115 +291,85 @@ def _poll_canvas_artifacts(
             schedule.complete(generation, counts)
 
 
-def _poll_commands(config: CollectorConfig, queue: SyncQueue, watcher: FileWatcher,
-                   sync_client: SyncClient, logger: logging.Logger,
-                   on_resync: Callable[[], None] | None = None) -> None:
-    """Poll server for pending commands (resync, etc.)."""
-    try:
-        import httpx
+def execute_control_command(
+    kind: str,
+    payload: dict,
+    *,
+    config: CollectorConfig,
+    queue: SyncQueue,
+    watcher: FileWatcher,
+    sync_client: SyncClient,
+    logger: logging.Logger,
+    on_resync: Callable[[], None] | None = None,
+) -> tuple[str, str | None, dict]:
+    """Execute one durable control command and return its terminal outcome.
 
-        from .tls import SSL_CONTEXT
+    Returns ``(status, error_code, detail)`` with ``status`` in
+    ``completed``/``failed``/``cancelled``. Previously these actions ran
+    fire-and-forget after a legacy ack; every result is now reported so the
+    server's command row records what actually happened.
+    """
+    if kind in ("device.resync", "resync"):
+        logger.info("Received resync — draining uploads before full re-scan")
+        if not watcher.cancel_scan(timeout=60):
+            logger.error("Resync aborted: current scan did not stop")
+            watcher.allow_scan()
+            return "failed", "command.execution_failed", {"reason": "scan_did_not_stop"}
+        if not sync_client.pause(timeout=75):
+            logger.error("Resync aborted: upload batch did not drain")
+            watcher.allow_scan()
+            sync_client.resume()
+            return (
+                "failed",
+                "command.execution_failed",
+                {"reason": "uploads_did_not_drain"},
+            )
         try:
-            from importlib.metadata import version
-            _ver = version(PACKAGE_NAME)
-        except Exception:
-            _ver = "dev"
-        resp = httpx.get(
-            f"{config.server.url}/api/devices/commands",
-            headers={
-                "X-Collector-Token": config.server.token,
-                "X-Device-Id": config.device_id,
-                "X-Collector-Version": _ver,
-            },
-            timeout=10,
-            verify=SSL_CONTEXT,
+            queue.clear_all_state()
+            if on_resync is not None:
+                on_resync()
+            try:
+                from .parsers import antigravity_export as _ag
+                _ag._last_hashes.clear()
+                _ag._title_map_cache = None  # Force re-read on next export
+            except Exception:
+                pass
+        finally:
+            watcher.allow_scan()
+            sync_client.resume()
+        threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
+        logger.info("Resync triggered — cache cleared, re-scan started")
+        return "completed", None, {"rescan_started": True}
+
+    if kind in ("conversation.repair", "repair-conversations"):
+        targets = [
+            target
+            for target in (payload.get("paths") or [])[:2]
+            if isinstance(target, dict)
+        ]
+        queued = sum(
+            watcher.request_relative_resync(
+                str(target.get("tool_name", "")),
+                str(target.get("relative_path", "")),
+            )
+            for target in targets
         )
-        if resp.status_code != 200:
-            return
-        commands = resp.json()
-        for cmd in commands:
-            action = cmd.get("action")
-            cmd_id = cmd.get("id")
+        logger.info(
+            "Received targeted conversation repair — %d snapshots queued",
+            queued,
+        )
+        return "completed", None, {"targets": len(targets), "queued": queued}
 
-            # Ack FIRST before executing.  If the ack is lost, leave the
-            # command queued and retry it on the next poll instead of running
-            # the same destructive/expensive action repeatedly.
-            acknowledged = not cmd_id
-            if cmd_id:
-                try:
-                    ack_response = httpx.post(
-                        f"{config.server.url}/api/devices/commands/{cmd_id}/ack",
-                        headers={
-                            "X-Collector-Token": config.server.token,
-                            "X-Device-Id": config.device_id,
-                        },
-                        timeout=5,
-                        verify=SSL_CONTEXT,
-                    )
-                    acknowledged = ack_response.status_code == 200
-                except Exception:
-                    acknowledged = False
-            if not acknowledged:
-                logger.warning("Deferring command %s until its ack succeeds", cmd_id)
-                continue
+    if kind in ("collector.update", "update"):
+        if not config.auto_update_enabled:
+            logger.info("Ignoring update command: auto-update is disabled")
+            return "completed", None, {"skipped": "auto_update_disabled"}
+        logger.info("Received update command from server")
+        threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
+        return "completed", None, {"initiated": True}
 
-            if action == "resync":
-                logger.info("Received resync — draining uploads before full re-scan")
-                if not watcher.cancel_scan(timeout=60):
-                    logger.error("Resync aborted: current scan did not stop")
-                    watcher.allow_scan()
-                    continue
-                if not sync_client.pause(timeout=75):
-                    logger.error("Resync aborted: upload batch did not drain")
-                    watcher.allow_scan()
-                    sync_client.resume()
-                    continue
-                try:
-                    queue.clear_all_state()
-                    if on_resync is not None:
-                        on_resync()
-                    try:
-                        from .parsers import antigravity_export as _ag
-                        _ag._last_hashes.clear()
-                        _ag._title_map_cache = None  # Force re-read on next export
-                    except Exception:
-                        pass
-                finally:
-                    watcher.allow_scan()
-                    sync_client.resume()
-                threading.Thread(target=_run_initial_scan, args=(watcher, logger), daemon=True).start()
-                logger.info("Resync triggered — cache cleared, re-scan started")
-            elif action == "repair-conversations":
-                queued = sum(
-                    watcher.request_relative_resync(
-                        str(target.get("tool_name", "")),
-                        str(target.get("relative_path", "")),
-                    )
-                    for target in cmd.get("paths", [])[:2]
-                    if isinstance(target, dict)
-                )
-                logger.info(
-                    "Received targeted conversation repair — %d snapshots queued",
-                    queued,
-                )
-            elif action == "update":
-                if config.auto_update_enabled:
-                    logger.info("Received update command from server")
-                    threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
-                else:
-                    logger.info("Ignoring update command: auto-update is disabled")
-    except Exception:
-        pass  # Server unreachable, skip
-
-
-def _poll_commands_nonoverlap(*args) -> None:
-    """Keep the control-plane request off the latency-sensitive main loop."""
-    if not _command_poll_lock.acquire(blocking=False):
-        return
-    try:
-        _poll_commands(*args)
-    finally:
-        _command_poll_lock.release()
+    logger.warning("Unsupported control command kind: %s", kind)
+    return "failed", "capability.unsupported", {"kind": kind}
 
 
 def _get_pypi_latest(package: str) -> str | None:
@@ -848,6 +817,20 @@ def main() -> None:
         with _claude_pending_poll_lock:
             claude_pending_poller.invalidate()
 
+    def _execute_control_command(kind: str, payload: dict) -> tuple[str, str | None, dict]:
+        return execute_control_command(
+            kind,
+            payload,
+            config=config,
+            queue=queue,
+            watcher=watcher,
+            sync_client=sync_client,
+            logger=logger,
+            on_resync=_invalidate_source_pollers,
+        )
+
+    control_channel = ControlChannel(config, _execute_control_command)
+
     # Graceful shutdown
     shutdown = False
 
@@ -902,6 +885,7 @@ def main() -> None:
     # 4. Start uploader only after the startup reconciliation pass.
     sync_client.start()
     orchestration_sync.start()
+    control_channel.start()
 
     logger.info("Collector running. Watching for file changes...")
 
@@ -919,7 +903,6 @@ def main() -> None:
     # --- Main loop: heartbeat + periodic tasks ---
     last_heartbeat = time.monotonic()
     last_heartbeat_token = -1
-    last_command_poll = time.monotonic()
     last_update_check = time.monotonic()
     last_queue_maintenance = time.monotonic()
     last_legacy_reconciliation = time.monotonic()
@@ -940,22 +923,6 @@ def main() -> None:
                     logger,
                     last_heartbeat_token,
                 )
-
-            # Poll server commands every 10s
-            if now - last_command_poll > COMMAND_POLL_INTERVAL:
-                last_command_poll = now
-                threading.Thread(
-                    target=_poll_commands_nonoverlap,
-                    args=(
-                        config,
-                        queue,
-                        watcher,
-                        sync_client,
-                        logger,
-                        _invalidate_source_pollers,
-                    ),
-                    daemon=True,
-                ).start()
 
             canvas_generation = canvas_schedule.claim_due(now)
             if canvas_generation is not None:
@@ -1037,6 +1004,7 @@ def main() -> None:
     finally:
         logger.info("Shutting down...")
         watcher.stop()
+        control_channel.stop()
         orchestration_sync.stop()
         sync_client.stop()
         queue.close()

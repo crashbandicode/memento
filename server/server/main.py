@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import admin, auth, canvas_artifacts, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
+from .api import admin, auth, canvas_artifacts, control, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -239,6 +239,121 @@ def _run_migrations(conn) -> None:
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_orchestration_receipt_created "
         "ON orchestration_event_receipts (created_at)"
+    ))
+    # Agent control plane: durable command/session/event storage replaces the
+    # old process-local device command queue. Commands are admitted before any
+    # side effect is acknowledged and closed only by terminal transitions.
+    if "capabilities" not in machine_cols:
+        conn.execute(text("ALTER TABLE machines ADD COLUMN capabilities JSONB"))
+    if "capabilities_updated_at" not in machine_cols:
+        conn.execute(text(
+            "ALTER TABLE machines ADD COLUMN capabilities_updated_at TIMESTAMPTZ"
+        ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS agent_control_sessions ("
+        "id UUID PRIMARY KEY, "
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "tool_id VARCHAR(50) NOT NULL, "
+        "adapter VARCHAR(64) NOT NULL, "
+        "adapter_version VARCHAR(64), "
+        "capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "native_session_id VARCHAR(512), "
+        "document_id UUID REFERENCES documents(id) ON DELETE SET NULL, "
+        "state VARCHAR(32) NOT NULL DEFAULT 'starting', "
+        "state_reason VARCHAR(128), "
+        "collector_revision VARCHAR(64), server_revision VARCHAR(64), "
+        "started_at TIMESTAMPTZ, last_event_at TIMESTAMPTZ, closed_at TIMESTAMPTZ, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_session_machine "
+        "ON agent_control_sessions (machine_id, state)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_session_document "
+        "ON agent_control_sessions (document_id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_session_native "
+        "ON agent_control_sessions (tool_id, native_session_id)"
+    ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS agent_control_commands ("
+        "id UUID PRIMARY KEY, "
+        "trace_id UUID NOT NULL, "
+        "idempotency_key VARCHAR(128) NOT NULL, "
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "kind VARCHAR(64) NOT NULL, "
+        "payload JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "control_session_id UUID REFERENCES agent_control_sessions(id) ON DELETE SET NULL, "
+        "document_id UUID REFERENCES documents(id) ON DELETE SET NULL, "
+        "native_session_id VARCHAR(512), native_turn_id VARCHAR(256), "
+        "interaction_id VARCHAR(256), "
+        "state VARCHAR(32) NOT NULL DEFAULT 'queued', "
+        "redelivery_policy VARCHAR(24) NOT NULL DEFAULT 'retry', "
+        "lease_id UUID, lease_expires_at TIMESTAMPTZ, "
+        "delivery_attempts INTEGER NOT NULL DEFAULT 0, "
+        "max_delivery_attempts INTEGER NOT NULL DEFAULT 5, "
+        "expires_at TIMESTAMPTZ, "
+        "error_code VARCHAR(64), outcome JSONB, "
+        "delivered_at TIMESTAMPTZ, terminal_at TIMESTAMPTZ, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "CONSTRAINT uq_agent_control_command_idempotency UNIQUE "
+        "(machine_id, idempotency_key)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_command_pending "
+        "ON agent_control_commands (machine_id, state, created_at)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_command_session "
+        "ON agent_control_commands (control_session_id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_command_trace "
+        "ON agent_control_commands (trace_id)"
+    ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS agent_control_events ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "schema_version INTEGER NOT NULL DEFAULT 1, "
+        "event_id VARCHAR(128) NOT NULL, "
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "command_id UUID REFERENCES agent_control_commands(id) ON DELETE CASCADE, "
+        "control_session_id UUID REFERENCES agent_control_sessions(id) ON DELETE SET NULL, "
+        "trace_id UUID, parent_event_id VARCHAR(128), "
+        "event_type VARCHAR(96) NOT NULL, "
+        "origin VARCHAR(16) NOT NULL DEFAULT 'server', "
+        "document_id UUID, "
+        "native_session_id VARCHAR(512), native_turn_id VARCHAR(256), "
+        "interaction_id VARCHAR(256), "
+        "adapter VARCHAR(64), adapter_version VARCHAR(64), "
+        "collector_revision VARCHAR(64), server_revision VARCHAR(64), "
+        "occurred_at_device TIMESTAMPTZ, elapsed_ms INTEGER, "
+        "received_at_server TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "outcome VARCHAR(32), error_code VARCHAR(64), "
+        "payload_digest VARCHAR(80), "
+        "details JSONB NOT NULL DEFAULT '{}'::jsonb, "
+        "CONSTRAINT uq_agent_control_event_id UNIQUE (machine_id, event_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_event_command "
+        "ON agent_control_events (command_id, id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_event_trace "
+        "ON agent_control_events (trace_id)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_agent_control_event_received "
+        "ON agent_control_events (received_at_server)"
     ))
     if "embedding_status" not in doc_cols:
         conn.execute(text(
@@ -1032,6 +1147,7 @@ app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(events.router)
 app.include_router(devices.router)
+app.include_router(control.router)
 app.include_router(hierarchy.router)
 app.include_router(tasks.router)
 app.include_router(memory.router)

@@ -10,9 +10,9 @@ Building an ``httpx`` client per request re-reads ``cacert.pem`` every single
 time, so once the reaper deletes it every request raises a bare
 ``FileNotFoundError: [Errno 2] No such file or directory`` (no filename — it
 surfaces from OpenSSL, not Python's ``open``). That is especially nasty in
-``_poll_commands``, which swallows exceptions: the collector would keep
-running and syncing via its long-lived client while silently going deaf to
-every server command (resync / update) with nothing in the log.
+the control channel's backoff loop: the collector would keep running and
+syncing via its long-lived client while silently going deaf to every server
+command (resync / update) with nothing in the log.
 
 Reading the bundle into memory here touches the file exactly once, at startup,
 while it is still guaranteed to exist.

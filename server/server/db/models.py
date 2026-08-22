@@ -44,6 +44,10 @@ class Machine(Base):
         String(255), nullable=False, unique=True,
     )
     collector_version: Mapped[str | None] = mapped_column(String(50))
+    # Bounded collector capability snapshot (schema-versioned JSON) reported on
+    # the control poll so the server can route only supported command kinds.
+    capabilities: Mapped[dict | None] = mapped_column(JSONB)
+    capabilities_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -537,6 +541,175 @@ class OrchestrationEventReceipt(Base):
     __table_args__ = (
         UniqueConstraint("machine_id", "event_id", name="uq_orchestration_event_receipt"),
         Index("idx_orchestration_receipt_created", "created_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent control plane (bidirectional server ⇄ collector command channel)
+# ---------------------------------------------------------------------------
+class AgentControlSession(Base):
+    """One managed agent session started or resumed through Memento.
+
+    Sessions discovered only from transcript files never get a row here —
+    file observation is not an input channel, so those remain view-only.
+    """
+
+    __tablename__ = "agent_control_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    adapter: Mapped[str] = mapped_column(String(64), nullable=False)
+    adapter_version: Mapped[str | None] = mapped_column(String(64))
+    capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    native_session_id: Mapped[str | None] = mapped_column(String(512))
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL")
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="starting")
+    state_reason: Mapped[str | None] = mapped_column(String(128))
+    collector_revision: Mapped[str | None] = mapped_column(String(64))
+    server_revision: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_agent_control_session_machine", "machine_id", "state"),
+        Index("idx_agent_control_session_document", "document_id"),
+        Index("idx_agent_control_session_native", "tool_id", "native_session_id"),
+    )
+
+
+class AgentControlCommand(Base):
+    """Authoritative current state of one control command.
+
+    A command is admitted durably before any side effect is acknowledged,
+    delivered under an expiring lease, and closed only by an explicit terminal
+    transition — delivery alone never deletes or completes it.
+    """
+
+    __tablename__ = "agent_control_commands"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    trace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, default=uuid.uuid4
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    control_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_control_sessions.id", ondelete="SET NULL")
+    )
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL")
+    )
+    native_session_id: Mapped[str | None] = mapped_column(String(512))
+    native_turn_id: Mapped[str | None] = mapped_column(String(256))
+    interaction_id: Mapped[str | None] = mapped_column(String(256))
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    # "retry" re-queues after a lost lease; "fail_once_delivered" refuses to
+    # repeat a delivered-but-unreported command (destructive legacy semantics).
+    redelivery_policy: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="retry"
+    )
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    outcome: Mapped[dict | None] = mapped_column(JSONB)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "machine_id", "idempotency_key",
+            name="uq_agent_control_command_idempotency",
+        ),
+        Index("idx_agent_control_command_pending", "machine_id", "state", "created_at"),
+        Index("idx_agent_control_command_session", "control_session_id"),
+        Index("idx_agent_control_command_trace", "trace_id"),
+    )
+
+
+class AgentControlEvent(Base):
+    """Append-only structural lifecycle trace for control commands/sessions.
+
+    ``received_at_server`` is the authoritative ordering time; device wall
+    time and monotonic elapsed time are retained for latency analysis only.
+    Rows reference content by digest — never by payload body.
+    """
+
+    __tablename__ = "agent_control_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), nullable=False
+    )
+    command_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_control_commands.id", ondelete="CASCADE")
+    )
+    control_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_control_sessions.id", ondelete="SET NULL")
+    )
+    trace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    parent_event_id: Mapped[str | None] = mapped_column(String(128))
+    event_type: Mapped[str] = mapped_column(String(96), nullable=False)
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="server")
+    document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    native_session_id: Mapped[str | None] = mapped_column(String(512))
+    native_turn_id: Mapped[str | None] = mapped_column(String(256))
+    interaction_id: Mapped[str | None] = mapped_column(String(256))
+    adapter: Mapped[str | None] = mapped_column(String(64))
+    adapter_version: Mapped[str | None] = mapped_column(String(64))
+    collector_revision: Mapped[str | None] = mapped_column(String(64))
+    server_revision: Mapped[str | None] = mapped_column(String(64))
+    occurred_at_device: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer)
+    received_at_server: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    outcome: Mapped[str | None] = mapped_column(String(32))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    payload_digest: Mapped[str | None] = mapped_column(String(80))
+    details: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("machine_id", "event_id", name="uq_agent_control_event_id"),
+        Index("idx_agent_control_event_command", "command_id", "id"),
+        Index("idx_agent_control_event_trace", "trace_id"),
+        Index("idx_agent_control_event_received", "received_at_server"),
     )
 
 

@@ -1,7 +1,6 @@
 import logging
 from types import SimpleNamespace
 
-import httpx
 import pytest
 from concurrent_log_handler import ConcurrentRotatingFileHandler
 
@@ -10,18 +9,9 @@ from collector.main import (
     _COLLECTOR_LOG_HANDLER_MARKER,
     _CanvasPollSchedule,
     _log_queue_heartbeat,
-    _poll_commands,
     _setup_logging,
+    execute_control_command,
 )
-
-
-class Response:
-    def __init__(self, status_code: int, body=None) -> None:
-        self.status_code = status_code
-        self._body = body
-
-    def json(self):
-        return self._body
 
 
 @pytest.fixture
@@ -123,28 +113,81 @@ def test_logging_writes_utf8(
     assert "同步标题 → complete" in text
 
 
-def test_command_is_not_executed_until_ack_succeeds(monkeypatch):
-    command = {
-        "id": 42,
-        "action": "repair-conversations",
-        "paths": [{"tool_name": "codex", "relative_path": "sessions/a.jsonl"}],
+def _executor_deps(**overrides):
+    deps = {
+        "config": SimpleNamespace(auto_update_enabled=False),
+        "queue": SimpleNamespace(),
+        "watcher": SimpleNamespace(),
+        "sync_client": SimpleNamespace(),
+        "logger": logging.getLogger("collector.test-executor"),
+        "on_resync": None,
     }
-    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: Response(200, [command]))
-    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: Response(502))
+    deps.update(overrides)
+    return deps
+
+
+def test_repair_command_reports_exact_queued_outcome():
     requested: list[tuple[str, str]] = []
     watcher = SimpleNamespace(
         request_relative_resync=lambda tool, path: requested.append((tool, path)) or True,
     )
-    config = SimpleNamespace(
-        server=SimpleNamespace(url="https://example.test", token="token"),
-        device_id="device",
-        auto_update_enabled=False,
+
+    status, error_code, detail = execute_control_command(
+        "conversation.repair",
+        {
+            "paths": [
+                {"tool_name": "codex", "relative_path": "sessions/a.jsonl"},
+                {"tool_name": "cursor", "relative_path": "b/b.jsonl"},
+                {"tool_name": "codex", "relative_path": "ignored-over-batch.jsonl"},
+            ]
+        },
+        **_executor_deps(watcher=watcher),
     )
-    logger = SimpleNamespace(warning=lambda *args: None)
 
-    _poll_commands(config, SimpleNamespace(), watcher, SimpleNamespace(), logger)
+    assert status == "completed"
+    assert error_code is None
+    assert detail == {"targets": 2, "queued": 2}
+    assert requested == [
+        ("codex", "sessions/a.jsonl"),
+        ("cursor", "b/b.jsonl"),
+    ]
 
-    assert requested == []
+
+def test_unknown_command_kind_fails_with_stable_capability_code():
+    status, error_code, detail = execute_control_command(
+        "agent.send_message", {}, **_executor_deps()
+    )
+
+    assert status == "failed"
+    assert error_code == "capability.unsupported"
+    assert detail == {"kind": "agent.send_message"}
+
+
+def test_resync_failure_reports_outcome_and_reallows_scanning():
+    calls: list[str] = []
+    watcher = SimpleNamespace(
+        cancel_scan=lambda timeout: calls.append("cancel") or False,
+        allow_scan=lambda: calls.append("allow"),
+    )
+
+    status, error_code, detail = execute_control_command(
+        "device.resync", {}, **_executor_deps(watcher=watcher)
+    )
+
+    assert status == "failed"
+    assert error_code == "command.execution_failed"
+    assert detail == {"reason": "scan_did_not_stop"}
+    assert calls == ["cancel", "allow"]
+
+
+def test_update_command_honors_disabled_auto_update():
+    status, error_code, detail = execute_control_command(
+        "collector.update", {}, **_executor_deps()
+    )
+
+    assert status == "completed"
+    assert error_code is None
+    assert detail == {"skipped": "auto_update_disabled"}
 
 
 def test_canvas_polling_backs_off_when_idle_and_resets_after_upload():
