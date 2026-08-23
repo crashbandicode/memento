@@ -457,6 +457,11 @@ class AgentSessionManager:
             )
             return
         if kind == "codex.process_closed":
+            # adapter.stop() intentionally closes the same transport used for
+            # crash detection.  _session_close marks the session first, so do
+            # not race a clean close with a contradictory process-failed event.
+            if session.state == "closed":
+                return
             session.state = "failed"
             self._cancel_pendings(session)
             with self._lock:

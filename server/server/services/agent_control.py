@@ -1074,6 +1074,11 @@ def _apply_session_lifecycle_event(
         session.active_native_turn_id = None
         session.pending_interactions = []
     elif event_type == "adapter.process_failed":
+        # A legacy collector may report its transport shutdown after it has
+        # already completed an intentional close. Preserve that terminal user
+        # action while retaining the late event itself for audit/debugging.
+        if session.state == SESSION_CLOSED:
+            return
         session.state = SESSION_FAILED
         session.state_reason = ControlErrorCodes.ADAPTER_PROCESS_FAILED
         session.active_native_turn_id = None

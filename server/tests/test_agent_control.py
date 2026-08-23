@@ -683,6 +683,15 @@ async def test_managed_session_lifecycle_via_commands_and_events(session_factory
         assert session.state == SESSION_CLOSED
         assert session.closed_at is not None
 
+        await ingest_control_events(
+            db,
+            machine=machine,
+            events=[_event("adapter.process_failed", error_code="adapter.process_failed")],
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.state == SESSION_CLOSED
+
 
 @requires_postgres
 @pytest.mark.asyncio

@@ -75,7 +75,14 @@ def capability_snapshot(
 
 
 class ControlChannel:
-    """One daemon thread owning the durable command long-poll."""
+    """Durable long-poll plus a bounded set of command workers.
+
+    Command execution cannot run on the poll thread: managed-agent sends may
+    stay open for minutes, while steer, interrupt, and interaction responses
+    must reach that same live turn.  Workers are daemon threads so collector
+    shutdown remains bounded; the poller never leases more work than it has
+    an immediately available worker for.
+    """
 
     def __init__(
         self,
@@ -95,6 +102,9 @@ class ControlChannel:
         self._max_commands = max(1, min(int(max_commands), 16))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._workers_lock = threading.Lock()
+        self._workers: set[threading.Thread] = set()
+        self._max_workers = self._max_commands
         self._version = collector_version()
         self._client = httpx.Client(
             base_url=config.server.url,
@@ -125,12 +135,31 @@ class ControlChannel:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        deadline = time.monotonic() + 5.0
+        while True:
+            with self._workers_lock:
+                workers = list(self._workers)
+            if not workers or time.monotonic() >= deadline:
+                break
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
         self._client.close()
 
     # -- one poll cycle ----------------------------------------------------
 
     def poll_once(self) -> int:
-        """Long-poll once and process every delivered command. Returns count."""
+        """Synchronously poll/process once (used by tests and manual probes)."""
+        commands = self._poll_commands(self._max_commands)
+        processed = 0
+        for command in commands:
+            if self._stop.is_set():
+                break
+            if self._process(command):
+                processed += 1
+        return processed
+
+    def _poll_commands(self, max_commands: int) -> list[dict]:
+        """Lease at most ``max_commands`` from the server."""
         if self._capabilities_provider is not None:
             capabilities = self._capabilities_provider()
         else:
@@ -139,7 +168,7 @@ class ControlChannel:
             "/api/control/poll",
             json={
                 "wait_seconds": self._wait_seconds,
-                "max_commands": self._max_commands,
+                "max_commands": max_commands,
                 "lease_seconds": self._lease_seconds,
                 "collector_version": self._version,
                 "capabilities": capabilities,
@@ -148,14 +177,45 @@ class ControlChannel:
         if response.status_code in (404, 405):
             raise UnsupportedServerError(response.status_code)
         response.raise_for_status()
-        commands = response.json().get("commands", [])
-        processed = 0
-        for command in commands:
+        return list(response.json().get("commands", []))
+
+    def _available_worker_slots(self) -> int:
+        with self._workers_lock:
+            return max(0, self._max_workers - len(self._workers))
+
+    def _dispatch_once(self) -> int:
+        """Poll and hand commands to bounded daemon workers without blocking."""
+        available = self._available_worker_slots()
+        if available <= 0:
+            self._stop.wait(0.05)
+            return 0
+        commands = self._poll_commands(min(self._max_commands, available))
+        dispatched = 0
+        for command in commands[:available]:
             if self._stop.is_set():
                 break
-            if self._process(command):
-                processed += 1
-        return processed
+            command_id = str(command.get("id") or "unknown")
+            worker = threading.Thread(
+                target=self._run_worker,
+                args=(command,),
+                daemon=True,
+                name=f"control-command-{command_id[:8]}",
+            )
+            with self._workers_lock:
+                # The server respected the requested limit, so every command
+                # has a slot. Register before start to close the polling race.
+                self._workers.add(worker)
+            worker.start()
+            dispatched += 1
+        return dispatched
+
+    def _run_worker(self, command: dict) -> None:
+        try:
+            self._process(command)
+        finally:
+            current = threading.current_thread()
+            with self._workers_lock:
+                self._workers.discard(current)
 
     def _process(self, command: dict) -> bool:
         command_id = str(command.get("id") or "")
@@ -265,7 +325,7 @@ class ControlChannel:
         backoff = _ERROR_BACKOFF_INITIAL
         while not self._stop.is_set():
             try:
-                self.poll_once()
+                self._dispatch_once()
                 backoff = _ERROR_BACKOFF_INITIAL
             except UnsupportedServerError:
                 logger.info(

@@ -225,6 +225,10 @@ def test_interrupt_and_close(tmp_path: Path) -> None:
         )
         assert (status, detail["closed"]) == ("completed", True)
         _wait_for_event(spool, "adapter.session_closed")
+        time.sleep(0.05)
+        assert "adapter.process_failed" not in {
+            event["event_type"] for event in _spool_events(spool)
+        }
 
         status, _, detail = manager.execute(
             "agent.session.close", {"control_session_id": "cs-6"}

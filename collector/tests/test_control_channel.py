@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -42,6 +43,9 @@ def _channel(client: _FakeClient, execute) -> ControlChannel:
     channel._max_commands = 4
     channel._version = "test"
     channel._stop = threading.Event()
+    channel._workers_lock = threading.Lock()
+    channel._workers = set()
+    channel._max_workers = channel._max_commands
     channel._config = SimpleNamespace(
         platform="TestOS",
         server=SimpleNamespace(url="https://memento.invalid", token="token"),
@@ -97,6 +101,50 @@ def test_successful_command_reports_fenced_outcome() -> None:
     assert body["status"] == "completed"
     assert body["detail"] == {"queued": 1}
     assert isinstance(body["elapsed_ms"], int)
+
+
+def test_run_loop_can_deliver_steer_while_turn_send_is_still_running(
+    monkeypatch,
+) -> None:
+    """A long turn must not monopolize the collector's only poll path."""
+    send_started = threading.Event()
+    release_send = threading.Event()
+    steer_completed = threading.Event()
+    batches = [
+        [_command(id="send", kind="agent.turn.send")],
+        [_command(id="steer", kind="agent.turn.steer")],
+    ]
+
+    channel = _channel(_FakeClient({}), lambda kind, payload: ("completed", None, {}))
+    channel._max_workers = 2
+    monkeypatch.setattr(
+        channel,
+        "_poll_commands",
+        lambda max_commands: batches.pop(0) if batches else [],
+    )
+
+    def process(command: dict) -> bool:
+        if command["kind"] == "agent.turn.send":
+            send_started.set()
+            assert release_send.wait(2)
+        else:
+            steer_completed.set()
+        return True
+
+    monkeypatch.setattr(channel, "_process", process)
+
+    assert channel._dispatch_once() == 1
+    assert send_started.wait(1)
+    assert channel._dispatch_once() == 1
+    assert steer_completed.wait(1)
+    # The steer worker finished while the original turn worker is still held.
+    assert not release_send.is_set()
+
+    release_send.set()
+    deadline = time.monotonic() + 2
+    while channel._available_worker_slots() != channel._max_workers:
+        assert time.monotonic() < deadline
+        threading.Event().wait(0.01)
 
 
 def test_executor_exception_becomes_stable_failure_outcome() -> None:
