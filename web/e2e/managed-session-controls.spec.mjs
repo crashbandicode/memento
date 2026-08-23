@@ -71,7 +71,7 @@ const APPROVAL_INTERACTION = {
 
 /**
  * @param {import('@playwright/test').Page} page
- * @param {{ sessions: () => any[], capture: Array<{path: string, body: any}> }} control
+ * @param {{ sessions: () => any[], capture: Array<{path: string, body: any}>, queries?: string[], conversationRef?: string }} control
  */
 async function openManagedConversation(page, control) {
   await seedAuth(page);
@@ -79,8 +79,10 @@ async function openManagedConversation(page, control) {
   // Registered after the catch-all so Playwright matches it first.
   await page.route("**/api/control/**", async (route) => {
     const request = route.request();
-    const pathname = new URL(request.url()).pathname;
+    const requestUrl = new URL(request.url());
+    const pathname = requestUrl.pathname;
     if (request.method() === "GET" && pathname.endsWith("/api/control/sessions")) {
+      control.queries?.push(requestUrl.searchParams.get("document_id") || "");
       await route.fulfill({ status: 200, json: control.sessions() });
       return;
     }
@@ -103,9 +105,23 @@ async function openManagedConversation(page, control) {
     }
     await route.fulfill({ status: 200, json: {} });
   });
-  await page.goto(`/conversations/${metadataOnlyPrompts.docId}`);
+  await page.goto(`/conversations/${control.conversationRef ?? metadataOnlyPrompts.docId}`);
   await page.waitForSelector("[data-conversation-viewer]", { timeout: 15000 });
 }
+
+test("native conversation URLs wait for the canonical document id before control lookup", async ({ page }) => {
+  const queries = [];
+  await openManagedConversation(page, {
+    sessions: () => [],
+    capture: [],
+    queries,
+    conversationRef: "claude/native-thread-fixture",
+  });
+
+  await expect.poll(() => queries.length).toBeGreaterThan(0);
+  expect(new Set(queries)).toEqual(new Set([metadataOnlyPrompts.docId]));
+  expect(queries).not.toContain("claude~native-thread-fixture");
+});
 
 test("view-only conversations render zero control affordances", async ({ page }) => {
   await openManagedConversation(page, { sessions: () => [], capture: [] });

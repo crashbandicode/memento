@@ -283,10 +283,12 @@ export default function ConversationPage() {
           </div>
         </div>
       )}
-      <ManagedSessionControls
-        documentId={currentMeta?.id || docId}
-        refreshSignal={syncVersions.controlSessions}
-      />
+      {currentMeta?.id && (
+        <ManagedSessionControls
+          documentId={currentMeta.id}
+          refreshSignal={syncVersions.controlSessions}
+        />
+      )}
       <ConversationViewer
         documentId={currentMeta?.id || docId}
         prompts={prompts}
