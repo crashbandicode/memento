@@ -187,13 +187,22 @@
   white-space: nowrap;
 }
 .statusDot { width: 6px; height: 6px; margin-right: 5px; flex: 0 0 auto; border-radius: 999px; background: var(--aurora-fg4); }
-.status_running { background: #22c55e; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.16); }
+/* Dots are 6px, so states must differ by hue, not shade. Hues mirror the
+   ConversationViewer subagent maps: running blue, completed green. */
+.status_running { background: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18); animation: statusPulse 1.6s ease-in-out infinite; }
 .status_completed { background: #059669; }
 .status_cancelled { background: #b45309; }
 .status_interrupted { background: #d97706; }
 .status_failed { background: #dc2626; }
 .status_unknown { background: var(--aurora-fg4); }
-.status_disconnected { background: #64748b; }
+.status_disconnected { background: transparent; box-shadow: inset 0 0 0 1.5px #64748b; }
+@keyframes statusPulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18); }
+  50% { box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.32); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status_running { animation: none; }
+}
 .matchLabel { color: var(--aurora-accent); font-size: 9px; font-weight: 750; text-transform: uppercase; }
 .previewBody { display: grid; gap: 8px; padding: 2px 9px 10px 46px; border-top: 1px solid color-mix(in srgb, var(--aurora-border) 72%, transparent); touch-action: pan-y; }
 .previewHeader { display: flex; justify-content: space-between; gap: 8px; padding-top: 8px; color: var(--aurora-fg4); font-size: 8.5px; font-weight: 650; }
