@@ -17,10 +17,15 @@ interface SourceMeta {
 
 interface SpendPart {
   source?: string;
+  // spend.all.parts[] entries use id/label/usageCents instead of
+  // source/name/usedCents; both shapes must render.
+  id?: string;
+  label?: string;
   name?: string;
   used?: string;
   limit?: string;
   usedCents?: number;
+  usageCents?: number;
   limitCents?: number;
   pctUsed?: number;
 }
@@ -212,7 +217,9 @@ function dateLabel(value?: string | null): string {
   if (!value) return "Unavailable";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unavailable";
-  return date.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+  // Billing resets are midnight-UTC instants; local formatting would show
+  // the previous day and disagree with the source dashboard.
+  return date.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
 
 function filterRange(points: StackPoint[], range: SpendRange, cycleStart?: string | null): StackPoint[] {
@@ -481,14 +488,19 @@ function ProviderRows({ parts, projections }: { parts: SpendPart[]; projections?
   return (
     <div className="spend-provider-list">
       {parts.map((part) => {
-        const source = (part.source?.toLowerCase() || "all") as SpendSource;
-        const pct = Math.max(0, Math.min(100, finite(part.pctUsed)));
+        const source = ((part.source || part.id)?.toLowerCase() || "all") as SpendSource;
+        const usedCents = part.usedCents ?? part.usageCents;
+        const pct = Math.max(0, Math.min(100, part.pctUsed != null
+          ? finite(part.pctUsed)
+          : finite(part.limitCents) > 0
+            ? (finite(usedCents) / finite(part.limitCents)) * 100
+            : 0));
         return (
-          <div className="spend-provider" key={part.source || part.name}>
-            <strong>{part.name || part.source}</strong>
+          <div className="spend-provider" key={part.source || part.id || part.name}>
+            <strong title={part.name || undefined}>{part.label || part.name || part.source || part.id}</strong>
             <div>
               <span className="spend-provider-track"><i style={{ width: `${pct}%`, background: SOURCE_COLORS[source] || SOURCE_COLORS.all }} /></span>
-              <small><b>{part.used || centsLabel(finite(part.usedCents))}</b> of {part.limit || centsLabel(finite(part.limitCents))}</small>
+              <small><b>{part.used || centsLabel(finite(usedCents))}</b> of {part.limit || centsLabel(finite(part.limitCents))}</small>
             </div>
           </div>
         );

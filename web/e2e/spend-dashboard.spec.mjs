@@ -52,10 +52,12 @@ const snapshot = {
       used: "$180.00", limit: "$500.00", remaining: "$320.00",
       usedCents: 18000, limitCents: 50000, remainingCents: 32000, pctUsed: 36,
       billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000),
+      // Real snapshot contract: parts use id/label/usageCents (no source/used/
+      // pctUsed) and carry the ACCOUNT name, which must not replace the label.
       parts: [
-        { source: "claude", name: "Claude", used: "$90.00", limit: "$200.00", pctUsed: 45 },
-        { source: "cursor", name: "Cursor", used: "$60.00", limit: "$200.00", pctUsed: 30 },
-        { source: "codex", name: "Codex", used: "$30.00", limit: "$100.00", pctUsed: 30 },
+        { id: "claude", label: "Claude", authenticated: true, unit: "cents", usageCents: 9000, limitCents: 20000, remainingCents: 11000, name: "Account One", email: "claude@example.test" },
+        { id: "cursor", label: "Cursor", authenticated: true, unit: "cents", usageCents: 6000, limitCents: 20000, remainingCents: 14000, name: "Account Two", email: "claude@example.test" },
+        { id: "codex", label: "Codex", authenticated: true, unit: "cents", usageCents: 3000, limitCents: 10000, remainingCents: 7000, name: "account-three", email: "claude@example.test" },
       ],
     },
     claude: { name: "Claude", email: "claude@example.test", used: "$90.00", limit: "$200.00", remaining: "$110.00", usedCents: 9000, limitCents: 20000, pctUsed: 45, billingCycleStart: at(-20 * 86400000), resetsAt: at(10 * 86400000) },
@@ -138,6 +140,15 @@ async function assertSpendDashboard(page) {
   await expect(page.getByText("AI quota left")).toBeVisible();
   await expect(page.getByRole("button", { name: "MTD" })).toHaveClass(/active/);
   await expect(page.getByRole("button", { name: "Projection" })).toHaveClass(/active/);
+
+  // Combined provider rows must show provider labels (not account names) with
+  // real used amounts derived from usageCents/limitCents.
+  const providerRows = page.locator(".spend-provider");
+  await expect(providerRows).toHaveCount(3);
+  await expect(providerRows.filter({ hasText: "Claude" })).toContainText("$90 of $200");
+  await expect(providerRows.filter({ hasText: "Cursor" })).toContainText("$60 of $200");
+  await expect(providerRows.filter({ hasText: "Codex" })).toContainText("$30 of $100");
+  await expect(providerRows.filter({ hasText: "Account One" })).toHaveCount(0);
 
   await page.getByRole("tab", { name: "Claude" }).click();
   await expect(page.getByRole("img", { name: "claude month-to-date spend history" })).toBeVisible();
