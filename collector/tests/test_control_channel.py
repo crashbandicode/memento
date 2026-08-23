@@ -224,6 +224,15 @@ def test_lease_keeper_stops_after_superseded_lease() -> None:
     assert keeper.renewals == 0
 
 
+def test_lease_keeper_default_interval_precedes_short_lease() -> None:
+    from collector.control_channel import _LeaseKeeper
+
+    keeper = _LeaseKeeper(
+        SimpleNamespace(), "cmd-short", "lease-short", lease_seconds=5
+    )
+    assert 0 < keeper._interval < 5
+
+
 def test_run_loop_survives_unexpected_exceptions(monkeypatch) -> None:
     """A dead channel thread silently kills the machine's heartbeat.
 

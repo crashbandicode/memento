@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from server.api.devices import _is_visible_device
+from server.api.devices import _is_visible_device, _managed_agent_tools
 from server.db.models import Machine
 
 
@@ -43,3 +43,18 @@ def test_versioned_or_document_bearing_device_never_disappears() -> None:
 
     unversioned = machine(heartbeat_age=timedelta(days=19))
     assert _is_visible_device(unversioned, 1, now=NOW)
+
+
+def test_managed_agent_tools_require_live_adapter_capabilities() -> None:
+    target = machine(heartbeat_age=timedelta(minutes=1), version="0.0.42")
+    target.capabilities = {
+        "control": {"commands": ["agent.session.start"]},
+        "agents": {
+            "codex": {"available": True},
+            "claude": {"available": False},
+        },
+    }
+    assert _managed_agent_tools(target) == ["codex"]
+
+    target.capabilities = {"control": {"commands": []}, "agents": {"codex": {"available": True}}}
+    assert _managed_agent_tools(target) == []

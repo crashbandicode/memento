@@ -24,6 +24,8 @@ from ..db.models import (
     AgentControlCommand,
     AgentControlEvent,
     AgentControlSession,
+    ConversationReadModel,
+    Document,
     Machine,
     User,
 )
@@ -492,6 +494,52 @@ def _pending_interaction(
     )
 
 
+async def _validate_resume_binding(
+    db: AsyncSession,
+    *,
+    machine_id: uuid.UUID,
+    document_id: uuid.UUID | None,
+    native_session_id: str | None,
+) -> None:
+    """Prove that an explicitly bound transcript is the requested Codex thread.
+
+    A native id without a document remains valid: ingest can bind the session
+    later by exact read-model identity. Once the browser supplies a document,
+    however, accepting an unchecked UUID would let a managed session attach to
+    a transcript from another device/tool/thread.
+    """
+    if document_id is None:
+        return
+    if not native_session_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "session.binding_mismatch", "reason": "native_session_required"},
+        )
+    binding = (
+        await db.execute(
+            select(Document, ConversationReadModel)
+            .join(
+                ConversationReadModel,
+                ConversationReadModel.document_id == Document.id,
+            )
+            .where(
+                Document.id == document_id,
+                Document.machine_id == machine_id,
+                Document.tool_id == "codex",
+                Document.category == "conversation",
+                ConversationReadModel.machine_id == machine_id,
+                ConversationReadModel.tool_id == "codex",
+                ConversationReadModel.thread_id == native_session_id,
+            )
+        )
+    ).first()
+    if binding is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "session.binding_mismatch", "reason": "conversation_identity"},
+        )
+
+
 @router.post("/sessions")
 async def create_session(
     req: ControlSessionCreateRequest,
@@ -508,6 +556,13 @@ async def create_session(
         user.role not in ("admin", "owner") and machine.user_id != user.id
     ):
         raise HTTPException(status_code=404, detail="Device not found")
+
+    await _validate_resume_binding(
+        db,
+        machine_id=machine.id,
+        document_id=req.document_id,
+        native_session_id=req.native_session_id,
+    )
 
     resume = bool(req.native_session_id)
     session = create_control_session(

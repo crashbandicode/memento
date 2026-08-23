@@ -16,6 +16,7 @@ interface Device {
   created_at: string;
   document_count: number;
   tools: string[];
+  managed_agents?: string[];
 }
 
 function useTimeAgo(t: ReturnType<typeof useI18n>["t"]) {
@@ -194,7 +195,7 @@ memento-collector setup`}
                       </div>
                     ))}
                   </div>
-                  {d.tools.includes("codex") && isOnline && (
+                  {d.managed_agents?.includes("codex") && isOnline && (
                     <Btn
                       size="sm"
                       variant="ghost"

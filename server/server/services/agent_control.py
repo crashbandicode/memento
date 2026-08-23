@@ -966,14 +966,28 @@ async def _apply_agent_command_effects(db: AsyncSession, command: AgentControlCo
         if command.kind in (KIND_AGENT_SESSION_START, KIND_AGENT_SESSION_RESUME):
             native = str(outcome.get("native_thread_id") or "") or session.native_session_id
             session.native_session_id = native
-            session.state = SESSION_ACTIVE
-            session.state_reason = None
-            session.started_at = session.started_at or now
-            if outcome.get("native_turn_id"):
-                session.active_native_turn_id = str(outcome["native_turn_id"])
+            # A process-failed/session-closed lifecycle event can beat the
+            # command outcome through the independent durable event spool.
+            # Terminal lifecycle state is newer evidence and must win.
+            if session.state not in (SESSION_FAILED, SESSION_CLOSED):
+                session.state = SESSION_ACTIVE
+                session.state_reason = None
+                session.started_at = session.started_at or now
+                turn_id = str(outcome.get("native_turn_id") or "")
+                if turn_id and not await _turn_has_completed_event(
+                    db, session_id=session.id, turn_id=turn_id
+                ):
+                    session.active_native_turn_id = turn_id
         elif command.kind in (KIND_AGENT_TURN_SEND, KIND_AGENT_TURN_STEER):
-            if outcome.get("native_turn_id"):
-                session.active_native_turn_id = str(outcome["native_turn_id"])
+            turn_id = str(outcome.get("native_turn_id") or "")
+            if (
+                turn_id
+                and session.state not in (SESSION_FAILED, SESSION_CLOSED)
+                and not await _turn_has_completed_event(
+                    db, session_id=session.id, turn_id=turn_id
+                )
+            ):
+                session.active_native_turn_id = turn_id
         elif command.kind == KIND_AGENT_SESSION_CLOSE:
             session.state = SESSION_CLOSED
             session.closed_at = now
@@ -987,6 +1001,23 @@ async def _apply_agent_command_effects(db: AsyncSession, command: AgentControlCo
             session.state = SESSION_FAILED
             session.state_reason = command.error_code
     _publish_session_state(db, session, session.user_id)
+
+
+async def _turn_has_completed_event(
+    db: AsyncSession, *, session_id: uuid.UUID, turn_id: str
+) -> bool:
+    """Fence command/event reordering across the two collector upload paths."""
+    return (
+        await db.execute(
+            select(AgentControlEvent.id)
+            .where(
+                AgentControlEvent.control_session_id == session_id,
+                AgentControlEvent.event_type == "adapter.turn_completed",
+                AgentControlEvent.native_turn_id == turn_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
 
 
 def _apply_session_lifecycle_event(

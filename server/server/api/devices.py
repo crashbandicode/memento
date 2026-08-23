@@ -65,6 +65,21 @@ def _is_visible_device(
     return last_seen >= current - _STALE_EMPTY_DEVICE_AGE
 
 
+def _managed_agent_tools(machine: Machine) -> list[str]:
+    """Return only adapters the live collector explicitly reports usable."""
+    capabilities = machine.capabilities if isinstance(machine.capabilities, dict) else {}
+    control = capabilities.get("control")
+    commands = set(control.get("commands") or []) if isinstance(control, dict) else set()
+    agents = capabilities.get("agents")
+    if "agent.session.start" not in commands or not isinstance(agents, dict):
+        return []
+    return sorted(
+        str(tool_id)
+        for tool_id, details in agents.items()
+        if isinstance(details, dict) and details.get("available") is True
+    )
+
+
 @router.get("")
 async def list_devices(
     db: AsyncSession = Depends(get_db),
@@ -106,6 +121,7 @@ async def list_devices(
             "created_at": m.created_at.isoformat(),
             "document_count": document_count,
             "tools": tools_by_machine.get(m.id, []),
+            "managed_agents": _managed_agent_tools(m),
         })
 
     return items

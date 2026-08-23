@@ -580,6 +580,7 @@ export interface DeviceSummary {
   document_count?: number;
   total_files?: number;
   tools?: string[];
+  managed_agents?: string[];
 }
 
 export interface DeviceIdentitySummary {

@@ -30,12 +30,18 @@ class _EventLog:
         with self._lock:
             self.events.append((event_type, payload))
 
-    def wait_for(self, event_type: str, *, timeout: float = 15.0) -> dict:
+    def wait_for(
+        self,
+        event_type: str,
+        *,
+        where=lambda payload: True,
+        timeout: float = 15.0,
+    ) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
                 for kind, payload in self.events:
-                    if kind == event_type:
+                    if kind == event_type and where(payload):
                         return payload
             time.sleep(0.02)
         raise AssertionError(f"event {event_type} not observed; saw {self.types()}")
@@ -160,13 +166,11 @@ def test_interrupt_yields_interrupted_terminal_turn() -> None:
         thread = adapter.thread_start()
         turn = adapter.turn_start(thread["id"], "long work")
         adapter.turn_interrupt(thread["id"], turn["id"])
-        payload = events.wait_for("turn/completed")
-        statuses = [
-            p["turn"]["status"]
-            for kind, p in events.events
-            if kind == "turn/completed"
-        ]
-        assert "interrupted" in statuses or payload["turn"]["status"] == "interrupted"
+        payload = events.wait_for(
+            "turn/completed",
+            where=lambda item: item.get("turn", {}).get("status") == "interrupted",
+        )
+        assert payload["turn"]["status"] == "interrupted"
     finally:
         adapter.stop()
 

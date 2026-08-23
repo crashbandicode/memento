@@ -296,6 +296,7 @@ test("devices page can start a managed Codex session", async ({ page }) => {
           created_at: "2026-08-01T00:00:00Z",
           document_count: 12,
           tools: ["codex", "claude_code"],
+          managed_agents: ["codex"],
         },
       ],
     });

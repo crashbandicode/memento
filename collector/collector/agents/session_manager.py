@@ -181,47 +181,51 @@ class AgentSessionManager:
         )
         session = ManagedSession(control_session_id=control_session_id, adapter=adapter)
         self._bind_adapter(session)
-        adapter.start()
-        with self._lock:
-            self._sessions[control_session_id] = session
-        self._spool.emit(
-            "adapter.session_started",
-            control_session_id=control_session_id,
-            adapter=ADAPTER_CODEX,
-            details={"cwd": options.get("cwd")},
-        )
-        thread_options: dict[str, Any] = {}
-        for key, wire in (
-            ("cwd", "cwd"),
-            ("model", "model"),
-            ("approval_policy", "approvalPolicy"),
-            ("sandbox", "sandbox"),
-            ("personality", "personality"),
-        ):
-            if options.get(key) is not None:
-                thread_options[wire] = options[key]
-        thread = session.adapter.thread_start(**thread_options)
-        session.native_thread_id = str(thread.get("id") or "")
-        session.state = "active"
-        self._spool.emit(
-            "adapter.native_bound",
-            control_session_id=control_session_id,
-            native_session_id=session.native_thread_id,
-            adapter=ADAPTER_CODEX,
-        )
-        detail: dict = {"native_thread_id": session.native_thread_id}
-        initial = payload.get("initial_message")
-        if initial:
-            turn = session.adapter.turn_start(
-                session.native_thread_id,
-                str(initial),
-                client_message_id=payload.get("client_message_id"),
-                model=options.get("model"),
-                effort=options.get("effort"),
+        try:
+            adapter.start()
+            with self._lock:
+                self._sessions[control_session_id] = session
+            self._spool.emit(
+                "adapter.session_started",
+                control_session_id=control_session_id,
+                adapter=ADAPTER_CODEX,
+                details={"cwd": options.get("cwd")},
             )
-            session.active_turn_id = str(turn.get("id") or "")
-            detail["native_turn_id"] = session.active_turn_id
-        return "completed", None, detail
+            thread_options: dict[str, Any] = {}
+            for key, wire in (
+                ("cwd", "cwd"),
+                ("model", "model"),
+                ("approval_policy", "approvalPolicy"),
+                ("sandbox", "sandbox"),
+                ("personality", "personality"),
+            ):
+                if options.get(key) is not None:
+                    thread_options[wire] = options[key]
+            thread = session.adapter.thread_start(**thread_options)
+            session.native_thread_id = str(thread.get("id") or "")
+            session.state = "active"
+            self._spool.emit(
+                "adapter.native_bound",
+                control_session_id=control_session_id,
+                native_session_id=session.native_thread_id,
+                adapter=ADAPTER_CODEX,
+            )
+            detail: dict = {"native_thread_id": session.native_thread_id}
+            initial = payload.get("initial_message")
+            if initial:
+                turn = session.adapter.turn_start(
+                    session.native_thread_id,
+                    str(initial),
+                    client_message_id=payload.get("client_message_id"),
+                    model=options.get("model"),
+                    effort=options.get("effort"),
+                )
+                session.active_turn_id = str(turn.get("id") or "")
+                detail["native_turn_id"] = session.active_turn_id
+            return "completed", None, detail
+        except Exception:
+            self._abort_startup(session)
+            raise
 
     def _session_resume(self, payload: dict) -> CommandOutcome:
         control_session_id = _required(payload, "control_session_id")
@@ -239,19 +243,37 @@ class AgentSessionManager:
         )
         session = ManagedSession(control_session_id=control_session_id, adapter=adapter)
         self._bind_adapter(session)
-        adapter.start()
+        try:
+            adapter.start()
+            with self._lock:
+                self._sessions[control_session_id] = session
+            thread = session.adapter.thread_resume(native_session_id)
+            session.native_thread_id = str(thread.get("id") or native_session_id)
+            session.state = "active"
+            self._spool.emit(
+                "adapter.session_resumed",
+                control_session_id=control_session_id,
+                native_session_id=session.native_thread_id,
+                adapter=ADAPTER_CODEX,
+            )
+            return "completed", None, {"native_thread_id": session.native_thread_id}
+        except Exception:
+            self._abort_startup(session)
+            raise
+
+    def _abort_startup(self, session: ManagedSession) -> None:
+        """Remove and stop a partially initialized adapter without leaking it."""
         with self._lock:
-            self._sessions[control_session_id] = session
-        thread = session.adapter.thread_resume(native_session_id)
-        session.native_thread_id = str(thread.get("id") or native_session_id)
-        session.state = "active"
-        self._spool.emit(
-            "adapter.session_resumed",
-            control_session_id=control_session_id,
-            native_session_id=session.native_thread_id,
-            adapter=ADAPTER_CODEX,
-        )
-        return "completed", None, {"native_thread_id": session.native_thread_id}
+            if self._sessions.get(session.control_session_id) is session:
+                self._sessions.pop(session.control_session_id, None)
+        self._cancel_pendings(session)
+        session.state = "failed"
+        try:
+            session.adapter.stop()
+        except Exception:
+            logger.exception(
+                "Adapter cleanup failed for %s", session.control_session_id
+            )
 
     def _session_close(self, payload: dict) -> CommandOutcome:
         control_session_id = _required(payload, "control_session_id")

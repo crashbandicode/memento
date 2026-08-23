@@ -321,7 +321,7 @@ class _LeaseKeeper:
         self._lease_id = lease_id
         self._lease_seconds = lease_seconds
         self._interval = interval_seconds if interval_seconds is not None else max(
-            20.0, lease_seconds / 3.0
+            1.0, min(20.0, lease_seconds / 3.0)
         )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None

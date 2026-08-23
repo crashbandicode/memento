@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -28,6 +29,7 @@ from server.db.models import (
     Tool,
     User,
 )
+from server.api.control import _validate_resume_binding
 from server.services.agent_control import (
     AGENT_KINDS,
     KIND_AGENT_INTERACTION_ANSWER,
@@ -684,6 +686,60 @@ async def test_managed_session_lifecycle_via_commands_and_events(session_factory
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_completed_turn_event_wins_when_it_arrives_before_command_outcome(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user, machine = await _seed_agent_machine(db)
+        session = create_control_session(
+            db, machine=machine, user_id=user.id, tool_id="codex", adapter="codex_app_server"
+        )
+        session.state = SESSION_ACTIVE
+        session.native_session_id = "thr_race"
+        await db.flush()
+        command, _ = await admit_command(
+            db,
+            machine=machine,
+            user_id=user.id,
+            kind=KIND_AGENT_TURN_SEND,
+            payload={"control_session_id": str(session.id), "text": "fast turn"},
+            control_session_id=session.id,
+        )
+        leased = await lease_commands(db, machine=machine)
+        target = next(item for item in leased if item.id == command.id)
+        await acknowledge_command(
+            db, machine=machine, command_id=command.id, lease_id=target.lease_id
+        )
+
+        await ingest_control_events(
+            db,
+            machine=machine,
+            events=[
+                {
+                    "schema_version": 1,
+                    "event_id": str(uuid.uuid4()),
+                    "event_type": "adapter.turn_completed",
+                    "control_session_id": session.id,
+                    "native_turn_id": "turn_fast",
+                    "outcome": "completed",
+                }
+            ],
+        )
+        await complete_command(
+            db,
+            machine=machine,
+            command_id=command.id,
+            lease_id=target.lease_id,
+            status=STATE_COMPLETED,
+            detail={"native_turn_id": "turn_fast"},
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.active_native_turn_id is None
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_failed_session_start_marks_session_failed(session_factory) -> None:
     async with session_factory() as db:
         user, machine = await _seed_agent_machine(db)
@@ -830,3 +886,60 @@ async def test_bind_control_session_documents_by_exact_thread_id(session_factory
         await db.flush()
         await db.refresh(session)
         assert session.document_id == document.id
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_resume_binding_requires_exact_machine_tool_and_thread(session_factory) -> None:
+    async with session_factory() as db:
+        _user, machine = await _seed_agent_machine(db)
+        if await db.get(Tool, "codex") is None:
+            db.add(Tool(id="codex", display_name="Codex"))
+        document = Document(
+            id=uuid.uuid4(),
+            tool_id="codex",
+            machine_id=machine.id,
+            relative_path=f"sessions/{uuid.uuid4()}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Resume target",
+            content_hash=uuid.uuid4().hex,
+            file_size_bytes=1,
+        )
+        db.add(document)
+        await db.flush()
+        db.add(
+            ConversationReadModel(
+                document_id=document.id,
+                machine_id=machine.id,
+                tool_id="codex",
+                thread_id="thr_exact",
+            )
+        )
+        await db.flush()
+
+        await _validate_resume_binding(
+            db,
+            machine_id=machine.id,
+            document_id=document.id,
+            native_session_id="thr_exact",
+        )
+
+        with pytest.raises(HTTPException) as wrong_thread:
+            await _validate_resume_binding(
+                db,
+                machine_id=machine.id,
+                document_id=document.id,
+                native_session_id="thr_other",
+            )
+        assert wrong_thread.value.status_code == 409
+        assert wrong_thread.value.detail["code"] == "session.binding_mismatch"
+
+        with pytest.raises(HTTPException) as missing_native:
+            await _validate_resume_binding(
+                db,
+                machine_id=machine.id,
+                document_id=document.id,
+                native_session_id=None,
+            )
+        assert missing_native.value.status_code == 409

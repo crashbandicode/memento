@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from collector.agents.codex_app_server import CodexAppServerAdapter
+from collector.agents.codex_app_server import CodexAdapterError, CodexAppServerAdapter
 from collector.agents.control_event_spool import ControlEventSpool
 from collector.agents.session_manager import (
     AGENT_COMMANDS,
@@ -267,6 +267,51 @@ def test_unknown_session_and_resume_round_trip(tmp_path: Path) -> None:
         )
         assert status == "completed"
         assert detail["native_thread_id"] == "thr_previous"
+    finally:
+        manager.shutdown()
+
+
+def test_failed_thread_start_stops_and_forgets_partial_adapter(tmp_path: Path) -> None:
+    spool = ControlEventSpool(tmp_path / "events.jsonl", tmp_path / "state.json")
+    config = SimpleNamespace(
+        platform="TestOS",
+        server=SimpleNamespace(url="https://memento.invalid", token="token"),
+        device_id="device",
+        device_name="device-name",
+    )
+
+    class FailingAdapter:
+        def __init__(self) -> None:
+            self.alive = False
+            self.stopped = False
+            self.on_event = lambda kind, payload: None
+            self.approval_handler = lambda method, params: {"decision": "decline"}
+            self.user_input_handler = lambda params: {"answers": {}}
+
+        def start(self) -> None:
+            self.alive = True
+
+        def stop(self) -> None:
+            self.alive = False
+            self.stopped = True
+
+        def thread_start(self, **options: object) -> dict:
+            raise CodexAdapterError("scripted thread/start failure")
+
+    adapter = FailingAdapter()
+    manager = AgentSessionManager(
+        config,
+        spool,
+        adapter_factory=lambda **_kwargs: adapter,
+    )
+    try:
+        status, error_code, detail = manager.execute(
+            "agent.session.start", {"control_session_id": "cs-partial"}
+        )
+        assert (status, error_code) == ("failed", "adapter.process_failed")
+        assert "thread/start failure" in detail["error"]
+        assert adapter.stopped is True
+        assert manager.session_snapshot() == []
     finally:
         manager.shutdown()
 
