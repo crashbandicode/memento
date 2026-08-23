@@ -221,3 +221,16 @@ def test_thread_resume_round_trip() -> None:
         assert resumed["resumed"] is True
     finally:
         adapter.stop()
+
+
+def test_resolve_codex_command_disables_code_mode(monkeypatch) -> None:
+    """Managed app-servers must not expose the code-mode shell bypass."""
+    from collector.agents.codex_app_server import resolve_codex_command
+
+    monkeypatch.setenv("MEMENTO_CODEX_COMMAND", "C:/fake/codex.exe")
+    assert resolve_codex_command() == [
+        "C:/fake/codex.exe",
+        "app-server",
+        "-c",
+        "features.plugins=false",
+    ]

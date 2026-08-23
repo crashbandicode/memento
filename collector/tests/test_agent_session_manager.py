@@ -364,3 +364,56 @@ def test_agent_capability_surface_is_stable() -> None:
         "agent.interaction.answer",
         "agent.approval.respond",
     )
+
+
+def test_session_start_spools_effective_thread_config(tmp_path: Path) -> None:
+    manager, spool = _manager(tmp_path)
+    try:
+        status, error_code, _detail = manager.execute(
+            "agent.session.start",
+            {
+                "control_session_id": "cs-cfg",
+                "options": {"approval_policy": "untrusted", "sandbox": "workspace-write"},
+            },
+        )
+        assert (status, error_code) == ("completed", None)
+        config_event = _wait_for_event(spool, "adapter.thread_config")
+        assert config_event["details"]["approvalPolicy"] == "untrusted"
+        assert config_event["details"]["sandbox"] == "workspace-write"
+    finally:
+        manager.shutdown()
+
+
+def test_session_start_fails_when_policy_silently_substituted(tmp_path: Path) -> None:
+    """A permissive default in place of the requested policy must not bind."""
+    manager, _spool = _manager(tmp_path)
+    try:
+        status, error_code, detail = manager.execute(
+            "agent.session.start",
+            {
+                "control_session_id": "cs-lie",
+                "options": {
+                    "approval_policy": "untrusted",
+                    "sandbox": "workspace-write",
+                    "model": "LIE-POLICY",
+                },
+            },
+        )
+        assert status == "failed"
+        assert error_code == "adapter.config_mismatch"
+        assert detail["mismatches"]["approvalPolicy"] == {
+            "requested": "untrusted",
+            "effective": "on-request",
+        }
+
+        # The partial session must be forgotten: a retry starts cleanly.
+        status, error_code, _detail = manager.execute(
+            "agent.session.start",
+            {
+                "control_session_id": "cs-lie",
+                "options": {"approval_policy": "untrusted"},
+            },
+        )
+        assert (status, error_code) == ("completed", None)
+    finally:
+        manager.shutdown()

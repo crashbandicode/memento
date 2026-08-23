@@ -202,8 +202,26 @@ class AgentSessionManager:
                 if options.get(key) is not None:
                     thread_options[wire] = options[key]
             thread = session.adapter.thread_start(**thread_options)
+            # Fail loudly if the app-server silently substituted a different
+            # policy than requested: a permissive default here means shell
+            # commands run without the approvals the user asked for.
+            effective = _effective_thread_config(session.adapter)
+            mismatches = _thread_config_mismatches(thread_options, effective)
+            if mismatches:
+                self._abort_startup(session)
+                return "failed", "adapter.config_mismatch", {
+                    "mismatches": mismatches,
+                    "effective": effective,
+                }
             session.native_thread_id = str(thread.get("id") or "")
             session.state = "active"
+            if effective:
+                self._spool.emit(
+                    "adapter.thread_config",
+                    control_session_id=control_session_id,
+                    adapter=ADAPTER_CODEX,
+                    details=effective,
+                )
             self._spool.emit(
                 "adapter.native_bound",
                 control_session_id=control_session_id,
@@ -513,6 +531,35 @@ class AgentSessionManager:
 
 class _UnknownSession(Exception):
     pass
+
+
+def _effective_thread_config(adapter) -> dict:
+    """Bounded projection of the thread/start echo (no content fields)."""
+    config = getattr(adapter, "last_thread_config", {}) or {}
+    effective: dict = {}
+    if config.get("approvalPolicy") is not None:
+        effective["approvalPolicy"] = str(config["approvalPolicy"])
+    sandbox = config.get("sandbox")
+    if isinstance(sandbox, dict):
+        sandbox = sandbox.get("type")
+    if sandbox is not None:
+        effective["sandbox"] = str(sandbox)
+    if config.get("model") is not None:
+        effective["model"] = str(config["model"])
+    return effective
+
+
+def _thread_config_mismatches(requested: dict, effective: dict) -> dict:
+    """Requested-vs-echoed diffs for the fields that gate side effects."""
+    mismatches: dict = {}
+    for key in ("approvalPolicy", "sandbox"):
+        wanted = requested.get(key)
+        if wanted is None:
+            continue
+        got = effective.get(key)
+        if got is not None and str(got) != str(wanted):
+            mismatches[key] = {"requested": str(wanted), "effective": str(got)}
+    return mismatches
 
 
 def _required(payload: dict, key: str) -> str:

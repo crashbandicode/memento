@@ -69,16 +69,34 @@ class CodexAdapterError(Exception):
     pass
 
 
+# The plugin runtime injects a custom `exec` tool whose tools.shell_command
+# never reaches the exec-approval assessment, silently bypassing
+# approvalPolicy (observed live: an `untrusted` thread ran shell writes with
+# no approval request). Feature-level -c overrides lose to the plugin's own
+# re-enabling, so managed sessions disable the plugin runtime entirely:
+# a lean, predictable tool surface where every shell command goes through
+# the native approval path.
+MANAGED_CONFIG_OVERRIDES: tuple[str, ...] = (
+    "features.plugins=false",
+)
+
+
 def resolve_codex_command() -> list[str]:
     """Locate the Codex CLI without a shell, honoring an explicit override."""
     override = os.environ.get("MEMENTO_CODEX_COMMAND", "").strip()
     if override:
-        return [override, "app-server"]
-    for candidate in ("codex.exe", "codex.cmd", "codex"):
-        found = shutil.which(candidate)
-        if found:
-            return [found, "app-server"]
-    raise CodexAdapterError("codex CLI not found on PATH")
+        command = [override, "app-server"]
+    else:
+        for candidate in ("codex.exe", "codex.cmd", "codex"):
+            found = shutil.which(candidate)
+            if found:
+                command = [found, "app-server"]
+                break
+        else:
+            raise CodexAdapterError("codex CLI not found on PATH")
+    for entry in MANAGED_CONFIG_OVERRIDES:
+        command.extend(("-c", entry))
+    return command
 
 
 def _bounded_item_summary(item: dict) -> dict:
@@ -133,6 +151,7 @@ class CodexAppServerAdapter:
         self._deltas_lock = threading.Lock()
         self._deltas: dict[str, _TurnDeltas] = {}
         self.server_info: dict = {}
+        self.last_thread_config: dict = {}
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -184,7 +203,18 @@ class CodexAppServerAdapter:
             rpc.close()
         if process is not None:
             try:
-                process.terminate()
+                if sys.platform == "win32":
+                    # codex.cmd spawns cmd -> node -> codex.exe; terminate()
+                    # only kills the top of that tree and leaves an orphaned
+                    # app-server running after close. Kill the whole tree.
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        timeout=15,
+                    )
+                else:
+                    process.terminate()
                 process.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 try:
@@ -213,7 +243,15 @@ class CodexAppServerAdapter:
     def thread_start(self, **options: Any) -> dict:
         """Create a new thread. Options pass through (model, cwd, ...)."""
         result = self._request("thread/start", options or {})
-        return (result or {}).get("thread") or {}
+        result = result or {}
+        # The response echoes the EFFECTIVE thread config; callers verify it
+        # against what they requested instead of trusting silent defaults.
+        self.last_thread_config = {
+            key: result.get(key)
+            for key in ("approvalPolicy", "sandbox", "model")
+            if key in result
+        }
+        return result.get("thread") or {}
 
     def thread_resume(self, thread_id: str, **options: Any) -> dict:
         params = {"threadId": thread_id, **options}
