@@ -806,7 +806,6 @@ async def get_project_timeline(
         d_meta = row.metadata
         d_src_mod = row.source_modified_at
         d_synced = row.synced_at
-        d_activity = row.activity_at
         if (
             d_category == "conversation"
             and d_id not in conversation_hierarchy.visible_document_ids
@@ -977,7 +976,7 @@ async def get_project_timeline(
                     ).label("message_count"),
                 ).where(
                     DashboardDocumentProjection.document_id.in_(page_conv_ids),
-                    DashboardDocumentProjection.projection_version == 1,
+                    DashboardDocumentProjection.projection_version >= 1,
                 )
             )
         ).all()

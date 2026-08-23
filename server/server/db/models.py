@@ -1145,6 +1145,9 @@ class DashboardDocumentProjection(Base):
     is_subagent: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    is_archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     hierarchy_metadata: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict
     )

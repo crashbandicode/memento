@@ -43,6 +43,8 @@ from ..services.conversation_hierarchy import (
     group_conversation_root_thread_ids,
 )
 from ..services.dashboard_projection import (
+    ARCHIVED_METADATA_KEY,
+    DASHBOARD_PROJECTION_VERSION,
     dashboard_projection_backfill_complete,
 )
 from ..services.device_grouping import resolve_device_scope_ids
@@ -76,9 +78,23 @@ def _apply_device_filter(query, machine_ids, machine_column):
     return query.where(machine_column.in_(machine_ids))
 
 
-def _dashboard_projection_select():
+def _legacy_is_archived_expression(metadata):
+    archived_text = func.lower(
+        func.coalesce(metadata[ARCHIVED_METADATA_KEY].astext, "")
+    )
+    return archived_text.in_(("true", "t", "1", "yes"))
+
+
+def _unarchived_conversation_filter(source):
+    return and_(
+        source.c.category == "conversation",
+        source.c.is_archived.is_(False),
+    )
+
+
+def _dashboard_projection_select(*, current_version_only: bool = False):
     projection = DashboardDocumentProjection
-    return select(
+    statement = select(
         projection.document_id.label("id"),
         projection.tool_id.label("tool_id"),
         projection.title.label("title"),
@@ -96,6 +112,7 @@ def _dashboard_projection_select():
         projection.root_thread_id.label("root_thread_id"),
         projection.parent_thread_id.label("parent_thread_id"),
         projection.is_subagent.label("is_subagent"),
+        projection.is_archived.label("is_archived"),
         projection.message_count.label("message_count"),
         projection.user_message_count.label("user_message_count"),
         projection.assistant_message_count.label("assistant_message_count"),
@@ -104,6 +121,11 @@ def _dashboard_projection_select():
         projection.agent_mode.label("agent_mode"),
         literal(True).label("projected"),
     )
+    if current_version_only:
+        statement = statement.where(
+            projection.projection_version == DASHBOARD_PROJECTION_VERSION
+        )
+    return statement
 
 
 def _legacy_dashboard_select():
@@ -145,6 +167,7 @@ def _legacy_dashboard_select():
             root_thread_id.label("root_thread_id"),
             metadata["parent_thread_id"].astext.label("parent_thread_id"),
             literal(False).label("is_subagent"),
+            _legacy_is_archived_expression(metadata).label("is_archived"),
             literal(0).label("message_count"),
             literal(0).label("user_message_count"),
             literal(0).label("assistant_message_count"),
@@ -160,13 +183,24 @@ def _legacy_dashboard_select():
             DashboardDocumentProjection,
             DashboardDocumentProjection.document_id == Document.id,
         )
-        .where(DashboardDocumentProjection.document_id.is_(None))
+        # A version bump must keep using normalized document metadata for an
+        # old projection until its lightweight upgrade has completed.  In
+        # particular, a newly added projected column has its database default
+        # on old rows and must not leak archived conversations during that
+        # compatibility window.
+        .where(or_(
+            DashboardDocumentProjection.document_id.is_(None),
+            DashboardDocumentProjection.projection_version
+            < DASHBOARD_PROJECTION_VERSION,
+        ))
     )
 
 
 def dashboard_source_statement(*, include_legacy: bool):
     """Return the narrow dashboard source, with a temporary legacy union."""
-    projected = _dashboard_projection_select()
+    projected = _dashboard_projection_select(
+        current_version_only=include_legacy,
+    )
     if not include_legacy:
         return projected
     return union_all(projected, _legacy_dashboard_select())
@@ -278,6 +312,7 @@ async def get_dashboard(
         source.c.root_thread_id,
         source.c.parent_thread_id,
         source.c.is_subagent,
+        source.c.is_archived,
         source.c.message_count,
         source.c.user_message_count,
         source.c.assistant_message_count,
@@ -294,7 +329,7 @@ async def get_dashboard(
     recent_convos_q = (
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
-        .where(source.c.category == "conversation")
+        .where(_unarchived_conversation_filter(source))
         .order_by(activity_expr.desc(), source.c.id.desc())
         .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
@@ -306,7 +341,7 @@ async def get_dashboard(
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
         .where(
-            source.c.category == "conversation",
+            _unarchived_conversation_filter(source),
             source.c.pending_question_count > 0,
         )
     )
@@ -346,7 +381,7 @@ async def get_dashboard(
             select(*conversation_columns)
             .outerjoin(Project, source.c.project_id == Project.id)
             .where(
-                source.c.category == "conversation",
+                _unarchived_conversation_filter(source),
                 or_(
                     *companion_filters,
                     build_conversation_companion_filter(
@@ -377,7 +412,7 @@ async def get_dashboard(
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
         .where(
-            source.c.category == "conversation",
+            _unarchived_conversation_filter(source),
             or_(
                 cast(source.c.id, String).in_(explicit_orchestration_parent_ids),
                 source.c.hierarchy_metadata[
@@ -420,6 +455,7 @@ async def get_dashboard(
         row
         for row in all_convo_rows
         if row.id in conversation_hierarchy.visible_document_ids
+        and not row.is_archived
     ]
 
     def activity_key(row):

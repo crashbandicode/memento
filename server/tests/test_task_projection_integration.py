@@ -1143,6 +1143,7 @@ async def test_cursor_projection_delta_reconciles_canvas_references_exactly(
             "canvas-stable",
             f"Open {reference('removed')} and {reference('retained')}.",
             timestamp=timestamp,
+            tool_name="Write",
         )
         await _extract_messages(session, document, initial, "full")
         await session.flush()
@@ -1175,11 +1176,13 @@ async def test_cursor_projection_delta_reconciles_canvas_references_exactly(
             "canvas-stable",
             f"Open {reference('retained')} and {reference('added')}.",
             timestamp=timestamp,
+            tool_name="Write",
         )
         appended = _cursor_tool_row(
             "canvas-new",
             f"Tool output mentions {reference('new-row')}.",
             timestamp=timestamp,
+            tool_name="Write",
         )
         delta = f"{changed}\n{appended}"
         await _extract_messages(session, document, delta, "delta")
@@ -1963,6 +1966,32 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
                 )
             ).scalars()
         )
+        dashboard_columns = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'dashboard_document_projections'"
+                    )
+                )
+            ).scalars()
+        )
+        await connection.execute(text(
+            "ALTER TABLE dashboard_document_projections DROP COLUMN is_archived"
+        ))
+        await connection.run_sync(_run_migrations)
+        restored_dashboard_columns = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'dashboard_document_projections'"
+                    )
+                )
+            ).scalars()
+        )
     assert exists == "conversation_task_states"
     assert read_exists == "conversation_read_models"
     assert prompt_exists == "conversation_prompt_projections"
@@ -2000,6 +2029,8 @@ async def test_startup_migration_recreates_projection_table_and_indexes(
         "assistant_message_count",
         "human_character_count",
     } <= read_columns
+    assert "is_archived" in dashboard_columns
+    assert "is_archived" in restored_dashboard_columns
     assert {
         "dashboard_document_projections_pkey",
         "idx_dashboard_projection_machine",

@@ -764,6 +764,7 @@ def _run_migrations(conn) -> None:
                 "root_thread_id VARCHAR(512), "
                 "parent_thread_id VARCHAR(512), "
                 "is_subagent BOOLEAN NOT NULL DEFAULT FALSE, "
+                "is_archived BOOLEAN NOT NULL DEFAULT FALSE, "
                 "hierarchy_metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
                 "message_count INTEGER NOT NULL DEFAULT 0, "
                 "user_message_count INTEGER NOT NULL DEFAULT 0, "
@@ -776,6 +777,17 @@ def _run_migrations(conn) -> None:
                 "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
                 ")"
             ))
+        else:
+            dashboard_columns = {
+                column["name"]
+                for column in insp.get_columns("dashboard_document_projections")
+            }
+            if "is_archived" not in dashboard_columns:
+                conn.execute(text(
+                    "ALTER TABLE dashboard_document_projections "
+                    "ADD COLUMN IF NOT EXISTS is_archived "
+                    "BOOLEAN NOT NULL DEFAULT FALSE"
+                ))
         for dashboard_index_sql in (
             "CREATE INDEX IF NOT EXISTS idx_dashboard_projection_machine "
             "ON dashboard_document_projections (machine_id)",
@@ -971,12 +983,14 @@ def _initialize_dashboard_projection_state(conn) -> None:
     """Seed the compatibility marker after both upgrade and fresh-install DDL."""
     from sqlalchemy import text
 
+    from .services.dashboard_projection import DASHBOARD_PROJECTION_VERSION
+
     conn.execute(text(
         "INSERT INTO dashboard_projection_state "
         "(id, projection_version, backfill_complete) "
-        "SELECT 1, 1, NOT EXISTS (SELECT 1 FROM documents) "
+        "SELECT 1, :version, NOT EXISTS (SELECT 1 FROM documents) "
         "ON CONFLICT (id) DO NOTHING"
-    ))
+    ), {"version": DASHBOARD_PROJECTION_VERSION})
 
 
 async def _schedule_daily_compaction():

@@ -27,9 +27,10 @@ from .subagent_lifecycle import (
     SUBAGENT_LIFECYCLE_STATUS_KEY,
 )
 
-DASHBOARD_PROJECTION_VERSION = 1
+DASHBOARD_PROJECTION_VERSION = 2
 DASHBOARD_PROJECTION_STATE_ID = 1
 DASHBOARD_BACKFILL_BATCH_SIZE = 250
+ARCHIVED_METADATA_KEY = "archived"
 
 _HIERARCHY_METADATA_KEYS = {
     "agent_depth",
@@ -56,6 +57,20 @@ def _non_negative_int(value: object) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def document_is_archived(metadata: object) -> bool:
+    """Return the collector-normalized archived flag from document metadata."""
+    if not isinstance(metadata, dict):
+        return False
+    value = metadata.get(ARCHIVED_METADATA_KEY)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes"}
+    return False
 
 
 def _hierarchy_metadata(
@@ -181,6 +196,7 @@ def dashboard_projection_values(
             or None
         ),
         "is_subagent": is_subagent,
+        "is_archived": document_is_archived(metadata),
         "hierarchy_metadata": _hierarchy_metadata(document, read_model),
         "message_count": (
             int(read_model.message_count or 0) if read_model is not None else 0
@@ -257,6 +273,70 @@ async def _set_backfill_complete(db: AsyncSession) -> None:
     await db.flush()
 
 
+def dashboard_projection_version_upgrade_statement(
+    *,
+    after_id: object | None = None,
+):
+    """Select stale projection rows plus already-normalized metadata only."""
+    statement = (
+        select(DashboardDocumentProjection, Document)
+        .join(
+            Document,
+            Document.id == DashboardDocumentProjection.document_id,
+        )
+        .options(load_only(
+            Document.id,
+            Document.metadata_,
+        ))
+        .where(
+            DashboardDocumentProjection.projection_version
+            < DASHBOARD_PROJECTION_VERSION
+        )
+        .order_by(DashboardDocumentProjection.document_id)
+        .limit(DASHBOARD_BACKFILL_BATCH_SIZE)
+    )
+    if after_id is not None:
+        statement = statement.where(
+            DashboardDocumentProjection.document_id > after_id
+        )
+    return statement
+
+
+async def upgrade_dashboard_document_projections(
+    db: AsyncSession,
+) -> dict[str, int]:
+    """Populate is_archived from stored metadata without rereading transcripts."""
+    last_id = None
+    visited = 0
+    changed = 0
+    while True:
+        rows = (
+            await db.execute(
+                dashboard_projection_version_upgrade_statement(after_id=last_id)
+            )
+        ).all()
+        if not rows:
+            break
+        for projection, document in rows:
+            archived = document_is_archived(document_metadata(document))
+            row_changed = (
+                projection.is_archived != archived
+                or projection.projection_version != DASHBOARD_PROJECTION_VERSION
+            )
+            projection.is_archived = archived
+            projection.projection_version = DASHBOARD_PROJECTION_VERSION
+            visited += 1
+            changed += int(row_changed)
+        last_id = rows[-1][0].document_id
+        await db.flush()
+
+    state = await db.get(DashboardProjectionState, DASHBOARD_PROJECTION_STATE_ID)
+    if state is not None and state.backfill_complete:
+        state.projection_version = DASHBOARD_PROJECTION_VERSION
+        await db.flush()
+    return {"documents": visited, "created_or_updated": changed}
+
+
 def dashboard_backfill_documents_statement(
     *,
     document_ids: Iterable[object] = (),
@@ -297,6 +377,10 @@ async def backfill_dashboard_document_projections(
 ) -> dict[str, int]:
     """Build exact replacement rows for legacy documents in bounded batches."""
     requested_ids = list(document_ids or [])
+    if not requested_ids:
+        upgrade = await upgrade_dashboard_document_projections(db)
+        if await dashboard_projection_backfill_complete(db):
+            return upgrade
     last_id = None
     visited = 0
     changed = 0
