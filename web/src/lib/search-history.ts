@@ -9,11 +9,29 @@ export function readSearchHistory(storageKey: string): string[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed
+    const normalized = parsed
       .filter((item): item is string => typeof item === "string")
       .map((item) => item.trim())
       .filter(Boolean)
       .slice(0, MAX_SEARCH_HISTORY);
+    if (storageKey !== PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY) return normalized;
+
+    // Older prompt-navigator builds persisted every input event, producing
+    // histories such as "Model, Mode, Mod, Mo, M". Keep the completed query
+    // and discard only entries that are strict prefixes of another stored
+    // query. Persist the repaired list so the cleanup happens once.
+    const repaired = normalized.filter((item, index) => {
+      const folded = item.toLocaleLowerCase();
+      return !normalized.some((candidate, candidateIndex) => (
+        candidateIndex !== index
+        && candidate.length > item.length
+        && candidate.toLocaleLowerCase().startsWith(folded)
+      ));
+    });
+    if (repaired.length !== normalized.length) {
+      window.localStorage.setItem(storageKey, JSON.stringify(repaired));
+    }
+    return repaired;
   } catch {
     return [];
   }
@@ -35,4 +53,5 @@ export function pushSearchHistory(storageKey: string, query: string): string[] {
 }
 
 export const CONVERSATION_SEARCH_HISTORY_KEY = "memento.conversationSearchHistory";
+export const GLOBAL_SEARCH_HISTORY_KEY = "memento.globalSearchHistory";
 export const PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY = "memento.promptNavigatorSearchHistory";

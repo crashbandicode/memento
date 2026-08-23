@@ -2516,13 +2516,14 @@ function PromptNavigator({
   }, [mobileOpen]);
 
   const closeMobileSheet = () => {
+    const clean = query.trim();
+    if (clean) setHistory(pushSearchHistory(PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY, clean));
     rememberScrollSpot(mobileListRef.current);
     setMobileOpen(false);
     window.requestAnimationFrame(() => triggerRef.current?.focus());
   };
 
-  const commitPromptQuery = (value: string) => {
-    setQuery(value);
+  const rememberPromptQuery = (value: string) => {
     const clean = value.trim();
     if (clean) setHistory(pushSearchHistory(PROMPT_NAVIGATOR_SEARCH_HISTORY_KEY, clean));
   };
@@ -2614,6 +2615,7 @@ function PromptNavigator({
         aria-busy={isLoading}
         disabled={navigationBusy}
         onClick={async () => {
+          rememberPromptQuery(query);
           await onSelect(prompt);
           if (opts.mobile && dialogRef.current) closeMobileSheet();
         }}
@@ -2818,7 +2820,13 @@ function PromptNavigator({
                 data-desktop-prompt-search
                 type="search"
                 value={query}
-                onChange={(event) => commitPromptQuery(event.target.value)}
+                onChange={(event) => setQuery(event.target.value)}
+                onBlur={() => rememberPromptQuery(query)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  rememberPromptQuery(event.currentTarget.value);
+                }}
                 placeholder={fmt(translations.conversation.searchPrompts, { count: prompts.length })}
                 autoComplete="off"
                 style={{
@@ -2842,7 +2850,7 @@ function PromptNavigator({
                   <button
                     key={item}
                     type="button"
-                    onClick={() => commitPromptQuery(item)}
+                    onClick={() => setQuery(item)}
                     style={{
                       maxWidth: "100%",
                       overflow: "hidden",
@@ -3143,7 +3151,13 @@ function PromptNavigator({
                   data-mobile-prompt-search
                   type="search"
                   value={query}
-                  onChange={(event) => commitPromptQuery(event.target.value)}
+                  onChange={(event) => setQuery(event.target.value)}
+                  onBlur={() => rememberPromptQuery(query)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    rememberPromptQuery(event.currentTarget.value);
+                  }}
                   placeholder={fmt(translations.conversation.searchPrompts, { count: prompts.length })}
                   autoComplete="off"
                   style={{
@@ -3167,7 +3181,7 @@ function PromptNavigator({
                     <button
                       key={item}
                       type="button"
-                      onClick={() => commitPromptQuery(item)}
+                      onClick={() => setQuery(item)}
                       style={{
                         maxWidth: "100%",
                         overflow: "hidden",

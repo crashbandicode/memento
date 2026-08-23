@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   GlobalMessageSearchResponse,
@@ -11,6 +11,11 @@ import {
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
 import { useDevice } from "@/lib/device-context";
+import {
+  GLOBAL_SEARCH_HISTORY_KEY,
+  pushSearchHistory,
+  readSearchHistory,
+} from "@/lib/search-history";
 import { Icon, ToolGlyph } from "@/components/aurora/Icon";
 import { Btn, Chip, Glass, GhostInput, TopBar } from "@/components/aurora/primitives";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
@@ -24,12 +29,20 @@ export default function SearchPage() {
   const [fileResult, setFileResult] = useState<SearchResult | null>(null);
   const [messageResult, setMessageResult] = useState<GlobalMessageSearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState<string[]>([]);
   const { t, locale } = useI18n();
   const { selectedDeviceId } = useDevice();
+
+  useEffect(() => {
+    setHistory(readSearchHistory(GLOBAL_SEARCH_HISTORY_KEY));
+  }, []);
 
   const runSearch = async ({ append = false }: { append?: boolean } = {}) => {
     const cleanQuery = query.trim();
     if (!cleanQuery) return;
+    if (!append) {
+      setHistory(pushSearchHistory(GLOBAL_SEARCH_HISTORY_KEY, cleanQuery));
+    }
     setLoading(true);
     try {
       if (scope === "messages") {
@@ -132,6 +145,42 @@ export default function SearchPage() {
           {loading ? "…" : t.search}
         </Btn>
       </form>
+
+      {!query.trim() && history.length > 0 && (
+        <section
+          data-global-search-history
+          aria-label={t.conversation.recentSearches}
+          style={{ marginTop: -10, marginBottom: 22 }}
+        >
+          <div style={{ marginBottom: 7, color: "var(--aurora-fg4)", fontSize: 11, fontWeight: 650 }}>
+            {t.conversation.recentSearches}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+            {history.slice(0, 8).map((item) => (
+              <button
+                key={item}
+                type="button"
+                onClick={() => setQuery(item)}
+                style={{
+                  maxWidth: "100%",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  border: "1px solid var(--aurora-border)",
+                  borderRadius: 999,
+                  background: "var(--aurora-surface-solid)",
+                  color: "var(--aurora-fg3)",
+                  padding: "6px 11px",
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
 
       {scope === "messages" && messageResult && (
         <div data-global-message-results style={{ display: "flex", flexDirection: "column", gap: 12 }}>
