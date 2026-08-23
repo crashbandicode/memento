@@ -412,7 +412,11 @@ class ControlSessionCreateRequest(BaseModel):
     sandbox: str | None = Field(
         default=None, pattern="^(read-only|workspace-write|danger-full-access)$"
     )
-    approval_policy: str | None = Field(default=None, max_length=32)
+    # Real Codex 0.147 wire variants — the pinned README's camelCase examples
+    # (e.g. "unlessTrusted") are rejected by the live CLI.
+    approval_policy: str | None = Field(
+        default=None, pattern="^(untrusted|on-request|granular|never)$"
+    )
     initial_message: str | None = Field(default=None, max_length=32_768)
     # Resume-under-Memento-control: the exact native thread id of an
     # existing (view-only) conversation, plus its document for binding.
@@ -609,6 +613,9 @@ async def create_session(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"session": session_public(session), "command": command_public(command)}
 
 
@@ -685,6 +692,9 @@ async def send_session_message(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
@@ -731,6 +741,9 @@ async def steer_session_turn(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
@@ -766,6 +779,9 @@ async def answer_session_interaction(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
@@ -805,6 +821,9 @@ async def respond_session_approval(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
@@ -838,6 +857,9 @@ async def interrupt_session(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
@@ -863,6 +885,9 @@ async def close_session(
         )
     except UnsupportedCommandKind as error:
         raise _unsupported_response(error) from error
+    # Commit before returning: yield-dependency teardown runs after the
+    # response is sent, so an immediate read could otherwise miss the row.
+    await db.commit()
     return {"command": command_public(command)}
 
 
