@@ -11,6 +11,11 @@ import sys
 
 
 def cli() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] in {"--version", "version"}:
+        from collector._version import __version__
+
+        print(__version__)
+        return
     if len(sys.argv) >= 2 and sys.argv[1] == "claude-hook":
         from collector.claude_pending_hook import main as hook_main
 

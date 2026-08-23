@@ -10,7 +10,9 @@ from collector.control_channel import (
     ControlChannel,
     UnsupportedServerError,
     capability_snapshot,
+    collector_version,
 )
+from collector._version import __version__
 
 
 class _FakeClient:
@@ -167,6 +169,10 @@ def test_capability_snapshot_is_bounded_and_versioned() -> None:
     assert snapshot["schema_version"] == 1
     assert snapshot["platform"] == "Windows"
     assert snapshot["agents"] == {}
+
+
+def test_reported_collector_version_uses_packaged_source_version() -> None:
+    assert collector_version() == __version__
 
 
 def test_lease_keeper_renews_while_execution_runs() -> None:

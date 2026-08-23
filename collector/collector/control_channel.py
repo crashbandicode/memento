@@ -23,6 +23,7 @@ from collections.abc import Callable
 
 import httpx
 
+from ._version import __version__
 from .config import CollectorConfig
 from .tls import SSL_CONTEXT
 
@@ -50,12 +51,7 @@ CommandExecutor = Callable[[str, dict], CommandOutcome]
 
 
 def collector_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("memento-brain-collector")
-    except Exception:
-        return "dev"
+    return __version__
 
 
 def capability_snapshot(

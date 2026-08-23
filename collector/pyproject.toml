@@ -1,6 +1,6 @@
 [project]
 name = "memento-brain-collector"
-version = "0.0.42"
+dynamic = ["version"]
 description = "Cross-platform agent that collects AI coding tool memory files and syncs to a central server"
 readme = "README.md"
 license = {text = "AGPL-3.0-only"}
@@ -58,6 +58,9 @@ Issues = "https://github.com/ddong8/memento/issues"
 [project.scripts]
 # Primary — matches pkg name
 memento-brain-collector = "collector.cli:cli_main"
+
+[tool.hatch.version]
+path = "collector/_version.py"
 memento-brain-export-codex = "collector.codex_export:main"
 # Short aliases — back-compat and convenience
 memento-collector = "collector.cli:cli_main"
