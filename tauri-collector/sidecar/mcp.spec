@@ -7,6 +7,13 @@
 #
 # Don't invoke directly — use build_sidecar.py.
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(SPECPATH).resolve().parents[1]
+MCP_SOURCE = REPO_ROOT / "mcp_server"
+sys.path.insert(0, str(MCP_SOURCE))
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
@@ -51,7 +58,7 @@ for pkg in (
 
 a = Analysis(
     ["mcp_entry.py"],
-    pathex=[],
+    pathex=[str(MCP_SOURCE)],
     binaries=extra_binaries,
     datas=extra_datas,
     hiddenimports=hidden,

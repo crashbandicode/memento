@@ -4,7 +4,12 @@
 # Tauri's `<triple>` naming convention and drops the binary in
 # ../src-tauri/binaries/.
 
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(SPECPATH).resolve().parents[1]
+COLLECTOR_SOURCE = REPO_ROOT / "collector"
+sys.path.insert(0, str(COLLECTOR_SOURCE))
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -32,7 +37,7 @@ hidden = (
 extra_datas = []
 extra_binaries = []
 compiler_script = (
-    Path(SPECPATH).resolve().parents[1]
+    REPO_ROOT
     / "collector"
     / "collector"
     / "canvas_compile.cjs"
@@ -50,7 +55,7 @@ for pkg in ("tomli", "pydantic", "pydantic_core", "watchdog", "cryptography",
 
 a = Analysis(
     ["entry.py"],
-    pathex=[],
+    pathex=[str(COLLECTOR_SOURCE)],
     binaries=extra_binaries,
     datas=extra_datas,
     hiddenimports=hidden,

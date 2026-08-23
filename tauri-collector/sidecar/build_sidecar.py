@@ -17,6 +17,7 @@ this script's prerequisite (`cargo tauri`), so the user already has it.
 from __future__ import annotations
 
 import platform
+import os
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,10 @@ if sys.platform == "win32":
 
 HERE = Path(__file__).resolve().parent
 BIN_DIR = HERE.parent / "src-tauri" / "binaries"
+REPO_ROOT = HERE.parents[1]
+COLLECTOR_SOURCE = REPO_ROOT / "collector"
+MCP_SOURCE = REPO_ROOT / "mcp_server"
+SOURCE_PATHS = (COLLECTOR_SOURCE, MCP_SOURCE)
 
 
 def host_triple() -> str:
@@ -82,7 +87,12 @@ def _build_one(spec_name: str, exe_name: str, triple: str, exe_suffix: str) -> P
         str(spec),
     ]
     print("->", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    env = dict(os.environ)
+    # Never let an ambient editable install or PYTHONPATH from another Memento
+    # worktree decide which code gets frozen. The spec files pin the same roots
+    # for hook discovery and Analysis.
+    env["PYTHONPATH"] = os.pathsep.join(str(path) for path in SOURCE_PATHS)
+    subprocess.run(cmd, check=True, env=env)
 
     src = dist / f"{exe_name}{exe_suffix}"
     if not src.exists():
@@ -109,11 +119,15 @@ def main() -> int:
     except ImportError:
         print("PyInstaller not installed. Run: pip install pyinstaller", file=sys.stderr)
         return 1
+    for source_path in reversed(SOURCE_PATHS):
+        sys.path.insert(0, str(source_path))
+
     # Sanity: both runtime entry points importable?  Importing only the package
     # root is insufficient: collector.__init__ intentionally has no runtime
     # dependencies, so PyInstaller could otherwise emit a binary that crashes
     # immediately when collector.main imports an omitted direct dependency.
     try:
+        import collector
         import collector.main  # noqa: F401
     except ImportError:
         print(
@@ -121,10 +135,24 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    collector_path = Path(collector.__file__).resolve()
+    if not collector_path.is_relative_to(COLLECTOR_SOURCE.resolve()):
+        print(
+            f"collector resolved outside this worktree: {collector_path}",
+            file=sys.stderr,
+        )
+        return 1
     try:
-        import mcp_server  # noqa: F401
+        import mcp_server
     except ImportError:
         print("mcp_server not importable. Run: pip install -e ../../mcp_server", file=sys.stderr)
+        return 1
+    mcp_path = Path(mcp_server.__file__).resolve()
+    if not mcp_path.is_relative_to(MCP_SOURCE.resolve()):
+        print(
+            f"mcp_server resolved outside this worktree: {mcp_path}",
+            file=sys.stderr,
+        )
         return 1
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
