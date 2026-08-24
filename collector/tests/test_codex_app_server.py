@@ -234,5 +234,7 @@ def test_resolve_codex_command_disables_code_mode(monkeypatch) -> None:
         "-c",
         "features.plugins=false",
         "-c",
+        "features.code_mode=false",
+        "-c",
         "features.default_mode_request_user_input=true",
     ]

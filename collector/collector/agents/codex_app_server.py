@@ -77,10 +77,19 @@ class CodexAdapterError(Exception):
 # a lean, predictable tool surface where every shell command goes through
 # the native approval path.
 MANAGED_CONFIG_OVERRIDES: tuple[str, ...] = (
+    # Both the marketplace plugin surface AND code-mode expose a custom `exec`
+    # tool whose tools.shell_command runs shell commands WITHOUT the exec
+    # approval assessment, silently bypassing approvalPolicy (observed live).
+    # Disable both so every shell command goes through the native,
+    # approval-gated commandExecution path. The code-mode HOST stays enabled:
+    # disabling it too breaks the plain shell tool ("code-mode host is
+    # disabled").
     "features.plugins=false",
+    "features.code_mode=false",
     # Default-mode threads only expose request_user_input behind this
     # under-development flag; managed sessions need the question flow on
-    # every machine regardless of the local config.toml.
+    # every machine — set per-session here, never by editing the user's
+    # local config.toml.
     "features.default_mode_request_user_input=true",
 )
 
