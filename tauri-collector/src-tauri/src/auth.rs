@@ -101,8 +101,13 @@ pub async fn mint_web_token(server_url: String, collector_token: String) -> Resu
         .send()
         .await?;
     if !resp.status().is_success() {
+        // Prefix the HTTP status so the UI can distinguish a terminal auth
+        // failure (401/403 → re-login) from a retryable server error (5xx).
+        // Transport failures (offline) never reach here — they propagate via
+        // `?` above with no status prefix, and the UI retries those too.
+        let status = resp.status().as_u16();
         return Err(CmdError {
-            message: error_detail(resp).await,
+            message: format!("[status:{status}] {}", error_detail(resp).await),
         });
     }
     let tok: TokenResponse = resp.json().await?;

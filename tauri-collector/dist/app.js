@@ -153,7 +153,51 @@ function normalizeDashboardPath(path, webBase) {
   }
 }
 
-async function dashboardUrlFor(apiUrl, token, webBase, path = "/app") {
+// A terminal auth failure (revoked/rotated collector token) — retrying the
+// mint won't help, the user must sign in again. Everything else (offline,
+// DNS, TLS, 5xx, server-not-ready-at-autostart) is transient: retry.
+function mintErrorIsTerminal(error) {
+  const message = String(error?.message ?? error ?? "");
+  const match = /\[status:(\d+)\]/.exec(message);
+  if (!match) return false; // transport failure — no HTTP status — retryable
+  const status = Number(match[1]);
+  return status === 401 || status === 403;
+}
+
+// Mint the web JWT, retrying transient failures with capped backoff. The app's
+// durable identity is the native collector token, so "can't reach the server
+// right now" (flaky wifi, VPN/network not up yet at silent autostart) must
+// become "wait and retry", never "log the user out". Returns the JWT, or null
+// if the token is terminally rejected (→ caller sends the user to login).
+async function mintWebTokenWithRetry(apiUrl, token, { signal } = {}) {
+  const delays = [1000, 2000, 4000, 8000, 15000, 15000, 15000]; // ~60s, then steady
+  let attempt = 0;
+  for (;;) {
+    if (signal?.aborted) return null;
+    try {
+      return await invoke("mint_web_token", { serverUrl: apiUrl, collectorToken: token });
+    } catch (e) {
+      if (mintErrorIsTerminal(e)) {
+        console.warn("mint_web_token rejected (auth); sending to login:", e);
+        return null;
+      }
+      const wait = delays[Math.min(attempt, delays.length - 1)];
+      attempt += 1;
+      console.warn(`mint_web_token transient failure (attempt ${attempt}); retrying in ${wait}ms:`, e);
+      setDashboardReconnecting(true);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+}
+
+// Toggle a lightweight "reconnecting" overlay while the mint retries, so a slow
+// network shows a clear status instead of a blank frame or a login flash.
+function setDashboardReconnecting(on) {
+  const el = document.getElementById("dashboardReconnecting");
+  if (el) el.style.display = on ? "flex" : "none";
+}
+
+async function dashboardUrlFor(apiUrl, token, webBase, path = "/app", opts = {}) {
   const nextPath = normalizeDashboardPath(path, webBase);
   const embedPath = new URL(nextPath, webBase);
   embedPath.searchParams.set("embed", "memento");
@@ -162,20 +206,16 @@ async function dashboardUrlFor(apiUrl, token, webBase, path = "/app") {
   // login page directly rather than /app, which would flash "Failed to load
   // dashboard" while AuthProvider redirects.
   if (!token) return `${webBase}/auth/login?embed=memento&next=${encodeURIComponent(next)}`;
-  try {
-    const jwt = await invoke("mint_web_token", {
-      serverUrl: apiUrl,
-      collectorToken: token,
-    });
+  const jwt = await mintWebTokenWithRetry(apiUrl, token, opts);
+  setDashboardReconnecting(false);
+  if (jwt) {
     const p = new URLSearchParams({ token: jwt, next });
     return `${webBase}/auth/handoff#${p.toString()}`;
-  } catch (e) {
-    // Offline, server down, or the token was revoked. Fall back to /app so a
-    // user whose iframe storage is still intact gets in anyway; if it isn't,
-    // the web app redirects to its own login. Not worth alarming anyone over.
-    console.warn("mint_web_token failed, falling back to iframe-local auth:", e);
-    return `${webBase}${next}`;
   }
+  // Only reached on a terminal auth rejection: the collector token itself is no
+  // longer valid, so send the user to login to re-establish identity. (Network
+  // failures never land here — mintWebTokenWithRetry keeps retrying them.)
+  return `${webBase}/auth/login?embed=memento&next=${encodeURIComponent(next)}`;
 }
 
 async function openDashboard() {

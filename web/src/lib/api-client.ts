@@ -16,6 +16,37 @@ export function getApiBase(): string {
 // Keep for import compat — but always call getApiBase() instead
 export const API_BASE = "";
 
+// Running inside the desktop app's dashboard iframe. The desktop loads the web
+// UI with ?embed=memento (stashed sticky in sessionStorage by AuthProvider) and
+// holds a durable collector token it can re-mint from.
+function isEmbeddedInDesktop(): boolean {
+  if (typeof window === "undefined" || window.parent === window) return false;
+  try {
+    if (sessionStorage.getItem("memento_embed") === "1") return true;
+  } catch {
+    /* sessionStorage unavailable */
+  }
+  return new URLSearchParams(window.location.search).get("embed") === "memento";
+}
+
+// When an embedded session hits a 401, ask the desktop parent to re-mint a
+// fresh JWT (it has the durable collector token) instead of clearing the token
+// and bouncing to /auth/login. Throttled so a persistent 401 can't spam the
+// parent — the parent's own mint has backoff + terminal-auth handling.
+let _lastRestoreRequestAt = 0;
+function requestParentReMint(): boolean {
+  if (!isEmbeddedInDesktop()) return false;
+  const now = Date.now();
+  if (now - _lastRestoreRequestAt < 5000) return true;
+  _lastRestoreRequestAt = now;
+  try {
+    window.parent.postMessage({ type: "memento:restore-session" }, "*");
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 /** Authenticated fetch — wraps native fetch with the remembered/session JWT. */
 export function authFetch(url: string, init?: RequestInit): Promise<Response> {
   const token = _getToken();
@@ -27,6 +58,8 @@ export function authFetch(url: string, init?: RequestInit): Promise<Response> {
   }
   return fetch(url, { ...init, headers }).then((res) => {
     if (res.status === 401 && typeof window !== "undefined") {
+      // Embedded: let the desktop parent re-mint rather than logging out.
+      if (requestParentReMint()) return res;
       const onAuthPage = window.location.pathname.startsWith("/auth/");
       clearStoredAuthToken();
       if (!onAuthPage) {
@@ -133,6 +166,8 @@ async function apiFetch<T>(path: string, opts: FetchOptions = {}): Promise<T> {
     const res = await fetch(`${base}${path}`, { ...init, headers });
     if (!res.ok) {
       if (res.status === 401 && typeof window !== "undefined" && !isPublic) {
+        // Embedded: let the desktop parent re-mint rather than logging out.
+        if (requestParentReMint()) throw new Error("Unauthorized");
         const onAuthPage = window.location.pathname.startsWith("/auth/");
         const onLanding = window.location.pathname === "/" || window.location.pathname === "/splash";
         clearStoredAuthToken();
