@@ -424,6 +424,35 @@ class ControlSessionCreateRequest(BaseModel):
     document_id: uuid.UUID | None = None
 
 
+def _session_start_options(
+    req: "ControlSessionCreateRequest", *, resume: bool
+) -> dict:
+    """Command options for a session start/resume.
+
+    Fresh managed sessions must not silently inherit the machine's local
+    codex defaults: a workstation configured with approval "never" +
+    danger-full-access would make every managed command run unprompted.
+    Omitted fields default to a safe posture; permissive modes stay
+    available but only by explicit request. Resume keeps the original
+    thread's configuration untouched.
+    """
+    sandbox = req.sandbox if resume else (req.sandbox or "workspace-write")
+    approval_policy = (
+        req.approval_policy if resume else (req.approval_policy or "on-request")
+    )
+    return {
+        key: value
+        for key, value in (
+            ("cwd", req.cwd),
+            ("model", req.model),
+            ("effort", req.effort),
+            ("sandbox", sandbox),
+            ("approval_policy", approval_policy),
+        )
+        if value is not None
+    }
+
+
 class ControlMessageRequest(BaseModel):
     text: str = Field(min_length=1, max_length=32_768)
     model: str | None = Field(default=None, max_length=128)
@@ -580,17 +609,7 @@ async def create_session(
     )
     await db.flush()
 
-    options = {
-        key: value
-        for key, value in (
-            ("cwd", req.cwd),
-            ("model", req.model),
-            ("effort", req.effort),
-            ("sandbox", req.sandbox),
-            ("approval_policy", req.approval_policy),
-        )
-        if value is not None
-    }
+    options = _session_start_options(req, resume=resume)
     payload: dict = {"control_session_id": str(session.id), "options": options}
     if resume:
         kind = KIND_AGENT_SESSION_RESUME

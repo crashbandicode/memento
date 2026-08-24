@@ -952,3 +952,29 @@ async def test_resume_binding_requires_exact_machine_tool_and_thread(session_fac
                 native_session_id=None,
             )
         assert missing_native.value.status_code == 409
+
+
+def test_session_start_options_default_to_safe_posture() -> None:
+    """Fresh sessions never inherit the machine's local codex defaults."""
+    from server.api.control import ControlSessionCreateRequest, _session_start_options
+
+    fresh = ControlSessionCreateRequest(machine_id=uuid.uuid4())
+    options = _session_start_options(fresh, resume=False)
+    assert options["sandbox"] == "workspace-write"
+    assert options["approval_policy"] == "on-request"
+
+    explicit = ControlSessionCreateRequest(
+        machine_id=uuid.uuid4(),
+        sandbox="danger-full-access",
+        approval_policy="never",
+    )
+    options = _session_start_options(explicit, resume=False)
+    assert options["sandbox"] == "danger-full-access"
+    assert options["approval_policy"] == "never"
+
+    resuming = ControlSessionCreateRequest(
+        machine_id=uuid.uuid4(), native_session_id="thr-existing"
+    )
+    options = _session_start_options(resuming, resume=True)
+    assert "sandbox" not in options
+    assert "approval_policy" not in options
