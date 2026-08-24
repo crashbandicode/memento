@@ -83,6 +83,13 @@ export default function StartControlSessionDialog({
   }, []);
 
   const submit = useCallback(async () => {
+    // A fresh codex thread writes no transcript until its first turn runs, so
+    // a session started with no message can never bind a conversation to open.
+    // Require the first instruction rather than let the session hang unbound.
+    if (!initialMessage.trim()) {
+      setStatus(t.control.firstMessageRequired);
+      return;
+    }
     setSubmitting(true);
     setStatus(t.control.starting);
     try {
@@ -178,7 +185,7 @@ export default function StartControlSessionDialog({
           </label>
         </div>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
-          {t.control.firstMessageLabel}
+          {t.control.firstMessageLabelRequired}
           <textarea
             data-start-session-message
             style={{ ...inputStyle, resize: "vertical" }}
@@ -186,6 +193,7 @@ export default function StartControlSessionDialog({
             value={initialMessage}
             onChange={(event) => setInitialMessage(event.target.value)}
             placeholder={t.control.firstMessagePlaceholder}
+            required
           />
         </label>
         {status && (

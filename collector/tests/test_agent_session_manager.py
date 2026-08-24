@@ -386,6 +386,37 @@ def test_session_start_spools_effective_thread_config(tmp_path: Path) -> None:
         manager.shutdown()
 
 
+def test_session_start_without_message_audits_awaiting_first_turn(tmp_path: Path) -> None:
+    """No initial message => no turn => no transcript; make it auditable."""
+    manager, spool = _manager(tmp_path)
+    try:
+        status, error_code, detail = manager.execute(
+            "agent.session.start", {"control_session_id": "cs-noturn"}
+        )
+        assert (status, error_code) == ("completed", None)
+        assert detail["awaiting_first_turn"] is True
+        event = _wait_for_event(spool, "adapter.awaiting_first_turn")
+        assert event["details"]["reason"] == "no_initial_message"
+    finally:
+        manager.shutdown()
+
+
+def test_session_start_with_message_does_not_await(tmp_path: Path) -> None:
+    manager, spool = _manager(tmp_path)
+    try:
+        status, error_code, detail = manager.execute(
+            "agent.session.start",
+            {"control_session_id": "cs-turn", "initial_message": "go"},
+        )
+        assert (status, error_code) == ("completed", None)
+        assert "awaiting_first_turn" not in detail
+        _wait_for_event(spool, "adapter.turn_started")
+        events = {e["event_type"] for e in _spool_events(spool)}
+        assert "adapter.awaiting_first_turn" not in events
+    finally:
+        manager.shutdown()
+
+
 def test_thread_config_mismatch_folds_kebab_camel_dialect() -> None:
     from collector.agents.session_manager import _thread_config_mismatches
 

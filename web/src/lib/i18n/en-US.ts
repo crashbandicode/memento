@@ -387,6 +387,8 @@ const enUS: Translations = {
     sandboxLabel: "Sandbox (optional)",
     agentDefaultOption: "Agent default",
     firstMessageLabel: "First message (optional)",
+    firstMessageLabelRequired: "First message (required)",
+    firstMessageRequired: "A first message is required — the session has no transcript until the agent takes its first turn.",
     firstMessagePlaceholder: "What should the agent do first?",
     start: "Start session",
     close: "Close",

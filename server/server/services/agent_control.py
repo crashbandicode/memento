@@ -1031,10 +1031,17 @@ def _apply_session_lifecycle_event(
         session.native_session_id = (
             str(event.get("native_session_id") or "") or session.native_session_id
         )
+    elif event_type == "adapter.awaiting_first_turn":
+        # The native thread exists but no turn has run, so no transcript file
+        # exists yet and the document cannot bind. Surface the reason instead
+        # of leaving the session looking silently stuck on "active".
+        session.state_reason = "awaiting_first_turn"
     elif event_type == "adapter.turn_started":
         session.active_native_turn_id = (
             str(event.get("native_turn_id") or "") or session.active_native_turn_id
         )
+        if session.state_reason == "awaiting_first_turn":
+            session.state_reason = None
     elif event_type == "adapter.turn_completed":
         turn_id = str(event.get("native_turn_id") or "")
         if not turn_id or session.active_native_turn_id == turn_id:

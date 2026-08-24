@@ -627,6 +627,17 @@ async def test_managed_session_lifecycle_via_commands_and_events(session_factory
                 **extra,
             }
 
+        # A session started with no first message surfaces the awaiting reason,
+        # which the first turn then clears.
+        await ingest_control_events(
+            db,
+            machine=machine,
+            events=[_event("adapter.awaiting_first_turn", details={"reason": "no_initial_message"})],
+        )
+        await db.flush()
+        await db.refresh(session)
+        assert session.state_reason == "awaiting_first_turn"
+
         result = await ingest_control_events(
             db,
             machine=machine,
@@ -648,6 +659,7 @@ async def test_managed_session_lifecycle_via_commands_and_events(session_factory
         await db.flush()
         await db.refresh(session)
         assert session.active_native_turn_id == "turn_9"
+        assert session.state_reason is None  # first turn cleared the awaiting reason
         assert session.pending_interactions[0]["interaction_id"] == "int-1"
         assert session.pending_interactions[0]["kind"] == "question"
 

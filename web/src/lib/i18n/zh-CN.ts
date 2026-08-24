@@ -395,6 +395,8 @@ const zhCN = {
     sandboxLabel: "沙箱（可选）",
     agentDefaultOption: "智能体默认",
     firstMessageLabel: "首条消息（可选）",
+    firstMessageLabelRequired: "首条消息（必填）",
+    firstMessageRequired: "必须填写首条消息——智能体执行首个回合前会话没有记录可绑定。",
     firstMessagePlaceholder: "希望智能体先做什么？",
     start: "启动会话",
     close: "关闭",

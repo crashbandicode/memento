@@ -215,6 +215,11 @@ class AgentSessionManager:
                 }
             session.native_thread_id = str(thread.get("id") or "")
             session.state = "active"
+            # The rollout path the app-server will write to. It does NOT exist
+            # until the first turn runs, so a session started with no initial
+            # message produces no transcript and never binds a document until a
+            # message is sent — record the path so that wait is diagnosable.
+            native_path = str(thread.get("path") or "")
             if effective:
                 self._spool.emit(
                     "adapter.thread_config",
@@ -227,6 +232,7 @@ class AgentSessionManager:
                 control_session_id=control_session_id,
                 native_session_id=session.native_thread_id,
                 adapter=ADAPTER_CODEX,
+                details={"native_rollout_path": native_path} if native_path else None,
             )
             detail: dict = {"native_thread_id": session.native_thread_id}
             initial = payload.get("initial_message")
@@ -240,6 +246,21 @@ class AgentSessionManager:
                 )
                 session.active_turn_id = str(turn.get("id") or "")
                 detail["native_turn_id"] = session.active_turn_id
+            else:
+                # No turn ran: no transcript will exist and the document
+                # cannot bind until the first message. Make that explicit in
+                # the audit trail instead of leaving a silent "waiting" state.
+                self._spool.emit(
+                    "adapter.awaiting_first_turn",
+                    control_session_id=control_session_id,
+                    native_session_id=session.native_thread_id,
+                    adapter=ADAPTER_CODEX,
+                    details={
+                        "reason": "no_initial_message",
+                        "native_rollout_path": native_path,
+                    },
+                )
+                detail["awaiting_first_turn"] = True
             return "completed", None, detail
         except Exception:
             self._abort_startup(session)
