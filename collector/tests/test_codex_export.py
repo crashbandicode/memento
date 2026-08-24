@@ -14,9 +14,28 @@ sys.path.insert(0, str(ROOT / "collector"))
 from collector.codex_export import (  # noqa: E402
     discover_threads,
     export_codex_home,
+    extract_code_mode_shell_command,
     parse_session_file,
     render_thread_markdown,
 )
+
+
+class CodeModeShellCommandTests(unittest.TestCase):
+    def test_unwraps_code_mode_exec_command(self) -> None:
+        js = (
+            'const r = await tools.shell_command({command:"& \'C:\\\\Program '
+            "Files\\\\PowerShell\\\\7\\\\pwsh.exe' -NoLogo -NoProfile -NonInteractive "
+            "-Command 'New-Item -ItemType Directory -Path probe-dir'\","
+            '"workdir":"C:\\\\Users\\\\intpa"});\ntext(r)\n'
+        )
+        command = extract_code_mode_shell_command("exec", js)
+        self.assertIsNotNone(command)
+        self.assertIn("New-Item -ItemType Directory -Path probe-dir", command)
+        self.assertNotIn("tools.shell_command", command)
+
+    def test_ignores_non_exec_and_non_shell_input(self) -> None:
+        self.assertIsNone(extract_code_mode_shell_command("web_search", "query"))
+        self.assertIsNone(extract_code_mode_shell_command("exec", "text('hi')"))
 
 
 def _write_session(path: Path) -> None:

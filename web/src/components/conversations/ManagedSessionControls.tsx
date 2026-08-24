@@ -66,6 +66,9 @@ export default function ManagedSessionControls({
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A pending interaction card unmounts the instant the interaction resolves,
+  // so without a transient acknowledgement a decline looks like it did nothing.
+  const [notice, setNotice] = useState<string | null>(null);
   const sessionRef = useRef<ControlSession | null>(null);
   sessionRef.current = session;
 
@@ -90,11 +93,13 @@ export default function ManagedSessionControls({
   }, [session, refresh]);
 
   const act = useCallback(
-    async (action: () => Promise<unknown>) => {
+    async (action: () => Promise<unknown>, successNote?: string) => {
       setBusy(true);
       setError(null);
+      setNotice(null);
       try {
         await action();
+        if (successNote) setNotice(successNote);
         await refresh();
         setTimeout(() => void refresh(), 1500);
       } catch (caught) {
@@ -105,6 +110,13 @@ export default function ManagedSessionControls({
     },
     [refresh, t.control.commandFailed],
   );
+
+  // Auto-clear the resolution acknowledgement so it stays transient.
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   const activeTurnId = session?.active_native_turn_id ?? null;
 
@@ -240,6 +252,12 @@ export default function ManagedSessionControls({
         </div>
       )}
 
+      {notice && (
+        <div data-control-notice role="status" style={{ fontSize: 12, color: "var(--aurora-fg2)" }}>
+          {notice}
+        </div>
+      )}
+
       {error && (
         <div data-control-error role="alert" style={{ fontSize: 12, color: "var(--aurora-danger, #e5484d)" }}>
           {error}
@@ -300,7 +318,7 @@ function PendingInteractionCard({
   sessionId: string;
   interaction: ControlPendingInteraction;
   busy: boolean;
-  act: (action: () => Promise<unknown>) => Promise<void> | void;
+  act: (action: () => Promise<unknown>, successNote?: string) => Promise<void> | void;
 }) {
   const { t } = useI18n();
   const [selections, setSelections] = useState<Record<string, string>>({});
@@ -324,8 +342,10 @@ function PendingInteractionCard({
         : t.control.commandApproval;
     const approve = (decision: "accept" | "acceptForSession") => {
       const subset = isPermissionRequest ? grantedSubset(grants) : undefined;
-      void act(() =>
-        api.respondControlApproval(sessionId, interaction.interaction_id, decision, subset),
+      void act(
+        () =>
+          api.respondControlApproval(sessionId, interaction.interaction_id, decision, subset),
+        t.control.approvedNotice,
       );
     };
     return (
@@ -394,8 +414,10 @@ function PendingInteractionCard({
             style={subtleButtonStyle}
             disabled={busy}
             onClick={() =>
-              void act(() =>
-                api.respondControlApproval(sessionId, interaction.interaction_id, "decline"),
+              void act(
+                () =>
+                  api.respondControlApproval(sessionId, interaction.interaction_id, "decline"),
+                t.control.declinedNotice,
               )
             }
           >
@@ -418,8 +440,9 @@ function PendingInteractionCard({
       const chosen = customText || selections[question.id];
       answers[question.id] = { answers: chosen ? [chosen] : [] };
     }
-    void act(() =>
-      api.answerControlInteraction(sessionId, interaction.interaction_id, answers),
+    void act(
+      () => api.answerControlInteraction(sessionId, interaction.interaction_id, answers),
+      t.control.answeredNotice,
     );
   };
 

@@ -503,6 +503,14 @@ def normalize_event_record(
             call_id = str(payload.get("call_id", "") or "")
             tool_name = str(payload.get("name", "") or payload_type)
             tool_input = extract_tool_input(payload)
+            # Code-mode wraps a shell command in an `exec` tool whose input is
+            # opaque JS (`const r = await tools.shell_command({command:"..."})`).
+            # Surface the real command so approved/declined commands are legible
+            # in the transcript instead of rendering as a JS blob.
+            shell_command = extract_code_mode_shell_command(tool_name, tool_input)
+            if shell_command is not None:
+                tool_name = "shell"
+                tool_input = shell_command
             text = tool_input
         elif payload_type in {"function_call_output", "custom_tool_call_output"}:
             kind = "tool_output"
@@ -943,6 +951,32 @@ def extract_codex_content(content: Any) -> str:
     if content is None:
         return ""
     return str(content).strip()
+
+
+_CODE_MODE_COMMAND_RE = re.compile(
+    r'shell_command\(\s*\{[^}]*?["\']?command["\']?\s*:\s*"((?:\\.|[^"\\])*)"',
+    re.DOTALL,
+)
+
+
+def extract_code_mode_shell_command(tool_name: str, tool_input: str) -> str | None:
+    """Pull the real shell command out of a code-mode ``exec`` tool call.
+
+    Code-mode's ``exec`` tool carries JavaScript like
+    ``const r = await tools.shell_command({command:"...",workdir:"..."})``.
+    Returns the unescaped command string, or None if this isn't that shape.
+    """
+    if tool_name != "exec" or "shell_command" not in tool_input:
+        return None
+    match = _CODE_MODE_COMMAND_RE.search(tool_input)
+    if not match:
+        return None
+    raw = match.group(1)
+    # Undo JS string escaping (\\ -> \, \" -> ", \n -> newline, ...).
+    try:
+        return json.loads(f'"{raw}"')
+    except (ValueError, json.JSONDecodeError):
+        return raw.replace('\\"', '"').replace("\\\\", "\\")
 
 
 def extract_tool_input(payload: dict[str, Any]) -> str:
