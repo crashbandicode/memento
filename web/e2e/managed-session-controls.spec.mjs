@@ -343,10 +343,14 @@ test("devices page can start a managed Codex session", async ({ page }) => {
   await page.locator("[data-start-codex-session]").click();
   await expect(page.locator("[data-start-control-session]")).toBeVisible();
   await page.locator("[data-start-session-message]").fill("MEMENTO test objective");
+  await page.locator("[data-start-session-approval-policy]").selectOption("untrusted");
+  await page.locator("[data-start-session-sandbox]").selectOption("workspace-write");
   await page.locator("[data-start-session-submit]").click();
 
   await expect.poll(() => capture.length).toBeGreaterThan(0);
   expect(capture[0].body.machine_id).toBe("99999999-8888-4777-8666-555555555555");
   expect(capture[0].body.initial_message).toBe("MEMENTO test objective");
+  expect(capture[0].body.approval_policy).toBe("untrusted");
+  expect(capture[0].body.sandbox).toBe("workspace-write");
   await expect(page.locator("[data-start-session-status]")).toBeVisible();
 });

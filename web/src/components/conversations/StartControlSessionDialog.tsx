@@ -61,6 +61,8 @@ export default function StartControlSessionDialog({
   const { t } = useI18n();
   const [cwd, setCwd] = useState(defaultCwd ?? "");
   const [model, setModel] = useState("");
+  const [approvalPolicy, setApprovalPolicy] = useState("");
+  const [sandbox, setSandbox] = useState("");
   const [initialMessage, setInitialMessage] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -79,6 +81,8 @@ export default function StartControlSessionDialog({
         tool_id: "codex",
         cwd: cwd.trim() || undefined,
         model: model.trim() || undefined,
+        approval_policy: approvalPolicy || undefined,
+        sandbox: (sandbox || undefined) as "read-only" | "workspace-write" | "danger-full-access" | undefined,
         initial_message: initialMessage.trim() || undefined,
       });
       setStatus(t.control.waitingAgent);
@@ -106,7 +110,7 @@ export default function StartControlSessionDialog({
       setStatus(caught instanceof Error ? caught.message : t.control.startFailed);
       setSubmitting(false);
     }
-  }, [machineId, cwd, model, initialMessage, router, onClose, t]);
+  }, [machineId, cwd, model, approvalPolicy, sandbox, initialMessage, router, onClose, t]);
 
   return (
     <div style={overlayStyle} role="dialog" aria-modal="true" aria-label={`${t.control.dialogTitle} · ${machineName}`}>
@@ -132,6 +136,37 @@ export default function StartControlSessionDialog({
             placeholder={t.control.modelPlaceholder}
           />
         </label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, flex: 1 }}>
+            {t.control.approvalPolicyLabel}
+            <select
+              data-start-session-approval-policy
+              style={inputStyle}
+              value={approvalPolicy}
+              onChange={(event) => setApprovalPolicy(event.target.value)}
+            >
+              <option value="">{t.control.agentDefaultOption}</option>
+              <option value="untrusted">untrusted</option>
+              <option value="on-request">on-request</option>
+              <option value="granular">granular</option>
+              <option value="never">never</option>
+            </select>
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, flex: 1 }}>
+            {t.control.sandboxLabel}
+            <select
+              data-start-session-sandbox
+              style={inputStyle}
+              value={sandbox}
+              onChange={(event) => setSandbox(event.target.value)}
+            >
+              <option value="">{t.control.agentDefaultOption}</option>
+              <option value="read-only">read-only</option>
+              <option value="workspace-write">workspace-write</option>
+              <option value="danger-full-access">danger-full-access</option>
+            </select>
+          </label>
+        </div>
         <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
           {t.control.firstMessageLabel}
           <textarea
