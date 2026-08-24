@@ -400,6 +400,69 @@ def test_restarted_scan_skips_durable_unchanged_source(
         queue.close()
 
 
+def test_enriched_full_identity_backfills_an_unchanged_cursor_transcript(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        "\n".join(
+            (
+                '{"role":"user","message":{"content":"hello"}}',
+                '{"role":"assistant","message":{"content":"done"}}',
+            )
+        ),
+        encoding="utf-8",
+    )
+    classification = FileClassification(
+        tool_name="cursor",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.FULL,
+        relative_path="projects/demo/agent-transcripts/child/child.jsonl",
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(
+            classify_file=lambda _path: classification,
+        )
+    }
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch()[0]
+        assert queue.mark_synced(original)
+
+        def enrich(line: str) -> str:
+            record = json.loads(line)
+            if record.get("role") == "assistant":
+                record["model"] = "cursor-grok-4.6-high-fast"
+            return json.dumps(record, separators=(",", ":"))
+
+        watcher._tool_map = {
+            str(tmp_path): SimpleNamespace(
+                classify_file=lambda _path: classification,
+                full_identity_version=lambda _classification: "cursor-chats-store-v1",
+                make_jsonl_line_enricher=lambda _classification, _path: enrich,
+            )
+        }
+        watcher._process_file_changed(path, emit_live_signals=False)
+
+        enriched = queue.claim_batch()[0]
+        assert '"model":"cursor-grok-4.6-high-fast"' in queue.read_payload_text(
+            enriched
+        )
+        assert enriched.content_hash != original.content_hash
+        assert queue.get_source_revision(
+            "cursor",
+            classification.relative_path,
+            identity_version="cursor-chats-store-v1",
+        ) == (path.stat().st_size, path.stat().st_mtime_ns)
+    finally:
+        queue.close()
+
+
 def _legacy_full_watcher(
     tmp_path: Path,
     path: Path,
@@ -646,11 +709,14 @@ def test_inactive_legacy_proof_fully_ingests_same_size_changes(
         assert current_stat.st_size == original_stat.st_size
         if preserve_mtime:
             assert current_stat.st_mtime_ns == original_stat.st_mtime_ns
-        assert _legacy_full_hash_revision(
-            path,
-            size=current_stat.st_size,
-            mtime_ns=current_stat.st_mtime_ns,
-        ) != legacy_hash
+        assert (
+            _legacy_full_hash_revision(
+                path,
+                size=current_stat.st_size,
+                mtime_ns=current_stat.st_mtime_ns,
+            )
+            != legacy_hash
+        )
 
         try:
             assert queue.pending_count() == 0
@@ -659,9 +725,10 @@ def test_inactive_legacy_proof_fully_ingests_same_size_changes(
             changed = queue.claim_batch()[0]
             expected = sanitize_jsonl(after).content
             assert queue.read_payload_text(changed) == expected
-            assert changed.content_hash == hashlib.sha256(
-                expected.encode("utf-8")
-            ).hexdigest()
+            assert (
+                changed.content_hash
+                == hashlib.sha256(expected.encode("utf-8")).hexdigest()
+            )
             assert queue.get_source_revision(
                 "codex",
                 "archived_sessions/same-size.jsonl",
@@ -824,12 +891,8 @@ def test_legacy_archived_full_adopts_only_acknowledged_unchanged_source(
     )
 
     try:
-        canonical_content = sanitize_jsonl(
-            path.read_text(encoding="utf-8")
-        ).content
-        canonical_hash = hashlib.sha256(
-            canonical_content.encode("utf-8")
-        ).hexdigest()
+        canonical_content = sanitize_jsonl(path.read_text(encoding="utf-8")).content
+        canonical_hash = hashlib.sha256(canonical_content.encode("utf-8")).hexdigest()
         queue.enqueue(
             tool_name="codex",
             category="conversation",
@@ -1034,8 +1097,8 @@ def test_startup_reconciliation_requires_canonical_hash_not_legacy_prefix_only(
     original_stat = path.stat()
     queue = SyncQueue(tmp_path / "queue" / "sync.db", spool_threshold=64 * 1024)
     watcher = _reconciliation_watcher(queue, archive_dir)
-    item_id, legacy_hash, old_canonical_hash = (
-        _enqueue_legacy_transition_candidate(queue, path)
+    item_id, legacy_hash, old_canonical_hash = _enqueue_legacy_transition_candidate(
+        queue, path
     )
 
     path.write_text(after + "\n", encoding="utf-8")
@@ -1048,11 +1111,14 @@ def test_startup_reconciliation_requires_canonical_hash_not_legacy_prefix_only(
         original_stat.st_size,
         original_stat.st_mtime_ns,
     )
-    assert _legacy_full_hash_revision(
-        path,
-        size=current_stat.st_size,
-        mtime_ns=current_stat.st_mtime_ns,
-    ) == legacy_hash
+    assert (
+        _legacy_full_hash_revision(
+            path,
+            size=current_stat.st_size,
+            mtime_ns=current_stat.st_mtime_ns,
+        )
+        == legacy_hash
+    )
 
     try:
         result = watcher.reconcile_legacy_full_queue()
@@ -1201,12 +1267,15 @@ def test_startup_reconciliation_backs_off_source_race_without_data_loss(
     try:
         assert reopened.begin_legacy_full_reconciliation() == 1
         assert reopened.legacy_full_reconciliation_candidates(limit=1) == []
-        assert len(
-            reopened.legacy_full_reconciliation_candidates(
-                limit=1,
-                now=before + 120,
+        assert (
+            len(
+                reopened.legacy_full_reconciliation_candidates(
+                    limit=1,
+                    now=before + 120,
+                )
             )
-        ) == 1
+            == 1
+        )
         assert reopened.claim_batch() == []
     finally:
         reopened.close()
@@ -1242,9 +1311,10 @@ def test_changed_or_unacknowledged_legacy_full_is_not_adopted(
 
             item = queue.claim_batch()[0]
             assert item.content_hash != legacy_hash
-            assert queue.read_payload_text(item) == sanitize_jsonl(
-                path.read_text(encoding="utf-8")
-            ).content
+            assert (
+                queue.read_payload_text(item)
+                == sanitize_jsonl(path.read_text(encoding="utf-8")).content
+            )
         finally:
             queue.close()
 
@@ -1369,9 +1439,10 @@ def test_pruned_terminal_payload_rebuilds_from_exact_source(tmp_path: Path) -> N
         rebuilt = queue.claim_batch(max_bytes=100_000)[0]
         assert rebuilt.id == item_id
         assert rebuilt.metadata["_queue_force_reprocess_nonce"]
-        assert queue.read_payload_text(rebuilt) == sanitize_jsonl(
-            path.read_text(encoding="utf-8")
-        ).content
+        assert (
+            queue.read_payload_text(rebuilt)
+            == sanitize_jsonl(path.read_text(encoding="utf-8")).content
+        )
     finally:
         queue.close()
 
@@ -1448,9 +1519,10 @@ def test_unchanged_touch_updates_observation_without_requeue(tmp_path: Path) -> 
         assert queue.get_file_state("cursor", "projects/session.jsonl")[0] == (
             original.content_hash
         )
-        assert queue.get_source_revision(
-            "cursor", "projects/session.jsonl"
-        ) == (path.stat().st_size, path.stat().st_mtime_ns)
+        assert queue.get_source_revision("cursor", "projects/session.jsonl") == (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
         with queue._lock:
             assert queue._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0] == 1
     finally:

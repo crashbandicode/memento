@@ -3,19 +3,193 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import sqlite3
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterator
 from urllib.parse import unquote
 
 from ..config import TOOL_PATHS
 from .claude_code import _extract_cwd_from_jsonl
 from .base import (
-    BaseTool, Category, ContentType, FileClassification, SyncStrategy, WatchPath,
+    BaseTool,
+    Category,
+    ContentType,
+    FileClassification,
+    SyncStrategy,
+    WatchPath,
     path_linked_subagent_identity,
 )
+
+
+_CURSOR_CHATS_STORE_FULL_IDENTITY_VERSION = "cursor-chats-store-v1"
+
+
+@dataclass(frozen=True)
+class CursorChatsStoreMetadata:
+    """Conversation facts Cursor keeps beside sparse agent transcripts."""
+
+    started_at: str = ""
+    completed_at: str = ""
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class _CursorChatsStoreCacheEntry:
+    chat_path: Path
+    meta_token: tuple[int, int] | None
+    store_token: tuple[int, int] | None
+    metadata: CursorChatsStoreMetadata
+
+
+def _path_token(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _iso_cursor_timestamp(value: object) -> str:
+    """Normalize Cursor epoch-ms/ISO timestamps using the state-export rules."""
+    if value in (None, "") or isinstance(value, bool):
+        return ""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        if not math.isfinite(seconds):
+            return ""
+        while abs(seconds) > 10_000_000_000:
+            seconds /= 1000
+        try:
+            parsed = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return ""
+    if parsed.microsecond == 0:
+        timespec = "seconds"
+    elif parsed.microsecond % 1000 == 0:
+        timespec = "milliseconds"
+    else:
+        timespec = "microseconds"
+    return parsed.isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _json_mappings(value: object) -> Iterator[dict[str, object]]:
+    """Yield nested JSON objects without inspecting text content semantically."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            yield current
+            pending.extend(reversed(list(current.values())))
+        elif isinstance(current, list):
+            pending.extend(reversed(current))
+
+
+def _cursor_model_from_blob(value: object) -> str:
+    """Return the first explicit Cursor model name from one chats-store blob."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+    if not isinstance(value, str) or "modelName" not in value:
+        return ""
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    for item in _json_mappings(decoded):
+        provider_options = item.get("providerOptions")
+        if not isinstance(provider_options, dict):
+            continue
+        cursor_options = provider_options.get("cursor")
+        if not isinstance(cursor_options, dict):
+            continue
+        model = cursor_options.get("modelName")
+        if isinstance(model, str) and model.strip():
+            return model.strip()[:256]
+    return ""
+
+
+def _cursor_agent_message_count(path: Path) -> int:
+    """Count visible Cursor rows so only known conversation bounds get timestamps."""
+    count = 0
+    try:
+        with path.open("rb") as stream:
+            for raw_line in stream:
+                try:
+                    record = json.loads(raw_line.decode("utf-8", "replace"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(record, dict) and record.get("role") in {
+                    "user",
+                    "assistant",
+                }:
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+class _CursorAgentTranscriptLineEnricher:
+    """Add only conversation-level facts that sparse Cursor rows lack."""
+
+    def __init__(
+        self,
+        metadata: CursorChatsStoreMetadata,
+        *,
+        message_count: int,
+    ) -> None:
+        self._metadata = metadata
+        self._message_count = message_count
+        self._message_index = 0
+
+    def __call__(self, line: str) -> str:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return line
+        if not isinstance(record, dict) or record.get("role") not in {
+            "user",
+            "assistant",
+        }:
+            return line
+
+        self._message_index += 1
+        changed = False
+        if (
+            record.get("role") == "assistant"
+            and self._metadata.model
+            and not record.get("model")
+        ):
+            record["model"] = self._metadata.model
+            changed = True
+        if not record.get("timestamp"):
+            if self._message_index == 1 and self._metadata.started_at:
+                record["timestamp"] = self._metadata.started_at
+                changed = True
+            elif (
+                self._message_index == self._message_count
+                and self._metadata.completed_at
+            ):
+                record["timestamp"] = self._metadata.completed_at
+                changed = True
+        if not changed:
+            return line
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
 
 
 def _load_workspace_storage_map() -> dict[str, str]:
@@ -29,12 +203,21 @@ def _load_workspace_storage_map() -> dict[str, str]:
     but the folder URI maps to the same real path.
     """
     import platform
+
     home = Path.home()
     system = platform.system()
     if system == "Darwin":
-        ws_root = home / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
+        ws_root = (
+            home
+            / "Library"
+            / "Application Support"
+            / "Cursor"
+            / "User"
+            / "workspaceStorage"
+        )
     elif system == "Windows":
         import os
+
         appdata = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
         ws_root = appdata / "Cursor" / "User" / "workspaceStorage"
     else:
@@ -62,7 +245,9 @@ def _load_workspace_storage_map() -> dict[str, str]:
     return uri_to_path
 
 
-def _match_hash_to_workspace(project_hash: str, workspaces: dict[str, str]) -> str | None:
+def _match_hash_to_workspace(
+    project_hash: str, workspaces: dict[str, str]
+) -> str | None:
     """Match a Cursor project hash to a real workspace path.
 
     Hash: 'Users-haixingdong-Desktop-dev-ft-userdata'
@@ -75,7 +260,14 @@ def _match_hash_to_workspace(project_hash: str, workspaces: dict[str, str]) -> s
 
     for real_path in workspaces:
         # Normalize path: strip leading /, replace / and _ and - with empty
-        path_norm = real_path.strip("/").lower().replace("/", "").replace("_", "").replace("-", "").replace("\\", "")
+        path_norm = (
+            real_path.strip("/")
+            .lower()
+            .replace("/", "")
+            .replace("_", "")
+            .replace("-", "")
+            .replace("\\", "")
+        )
         if hash_norm == path_norm:
             return real_path
 
@@ -83,7 +275,6 @@ def _match_hash_to_workspace(project_hash: str, workspaces: dict[str, str]) -> s
 
 
 class CursorTool(BaseTool):
-
     _project_path_cache: dict[str, str | None] = {}
     _workspace_map: dict[str, str] | None = None
 
@@ -92,6 +283,7 @@ class CursorTool(BaseTool):
         self._state_session_ids: frozenset[str] = frozenset()
         self._state_session_ids_checked_at = 0.0
         self._state_session_misses: dict[str, float] = {}
+        self._chats_store_cache: dict[str, _CursorChatsStoreCacheEntry] = {}
 
     @property
     def state_database_path(self) -> Path:
@@ -152,9 +344,7 @@ class CursorTool(BaseTool):
                     )
                 except sqlite3.OperationalError:
                     rows = connection.execute("SELECT composerId FROM composerHeaders")
-                session_ids = frozenset(
-                    str(row[0]) for row in rows if row and row[0]
-                )
+                session_ids = frozenset(str(row[0]) for row in rows if row and row[0])
             except (OSError, sqlite3.Error):
                 # Keep the last good view during Cursor's brief database swaps.
                 session_ids = self._state_session_ids
@@ -236,7 +426,9 @@ class CursorTool(BaseTool):
             result = _match_hash_to_workspace(project_hash, self._get_workspace_map())
             if not result:
                 # Fallback: try cwd from JSONL
-                result = _extract_cwd_from_jsonl(self.root_path / "projects" / project_hash)
+                result = _extract_cwd_from_jsonl(
+                    self.root_path / "projects" / project_hash
+                )
             self._project_path_cache[project_hash] = result
         return self._project_path_cache[project_hash]
 
@@ -332,16 +524,20 @@ class CursorTool(BaseTool):
         # argv.json
         if rel_str == "argv.json":
             return FileClassification(
-                tool_name=self.name, category=Category.CONFIG,
-                content_type=ContentType.JSON, sync_strategy=SyncStrategy.FULL,
+                tool_name=self.name,
+                category=Category.CONFIG,
+                content_type=ContentType.JSON,
+                sync_strategy=SyncStrategy.FULL,
                 relative_path=rel_str,
             )
 
         # extensions
         if rel_str == "extensions/extensions.json":
             return FileClassification(
-                tool_name=self.name, category=Category.EXTENSION,
-                content_type=ContentType.JSON, sync_strategy=SyncStrategy.FULL,
+                tool_name=self.name,
+                category=Category.EXTENSION,
+                content_type=ContentType.JSON,
+                sync_strategy=SyncStrategy.FULL,
                 relative_path=rel_str,
             )
 
@@ -353,14 +549,18 @@ class CursorTool(BaseTool):
                 return self.classify_transcript_source(abs_path)
             if abs_path.suffix == ".md":
                 return FileClassification(
-                    tool_name=self.name, category=Category.MEMORY,
-                    content_type=ContentType.MARKDOWN, sync_strategy=SyncStrategy.FULL,
+                    tool_name=self.name,
+                    category=Category.MEMORY,
+                    content_type=ContentType.MARKDOWN,
+                    sync_strategy=SyncStrategy.FULL,
                     relative_path=rel_str,
                 )
             if abs_path.suffix == ".json":
                 return FileClassification(
-                    tool_name=self.name, category=Category.CONFIG,
-                    content_type=ContentType.JSON, sync_strategy=SyncStrategy.FULL,
+                    tool_name=self.name,
+                    category=Category.CONFIG,
+                    content_type=ContentType.JSON,
+                    sync_strategy=SyncStrategy.FULL,
                     relative_path=rel_str,
                 )
 
@@ -371,8 +571,10 @@ class CursorTool(BaseTool):
         # ai-tracking
         if parts and parts[0] == "ai-tracking" and abs_path.suffix == ".db":
             return FileClassification(
-                tool_name=self.name, category=Category.STATE,
-                content_type=ContentType.SQLITE, sync_strategy=SyncStrategy.POLL,
+                tool_name=self.name,
+                category=Category.STATE,
+                content_type=ContentType.SQLITE,
+                sync_strategy=SyncStrategy.POLL,
                 relative_path=rel_str,
             )
 
@@ -413,6 +615,16 @@ class CursorTool(BaseTool):
             meta.update(path_linked_subagent_identity(rel_str))
         if real_path:
             meta["project_path"] = real_path
+        chats_metadata = self._chats_store_metadata(abs_path.stem)
+        if chats_metadata.started_at:
+            meta["started_at"] = chats_metadata.started_at
+        if chats_metadata.completed_at:
+            meta["completed_at"] = chats_metadata.completed_at
+        if chats_metadata.model:
+            # This is the same native Cursor model-name convention used by
+            # the state.vscdb projection. It also seeds assistant-message
+            # identity for sparse transcripts that contain no model fields.
+            meta["model"] = chats_metadata.model
         return FileClassification(
             tool_name=self.name,
             category=Category.CONVERSATION,
@@ -421,3 +633,108 @@ class CursorTool(BaseTool):
             relative_path=rel_str,
             metadata=meta,
         )
+
+    def full_identity_version(self, classification: FileClassification) -> str:
+        """Version only enriched sparse transcripts for one automatic refresh."""
+        if "/agent-transcripts/" in classification.relative_path.replace(
+            "\\", "/"
+        ) and any(
+            classification.metadata.get(key)
+            for key in ("started_at", "completed_at", "model")
+        ):
+            return _CURSOR_CHATS_STORE_FULL_IDENTITY_VERSION
+        return ""
+
+    def make_jsonl_line_enricher(
+        self,
+        classification: FileClassification,
+        path: Path,
+    ) -> Callable[[str], str] | None:
+        """Build a streaming projection for a sparse agent transcript only."""
+        if not self.full_identity_version(classification):
+            return None
+        metadata = CursorChatsStoreMetadata(
+            started_at=str(classification.metadata.get("started_at") or ""),
+            completed_at=str(classification.metadata.get("completed_at") or ""),
+            model=str(classification.metadata.get("model") or ""),
+        )
+        return _CursorAgentTranscriptLineEnricher(
+            metadata,
+            message_count=_cursor_agent_message_count(path),
+        )
+
+    def _chats_store_metadata(self, session_id: str) -> CursorChatsStoreMetadata:
+        """Read one Cursor chats-store entry without locking a live session."""
+        if not session_id:
+            return CursorChatsStoreMetadata()
+
+        cached = self._chats_store_cache.get(session_id)
+        if cached is not None:
+            if (
+                _path_token(cached.chat_path / "meta.json") == cached.meta_token
+                and _path_token(cached.chat_path / "store.db") == cached.store_token
+            ):
+                return cached.metadata
+
+        chats_root = self.root_path / "chats"
+        try:
+            candidates = sorted(
+                path for path in chats_root.glob(f"*/{session_id}") if path.is_dir()
+            )
+        except OSError:
+            return CursorChatsStoreMetadata()
+        if not candidates:
+            return CursorChatsStoreMetadata()
+
+        # Chat IDs are globally unique in Cursor today. Sorting gives a stable
+        # answer if a future release leaves an obsolete workspace copy behind.
+        chat_path = candidates[0]
+        meta_path = chat_path / "meta.json"
+        store_path = chat_path / "store.db"
+        metadata = CursorChatsStoreMetadata(
+            started_at=self._chats_store_timestamp(meta_path, "createdAtMs"),
+            completed_at=self._chats_store_timestamp(meta_path, "updatedAtMs"),
+            model=self._chats_store_model(store_path),
+        )
+        self._chats_store_cache[session_id] = _CursorChatsStoreCacheEntry(
+            chat_path=chat_path,
+            meta_token=_path_token(meta_path),
+            store_token=_path_token(store_path),
+            metadata=metadata,
+        )
+        return metadata
+
+    @staticmethod
+    def _chats_store_timestamp(meta_path: Path, field: str) -> str:
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return _iso_cursor_timestamp(payload.get(field))
+
+    @staticmethod
+    def _chats_store_model(store_path: Path) -> str:
+        if not store_path.is_file():
+            return ""
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"{store_path.resolve().as_uri()}?mode=ro&immutable=1",
+                uri=True,
+                timeout=1,
+            )
+            connection.execute("PRAGMA query_only=ON")
+            for row in connection.execute("SELECT data FROM blobs"):
+                if not row:
+                    continue
+                model = _cursor_model_from_blob(row[0])
+                if model:
+                    return model
+        except (OSError, sqlite3.Error):
+            return ""
+        finally:
+            if connection is not None:
+                connection.close()
+        return ""

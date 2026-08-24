@@ -647,13 +647,25 @@ class FileWatcher:
         except OSError:
             return
         source_revision = (source_stat.st_size, source_stat.st_mtime_ns)
+        full_identity_version = FULL_IDENTITY_VERSION
+        if classification.sync_strategy == SyncStrategy.FULL:
+            identity_version_for_file = getattr(tool, "full_identity_version", None)
+            if callable(identity_version_for_file):
+                candidate_version = identity_version_for_file(classification)
+                if isinstance(candidate_version, str) and candidate_version:
+                    full_identity_version = candidate_version
+        legacy_full_proof_version = (
+            LEGACY_FULL_PROOF_VERSION
+            if full_identity_version == FULL_IDENTITY_VERSION
+            else f"{full_identity_version}-legacy-proof-v1"
+        )
         get_source_revision = getattr(self._queue, "get_source_revision", None)
         if not force_full and callable(get_source_revision):
             observed_source_revision = get_source_revision(
                 classification.tool_name,
                 classification.relative_path,
                 identity_version=(
-                    FULL_IDENTITY_VERSION
+                    full_identity_version
                     if classification.sync_strategy == SyncStrategy.FULL
                     else None
                 ),
@@ -665,7 +677,7 @@ class FileWatcher:
                 observed_source_revision = get_source_revision(
                     classification.tool_name,
                     classification.relative_path,
-                    identity_version=LEGACY_FULL_PROOF_VERSION,
+                    identity_version=legacy_full_proof_version,
                 )
             if observed_source_revision == source_revision:
                 # Startup/catch-up scans can contain thousands of durable,
@@ -699,7 +711,7 @@ class FileWatcher:
             legacy_adoption_hash = get_legacy_adoption(
                 classification.tool_name,
                 classification.relative_path,
-                identity_version=FULL_IDENTITY_VERSION,
+                identity_version=full_identity_version,
             )
             if legacy_adoption_hash:
                 legacy_source_hash = _legacy_full_hash_revision(
@@ -736,7 +748,7 @@ class FileWatcher:
                         legacy_hash=legacy_adoption_hash,
                         source_size=file_size,
                         source_mtime_ns=source_stat.st_mtime_ns,
-                        identity_version=LEGACY_FULL_PROOF_VERSION,
+                        identity_version=legacy_full_proof_version,
                     ):
                         logger.debug(
                             "Recorded unchanged legacy FULL source proof for %s",
@@ -813,6 +825,12 @@ class FileWatcher:
         payload_writer = None
         try:
             parser = self._get_parser(classification.content_type)
+            make_line_enricher = getattr(tool, "make_jsonl_line_enricher", None)
+            line_enricher = (
+                make_line_enricher(classification, path)
+                if isinstance(parser, JsonlParser) and callable(make_line_enricher)
+                else None
+            )
             append_only_snapshot = (
                 force_full
                 and classification.sync_strategy == SyncStrategy.DELTA
@@ -824,9 +842,8 @@ class FileWatcher:
                 and isinstance(parser, JsonlParser)
                 and read_end_offset < file_size
             )
-            can_stream_jsonl = (
-                type(parser) is JsonlParser
-                and callable(getattr(self._queue, "payload_writer", None))
+            can_stream_jsonl = type(parser) is JsonlParser and callable(
+                getattr(self._queue, "payload_writer", None)
             )
             if can_stream_jsonl:
                 payload_writer = self._queue.payload_writer()
@@ -835,7 +852,11 @@ class FileWatcher:
                     payload_writer.write,
                     offset=0 if append_only_snapshot else read_offset,
                     end_offset=read_end_offset,
-                    transform_line=lambda line: sanitize_jsonl_line(line).content,
+                    transform_line=lambda line: (
+                        line_enricher(sanitize_jsonl_line(line).content)
+                        if line_enricher is not None
+                        else sanitize_jsonl_line(line).content
+                    ),
                 )
                 prepared_payload = payload_writer.finish()
                 parsed_content = ""
@@ -970,7 +991,7 @@ class FileWatcher:
                     canonical_hash=current_hash,
                     source_size=new_offset,
                     source_mtime_ns=source_stat.st_mtime_ns,
-                    identity_version=FULL_IDENTITY_VERSION,
+                    identity_version=full_identity_version,
                 )
             else:
                 adopt_legacy = getattr(
@@ -988,7 +1009,7 @@ class FileWatcher:
                         canonical_hash=current_hash,
                         source_size=new_offset,
                         source_mtime_ns=source_stat.st_mtime_ns,
-                        identity_version=FULL_IDENTITY_VERSION,
+                        identity_version=full_identity_version,
                     )
                     else "state_changed"
                 )
@@ -1001,11 +1022,15 @@ class FileWatcher:
             # source was being parsed. Keep the legacy state eligible for a
             # later proof rather than stamping it canonical and allowing the
             # duplicate transition row to escape reconciliation.
-            if callable(get_legacy_adoption) and get_legacy_adoption(
-                classification.tool_name,
-                classification.relative_path,
-                identity_version=FULL_IDENTITY_VERSION,
-            ) and adoption_result != "canonical_mismatch":
+            if (
+                callable(get_legacy_adoption)
+                and get_legacy_adoption(
+                    classification.tool_name,
+                    classification.relative_path,
+                    identity_version=full_identity_version,
+                )
+                and adoption_result != "canonical_mismatch"
+            ):
                 if prepared_payload is not None:
                     self._queue.discard_prepared_payload(prepared_payload)
                 return
@@ -1027,7 +1052,7 @@ class FileWatcher:
                     current_hash,
                     source_size=new_offset,
                     source_mtime_ns=source_stat.st_mtime_ns,
-                    identity_version=FULL_IDENTITY_VERSION,
+                    identity_version=full_identity_version,
                 )
             if prepared_payload is not None:
                 self._queue.discard_prepared_payload(prepared_payload)
@@ -1061,7 +1086,7 @@ class FileWatcher:
             source_size=new_offset,
             source_mtime_ns=source_stat.st_mtime_ns,
             identity_version=(
-                FULL_IDENTITY_VERSION
+                full_identity_version
                 if classification.sync_strategy == SyncStrategy.FULL
                 else None
             ),
@@ -1158,10 +1183,8 @@ class FileWatcher:
                         result["released"] += 1
                     result["examined"] += 1
                     continue
-                if (
-                    result["examined"]
-                    and total_source_bytes + source_bytes
-                    > max(0, int(max_source_bytes))
+                if result["examined"] and total_source_bytes + source_bytes > max(
+                    0, int(max_source_bytes)
                 ):
                     break
                 total_source_bytes += source_bytes
@@ -1215,9 +1238,7 @@ class FileWatcher:
                         exc_info=True,
                     )
 
-                if self._queue.is_legacy_full_reconciliation_candidate(
-                    candidate.id
-                ):
+                if self._queue.is_legacy_full_reconciliation_candidate(candidate.id):
                     if legacy_hash_matches:
                         changed = (
                             self._queue.defer_legacy_full_reconciliation_candidate(

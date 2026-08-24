@@ -32,18 +32,22 @@ class FixtureCursorTool(CursorTool):
 
 
 def test_model_selection_reads_current_cursor_reasoning_parameter() -> None:
-    assert _model_selection({
-        "modelName": "gpt-5.6-sol",
-        "maxMode": True,
-        "selectedModels": [{
-            "modelId": "gpt-5.6-sol",
-            "parameters": [
-                {"id": "context", "value": "272k"},
-                {"id": "reasoning", "value": "xhigh"},
-                {"id": "fast", "value": "false"},
+    assert _model_selection(
+        {
+            "modelName": "gpt-5.6-sol",
+            "maxMode": True,
+            "selectedModels": [
+                {
+                    "modelId": "gpt-5.6-sol",
+                    "parameters": [
+                        {"id": "context", "value": "272k"},
+                        {"id": "reasoning", "value": "xhigh"},
+                        {"id": "fast", "value": "false"},
+                    ],
+                }
             ],
-        }],
-    }) == ("gpt-5.6-sol", "xhigh")
+        }
+    ) == ("gpt-5.6-sol", "xhigh")
 
 
 def test_pending_question_uses_cursor_interaction_status() -> None:
@@ -54,11 +58,13 @@ def test_pending_question_uses_cursor_interaction_status() -> None:
             "additionalData": {"status": "pending"},
             "params": {
                 "title": "Sample question",
-                "questions": [{
-                    "id": "choice",
-                    "prompt": "Which option?",
-                    "options": [{"id": "safe", "label": "Safe"}],
-                }],
+                "questions": [
+                    {
+                        "id": "choice",
+                        "prompt": "Which option?",
+                        "options": [{"id": "safe", "label": "Safe"}],
+                    }
+                ],
             },
             "toolCallId": "call-question-1",
         },
@@ -78,11 +84,13 @@ def test_plan_mode_request_projects_native_params_and_pending_status() -> None:
         {
             "name": "switch_mode",
             "status": "loading",
-            "params": json.dumps({
-                "fromModeId": "agent",
-                "toModeId": "plan",
-                "explanation": "Confirm the architecture before editing.",
-            }),
+            "params": json.dumps(
+                {
+                    "fromModeId": "agent",
+                    "toModeId": "plan",
+                    "explanation": "Confirm the architecture before editing.",
+                }
+            ),
             "rawArgs": "{}",
             "result": "{}",
             "toolCallId": "call-plan-1",
@@ -105,11 +113,13 @@ def test_skipped_plan_mode_request_projects_native_timeout_reason() -> None:
             "name": "switch_mode",
             "status": "cancelled",
             "additionalData": {"skipReason": "timeout"},
-            "params": json.dumps({
-                "fromModeId": "agent",
-                "toModeId": "plan",
-                "explanation": "Confirm the architecture before editing.",
-            }),
+            "params": json.dumps(
+                {
+                    "fromModeId": "agent",
+                    "toModeId": "plan",
+                    "explanation": "Confirm the architecture before editing.",
+                }
+            ),
             "rawArgs": "{}",
             "result": "{}",
             "toolCallId": "call-plan-1",
@@ -212,10 +222,12 @@ def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:
         "status": "aborted",
         "modelConfig": {
             "modelName": "grok-4.5",
-            "selectedModels": [{
-                "modelId": "grok-4.5",
-                "parameters": [{"id": "effort", "value": "high"}],
-            }],
+            "selectedModels": [
+                {
+                    "modelId": "grok-4.5",
+                    "parameters": [{"id": "effort", "value": "high"}],
+                }
+            ],
         },
         "fullConversationHeadersOnly": headers,
         "todos": [
@@ -313,6 +325,140 @@ def _write_state_fixture(tmp_path: Path) -> tuple[FixtureCursorTool, Path, str]:
     return FixtureCursorTool(root, database), transcript, session_id
 
 
+def _write_sparse_chats_store_fixture(
+    tool: FixtureCursorTool,
+    *,
+    meta_contents: str | None = None,
+    store_contents: bytes | None = None,
+) -> tuple[Path, str]:
+    session_id = "sparse-subagent-id"
+    transcript = (
+        tool.root_path
+        / "projects"
+        / "c-Users-intpa-demo"
+        / "agent-transcripts"
+        / session_id
+        / f"{session_id}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            (
+                json.dumps({"role": "user", "message": {"content": "Inspect."}}),
+                json.dumps({"role": "assistant", "message": {"content": "Done."}}),
+                json.dumps({"type": "turn_ended", "status": "success"}),
+            )
+        ),
+        encoding="utf-8",
+    )
+    chat_path = tool.root_path / "chats" / "workspace-hash" / session_id
+    chat_path.mkdir(parents=True)
+    if meta_contents is None:
+        meta_contents = json.dumps(
+            {
+                "createdAtMs": 1_785_378_873_625,
+                "updatedAtMs": 1_785_378_883_500,
+            }
+        )
+    if meta_contents:
+        (chat_path / "meta.json").write_text(meta_contents, encoding="utf-8")
+    if store_contents is None:
+        store_contents = json.dumps(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "providerOptions": {
+                            "cursor": {"modelName": "cursor-grok-4.6-high-fast"},
+                        },
+                    }
+                ],
+            }
+        ).encode("utf-8")
+    if store_contents:
+        connection = sqlite3.connect(chat_path / "store.db")
+        connection.execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+        connection.execute(
+            "INSERT INTO blobs VALUES (?, ?)", ("assistant-1", store_contents)
+        )
+        connection.commit()
+        connection.close()
+    return transcript, session_id
+
+
+def test_sparse_subagent_transcript_enriches_chats_store_time_and_model(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    transcript, _ = _write_sparse_chats_store_fixture(tool)
+
+    classification = tool.classify_file(transcript)
+
+    assert classification is not None
+    assert classification.metadata["started_at"] == "2026-07-30T02:34:33.625Z"
+    assert classification.metadata["completed_at"] == "2026-07-30T02:34:43.500Z"
+    assert classification.metadata["model"] == "cursor-grok-4.6-high-fast"
+    enricher = tool.make_jsonl_line_enricher(classification, transcript)
+    assert enricher is not None
+    records = [
+        json.loads(enricher(line))
+        for line in transcript.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[0]["timestamp"] == "2026-07-30T02:34:33.625Z"
+    assert records[1]["timestamp"] == "2026-07-30T02:34:43.500Z"
+    assert records[1]["model"] == "cursor-grok-4.6-high-fast"
+
+
+def test_sparse_subagent_transcript_keeps_model_when_chats_meta_is_missing(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    transcript, _ = _write_sparse_chats_store_fixture(tool, meta_contents="")
+
+    classification = tool.classify_file(transcript)
+
+    assert classification is not None
+    assert "started_at" not in classification.metadata
+    assert "completed_at" not in classification.metadata
+    assert classification.metadata["model"] == "cursor-grok-4.6-high-fast"
+
+
+def test_sparse_subagent_transcript_keeps_times_when_chats_store_is_corrupt(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    transcript, _ = _write_sparse_chats_store_fixture(
+        tool, store_contents=b"not sqlite"
+    )
+    chat_store = (
+        transcript.parents[4]
+        / "chats"
+        / "workspace-hash"
+        / transcript.stem
+        / "store.db"
+    )
+    chat_store.write_bytes(b"not sqlite")
+
+    classification = tool.classify_file(transcript)
+
+    assert classification is not None
+    assert classification.metadata["started_at"] == "2026-07-30T02:34:33.625Z"
+    assert classification.metadata["completed_at"] == "2026-07-30T02:34:43.500Z"
+    assert "model" not in classification.metadata
+
+
+def test_sparse_subagent_transcript_ignores_corrupt_meta_and_missing_store(tmp_path):
+    tool, _transcript, _session_id = _write_state_fixture(tmp_path)
+    transcript, _ = _write_sparse_chats_store_fixture(
+        tool,
+        meta_contents="{not valid json",
+        store_contents=b"",
+    )
+
+    classification = tool.classify_file(transcript)
+
+    assert classification is not None
+    assert "started_at" not in classification.metadata
+    assert "completed_at" not in classification.metadata
+    assert "model" not in classification.metadata
+    assert tool.make_jsonl_line_enricher(classification, transcript) is None
+
+
 def _add_subagent_state_fixture(
     tool: FixtureCursorTool,
     root_session_id: str,
@@ -333,36 +479,46 @@ def _add_subagent_state_fixture(
         "I need to locate artifacts, which involves searching for specific strings."
     )
     nested_transcript.write_text(
-        "\n".join([
-            json.dumps({
-                "role": "user",
-                "message": {
-                    "content": (
-                        "<timestamp>Wednesday, Jul 29, 2026, 10:34 PM "
-                        "(UTC-4)</timestamp>\n<user_query>Investigate</user_query>"
-                    )
-                },
-            }),
-            # Exact production shape: no outer ID or timestamp, and prose plus
-            # tool calls flattened into one compatibility record.
-            json.dumps({
-                "role": "assistant",
-                "message": {"content": [
-                    {"type": "text", "text": observed_thinking},
+        "\n".join(
+            [
+                json.dumps(
                     {
-                        "type": "tool_use",
-                        "name": "rg",
-                        "input": {"pattern": "handoff"},
-                    },
-                ]},
-            }),
-            json.dumps({
-                "role": "assistant",
-                "bubbleId": "compatibility-fallback",
-                "timestamp": "2026-07-30T02:35:10.123Z",
-                "message": {"content": "Compatibility timestamp fallback"},
-            }),
-        ]),
+                        "role": "user",
+                        "message": {
+                            "content": (
+                                "<timestamp>Wednesday, Jul 29, 2026, 10:34 PM "
+                                "(UTC-4)</timestamp>\n<user_query>Investigate</user_query>"
+                            )
+                        },
+                    }
+                ),
+                # Exact production shape: no outer ID or timestamp, and prose plus
+                # tool calls flattened into one compatibility record.
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": observed_thinking},
+                                {
+                                    "type": "tool_use",
+                                    "name": "rg",
+                                    "input": {"pattern": "handoff"},
+                                },
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "bubbleId": "compatibility-fallback",
+                        "timestamp": "2026-07-30T02:35:10.123Z",
+                        "message": {"content": "Compatibility timestamp fallback"},
+                    }
+                ),
+            ]
+        ),
         encoding="utf-8",
     )
     # Cursor can mirror a child at a top-level path. The exporter must prefer
@@ -446,14 +602,16 @@ def _add_subagent_state_fixture(
         """,
         (
             1_785_379_816_738,
-            json.dumps({
-                "name": "RC num_alloc USUSP",
-                "subagentInfo": {
-                    "parentComposerId": root_session_id,
-                    "rootParentConversationId": root_session_id,
-                    "subagentTypeName": "generalPurpose",
-                },
-            }),
+            json.dumps(
+                {
+                    "name": "RC num_alloc USUSP",
+                    "subagentInfo": {
+                        "parentComposerId": root_session_id,
+                        "rootParentConversationId": root_session_id,
+                        "subagentTypeName": "generalPurpose",
+                    },
+                }
+            ),
             session_id,
         ),
     )
@@ -518,12 +676,16 @@ def test_live_state_supersedes_sparse_transcript_and_projects_whitelist(tmp_path
 
 
 def test_workspace_folder_path_decodes_windows_hosted_wsl_uris() -> None:
-    assert _workspace_folder_path(
-        "file://wsl.localhost/Ubuntu/home/patrick/services/memento"
-    ) == "/home/patrick/services/memento"
-    assert _workspace_folder_path(
-        "vscode-remote://wsl+Ubuntu/home/patrick/My%20Project"
-    ) == "/home/patrick/My Project"
+    assert (
+        _workspace_folder_path(
+            "file://wsl.localhost/Ubuntu/home/patrick/services/memento"
+        )
+        == "/home/patrick/services/memento"
+    )
+    assert (
+        _workspace_folder_path("vscode-remote://wsl+Ubuntu/home/patrick/My%20Project")
+        == "/home/patrick/My Project"
+    )
     assert _workspace_folder_path("file:///C:/Users/intpa/demo") == (
         "C:/Users/intpa/demo"
     )
@@ -532,10 +694,12 @@ def test_workspace_folder_path_decodes_windows_hosted_wsl_uris() -> None:
 def test_terminal_composer_ignores_unreferenced_checkpoint_bubbles(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = "completed"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -545,12 +709,14 @@ def test_terminal_composer_ignores_unreferenced_checkpoint_bubbles(tmp_path):
         "INSERT INTO cursorDiskKV VALUES (?,?)",
         (
             f"bubbleId:{session_id}:superseded-checkpoint-copy",
-            json.dumps({
-                "bubbleId": "superseded-checkpoint-copy",
-                "type": 2,
-                "createdAt": "2026-07-18T14:19:02Z",
-                "text": "Stopping it now.",
-            }),
+            json.dumps(
+                {
+                    "bubbleId": "superseded-checkpoint-copy",
+                    "type": 2,
+                    "createdAt": "2026-07-18T14:19:02Z",
+                    "text": "Stopping it now.",
+                }
+            ),
         ),
     )
     connection.commit()
@@ -559,22 +725,25 @@ def test_terminal_composer_ignores_unreferenced_checkpoint_bubbles(tmp_path):
     snapshot = CursorStateExporter(tool).export_changed(limit=20)[0]
     records = [json.loads(line) for line in snapshot.content.splitlines()]
 
-    assert "superseded-checkpoint-copy" not in {
-        record.get("id") for record in records
-    }
-    assert sum(
-        record.get("message", {}).get("content") == "Stopping it now."
-        for record in records
-    ) == 1
+    assert "superseded-checkpoint-copy" not in {record.get("id") for record in records}
+    assert (
+        sum(
+            record.get("message", {}).get("content") == "Stopping it now."
+            for record in records
+        )
+        == 1
+    )
 
 
 def test_live_composer_keeps_unreferenced_inflight_bubble(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -584,12 +753,14 @@ def test_live_composer_keeps_unreferenced_inflight_bubble(tmp_path):
         "INSERT INTO cursorDiskKV VALUES (?,?)",
         (
             f"bubbleId:{session_id}:inflight",
-            json.dumps({
-                "bubbleId": "inflight",
-                "type": 2,
-                "createdAt": "2026-07-18T14:19:05Z",
-                "text": "Still working.",
-            }),
+            json.dumps(
+                {
+                    "bubbleId": "inflight",
+                    "type": 2,
+                    "createdAt": "2026-07-18T14:19:05Z",
+                    "text": "Still working.",
+                }
+            ),
         ),
     )
     connection.commit()
@@ -617,8 +788,7 @@ def test_subagent_state_supersedes_timestamp_free_compatibility_transcript(
 
     snapshots = CursorStateExporter(tool).export_changed(limit=20)
     snapshot = next(
-        item for item in snapshots
-        if item.metadata["session_id"] == session_id
+        item for item in snapshots if item.metadata["session_id"] == session_id
     )
     records = [json.loads(line) for line in snapshot.content.splitlines()]
 
@@ -641,9 +811,7 @@ def test_subagent_state_supersedes_timestamp_free_compatibility_transcript(
     observed = records[1]
     assert observed["id"] == "observed-thinking:thinking"
     assert observed["thinking_duration_ms"] == 933
-    assert "Investigating tool paths" in (
-        observed["message"]["content"][0]["thinking"]
-    )
+    assert "Investigating tool paths" in (observed["message"]["content"][0]["thinking"])
     assert records[2]["tool_name"] == "Ripgrep"
     assert snapshot.relative_path.endswith(
         f"/{root_session_id}/subagents/{session_id}.jsonl"
@@ -779,12 +947,14 @@ def _synthetic_projection_snapshot(
             separators=(",", ":"),
         )
         lines.append(line)
-        projection_records.append(CursorProjectionRecord(
-            source_id=source_id,
-            digest=hashlib.sha256(line.encode()).hexdigest(),
-            start=position,
-            end=position + len(line),
-        ))
+        projection_records.append(
+            CursorProjectionRecord(
+                source_id=source_id,
+                digest=hashlib.sha256(line.encode()).hexdigest(),
+                start=position,
+                end=position + len(line),
+            )
+        )
         position += len(line) + 1
     content = "\n".join(lines)
     encoded = content.encode()
@@ -802,10 +972,12 @@ def _synthetic_projection_snapshot(
 def test_cold_completed_composer_does_not_replay_historical_activity(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = "completed"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -859,15 +1031,19 @@ def _set_cursor_shell_state(
     timestamp: datetime,
 ) -> None:
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = composer_status
-    tool_bubble = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"bubbleId:{session_id}:tool-1",),
-    ).fetchone()[0])
+    tool_bubble = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"bubbleId:{session_id}:tool-1",),
+        ).fetchone()[0]
+    )
     tool_bubble["createdAt"] = timestamp.isoformat()
     if tool_status is None:
         tool_bubble["toolFormerData"].pop("status", None)
@@ -1021,16 +1197,19 @@ def test_cursor_terminal_noop_still_closes_published_running_shell(tmp_path):
     queue = _recording_queue()
     assert enqueue_cursor_state_snapshots(exporter, queue) == 1
     initial = queue.items.pop()
-    assert next(
-        iter(queue.metadata_items[0]["records"].values())
-    )["activity_status"] == "running"
+    assert (
+        next(iter(queue.metadata_items[0]["records"].values()))["activity_status"]
+        == "running"
+    )
 
     connection = sqlite3.connect(tool.state_database_path)
     composer_key = f"composerData:{session_id}"
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["status"] = "completed"
     finished_at = started_at + timedelta(seconds=30)
     connection.execute(
@@ -1060,14 +1239,18 @@ def test_cursor_terminal_noop_still_closes_published_running_shell(tmp_path):
 def test_state_snapshot_uses_native_time_not_projection_observation(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
-    composer["fullConversationHeadersOnly"] = [{
-        "bubbleId": "tool-1",
-        "type": 2,
-    }]
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
+    composer["fullConversationHeadersOnly"] = [
+        {
+            "bubbleId": "tool-1",
+            "type": 2,
+        }
+    ]
     composer["todos"] = []
     composer["status"] = "completed"
     connection.execute(
@@ -1079,27 +1262,31 @@ def test_state_snapshot_uses_native_time_not_projection_observation(tmp_path):
 
     snapshot = CursorStateExporter(tool).export_changed(limit=20)[0]
 
-    assert {
-        json.loads(line)["role"]
-        for line in snapshot.content.splitlines()
-    } == {"tool"}
-    assert snapshot.source_modified_at == datetime(
-        2026,
-        7,
-        18,
-        14,
-        20,
-        tzinfo=timezone.utc,
-    ).timestamp()
+    assert {json.loads(line)["role"] for line in snapshot.content.splitlines()} == {
+        "tool"
+    }
+    assert (
+        snapshot.source_modified_at
+        == datetime(
+            2026,
+            7,
+            18,
+            14,
+            20,
+            tzinfo=timezone.utc,
+        ).timestamp()
+    )
 
 
 def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -1114,15 +1301,19 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
     initial = queue.items.pop()
 
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
     composer["status"] = "completed"
-    composer["fullConversationHeadersOnly"].append({
-        "bubbleId": "assistant-2",
-        "type": 2,
-    })
+    composer["fullConversationHeadersOnly"].append(
+        {
+            "bubbleId": "assistant-2",
+            "type": 2,
+        }
+    )
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
         (json.dumps(composer), f"composerData:{session_id}"),
@@ -1131,12 +1322,14 @@ def test_enqueue_sends_only_new_records_when_existing_projection_is_prefix(tmp_p
         "INSERT INTO cursorDiskKV VALUES (?,?)",
         (
             f"bubbleId:{session_id}:assistant-2",
-            json.dumps({
-                "bubbleId": "assistant-2",
-                "type": 2,
-                "createdAt": "2026-07-18T14:21:00Z",
-                "text": "The resources are free.",
-            }),
+            json.dumps(
+                {
+                    "bubbleId": "assistant-2",
+                    "type": 2,
+                    "createdAt": "2026-07-18T14:21:00Z",
+                    "text": "The resources are free.",
+                }
+            ),
         ),
     )
     connection.execute(
@@ -1161,10 +1354,12 @@ def test_enqueue_sends_near_tail_insertions_with_bounded_anchor_hint(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     composer_key = f"composerData:{session_id}"
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     composer["todos"] = []
     composer["fullConversationHeadersOnly"] = [
@@ -1193,8 +1388,7 @@ def test_enqueue_sends_near_tail_insertions_with_bounded_anchor_hint(tmp_path):
 
     connection = sqlite3.connect(tool.state_database_path)
     composer["fullConversationHeadersOnly"][2:2] = [
-        {"bubbleId": f"inserted-tool-{index}", "type": 2}
-        for index in range(1, 4)
+        {"bubbleId": f"inserted-tool-{index}", "type": 2} for index in range(1, 4)
     ]
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -1206,25 +1400,29 @@ def test_enqueue_sends_near_tail_insertions_with_bounded_anchor_hint(tmp_path):
             "INSERT INTO cursorDiskKV VALUES (?,?)",
             (
                 f"bubbleId:{session_id}:{bubble_id}",
-                json.dumps({
-                    "bubbleId": bubble_id,
-                    "type": 2,
-                    "createdAt": f"2026-07-18T14:20:0{index}Z",
-                    "toolFormerData": {
-                        "name": "read_file_v2",
-                        "status": "completed",
-                        "params": {"path": f"file-{index}.py"},
-                        "result": {"bytes": index},
-                        "toolCallId": f"call-inserted-{index}",
-                    },
-                }),
+                json.dumps(
+                    {
+                        "bubbleId": bubble_id,
+                        "type": 2,
+                        "createdAt": f"2026-07-18T14:20:0{index}Z",
+                        "toolFormerData": {
+                            "name": "read_file_v2",
+                            "status": "completed",
+                            "params": {"path": f"file-{index}.py"},
+                            "result": {"bytes": index},
+                            "toolCallId": f"call-inserted-{index}",
+                        },
+                    }
+                ),
             ),
         )
     tail_key = f"bubbleId:{session_id}:tool-1"
-    tail = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (tail_key,),
-    ).fetchone()[0])
+    tail = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (tail_key,),
+        ).fetchone()[0]
+    )
     tail["toolFormerData"]["status"] = "completed"
     tail["toolFormerData"]["result"] = {"output": "tail completed"}
     connection.execute(
@@ -1255,15 +1453,17 @@ def test_enqueue_sends_near_tail_insertions_with_bounded_anchor_hint(tmp_path):
     assert hint == {
         "version": 1,
         "base_count": 3,
-        "groups": [{
-            "after_source_id": "assistant-1",
-            "before_source_id": "tool-1:tool",
-            "source_ids": [
-                "inserted-tool-1:tool",
-                "inserted-tool-2:tool",
-                "inserted-tool-3:tool",
-            ],
-        }],
+        "groups": [
+            {
+                "after_source_id": "assistant-1",
+                "before_source_id": "tool-1:tool",
+                "source_ids": [
+                    "inserted-tool-1:tool",
+                    "inserted-tool-2:tool",
+                    "inserted-tool-3:tool",
+                ],
+            }
+        ],
     }
 
 
@@ -1294,10 +1494,7 @@ def test_projection_delta_supports_multiple_bounded_insertion_groups(tmp_path):
     )
 
     assert delta is not None
-    assert [
-        json.loads(line)["id"]
-        for line in delta.content.splitlines()
-    ] == [
+    assert [json.loads(line)["id"] for line in delta.content.splitlines()] == [
         "inserted-a",
         "inserted-b",
         "inserted-c",
@@ -1334,24 +1531,30 @@ def test_projection_delta_rejects_far_insert_reorder_and_removal(tmp_path):
     baseline = _synthetic_projection_snapshot(baseline_ids)
     exporter.remember_queued_projection(baseline)
 
-    far_insert = _synthetic_projection_snapshot([
-        baseline_ids[0],
-        "too-far-from-tail",
-        *baseline_ids[1:],
-    ])
-    reordered = _synthetic_projection_snapshot([
-        baseline_ids[0],
-        baseline_ids[2],
-        baseline_ids[1],
-        *baseline_ids[3:],
-    ])
+    far_insert = _synthetic_projection_snapshot(
+        [
+            baseline_ids[0],
+            "too-far-from-tail",
+            *baseline_ids[1:],
+        ]
+    )
+    reordered = _synthetic_projection_snapshot(
+        [
+            baseline_ids[0],
+            baseline_ids[2],
+            baseline_ids[1],
+            *baseline_ids[3:],
+        ]
+    )
     removed = _synthetic_projection_snapshot(
         [source_id for source_id in baseline_ids if source_id != "stable-20"]
     )
-    oversized_identity = _synthetic_projection_snapshot([
-        *baseline_ids,
-        "x" * 257,
-    ])
+    oversized_identity = _synthetic_projection_snapshot(
+        [
+            *baseline_ids,
+            "x" * 257,
+        ]
+    )
 
     for unsafe_snapshot in (
         far_insert,
@@ -1359,26 +1562,31 @@ def test_projection_delta_rejects_far_insert_reorder_and_removal(tmp_path):
         removed,
         oversized_identity,
     ):
-        assert exporter.projection_delta(
-            unsafe_snapshot,
-            base_hash=baseline.content_hash,
-            base_offset=baseline.content_size,
-        ) is None
+        assert (
+            exporter.projection_delta(
+                unsafe_snapshot,
+                base_hash=baseline.content_hash,
+                base_offset=baseline.content_size,
+            )
+            is None
+        )
 
 
 def test_enqueue_sends_mutable_last_row_by_stable_source_id(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
     composer_key = f"composerData:{session_id}"
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     composer["todos"] = []
-    composer["fullConversationHeadersOnly"] = composer[
-        "fullConversationHeadersOnly"
-    ][:4]
+    composer["fullConversationHeadersOnly"] = composer["fullConversationHeadersOnly"][
+        :4
+    ]
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
         (json.dumps(composer), composer_key),
@@ -1393,10 +1601,12 @@ def test_enqueue_sends_mutable_last_row_by_stable_source_id(tmp_path):
 
     connection = sqlite3.connect(tool.state_database_path)
     tool_key = f"bubbleId:{session_id}:tool-1"
-    tool_row = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (tool_key,),
-    ).fetchone()[0])
+    tool_row = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (tool_key,),
+        ).fetchone()[0]
+    )
     tool_row["toolFormerData"]["status"] = "completed"
     tool_row["toolFormerData"]["result"] = {"output": "updated result"}
     connection.execute(
@@ -1424,10 +1634,12 @@ def test_enqueue_skips_revision_with_unchanged_projection(tmp_path):
     tool, _transcript, session_id = _write_state_fixture(tmp_path)
     connection = sqlite3.connect(tool.state_database_path)
     composer_key = f"composerData:{session_id}"
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -1456,10 +1668,12 @@ def test_enqueue_falls_back_to_full_when_projected_row_is_removed(tmp_path):
 
     connection = sqlite3.connect(tool.state_database_path)
     composer_key = f"composerData:{session_id}"
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["fullConversationHeadersOnly"] = [
         header
         for header in composer["fullConversationHeadersOnly"]
@@ -1491,19 +1705,23 @@ def test_enqueue_reconciles_changed_canvas_row_as_sparse_delta(tmp_path):
     assistant_key = f"bubbleId:{session_id}:assistant-1"
     connection = sqlite3.connect(tool.state_database_path)
     composer_key = f"composerData:{session_id}"
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (composer_key,),
-    ).fetchone()[0])
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (composer_key,),
+        ).fetchone()[0]
+    )
     composer["status"] = "generating"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
         (json.dumps(composer), composer_key),
     )
-    assistant = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (assistant_key,),
-    ).fetchone()[0])
+    assistant = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (assistant_key,),
+        ).fetchone()[0]
+    )
     assistant["text"] = (
         "Open [status.canvas.tsx]"
         "(/home/me/.cursor/projects/demo/canvases/status.canvas.tsx)."
@@ -1537,8 +1755,7 @@ def test_enqueue_reconciles_changed_canvas_row_as_sparse_delta(tmp_path):
     assert enqueue_cursor_state_snapshots(exporter, queue) == 1
     assert queue.items[0]["sync_strategy"] == "delta"
     assert [
-        json.loads(line)["id"]
-        for line in queue.items[0]["content"].splitlines()
+        json.loads(line)["id"] for line in queue.items[0]["content"].splitlines()
     ] == ["assistant-1"]
     assert ".canvas.tsx" not in queue.items[0]["content"].casefold()
 
@@ -1551,10 +1768,12 @@ def test_restarted_exporter_falls_back_to_full_for_unknown_base(tmp_path):
 
     connection = sqlite3.connect(tool.state_database_path)
     tool_key = f"bubbleId:{session_id}:tool-1"
-    tool_row = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (tool_key,),
-    ).fetchone()[0])
+    tool_row = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (tool_key,),
+        ).fetchone()[0]
+    )
     tool_row["toolFormerData"]["status"] = "completed"
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -1583,15 +1802,15 @@ def test_projection_delta_waits_behind_uploading_base(tmp_path):
 
         connection = sqlite3.connect(tool.state_database_path)
         composer_key = f"composerData:{session_id}"
-        composer = json.loads(connection.execute(
-            "SELECT value FROM cursorDiskKV WHERE key=?",
-            (composer_key,),
-        ).fetchone()[0])
+        composer = json.loads(
+            connection.execute(
+                "SELECT value FROM cursorDiskKV WHERE key=?",
+                (composer_key,),
+            ).fetchone()[0]
+        )
         tool_header_index = next(
             index
-            for index, header in enumerate(
-                composer["fullConversationHeadersOnly"]
-            )
+            for index, header in enumerate(composer["fullConversationHeadersOnly"])
             if header["bubbleId"] == "tool-1"
         )
         composer["fullConversationHeadersOnly"].insert(
@@ -1606,25 +1825,29 @@ def test_projection_delta_waits_behind_uploading_base(tmp_path):
             "INSERT INTO cursorDiskKV VALUES (?,?)",
             (
                 f"bubbleId:{session_id}:inserted-while-uploading",
-                json.dumps({
-                    "bubbleId": "inserted-while-uploading",
-                    "type": 2,
-                    "createdAt": "2026-07-18T14:20:30Z",
-                    "toolFormerData": {
-                        "name": "read_file_v2",
-                        "status": "completed",
-                        "params": {"path": "coalesced.py"},
-                        "result": {"bytes": 1},
-                        "toolCallId": "call-inserted-uploading",
-                    },
-                }),
+                json.dumps(
+                    {
+                        "bubbleId": "inserted-while-uploading",
+                        "type": 2,
+                        "createdAt": "2026-07-18T14:20:30Z",
+                        "toolFormerData": {
+                            "name": "read_file_v2",
+                            "status": "completed",
+                            "params": {"path": "coalesced.py"},
+                            "result": {"bytes": 1},
+                            "toolCallId": "call-inserted-uploading",
+                        },
+                    }
+                ),
             ),
         )
         tool_key = f"bubbleId:{session_id}:tool-1"
-        tool_row = json.loads(connection.execute(
-            "SELECT value FROM cursorDiskKV WHERE key=?",
-            (tool_key,),
-        ).fetchone()[0])
+        tool_row = json.loads(
+            connection.execute(
+                "SELECT value FROM cursorDiskKV WHERE key=?",
+                (tool_key,),
+            ).fetchone()[0]
+        )
         tool_row["toolFormerData"]["status"] = "completed"
         connection.execute(
             "UPDATE cursorDiskKV SET value=? WHERE key=?",
@@ -1691,14 +1914,18 @@ def test_state_export_captures_task_notification_without_compat_transcript(tmp_p
     )
 
     connection = sqlite3.connect(tool.state_database_path)
-    composer = json.loads(connection.execute(
-        "SELECT value FROM cursorDiskKV WHERE key=?",
-        (f"composerData:{session_id}",),
-    ).fetchone()[0])
-    composer["fullConversationHeadersOnly"].append({
-        "bubbleId": notification_id,
-        "type": 1,
-    })
+    composer = json.loads(
+        connection.execute(
+            "SELECT value FROM cursorDiskKV WHERE key=?",
+            (f"composerData:{session_id}",),
+        ).fetchone()[0]
+    )
+    composer["fullConversationHeadersOnly"].append(
+        {
+            "bubbleId": notification_id,
+            "type": 1,
+        }
+    )
     connection.execute(
         "UPDATE cursorDiskKV SET value=? WHERE key=?",
         (json.dumps(composer), f"composerData:{session_id}"),
@@ -1707,12 +1934,14 @@ def test_state_export_captures_task_notification_without_compat_transcript(tmp_p
         "INSERT INTO cursorDiskKV VALUES (?,?)",
         (
             f"bubbleId:{session_id}:{notification_id}",
-            json.dumps({
-                "bubbleId": notification_id,
-                "type": 1,
-                "createdAt": "2026-07-30T12:59:09.690Z",
-                "text": notification,
-            }),
+            json.dumps(
+                {
+                    "bubbleId": notification_id,
+                    "type": 1,
+                    "createdAt": "2026-07-30T12:59:09.690Z",
+                    "text": notification,
+                }
+            ),
         ),
     )
     connection.execute(
