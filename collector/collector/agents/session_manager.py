@@ -549,6 +549,17 @@ def _effective_thread_config(adapter) -> dict:
     return effective
 
 
+def _normalize_policy_token(value: object) -> str:
+    """Fold dialect noise so requested/echoed values compare equal.
+
+    The app-server echoes camelCase (`workspaceWrite`, `onRequest`) for the
+    kebab-case values we send (`workspace-write`, `on-request`). Only case and
+    separators differ; a real substitution (untrusted -> on-request) still
+    normalizes to distinct tokens.
+    """
+    return str(value).replace("-", "").replace("_", "").lower()
+
+
 def _thread_config_mismatches(requested: dict, effective: dict) -> dict:
     """Requested-vs-echoed diffs for the fields that gate side effects."""
     mismatches: dict = {}
@@ -557,7 +568,7 @@ def _thread_config_mismatches(requested: dict, effective: dict) -> dict:
         if wanted is None:
             continue
         got = effective.get(key)
-        if got is not None and str(got) != str(wanted):
+        if got is not None and _normalize_policy_token(got) != _normalize_policy_token(wanted):
             mismatches[key] = {"requested": str(wanted), "effective": str(got)}
     return mismatches
 

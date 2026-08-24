@@ -255,7 +255,14 @@ def main() -> None:
             if effective_policy is not None:
                 result["approvalPolicy"] = effective_policy
             if params.get("sandbox") is not None:
-                result["sandbox"] = {"type": params["sandbox"]}
+                # The real app-server echoes camelCase (`workspaceWrite`) for the
+                # kebab-case sandbox we send (`workspace-write`).
+                camel = {
+                    "read-only": "readOnly",
+                    "workspace-write": "workspaceWrite",
+                    "danger-full-access": "dangerFullAccess",
+                }.get(params["sandbox"], params["sandbox"])
+                result["sandbox"] = camel
             _send({"id": message_id, "result": result})
             _send({"method": "thread/started", "params": {"thread": {"id": "thr_fake"}}})
         elif method == "thread/resume":

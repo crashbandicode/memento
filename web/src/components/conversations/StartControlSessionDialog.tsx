@@ -46,6 +46,16 @@ const inputStyle: React.CSSProperties = {
   fontSize: 13,
 };
 
+// A native <select> renders its closed value with `inputStyle`, but the popup
+// option list falls back to the browser's default (light) palette unless the
+// control itself carries a solid surface + color, which the options inherit.
+// A transparent background makes selected text invisible in dark mode.
+const selectStyle: React.CSSProperties = {
+  ...inputStyle,
+  background: "var(--aurora-bg2, var(--aurora-bg1, #1c1c22))",
+  colorScheme: "dark light",
+};
+
 export default function StartControlSessionDialog({
   machineId,
   machineName,
@@ -141,7 +151,7 @@ export default function StartControlSessionDialog({
             {t.control.approvalPolicyLabel}
             <select
               data-start-session-approval-policy
-              style={inputStyle}
+              style={selectStyle}
               value={approvalPolicy}
               onChange={(event) => setApprovalPolicy(event.target.value)}
             >
@@ -156,7 +166,7 @@ export default function StartControlSessionDialog({
             {t.control.sandboxLabel}
             <select
               data-start-session-sandbox
-              style={inputStyle}
+              style={selectStyle}
               value={sandbox}
               onChange={(event) => setSandbox(event.target.value)}
             >

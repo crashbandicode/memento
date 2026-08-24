@@ -376,12 +376,29 @@ def test_session_start_spools_effective_thread_config(tmp_path: Path) -> None:
                 "options": {"approval_policy": "untrusted", "sandbox": "workspace-write"},
             },
         )
+        # The app-server echoes camelCase `workspaceWrite`; the kebab/camel
+        # difference must NOT read as a config mismatch and abort the session.
         assert (status, error_code) == ("completed", None)
         config_event = _wait_for_event(spool, "adapter.thread_config")
         assert config_event["details"]["approvalPolicy"] == "untrusted"
-        assert config_event["details"]["sandbox"] == "workspace-write"
+        assert config_event["details"]["sandbox"] == "workspaceWrite"
     finally:
         manager.shutdown()
+
+
+def test_thread_config_mismatch_folds_kebab_camel_dialect() -> None:
+    from collector.agents.session_manager import _thread_config_mismatches
+
+    # Pure dialect difference — not a mismatch.
+    assert _thread_config_mismatches(
+        {"sandbox": "workspace-write", "approvalPolicy": "on-request"},
+        {"sandbox": "workspaceWrite", "approvalPolicy": "onRequest"},
+    ) == {}
+    # A genuine substitution still trips the guard.
+    assert "approvalPolicy" in _thread_config_mismatches(
+        {"approvalPolicy": "untrusted"},
+        {"approvalPolicy": "onRequest"},
+    )
 
 
 def test_session_start_fails_when_policy_silently_substituted(tmp_path: Path) -> None:
