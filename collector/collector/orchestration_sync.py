@@ -188,9 +188,9 @@ class OrchestrationSync:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         try:
-            from importlib.metadata import version
-
-            collector_version = version("memento-brain-collector")
+            # Not importlib.metadata: frozen sidecars report whatever stale
+            # distribution happened to be installed in the build Python.
+            from collector._version import __version__ as collector_version
         except Exception:
             collector_version = "dev"
         self._client = httpx.Client(

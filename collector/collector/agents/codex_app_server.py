@@ -78,6 +78,10 @@ class CodexAdapterError(Exception):
 # the native approval path.
 MANAGED_CONFIG_OVERRIDES: tuple[str, ...] = (
     "features.plugins=false",
+    # Default-mode threads only expose request_user_input behind this
+    # under-development flag; managed sessions need the question flow on
+    # every machine regardless of the local config.toml.
+    "features.default_mode_request_user_input=true",
 )
 
 
