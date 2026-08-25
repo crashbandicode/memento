@@ -310,7 +310,14 @@ class ConversationMessage(Base):
 # Personal conversation message bookmarks
 # ---------------------------------------------------------------------------
 class PinnedMessage(Base):
-    """A user's personal bookmark for one normalized conversation message."""
+    """A user's personal bookmark for one conversation message.
+
+    Anchored to the message's stable native id (``source_id`` from the message
+    metadata), with the document-local ``line_number`` as a fallback, so a full
+    re-ingest of a conversation — which recreates its message rows with new
+    autoincrement ids — does not drop the pin. ``message_id`` is only a nullable
+    last-known row pointer (``ON DELETE SET NULL``), not the pin identity.
+    """
 
     __tablename__ = "pinned_messages"
 
@@ -320,11 +327,13 @@ class PinnedMessage(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    message_id: Mapped[int] = mapped_column(
-        ForeignKey("conversation_messages.id", ondelete="CASCADE"), nullable=False
-    )
     document_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[str | None] = mapped_column(Text)
+    line_number: Mapped[int | None] = mapped_column(Integer)
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("conversation_messages.id", ondelete="SET NULL")
     )
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -332,8 +341,21 @@ class PinnedMessage(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "message_id", name="uq_pinned_messages_user_message"
+        Index(
+            "uq_pinned_messages_user_source",
+            "user_id",
+            "document_id",
+            "source_id",
+            unique=True,
+            postgresql_where=text("source_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_pinned_messages_user_line",
+            "user_id",
+            "document_id",
+            "line_number",
+            unique=True,
+            postgresql_where=text("source_id IS NULL"),
         ),
         Index("idx_pinned_messages_user_created", "user_id", created_at.desc()),
         Index("idx_pinned_messages_user_document", "user_id", "document_id"),

@@ -132,17 +132,55 @@ def _run_migrations(conn) -> None:
         "ON document_delivery_state (project_id, activity_at DESC)"
     ))
     # Pins are personal bookmarks. Keep them normalized so a user's note never
-    # modifies the shared transcript or document metadata.
+    # modifies the shared transcript or document metadata. They anchor to a
+    # message's STABLE native id (metadata->>'source_id'), with the document
+    # -local line_number as a fallback, so a full conversation re-ingest — which
+    # deletes and recreates its message rows with new autoincrement ids — does
+    # not cascade-delete the pin. message_id is only a nullable last-known row
+    # id (ON DELETE SET NULL), no longer the pin identity.
     conn.execute(text(
         "CREATE TABLE IF NOT EXISTS pinned_messages ("
         "id UUID PRIMARY KEY, "
         "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
-        "message_id BIGINT NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE, "
         "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+        "source_id TEXT, "
+        "line_number INTEGER, "
+        "message_id BIGINT REFERENCES conversation_messages(id) ON DELETE SET NULL, "
         "note TEXT, "
-        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
-        "CONSTRAINT uq_pinned_messages_user_message UNIQUE (user_id, message_id)"
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
         ")"
+    ))
+    # Migrate a pre-source_id pins table in place. Each statement is idempotent
+    # so it is safe to re-run on every startup.
+    conn.execute(text("ALTER TABLE pinned_messages ADD COLUMN IF NOT EXISTS source_id TEXT"))
+    conn.execute(text("ALTER TABLE pinned_messages ADD COLUMN IF NOT EXISTS line_number INTEGER"))
+    # Backfill anchors for existing pins from their current message rows. Only
+    # touches rows still missing an anchor, so re-runs are no-ops.
+    conn.execute(text(
+        "UPDATE pinned_messages p SET "
+        "source_id = cm.metadata->>'source_id', "
+        "line_number = cm.line_number "
+        "FROM conversation_messages cm "
+        "WHERE cm.id = p.message_id "
+        "AND p.source_id IS NULL AND p.line_number IS NULL"
+    ))
+    # Demote message_id from the pin identity to a nullable last-known pointer.
+    conn.execute(text("ALTER TABLE pinned_messages ALTER COLUMN message_id DROP NOT NULL"))
+    conn.execute(text("ALTER TABLE pinned_messages DROP CONSTRAINT IF EXISTS uq_pinned_messages_user_message"))
+    conn.execute(text("ALTER TABLE pinned_messages DROP CONSTRAINT IF EXISTS pinned_messages_message_id_fkey"))
+    conn.execute(text(
+        "ALTER TABLE pinned_messages ADD CONSTRAINT pinned_messages_message_id_fkey "
+        "FOREIGN KEY (message_id) REFERENCES conversation_messages(id) ON DELETE SET NULL"
+    ))
+    # One pin per user per stable message identity (source_id when present,
+    # else the document-local line number).
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pinned_messages_user_source "
+        "ON pinned_messages (user_id, document_id, source_id) WHERE source_id IS NOT NULL"
+    ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pinned_messages_user_line "
+        "ON pinned_messages (user_id, document_id, line_number) WHERE source_id IS NULL"
     ))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_pinned_messages_user_created "

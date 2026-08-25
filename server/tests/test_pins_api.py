@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.api.pins import (
@@ -34,6 +34,9 @@ requires_postgres = pytest.mark.skipif(
     not TEST_DATABASE_URL,
     reason="isolated PostgreSQL pin test database is not configured",
 )
+
+OWNED_SOURCE_ID = "src-owned-message-1"
+OTHER_SOURCE_ID = "src-other-message-1"
 
 
 @pytest_asyncio.fixture
@@ -116,6 +119,7 @@ async def _seed_documents(session):
         role="assistant",
         content="A pinned response that stays inside the owner's machine scope.",
         timestamp=timestamp,
+        metadata_={"source_id": OWNED_SOURCE_ID},
     )
     other_message = ConversationMessage(
         document_id=other_document.id,
@@ -123,6 +127,7 @@ async def _seed_documents(session):
         role="assistant",
         content="A response owned by another user.",
         timestamp=timestamp,
+        metadata_={"source_id": OTHER_SOURCE_ID},
     )
     session.add_all([owned_message, other_message])
     await session.commit()
@@ -154,15 +159,17 @@ async def test_pin_repin_unpin_and_lists_are_idempotent(session_factory) -> None
 
         assert repeated["id"] == first["id"]
         assert repeated["note"] == "Updated note"
+        assert repeated["source_id"] == OWNED_SOURCE_ID
         stored = (
             await session.execute(
-                select(PinnedMessage).where(PinnedMessage.message_id == message.id)
+                select(PinnedMessage).where(PinnedMessage.source_id == OWNED_SOURCE_ID)
             )
         ).scalars().all()
         assert len(stored) == 1
 
         thread = await get_conversation_pins(document.id, db=session, user=user)
         assert len(thread["pins"]) == 1
+        assert thread["pins"][0]["message_id"] == message.id
         assert thread["pins"][0]["message"] == {
             "id": message.id,
             "line_number": 7,
@@ -186,6 +193,100 @@ async def test_pin_repin_unpin_and_lists_are_idempotent(session_factory) -> None
         assert await unpin_message(document.id, message.id, db=session, user=user) == {"ok": True}
         assert await unpin_message(document.id, message.id, db=session, user=user) == {"ok": True}
         assert (await get_conversation_pins(document.id, db=session, user=user))["pins"] == []
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_pin_survives_full_message_reingest(session_factory) -> None:
+    """A full re-ingest recreates message rows with new ids; the pin follows the
+    stable source_id to the new row instead of being cascade-deleted."""
+    async with session_factory() as session:
+        user, _other_user, document, _other_document, message, _other_message = (
+            await _seed_documents(session)
+        )
+        original_message_id = message.id
+
+        await pin_message(
+            document.id,
+            message.id,
+            PinRequest(note="survives reingest"),
+            db=session,
+            user=user,
+        )
+
+        # Simulate a full re-ingest: delete every message row for the document
+        # (ON DELETE SET NULL nulls the pin's last-known pointer but keeps the
+        # pin) and recreate it with a NEW autoincrement id but the same
+        # native source_id.
+        await session.execute(
+            delete(ConversationMessage).where(
+                ConversationMessage.document_id == document.id
+            )
+        )
+        await session.flush()
+        reingested = ConversationMessage(
+            document_id=document.id,
+            line_number=7,
+            role="assistant",
+            content="Re-ingested response carrying the same native id.",
+            timestamp=datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
+            metadata_={"source_id": OWNED_SOURCE_ID},
+        )
+        session.add(reingested)
+        await session.commit()
+        assert reingested.id != original_message_id
+
+        # The pin still exists and resolves to the fresh row.
+        thread = await get_conversation_pins(document.id, db=session, user=user)
+        assert len(thread["pins"]) == 1
+        assert thread["pins"][0]["note"] == "survives reingest"
+        assert thread["pins"][0]["message_id"] == reingested.id
+        assert thread["pins"][0]["message"]["id"] == reingested.id
+        assert "Re-ingested response" in thread["pins"][0]["message"]["snippet"]
+
+        global_pins = await get_pins(limit=10, offset=0, db=session, user=user)
+        assert global_pins["pins"][0]["message_id"] == reingested.id
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_pin_without_source_id_uses_line_number_anchor(session_factory) -> None:
+    """Messages lacking a native id anchor on the document-local line number."""
+    async with session_factory() as session:
+        user, _other_user, document, _other_document, _message, _other_message = (
+            await _seed_documents(session)
+        )
+        no_source = ConversationMessage(
+            document_id=document.id,
+            line_number=42,
+            role="assistant",
+            content="A message with no native source id.",
+            timestamp=datetime(2026, 8, 25, 13, tzinfo=timezone.utc),
+            metadata_={},
+        )
+        session.add(no_source)
+        await session.commit()
+
+        pinned = await pin_message(
+            document.id, no_source.id, PinRequest(), db=session, user=user
+        )
+        assert pinned["source_id"] is None
+
+        stored = (
+            await session.execute(
+                select(PinnedMessage).where(
+                    PinnedMessage.document_id == document.id,
+                    PinnedMessage.source_id.is_(None),
+                )
+            )
+        ).scalars().all()
+        assert len(stored) == 1
+        assert stored[0].line_number == 42
+
+        thread = await get_conversation_pins(document.id, db=session, user=user)
+        line_pin = next(p for p in thread["pins"] if p["source_id"] is None)
+        assert line_pin["message"]["line_number"] == 42
+        assert line_pin["message_id"] == no_source.id
 
 
 @requires_postgres
