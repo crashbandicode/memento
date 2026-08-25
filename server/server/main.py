@@ -910,6 +910,23 @@ def _run_migrations(conn) -> None:
         "autovacuum_analyze_scale_factor = 0.02, "
         "autovacuum_analyze_threshold = 100"
         ")",
+        # UPSERT-heavy per-turn usage rows and the read-model / projection
+        # tables churn constantly (every ingest delta rewrites rows), so the
+        # default 20% scale factor let them bloat and go stale (observed
+        # 2026-08-25: usage_events physically ~2x its live size, never
+        # autovacuumed). Keep them lean and their planner stats fresh.
+        "ALTER TABLE IF EXISTS conversation_usage_events SET ("
+        "autovacuum_vacuum_scale_factor = 0.05, "
+        "autovacuum_vacuum_threshold = 200, "
+        "autovacuum_analyze_scale_factor = 0.05, "
+        "autovacuum_analyze_threshold = 200"
+        ")",
+        "ALTER TABLE IF EXISTS conversation_read_models SET ("
+        "autovacuum_vacuum_scale_factor = 0.1, "
+        "autovacuum_vacuum_threshold = 100, "
+        "autovacuum_analyze_scale_factor = 0.05, "
+        "autovacuum_analyze_threshold = 100"
+        ")",
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_timestamp ON conversation_messages (timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_conv_msg_doc_ts ON conversation_messages (document_id, timestamp)",
         # Partial index for the daily / dashboard hot path: filter user+assistant
