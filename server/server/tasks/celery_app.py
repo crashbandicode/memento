@@ -58,6 +58,7 @@ celery_app = Celery(
         "server.tasks.db_backup",
         "server.tasks.ingest_spool",
         "server.tasks.post_ingest",
+        "server.tasks.activity_rollup_task",
     ],
 )
 
@@ -91,6 +92,14 @@ celery_app.conf.beat_schedule = {
             "queue": "ingest",
             "expires": INGEST_RECOVERY_EXPIRES_SECONDS,
         },
+    },
+    # Keep the daily-calendar activity rollup fresh (moves the expensive
+    # full-history aggregation off the request path). Every 5 minutes is well
+    # under the endpoint's own 60s cache TTL relative to how fast the calendar
+    # changes.
+    "activity-rollup-refresh": {
+        "task": "server.tasks.activity_rollup_task.refresh_activity_rollup",
+        "schedule": crontab(minute="*/5"),
     },
     "daily-digest": {
         "task": "server.tasks.daily_digest.generate_daily_digest",

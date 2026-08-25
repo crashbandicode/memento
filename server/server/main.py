@@ -882,6 +882,18 @@ def _run_migrations(conn) -> None:
     # Performance indexes (idempotent). Each runs in its own savepoint so a
     # single failure doesn't abort the whole migration tx.
     for stmt in (
+        # Precomputed hourly activity rollup for the daily calendar — the
+        # endpoint reads a few thousand rows instead of aggregating the
+        # multi-million-row conversation_messages table on every cold cache
+        # miss. Populated in the background; see services/activity_rollup.py.
+        "CREATE TABLE IF NOT EXISTS conversation_activity_hourly ("
+        "hour TIMESTAMPTZ NOT NULL, "
+        "machine_id UUID NOT NULL, "
+        "tool_id VARCHAR(50) NOT NULL, "
+        "message_count INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (hour, machine_id, tool_id))",
+        "CREATE INDEX IF NOT EXISTS idx_activity_hourly_machine_hour "
+        "ON conversation_activity_hourly (machine_id, hour)",
         # These append/update-heavy tables need vacuum/analyze decisions based
         # on a small absolute fraction of the table. PostgreSQL's default 20%
         # scale factor leaves hundreds of thousands of dead message tuples

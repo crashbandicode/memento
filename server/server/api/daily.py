@@ -54,38 +54,51 @@ async def list_daily_dates(
     tz = _user_tz(tz_offset)
     cutoff = datetime.now(tz) - timedelta(days=days)
 
-    # Use timezone-adjusted date grouping via SQL interval
-    tz_adjusted = ConversationMessage.timestamp + timedelta(minutes=-tz_offset)
-    q = (
-        select(
-            cast(tz_adjusted, Date).label("day"),
-            func.count().label("total"),
-            array_agg(func.distinct(Document.tool_id)).label("tools"),
-        )
-        .join(Document, ConversationMessage.document_id == Document.id)
-        .where(
-            ConversationMessage.timestamp >= cutoff,
-            ConversationMessage.timestamp.isnot(None),
-            ConversationMessage.role.in_(["user", "assistant"]),
-            ~ConversationMessage.content.like("[Result]%"),
-            ~ConversationMessage.content.like("[Tool:%"),
-            Document.tool_id != "system",
-        )
+    from ..services.activity_rollup import (
+        daily_dates_from_rollup,
+        rollup_is_populated,
     )
-    if mids is not None:
-        q = q.where(Document.machine_id.in_(mids))
-    q = q.group_by("day").order_by(cast(tz_adjusted, Date).desc())
-    result = await db.execute(q)
 
-    payload = [
-        {
-            "date": str(row.day),
-            "document_count": row.total,
-            "message_count": row.total,
-            "tools": sorted([t for t in (row.tools or []) if t]),
-        }
-        for row in result.all()
-    ]
+    # Preferred path: read the precomputed hourly rollup (a few thousand rows)
+    # and apply the tz offset. Falls back to the live aggregation over the full
+    # messages table when the rollup hasn't been populated yet (fresh deploy
+    # before the first background refresh).
+    if await rollup_is_populated(db):
+        payload = await daily_dates_from_rollup(
+            db, machine_ids=mids, cutoff=cutoff, tz_offset=tz_offset
+        )
+    else:
+        # Timezone-adjusted date grouping via SQL interval.
+        tz_adjusted = ConversationMessage.timestamp + timedelta(minutes=-tz_offset)
+        q = (
+            select(
+                cast(tz_adjusted, Date).label("day"),
+                func.count().label("total"),
+                array_agg(func.distinct(Document.tool_id)).label("tools"),
+            )
+            .join(Document, ConversationMessage.document_id == Document.id)
+            .where(
+                ConversationMessage.timestamp >= cutoff,
+                ConversationMessage.timestamp.isnot(None),
+                ConversationMessage.role.in_(["user", "assistant"]),
+                ~ConversationMessage.content.like("[Result]%"),
+                ~ConversationMessage.content.like("[Tool:%"),
+                Document.tool_id != "system",
+            )
+        )
+        if mids is not None:
+            q = q.where(Document.machine_id.in_(mids))
+        q = q.group_by("day").order_by(cast(tz_adjusted, Date).desc())
+        result = await db.execute(q)
+        payload = [
+            {
+                "date": str(row.day),
+                "document_count": row.total,
+                "message_count": row.total,
+                "tools": sorted([t for t in (row.tools or []) if t]),
+            }
+            for row in result.all()
+        ]
     # 60s TTL — daily list updates only when ingest writes new messages, so
     # the data lifecycle is "minutes", not seconds. Short enough for users
     # not to notice staleness on a fresh ingest.

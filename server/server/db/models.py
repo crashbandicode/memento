@@ -1101,6 +1101,38 @@ class ConversationReadModel(Base):
 
 
 # ---------------------------------------------------------------------------
+# Activity rollup (daily calendar)
+# ---------------------------------------------------------------------------
+class ConversationActivityHourly(Base):
+    """Precomputed hourly (UTC) countable-message counts per machine + tool.
+
+    Refreshed in the background so the daily-calendar endpoint reads a few
+    thousand rows instead of aggregating the multi-million-row messages table
+    on every cold cache miss. Hourly grain keeps the user's timezone-adjusted
+    day boundaries exact. See services/activity_rollup.py.
+    """
+
+    __tablename__ = "conversation_activity_hourly"
+
+    hour: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    # Documents with no machine_id are folded into the all-zero sentinel so
+    # this column can be part of the primary key (PK columns are NOT NULL).
+    # A machine-scoped read filters `machine_id = ANY(mids)`, which correctly
+    # excludes the sentinel; an unscoped (admin) read includes it.
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index("idx_activity_hourly_machine_hour", "machine_id", "hour"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard document projection
 # ---------------------------------------------------------------------------
 class DashboardDocumentProjection(Base):
