@@ -17,7 +17,7 @@ import { FIXTURE_TOKEN, FIXTURE_USER } from "./conversation-scenarios.mjs";
 /**
  * @typedef {(
  *   | { action: "abort" }
- *   | { action: "fulfill", status: number, json: unknown }
+ *   | { action: "fulfill", status: number, json?: unknown, body?: string, contentType?: string }
  * )} MockResult
  */
 
@@ -78,6 +78,34 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
   }
 
   // --- Conversation endpoints (order: most specific first) --------------------
+  if (/\/api\/conversations\/[^/]+\/pins$/.test(pathname)) {
+    return {
+      action: "fulfill",
+      status: 200,
+      json: { pins: scenario.pins ?? [] },
+    };
+  }
+  if (/\/api\/conversations\/[^/]+\/messages\/\d+\/pin$/.test(pathname)) {
+    const [, documentId, messageId] = pathname.match(
+      /\/api\/conversations\/([^/]+)\/messages\/(\d+)\/pin$/,
+    ) ?? [];
+    if (upperMethod === "DELETE") {
+      return { action: "fulfill", status: 200, json: { ok: true } };
+    }
+    if (upperMethod === "POST") {
+      return {
+        action: "fulfill",
+        status: 200,
+        json: {
+          id: `pin-${messageId}`,
+          message_id: Number(messageId),
+          document_id: documentId,
+          note: null,
+          created_at: "2026-08-25T12:00:00Z",
+        },
+      };
+    }
+  }
   if (/\/api\/conversations\/[^/]+\/prompts$/.test(pathname)) {
     return {
       action: "fulfill",
@@ -173,10 +201,31 @@ export function resolveConversationRoute({ url, method = "GET", scenario }) {
     return { action: "fulfill", status: 200, json: scenario.meta };
   }
 
-  // --- Safe default: never hit a real backend --------------------------------
-  // GET collections default to an empty array; everything else to empty object.
-  if (upperMethod === "GET" && /\/(files|projects|tools|daily)\/?$/.test(pathname)) {
-    return { action: "fulfill", status: 200, json: [] };
+  if (pathname.endsWith("/api/pins")) {
+    return {
+      action: "fulfill",
+      status: 200,
+      json: {
+        pins: scenario.globalPins ?? [],
+        limit: 50,
+        offset: 0,
+        has_more: false,
+      },
+    };
   }
+
+  if (/\/api\/exports\/conversations\/[^/]+$/.test(pathname)) {
+    return {
+      action: "fulfill",
+      status: 200,
+      body: scenario.exportMarkdown ?? "# Empty fixture export\n",
+      contentType: "text/markdown",
+    };
+  }
+
+  // --- Safe default: never hit a real backend --------------------------------
+  // GET requests default to an empty collection so new UI fetches can never
+  // accidentally consume a live API response during a hermetic test.
+  if (upperMethod === "GET") return { action: "fulfill", status: 200, json: [] };
   return { action: "fulfill", status: 200, json: {} };
 }

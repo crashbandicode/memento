@@ -23,6 +23,7 @@ import {
   InferredConversationInteractionResponse,
   LiveConversationActivity,
   PendingConversationInteraction,
+  Pin,
   QuestionAnswer,
   QuestionInteraction,
   QuestionInteractionResponse,
@@ -79,6 +80,10 @@ import {
   type ConversationHistoryReason,
   type ConversationUrlState,
 } from "@/lib/conversation-url-state";
+import {
+  readCopyOmitRolePrefix,
+  writeCopyOmitRolePrefix,
+} from "@/lib/conversation-copy-preference";
 
 interface Artifact {
   id: string;
@@ -86,6 +91,18 @@ interface Artifact {
   relative_path: string;
   content: string | null;
   file_size_bytes: number;
+}
+
+const DOCUMENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function pinPreviewForMessage(message: ConversationMessage): NonNullable<Pin["message"]> {
+  return {
+    id: message.id,
+    line_number: message.line_number,
+    role: message.role || message.message_type || "system",
+    snippet: cleanTerminalText(message.content).trim().slice(0, 500),
+    timestamp: message.timestamp,
+  };
 }
 
 const ANSI_ESCAPE_RE = /\u001B(?:\][^\u0007]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[@-~]|[@-_])|\u009B[0-?]*[ -/]*[@-~]/g;
@@ -480,6 +497,9 @@ export default function ConversationViewer({
   const [visibility, setVisibility] = useState<ConversationVisibility>(() =>
     readConversationVisibility(documentId),
   );
+  const [pins, setPins] = useState<Pin[]>([]);
+  const [pinMutations, setPinMutations] = useState<Set<number>>(() => new Set());
+  const [copyOmitRolePrefix, setCopyOmitRolePrefix] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const startOffsetRef = useRef(0);
   const offsetRef = useRef(0);
@@ -500,6 +520,11 @@ export default function ConversationViewer({
   const passiveAnchorIntentVersionRef = useRef(0);
   const navigationIntentVersionRef = useRef(0);
   const { t, locale } = useI18n();
+  const hasCanonicalDocumentId = DOCUMENT_ID_RE.test(documentId);
+  const pinnedMessageIds = useMemo(
+    () => new Set(pins.map((pin) => pin.message_id)),
+    [pins],
+  );
   const writeUrlState = useCallback((
     nextState: ConversationUrlState,
     reason: ConversationHistoryReason,
@@ -681,6 +706,71 @@ export default function ConversationViewer({
   useEffect(() => {
     setVisibility(readConversationVisibility(documentId));
   }, [documentId]);
+
+  useEffect(() => {
+    setCopyOmitRolePrefix(readCopyOmitRolePrefix());
+  }, []);
+
+  useEffect(() => {
+    if (!hasCanonicalDocumentId) {
+      setPins([]);
+      return undefined;
+    }
+    let current = true;
+    api.getConversationPins(documentId)
+      .then((response) => {
+        if (current) setPins(response.pins || []);
+      })
+      .catch((error: unknown) => {
+        if (current) console.error("Failed to load pinned messages:", error);
+      });
+    return () => {
+      current = false;
+    };
+  }, [documentId, hasCanonicalDocumentId, messageSyncVersion]);
+
+  const togglePinnedMessage = useCallback(async (message: ConversationMessage) => {
+    if (!hasCanonicalDocumentId || pinMutations.has(message.id)) return;
+    const existing = pins.find((pin) => pin.message_id === message.id);
+    const previousPins = pins;
+    setPinMutations((current) => new Set(current).add(message.id));
+    setPins((current) => existing
+      ? current.filter((pin) => pin.message_id !== message.id)
+      : [{
+          id: `pending:${message.id}`,
+          message_id: message.id,
+          document_id: documentId,
+          note: null,
+          created_at: new Date().toISOString(),
+          message: pinPreviewForMessage(message),
+        }, ...current]);
+    try {
+      if (existing) {
+        await api.unpinConversationMessage(documentId, message.id);
+      } else {
+        const saved = await api.pinConversationMessage(documentId, message.id);
+        setPins((current) => current.map((pin) => (
+          pin.id === `pending:${message.id}`
+            ? { ...saved, message: pinPreviewForMessage(message) }
+            : pin
+        )));
+      }
+    } catch (error) {
+      setPins(previousPins);
+      console.error("Failed to update pinned message:", error);
+    } finally {
+      setPinMutations((current) => {
+        const next = new Set(current);
+        next.delete(message.id);
+        return next;
+      });
+    }
+  }, [documentId, hasCanonicalDocumentId, pinMutations, pins]);
+
+  const updateCopyOmitRolePrefix = useCallback((value: boolean) => {
+    setCopyOmitRolePrefix(value);
+    writeCopyOmitRolePrefix(value);
+  }, []);
 
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
@@ -1424,6 +1514,11 @@ export default function ConversationViewer({
             userRoleOrigin={userRoleOrigin}
             locale={locale}
             t={t}
+            isPinned={pinnedMessageIds.has(msg.id)}
+            onTogglePin={hasCanonicalDocumentId
+              ? () => togglePinnedMessage(msg)
+              : undefined}
+            copyOmitRolePrefix={copyOmitRolePrefix}
             questionResponses={questionResponses}
             showUser={visibility.user}
             showAssistant={visibility.assistant}
@@ -1563,9 +1658,21 @@ export default function ConversationViewer({
         onSelectMatch={selectConversationSearchMatch}
         t={t}
       />
+      <CopyPrefixToggle
+        checked={copyOmitRolePrefix}
+        onChange={updateCopyOmitRolePrefix}
+        t={t}
+      />
       <ConversationVisibilityControls
         visibility={visibility}
         onChange={updateVisibility}
+        t={t}
+      />
+      <PinnedMessagesPanel
+        pins={pins}
+        onSelect={(lineNumber) => void navigateToLine(lineNumber, {
+          reason: "pinned-message",
+        })}
         t={t}
       />
       {visibility.tasks && activeTaskState && activeTaskState.total_count > 0 && (
@@ -1789,6 +1896,149 @@ export default function ConversationViewer({
       </div>
 
     </div>
+  );
+}
+
+function CopyPrefixToggle({
+  checked,
+  onChange,
+  t,
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  return (
+    <label
+      data-copy-omit-role-prefix
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        maxWidth: 896,
+        margin: "0 auto 10px",
+        padding: "7px 11px",
+        borderRadius: 11,
+        border: "1px solid var(--aurora-border)",
+        background: checked
+          ? "color-mix(in srgb, var(--aurora-accent) 8%, var(--aurora-surface-solid))"
+          : "var(--aurora-surface-solid)",
+        color: checked ? "var(--aurora-accent)" : "var(--aurora-fg3)",
+        fontSize: 11.5,
+        cursor: "pointer",
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        aria-label={t.conversation.copyOmitRolePrefix}
+        style={{ accentColor: "var(--aurora-accent)", width: 14, height: 14 }}
+      />
+      <Icon name="copy" size={13} />
+      <span>{t.conversation.copyOmitRolePrefix}</span>
+    </label>
+  );
+}
+
+function PinnedMessagesPanel({
+  pins,
+  onSelect,
+  t,
+}: {
+  pins: Pin[];
+  onSelect: (lineNumber: number) => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section
+      data-thread-pins
+      className="max-w-4xl mx-auto"
+      style={{ marginBottom: 10 }}
+    >
+      <button
+        type="button"
+        data-thread-pins-toggle
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 7,
+          minHeight: 34,
+          padding: "6px 11px",
+          borderRadius: 999,
+          border: "1px solid var(--aurora-border)",
+          background: pins.length > 0
+            ? "color-mix(in srgb, #D97706 8%, var(--aurora-surface-solid))"
+            : "var(--aurora-surface-solid)",
+          color: pins.length > 0 ? "#B45309" : "var(--aurora-fg3)",
+          cursor: "pointer",
+          fontSize: 11.5,
+          fontWeight: 650,
+        }}
+      >
+        <PinGlyph filled={pins.length > 0} size={14} />
+        {t.conversation.pinnedMessages}
+        <span style={{ color: "var(--aurora-fg4)", fontWeight: 600 }}>{pins.length}</span>
+        <Icon name={open ? "chevron_up" : "chevron_down"} size={12} />
+      </button>
+      {open && (
+        <div
+          data-thread-pinned-list
+          style={{
+            display: "grid",
+            gap: 6,
+            marginTop: 8,
+            padding: 8,
+            borderRadius: 13,
+            border: "1px solid var(--aurora-border)",
+            background: "var(--aurora-surface-solid)",
+          }}
+        >
+          {pins.length === 0 ? (
+            <span style={{ padding: "4px 5px", color: "var(--aurora-fg4)", fontSize: 12 }}>
+              {t.conversation.noPinnedMessages}
+            </span>
+          ) : pins.map((pin) => (
+            <button
+              key={pin.id}
+              type="button"
+              data-pinned-message={pin.message_id}
+              onClick={() => {
+                if (pin.message?.line_number) onSelect(pin.message.line_number);
+              }}
+              style={{
+                display: "grid",
+                gap: 3,
+                width: "100%",
+                padding: "8px 9px",
+                textAlign: "left",
+                border: 0,
+                borderRadius: 9,
+                background: "var(--aurora-chip)",
+                color: "var(--aurora-fg2)",
+                cursor: pin.message?.line_number ? "pointer" : "default",
+              }}
+            >
+              <span style={{ fontSize: 10.5, color: "var(--aurora-fg4)" }}>
+                {pin.message?.role || t.conversation.pinnedMessage}
+                {pin.message?.line_number ? ` · ${t.conversation.line} ${pin.message.line_number}` : ""}
+              </span>
+              <span style={{ fontSize: 12, lineHeight: 1.4, overflowWrap: "anywhere" }}>
+                {pin.message?.snippet || "…"}
+              </span>
+              {pin.note && (
+                <span style={{ fontSize: 11, color: "var(--aurora-fg3)" }}>
+                  {pin.note}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -4223,6 +4473,7 @@ export function conversationMessageMarkdown(
   locale: string,
   questionResponses: ReadonlyMap<string, PairedQuestionResponse> = new Map(),
   userRoleOrigin?: "parent_agent" | null,
+  omitRolePrefix = false,
 ): string {
   const role = msg.role || msg.message_type || "unknown";
   const content = cleanTerminalText(msg.content);
@@ -4242,7 +4493,9 @@ export function conversationMessageMarkdown(
         ? (msg.tool_name || "Tool result")
         : "System";
   const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString(locale) : "";
-  const parts = [`**${roleLabel}**${timestamp ? ` · ${timestamp}` : ""}`];
+  const parts = omitRolePrefix
+    ? []
+    : [`**${roleLabel}**${timestamp ? ` · ${timestamp}` : ""}`];
 
   const sessionContext = cleanTerminalText(msg.session_context?.trim() || "");
   if (sessionContext) parts.push(markdownQuote("Session context", sessionContext));
@@ -4460,6 +4713,68 @@ function MessageCopyMenu({
         ))}
       </div>
     </details>
+  );
+}
+
+function PinGlyph({ filled, size = 14 }: { filled: boolean; size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill={filled ? "currentColor" : "none"}
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ flex: "0 0 auto" }}
+    >
+      <path d="M8 4h8l-1 6 3 3v2H6v-2l3-3-1-6Z" />
+      <path d="M12 15v5" />
+    </svg>
+  );
+}
+
+function MessagePinButton({
+  pinned,
+  onToggle,
+  t,
+}: {
+  pinned: boolean;
+  onToggle: () => Promise<void>;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const label = pinned ? t.conversation.unpinMessage : t.conversation.pinMessage;
+  return (
+    <button
+      type="button"
+      data-pin-message
+      data-pinned={pinned ? "true" : "false"}
+      aria-label={label}
+      title={label}
+      aria-pressed={pinned}
+      onClick={() => { void onToggle(); }}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 30,
+        minHeight: 28,
+        padding: 3,
+        borderRadius: 8,
+        border: pinned
+          ? "1px solid color-mix(in srgb, #D97706 32%, var(--aurora-border))"
+          : "1px solid transparent",
+        background: pinned
+          ? "color-mix(in srgb, #D97706 12%, var(--aurora-surface-solid))"
+          : "color-mix(in srgb, var(--aurora-chip) 62%, transparent)",
+        color: pinned ? "#B45309" : "var(--aurora-fg4)",
+        cursor: "pointer",
+      }}
+    >
+      <PinGlyph filled={pinned} />
+    </button>
   );
 }
 
@@ -4694,11 +5009,15 @@ function MessageCopyFrame({
   children,
   t,
   placement = "edge",
+  pinned = false,
+  onTogglePin,
 }: {
   markdown: string;
   children: ReactNode | ((controls: { top: ReactNode; bottom: ReactNode | null }) => ReactNode);
   t: ReturnType<typeof useI18n>["t"];
   placement?: "edge" | "inset";
+  pinned?: boolean;
+  onTogglePin?: () => Promise<void>;
 }) {
   const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
   const [slackSheetOpen, setSlackSheetOpen] = useState(false);
@@ -4725,7 +5044,10 @@ function MessageCopyFrame({
     resetTimer.current = window.setTimeout(() => setStatus(null), 2_000);
   };
   const topControl = (
-    <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+      {onTogglePin && <MessagePinButton pinned={pinned} onToggle={onTogglePin} t={t} />}
+      <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
+    </div>
   );
   const bottomControl = showBottomCopy ? (
     <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
@@ -4743,6 +5065,8 @@ function MessageCopyFrame({
           zIndex: 20,
           top: placement === "inset" ? 8 : 0,
           right: placement === "inset" ? 8 : 34,
+          display: "flex",
+          alignItems: "center",
         }}>
           {topControl}
         </div>
@@ -5232,6 +5556,9 @@ export const ChatBubble = memo(function ChatBubble({
   userRoleOrigin,
   locale,
   t,
+  isPinned = false,
+  onTogglePin,
+  copyOmitRolePrefix = false,
   questionResponses = new Map(),
   showUser = true,
   showAssistant = true,
@@ -5246,6 +5573,9 @@ export const ChatBubble = memo(function ChatBubble({
   userRoleOrigin?: "parent_agent" | null;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
+  isPinned?: boolean;
+  onTogglePin?: () => Promise<void>;
+  copyOmitRolePrefix?: boolean;
   questionResponses?: ReadonlyMap<string, PairedQuestionResponse>;
   showUser?: boolean;
   showAssistant?: boolean;
@@ -5276,11 +5606,19 @@ export const ChatBubble = memo(function ChatBubble({
       locale,
       questionResponses,
       userRoleOrigin,
+      copyOmitRolePrefix,
     ),
-    [locale, msg, questionResponses, toolId, userRoleOrigin],
+    [copyOmitRolePrefix, locale, msg, questionResponses, toolId, userRoleOrigin],
   );
   const withCopyControls = (node: ReactNode) => (
-    <MessageCopyFrame markdown={messageMarkdown} t={t}>{node}</MessageCopyFrame>
+    <MessageCopyFrame
+      markdown={messageMarkdown}
+      t={t}
+      pinned={isPinned}
+      onTogglePin={onTogglePin}
+    >
+      {node}
+    </MessageCopyFrame>
   );
 
   if (msg.interaction_response && !messageOwnsQuestionResponse(msg)) {
@@ -5294,12 +5632,14 @@ export const ChatBubble = memo(function ChatBubble({
   const agentEvent = msg.agent_event;
   if (role === "tool" && agentEvent) {
     if (isTaskActivityEvent(agentEvent) ? !showTasks : !showAgents) return null;
-    return <AgentActivityCard event={agentEvent} timestamp={msg.timestamp} locale={locale} t={t} />;
+    return withCopyControls(
+      <AgentActivityCard event={agentEvent} timestamp={msg.timestamp} locale={locale} t={t} />,
+    );
   }
   if (role === "tool" && taskState) {
     if (!showTasks) return null;
     return (
-      <MessageCopyFrame markdown={messageMarkdown} t={t}>
+      <MessageCopyFrame markdown={messageMarkdown} t={t} pinned={isPinned} onTogglePin={onTogglePin}>
         {({ top, bottom }) => (
           <TaskProgressCard
             state={taskState}
@@ -5428,7 +5768,7 @@ export const ChatBubble = memo(function ChatBubble({
               </span>
             )}
           </div>
-          <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset">
+          <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset" pinned={isPinned} onTogglePin={onTogglePin}>
             <div
               data-message-copy-surface
               style={{
@@ -5566,7 +5906,7 @@ export const ChatBubble = memo(function ChatBubble({
                   </span>
                 )}
               </div>
-              <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset">
+              <MessageCopyFrame markdown={messageMarkdown} t={t} placement="inset" pinned={isPinned} onTogglePin={onTogglePin}>
                 <div
                   data-message-copy-surface
                   className="px-3 py-3 sm:px-4"
@@ -5655,7 +5995,7 @@ export const ChatBubble = memo(function ChatBubble({
     }
     if (!showTools) return null;
     return (
-      <MessageCopyFrame markdown={messageMarkdown} t={t}>
+      <MessageCopyFrame markdown={messageMarkdown} t={t} pinned={isPinned} onTogglePin={onTogglePin}>
         {({ top, bottom }) => (
           <ConversationToolCard
             name={toolName || "Tool result"}

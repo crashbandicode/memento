@@ -21,6 +21,7 @@ import TokenUsageBadge from "@/components/conversations/TokenUsageBadge";
 import AssistantIdentityBadge from "@/components/viewers/AssistantIdentityBadge";
 import { useConversationPrompts } from "@/lib/use-conversation-prompts";
 import { MarkdownExportDialog } from "@/components/conversations/MarkdownExportForm";
+import { useThreadFavicon } from "@/lib/thread-favicon";
 
 interface RelatedPlan {
   id: string;
@@ -52,6 +53,7 @@ export default function ConversationPage() {
   const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
   const currentMeta = metaRef === docId ? meta : null;
+  useThreadFavicon(currentMeta?.tool_id);
   const { prompts, syncVersions } = useConversationPrompts(docId, {
     toolId: currentMeta?.tool_id,
     relativePath: currentMeta?.relative_path,

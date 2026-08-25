@@ -143,9 +143,9 @@ export async function installConversationMocks(page, scenario) {
 
     await route.fulfill({
       status: result.status,
-      contentType: "application/json",
+      contentType: result.contentType ?? "application/json",
       headers: CORS_HEADERS,
-      body: JSON.stringify(result.json),
+      body: result.body ?? JSON.stringify(result.json),
     });
   });
 }

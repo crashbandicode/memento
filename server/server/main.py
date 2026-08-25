@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .middleware.profiling import ProfilingMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import admin, auth, canvas_artifacts, control, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
+from .api import admin, auth, canvas_artifacts, control, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, pins, projects, public, search, share, tasks, tools
 from .config import settings
 from .db.models import Base
 from .db.session import engine
@@ -130,6 +130,27 @@ def _run_migrations(conn) -> None:
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_document_delivery_project_activity "
         "ON document_delivery_state (project_id, activity_at DESC)"
+    ))
+    # Pins are personal bookmarks. Keep them normalized so a user's note never
+    # modifies the shared transcript or document metadata.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS pinned_messages ("
+        "id UUID PRIMARY KEY, "
+        "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "message_id BIGINT NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE, "
+        "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+        "note TEXT, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "CONSTRAINT uq_pinned_messages_user_message UNIQUE (user_id, message_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_pinned_messages_user_created "
+        "ON pinned_messages (user_id, created_at DESC)"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_pinned_messages_user_document "
+        "ON pinned_messages (user_id, document_id)"
     ))
     # Claude transcripts are parent-linked trees. Keep their raw UUID lineage
     # normalized instead of putting an unbounded branch path in documents
@@ -1205,6 +1226,7 @@ app.include_router(canvas_artifacts.router)
 app.include_router(tools.router)
 app.include_router(documents.router)
 app.include_router(conversations.router)
+app.include_router(pins.router)
 app.include_router(conversation_exports.router)
 app.include_router(projects.router)
 app.include_router(daily.router)

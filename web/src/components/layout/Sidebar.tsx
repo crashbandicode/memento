@@ -61,6 +61,7 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
   const STATIC_NAV: { href: string; label: string; icon: IconName }[] = [
     { href: "/projects", label: t.nav.projects, icon: "folder" },
     { href: "/memory", label: t.nav.memory || "Memory", icon: "brain" },
+    { href: "/pins", label: t.nav.pins, icon: "target" },
     { href: "/daily", label: t.nav.daily, icon: "calendar" },
     { href: "/search", label: t.nav.search, icon: "search" },
     { href: "/export", label: t.nav.export, icon: "arrow_down" },

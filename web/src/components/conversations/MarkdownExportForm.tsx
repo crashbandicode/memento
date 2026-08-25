@@ -4,6 +4,10 @@ import { useEffect, useMemo, useState } from "react";
 import { api, ConversationMarkdownExportSettings, ProjectSummary, ToolSummary } from "@/lib/api-client";
 import { copyMarkdownToClipboard } from "@/lib/rich-clipboard";
 import {
+  omitExportRolePrefixes,
+  readCopyOmitRolePrefix,
+} from "@/lib/conversation-copy-preference";
+import {
   DEFAULT_CONVERSATION_VISIBILITY,
   readConversationVisibility,
   type ConversationVisibility,
@@ -150,7 +154,10 @@ export function MarkdownExportForm({ documentId, onClose }: MarkdownExportFormPr
     setNotice("");
     try {
       const markdownPromise = api.exportConversationMarkdown(documentId, settings())
-        .then((download) => download.blob.text());
+        .then((download) => download.blob.text())
+        .then((markdown) => (
+          readCopyOmitRolePrefix() ? omitExportRolePrefixes(markdown) : markdown
+        ));
       const copiedFormat = await copyMarkdownToClipboard(await markdownPromise, "rich");
       setNotice(copiedFormat === "rich"
         ? "Copied as rich text, with Markdown as the plain-text fallback."

@@ -40,6 +40,7 @@ export type ConversationHistoryReason =
   | "prompt-jump"
   | "latest-agent"
   | "pending-interaction"
+  | "pinned-message"
   | "normalize";
 
 export type ConversationHistoryMode = "none" | "push" | "replace";
