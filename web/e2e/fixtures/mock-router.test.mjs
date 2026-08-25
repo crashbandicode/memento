@@ -97,12 +97,12 @@ test("pending-interactions and latest-agent-message resolve distinctly", () => {
   assert.deepEqual(latest.json, { line_number: runningSubagent.latestAgentLine });
 });
 
-test("unknown endpoints fall back to empty JSON, never the network", () => {
-  const obj = resolveConversationRoute({
+test("unknown endpoints fall back to empty collections, never the network", () => {
+  const collection = resolveConversationRoute({
     url: `${base}/api/inbox/counts`,
     scenario: metadataOnlyPrompts,
   });
-  assert.deepEqual(obj, { action: "fulfill", status: 200, json: {} });
+  assert.deepEqual(collection, { action: "fulfill", status: 200, json: [] });
 
   const list = resolveConversationRoute({
     url: `${base}/api/tools`,

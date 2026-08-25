@@ -48,6 +48,83 @@ export const FIXTURE_TOKEN = "fixture-jwt-token";
 
 const EMPTY_PENDING = { count: 0, interactions: [], inferred_responses: [] };
 
+/** Small UUID-backed thread shared by pinned-message and clipboard preferences. */
+export const pinnedMessageThread = {
+  docId: "11111111-1111-4111-8111-111111111111",
+  meta: /** @type {ConversationMeta} */ ({
+    id: "11111111-1111-4111-8111-111111111111",
+    tool_id: "codex",
+    title: "Pinned message fixture",
+    relative_path: "sessions/pinned-message-fixture.jsonl",
+    metadata: {},
+    message_count: 2,
+    subagent_count: 0,
+    pending_question_count: 0,
+    synced_at: T2,
+    activity_at: T2,
+  }),
+  messages: /** @type {ConversationMessage[]} */ ([
+    {
+      id: 101,
+      line_number: 1,
+      role: "user",
+      content: "Please preserve the message body when I copy it.",
+      timestamp: T0,
+    },
+    {
+      id: 102,
+      line_number: 2,
+      role: "assistant",
+      content: "The copied message body is retained without alteration.",
+      timestamp: T1,
+    },
+  ]),
+  prompts: [
+    { id: 101, line_number: 1, content: "Please preserve the message body when I copy it.", timestamp: T0 },
+  ],
+  pending: EMPTY_PENDING,
+  latestAgentLine: 2,
+  pins: [],
+  exportMarkdown: [
+    "# Pinned message fixture",
+    "",
+    "## Prompt 1 — You · 2026-08-25T12:00:00Z",
+    "",
+    "Please preserve the message body when I copy it.",
+    "",
+    "### Assistant · 2026-08-25T12:01:00Z",
+    "",
+    "The copied message body is retained without alteration.",
+    "",
+    "### Tool · 2026-08-25T12:02:00Z",
+    "",
+    "Tool output remains part of the copied thread.",
+    "",
+  ].join("\n"),
+  globalPins: [
+    {
+      id: "pin-102",
+      message_id: 102,
+      document_id: "11111111-1111-4111-8111-111111111111",
+      conversation_ref: "11111111-1111-4111-8111-111111111111",
+      note: "Keep this answer handy.",
+      created_at: T2,
+      message: {
+        id: 102,
+        line_number: 2,
+        role: "assistant",
+        snippet: "The copied message body is retained without alteration.",
+        timestamp: T1,
+      },
+      document: {
+        id: "11111111-1111-4111-8111-111111111111",
+        title: "Pinned message fixture",
+        tool_id: "codex",
+      },
+    },
+  ],
+};
+
 /**
  * Regression #1 + #3 — wrapper unwrap.
  *

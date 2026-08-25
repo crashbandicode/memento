@@ -306,6 +306,40 @@ class ConversationMessage(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Personal conversation message bookmarks
+# ---------------------------------------------------------------------------
+class PinnedMessage(Base):
+    """A user's personal bookmark for one normalized conversation message."""
+
+    __tablename__ = "pinned_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("conversation_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "message_id", name="uq_pinned_messages_user_message"
+        ),
+        Index("idx_pinned_messages_user_created", "user_id", created_at.desc()),
+        Index("idx_pinned_messages_user_document", "user_id", "document_id"),
+    )
+
+
 class ConversationUsageEvent(Base):
     """One exact native usage observation attributed to a model selection."""
 

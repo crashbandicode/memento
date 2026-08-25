@@ -112,6 +112,12 @@ export function invalidateConversationMetadata(id: string) {
   _cache.delete(`${getApiBase()}/api/conversations/${id}`);
 }
 
+/** Drop the personal pin lists after a pin is added, edited, or removed. */
+export function invalidateConversationPins(id?: string) {
+  if (id) invalidateApiCache(`${getApiBase()}/api/conversations/${id}/pins`);
+  _cache.delete(`${getApiBase()}/api/pins`);
+}
+
 function getCached<T>(cacheKey: string): T | null {
   const hit = _cache.get(cacheKey);
   if (!hit) return null;
@@ -536,6 +542,40 @@ export interface MessagesResponse {
   messages: ConversationMessage[];
 }
 
+export interface PinMessagePreview {
+  id: number;
+  line_number: number;
+  role: string;
+  snippet: string;
+  timestamp: string | null;
+}
+
+export interface Pin {
+  id: string;
+  message_id: number;
+  document_id: string;
+  note: string | null;
+  created_at: string | null;
+  message?: PinMessagePreview;
+  conversation_ref?: string;
+  document?: {
+    id: string;
+    title: string | null;
+    tool_id: string;
+  };
+}
+
+export interface ConversationPinsResponse {
+  pins: Pin[];
+}
+
+export interface PinsResponse {
+  pins: Pin[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
 export interface PendingConversationInteraction {
   document_id: string;
   source_title?: string | null;
@@ -939,6 +979,25 @@ export const api = {
   },
   getDocument: (id: string) => apiFetch<DocumentDetail>(`/api/documents/${id}`),
   getConversation: (id: string) => apiFetch<ConversationMeta>(`/api/conversations/${id}`),
+  getConversationPins: (id: string) =>
+    apiFetch<ConversationPinsResponse>(`/api/conversations/${id}/pins`, { cache: "no-store" }),
+  pinConversationMessage: (documentId: string, messageId: number, note?: string | null) =>
+    apiFetch<Pin>(`/api/conversations/${documentId}/messages/${messageId}/pin`, {
+      method: "POST",
+      body: JSON.stringify(note === undefined ? {} : { note }),
+    }).then((pin) => {
+      invalidateConversationPins(documentId);
+      return pin;
+    }),
+  unpinConversationMessage: (documentId: string, messageId: number) =>
+    apiFetch<{ ok: boolean }>(`/api/conversations/${documentId}/messages/${messageId}/pin`, {
+      method: "DELETE",
+    }).then((result) => {
+      invalidateConversationPins(documentId);
+      return result;
+    }),
+  getPins: (limit = 50, offset = 0) =>
+    apiFetch<PinsResponse>(`/api/pins?limit=${limit}&offset=${offset}`, { cache: "no-store" }),
   exportConversationMarkdown: (
     id: string,
     settings: ConversationMarkdownExportSettings,
