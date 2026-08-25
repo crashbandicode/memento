@@ -5044,7 +5044,24 @@ function MessageCopyFrame({
     resetTimer.current = window.setTimeout(() => setStatus(null), 2_000);
   };
   const topControl = (
-    <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+    <div
+      data-message-actions
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+        // The pin + copy actions sit absolutely over the message; their
+        // per-button fills are translucent, so a line whose last word runs
+        // under them used to show through and read as an overlap. An opaque,
+        // blurred backing chip with a little padding gives the cluster a clear
+        // buffer so it floats above the text instead of colliding with it.
+        padding: 3,
+        borderRadius: 10,
+        background: "color-mix(in srgb, var(--aurora-surface-solid) 88%, transparent)",
+        backdropFilter: "blur(6px)",
+        WebkitBackdropFilter: "blur(6px)",
+      }}
+    >
       {onTogglePin && <MessagePinButton pinned={pinned} onToggle={onTogglePin} t={t} />}
       <MessageCopyMenu position="top" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
     </div>
