@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef } from "react";
-import { api, getApiBase } from "./api-client";
+import { api, getApiBase, isEmbeddedInDesktop } from "./api-client";
 import { getStoredAuthToken } from "./auth-storage";
 import {
   buildEventStreamUrl,
@@ -43,6 +43,9 @@ export function useSSE(
     let lastResumeAt = 0;
     let lastEventId = "";
     let streamAttempted = false;
+    const MIN_RETRY_MS = 5000;
+    const MAX_RETRY_MS = 60000;
+    let retryDelay = MIN_RETRY_MS;
 
     function clearReconnectTimer() {
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
@@ -60,7 +63,12 @@ export function useSSE(
     function scheduleReconnect() {
       if (stopped || documentIsHidden()) return;
       clearReconnectTimer();
-      reconnectTimer = setTimeout(() => void connect(), 5000);
+      // Back off on repeated failures so a stream that can't authenticate (or a
+      // server that is down) never retries in a tight 5s loop. The delay resets
+      // to the floor as soon as a connection actually opens or the tab resumes.
+      const delay = retryDelay;
+      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
+      reconnectTimer = setTimeout(() => void connect(), delay);
     }
 
     async function connect() {
@@ -77,11 +85,16 @@ export function useSSE(
       const attempt = ++generation;
       connecting = true;
       try {
-        await api.createEventSession(token);
+        const session = await api.createEventSession(token);
         if (stopped || attempt !== generation || documentIsHidden()) return;
-        const next = new EventSource(buildEventStreamUrl(base, lastEventId), {
+        // Embedded webviews can't send the SameSite=lax session cookie on the
+        // cross-site stream request, so they authenticate with the scoped,
+        // short-lived token from the session response instead.
+        const streamToken = isEmbeddedInDesktop() ? session?.stream_token : undefined;
+        const next = new EventSource(buildEventStreamUrl(base, lastEventId, streamToken), {
           withCredentials: true,
         });
+        next.onopen = () => { retryDelay = MIN_RETRY_MS; };
         streamAttempted = true;
         es = next;
 
@@ -129,6 +142,9 @@ export function useSSE(
       // One reconnect/catch-up is sufficient for the whole resume transition.
       if (now - lastResumeAt < 750) return;
       lastResumeAt = now;
+      // A deliberate resume (focus/visibility/online) should reconnect promptly,
+      // not at a backed-off delay from earlier failures.
+      retryDelay = MIN_RETRY_MS;
       const needsReconciliation = streamAttempted && !lastEventId;
       closeStream();
       if (needsReconciliation) {

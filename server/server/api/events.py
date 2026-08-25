@@ -19,7 +19,6 @@ from ..middleware.auth import (
     EVENT_STREAM_TOKEN_EXPIRE_MINUTES,
     create_event_stream_token,
     decode_event_stream_token,
-    decode_token,
     get_current_user,
 )
 from ..services.sse_service import format_sse, subscribe
@@ -40,18 +39,27 @@ async def create_event_session(
     request: Request,
     response: Response,
     user: User = Depends(get_current_user),
-) -> dict[str, bool]:
-    """Issue a short-lived HttpOnly cookie scoped to the SSE endpoints."""
+) -> dict:
+    """Issue a short-lived credential scoped to the SSE endpoints.
+
+    One token is delivered two ways: an HttpOnly cookie for same-origin
+    browsers, and the same value in the response body so embedded webviews (the
+    desktop app's cross-origin iframe, where a SameSite=lax cookie is not sent
+    on the stream request) can pass it back as the ``token`` query param. The
+    credential is events-scoped and expires in 15 minutes, so exposing it to
+    the already-authenticated client is a bounded, low-value tradeoff.
+    """
+    stream_token = create_event_stream_token(str(user.id))
     response.set_cookie(
         key=EVENT_STREAM_COOKIE,
-        value=create_event_stream_token(str(user.id)),
+        value=stream_token,
         max_age=EVENT_STREAM_COOKIE_MAX_AGE,
         httponly=True,
         secure=_request_is_secure(request),
         samesite="lax",
         path="/api/events",
     )
-    return {"ok": True}
+    return {"ok": True, "stream_token": stream_token}
 
 
 @router.delete("/session")
@@ -73,19 +81,19 @@ async def event_stream(
     last_event_id: str | None = Header(None, alias="Last-Event-ID"),
     cursor: str | None = Query(None),
 ) -> StreamingResponse:
-    """Stream live updates using a scoped cookie.
+    """Stream live updates using an events-scoped credential.
 
-    The optional query token is a redacted, temporary compatibility path for
-    tabs opened before the cookie rollout. New clients never put JWTs in URLs.
+    Same-origin browsers authenticate with the HttpOnly cookie. Embedded
+    webviews (the desktop app's cross-origin iframe) can't send a SameSite=lax
+    cookie on this request, so they pass the same scoped, short-lived token as
+    the ``token`` query param instead — it is not the main JWT and is redacted
+    from logs.
     """
-    if not event_session and not token:
+    credential = event_session or token
+    if not credential:
         raise HTTPException(status_code=401, detail="Missing event stream session")
     try:
-        payload = (
-            decode_event_stream_token(event_session)
-            if event_session
-            else decode_token(token or "")
-        )
+        payload = decode_event_stream_token(credential)
     except HTTPException:
         raise HTTPException(status_code=401, detail="Invalid token")
     user_id = payload.get("sub")

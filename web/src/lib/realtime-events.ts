@@ -135,9 +135,18 @@ export function eventInvalidatesProject(
   return !event.data.project_id || event.data.project_id === projectId;
 }
 
-export function buildEventStreamUrl(base: string, lastEventId: string): string {
+export function buildEventStreamUrl(
+  base: string,
+  lastEventId: string,
+  streamToken?: string,
+): string {
   const endpoint = `${base}/api/events/stream`;
-  if (!lastEventId) return endpoint;
-  const query = new URLSearchParams({ cursor: lastEventId });
-  return `${endpoint}?${query.toString()}`;
+  const query = new URLSearchParams();
+  if (lastEventId) query.set("cursor", lastEventId);
+  // Embedded webviews can't send the SameSite=lax session cookie cross-site,
+  // so they pass the scoped, short-lived stream token here instead. Same-origin
+  // browsers omit it and authenticate with the cookie.
+  if (streamToken) query.set("token", streamToken);
+  const qs = query.toString();
+  return qs ? `${endpoint}?${qs}` : endpoint;
 }

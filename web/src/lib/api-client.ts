@@ -19,7 +19,7 @@ export const API_BASE = "";
 // Running inside the desktop app's dashboard iframe. The desktop loads the web
 // UI with ?embed=memento (stashed sticky in sessionStorage by AuthProvider) and
 // holds a durable collector token it can re-mint from.
-function isEmbeddedInDesktop(): boolean {
+export function isEmbeddedInDesktop(): boolean {
   if (typeof window === "undefined" || window.parent === window) return false;
   try {
     if (sessionStorage.getItem("memento_embed") === "1") return true;
@@ -1129,7 +1129,7 @@ export const api = {
   refreshToken: (token: string) =>
     apiFetch<TokenResponse>("/api/auth/refresh", { method: "POST", token }),
   createEventSession: (token: string) =>
-    apiFetch<{ ok: boolean }>("/api/events/session", {
+    apiFetch<{ ok: boolean; stream_token?: string }>("/api/events/session", {
       method: "POST",
       token,
       credentials: "include",

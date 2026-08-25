@@ -13,7 +13,11 @@ from server.api.events import (
     event_stream,
 )
 from server.logging_filters import SensitiveQueryFilter, redact_sensitive_query_values
-from server.middleware.auth import create_access_token, create_event_stream_token
+from server.middleware.auth import (
+    create_access_token,
+    create_event_stream_token,
+    decode_event_stream_token,
+)
 
 
 def request(*, scheme: str = "https") -> Request:
@@ -36,14 +40,21 @@ def request(*, scheme: str = "https") -> Request:
 class EventStreamAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_cookie_is_short_lived_scoped_and_httponly(self) -> None:
         response = Response()
+        user_id = uuid.uuid4()
 
         result = await create_event_session(
             request=request(),
             response=response,
-            user=SimpleNamespace(id=uuid.uuid4()),
+            user=SimpleNamespace(id=user_id),
         )
 
-        self.assertEqual(result, {"ok": True})
+        self.assertTrue(result["ok"])
+        # The scoped token is also returned in the body so an embedded webview,
+        # which cannot send the SameSite=lax cookie cross-site, can hand it back
+        # as the stream's ``token`` query param.
+        self.assertEqual(
+            decode_event_stream_token(result["stream_token"])["sub"], str(user_id)
+        )
         cookie = response.headers["set-cookie"]
         self.assertIn(f"{EVENT_STREAM_COOKIE}=", cookie)
         self.assertIn("HttpOnly", cookie)
@@ -52,21 +63,26 @@ class EventStreamAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SameSite=lax", cookie)
         self.assertIn("Secure", cookie)
 
-    async def test_stream_accepts_only_scoped_cookie(self) -> None:
+    async def test_stream_accepts_scoped_credential_by_cookie_or_query(self) -> None:
         user_id = str(uuid.uuid4())
+        scoped = create_event_stream_token(user_id)
 
-        response = await event_stream(
-            event_session=create_event_stream_token(user_id),
-            token=None,
-        )
+        # Same-origin browsers use the cookie; embedded webviews pass the SAME
+        # scoped token as the query fallback. Both are accepted.
+        for kwargs in ({"event_session": scoped, "token": None},
+                       {"event_session": None, "token": scoped}):
+            response = await event_stream(**kwargs)
+            self.assertEqual(response.media_type, "text/event-stream")
 
-        self.assertEqual(response.media_type, "text/event-stream")
-        with self.assertRaises(HTTPException) as raised:
-            await event_stream(
-                event_session=create_access_token(user_id, "owner"),
-                token=None,
-            )
-        self.assertEqual(raised.exception.status_code, 401)
+        # The main access token is never a valid stream credential on either
+        # channel — the query fallback must not accept a long-lived JWT.
+        access = create_access_token(user_id, "owner")
+        for kwargs in ({"event_session": access, "token": None},
+                       {"event_session": None, "token": access},
+                       {"event_session": None, "token": None}):
+            with self.assertRaises(HTTPException) as raised:
+                await event_stream(**kwargs)
+            self.assertEqual(raised.exception.status_code, 401)
 
     async def test_stream_forwards_query_cursor_for_resumable_replay(self) -> None:
         user_id = str(uuid.uuid4())
