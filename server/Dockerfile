@@ -27,6 +27,13 @@ RUN pip install --no-cache-dir .
 COPY mcp_server/ /tmp/mcp_server/
 RUN pip install --no-cache-dir /tmp/mcp_server && rm -rf /tmp/mcp_server
 
+# py-spy for on-demand, no-redeploy profiling of a live process (the API or a
+# Celery ingest worker): `docker exec <c> py-spy dump --pid 1` for a stack
+# snapshot, or `py-spy record -o /tmp/prof.svg --pid 1 --duration 20` for a
+# flame graph. Attaching needs SYS_PTRACE (add `cap_add: [SYS_PTRACE]` to the
+# service, or run the exec as root). See docs/PROFILING.md.
+RUN pip install --no-cache-dir py-spy
+
 # Bootstrap installer assets served at /install.sh, /install.ps1, /install
 COPY deploy/bootstrap/ /app/bootstrap/
 

@@ -7,6 +7,8 @@ from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+from .middleware.profiling import ProfilingMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import admin, auth, canvas_artifacts, control, conversation_exports, conversations, daily, dashboard, data_io, devices, documents, events, hierarchy, ingest, install_bootstrap, memory, projects, public, search, share, tasks, tools
@@ -1161,6 +1163,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# On-demand request profiling — inert unless MEMENTO_PROFILING_ENABLED + token
+# are set (see middleware/profiling.py). Added last so it wraps outermost and
+# can profile the full request incl. the other middleware.
+app.add_middleware(ProfilingMiddleware)
 
 # Register routers
 app.include_router(dashboard.router)

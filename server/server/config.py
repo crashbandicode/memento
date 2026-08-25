@@ -72,6 +72,15 @@ class Settings(BaseSettings):
     # set MEMENTO_CORS_ALLOW_ORIGIN_REGEX in .env to your domain(s) only.
     cors_allow_origin_regex: str = r".*"
 
+    # On-demand request profiling (pyinstrument). Off by default and gated by a
+    # secret so it can never be toggled on from outside: an operator sets both
+    # MEMENTO_PROFILING_ENABLED=1 and a MEMENTO_PROFILING_TOKEN, then adds
+    # `?profile=1` + the token header to any request to get a flame graph back
+    # instead of the normal response. When disabled (the default) the middleware
+    # is a single-boolean passthrough with no measurable overhead.
+    profiling_enabled: bool = False
+    profiling_token: str = ""
+
     # Registration control:
     #   open        — anyone can self-register (pending, needs admin approval)
     #   invite_only — must provide a valid invite_code at registration
