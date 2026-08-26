@@ -393,6 +393,26 @@ async def test_externalized_conversation_hash_changes_with_bounded_prefix() -> N
 
 
 @pytest.mark.asyncio
+async def test_delta_conversation_embedding_input_uses_normalized_rows() -> None:
+    class _DeferredConversation:
+        id = uuid4()
+        category = "conversation"
+        content_type = "jsonl"
+
+        @property
+        def content(self):
+            raise AssertionError("DELTA input must not fetch the raw snapshot")
+
+    chunks, _ = await embedding_service.document_embedding_input(
+        _MessageDB(["normalized delta message " + ("x" * 120)]),
+        _DeferredConversation(),
+        prefer_conversation_messages=True,
+    )
+
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
 async def test_embedding_hash_changes_when_short_input_becomes_embeddable() -> None:
     db = _MessageDB(["too short"])
     doc = SimpleNamespace(

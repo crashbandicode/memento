@@ -171,8 +171,9 @@ def test_tool_only_delta_invalidates_only_related_resources() -> None:
         search_text="",
         title_changed=False,
         interactions_changed=False,
+        dashboard_changed=False,
     )
-    assert "dashboard" in changes
+    assert "dashboard" not in changes
     assert "project" in changes
     assert "conversation.messages" in changes
     assert "conversation.prompts" not in changes

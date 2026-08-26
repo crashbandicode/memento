@@ -578,13 +578,19 @@ def chunk_embedding_is_reusable(
 async def document_embedding_input(
     db: AsyncSession,
     doc: Document,
+    *,
+    prefer_conversation_messages: bool = False,
 ) -> tuple[list[str], str]:
     """Return the exact bounded model input and its stable identity hash."""
     if doc.content_type in ("sqlite", "sqlite_export", "binary"):
         chunks: list[str] = []
         return chunks, embedding_input_hash(chunks)
 
-    embedding_content = doc.content or ""
+    embedding_content = (
+        ""
+        if prefer_conversation_messages and doc.category == "conversation"
+        else doc.content or ""
+    )
     if not embedding_content and doc.category == "conversation":
         rows = (
             (

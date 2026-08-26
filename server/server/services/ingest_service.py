@@ -10,13 +10,15 @@ import uuid
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..db.models import (
     ConversationMessage,
     ConversationUsageEvent,
+    DashboardDocumentProjection,
     Document,
     DocumentVersion,
     Machine,
@@ -1831,6 +1833,15 @@ async def _reconcile_recovered_history_rows(
         (
             await db.execute(
                 select(ConversationMessage)
+                # History reconciliation mutates only this narrow row shape;
+                # avoid hydrating its document FK and creation timestamp.
+                .options(load_only(
+                    ConversationMessage.id,
+                    ConversationMessage.line_number,
+                    ConversationMessage.content,
+                    ConversationMessage.metadata_,
+                    ConversationMessage.timestamp,
+                ))
                 .where(
                     ConversationMessage.document_id == document_id,
                     ConversationMessage.message_type == "history_user_message",
@@ -2388,6 +2399,35 @@ def _scoped_document_select(
     return statement
 
 
+def _ingest_document_load_only():
+    """Load ingest state without pulling raw source bodies on every DELTA."""
+    return load_only(
+        Document.id,
+        Document.tool_id,
+        Document.project_id,
+        Document.machine_id,
+        Document.relative_path,
+        Document.category,
+        Document.content_type,
+        Document.title,
+        Document.content_s3_key,
+        Document.content_hash,
+        Document.file_size_bytes,
+        Document.metadata_,
+        Document.needs_review,
+        Document.embedding_status,
+        Document.embedding_attempts,
+        Document.embedding_claim_token,
+        Document.embedding_claimed_at,
+        Document.embedding_content_hash,
+        Document.embedding_tier,
+        Document.source_modified_at,
+        Document.activity_at,
+        Document.synced_at,
+        Document.visibility,
+    )
+
+
 async def _reconcile_claude_subagent_launch_metadata(
     db: AsyncSession,
     document: Document,
@@ -2596,13 +2636,15 @@ def _conversation_event_changes(
     search_text: str,
     title_changed: bool,
     interactions_changed: bool,
+    dashboard_changed: bool,
 ) -> list[str]:
     changes = {
         "conversation.messages",
         "conversation.metadata",
-        "dashboard",
         "project",
     }
+    if dashboard_changed:
+        changes.add("dashboard")
     if mode == "full" or "[user]" in search_text:
         changes.add("conversation.prompts")
     if mode == "full" or search_text or title_changed:
@@ -2610,6 +2652,44 @@ def _conversation_event_changes(
     if interactions_changed:
         changes.add("conversation.pending_interactions")
     return sorted(changes)
+
+
+# The dashboard's message total is useful during a long-running conversation,
+# but sending a global invalidation for every normalized row recreates the SSE
+# refetch stampede. Crossing this stable bucket is stateless across workers.
+_DASHBOARD_MESSAGE_COUNT_EVENT_BUCKET = 20
+
+
+def _dashboard_projection_requires_event(
+    projection: DashboardDocumentProjection,
+    *,
+    is_new_document: bool = False,
+) -> bool:
+    """Return whether this projection change warrants a dashboard refetch."""
+    state = inspect(projection)
+    if is_new_document or state.pending:
+        return True
+    # These are immediately visible on the dashboard, unlike delivery-only
+    # fields such as synced_at and hierarchy bookkeeping.
+    if any(
+        state.attrs[field].history.has_changes()
+        for field in (
+            "title",
+            "category",
+            "activity_at",
+            "is_archived",
+            "pending_question_count",
+        )
+    ):
+        return True
+    message_count = state.attrs.message_count.history
+    if not message_count.deleted:
+        return False
+    previous_count = int(message_count.deleted[0] or 0)
+    return (
+        previous_count // _DASHBOARD_MESSAGE_COUNT_EVENT_BUCKET
+        != int(projection.message_count or 0) // _DASHBOARD_MESSAGE_COUNT_EVENT_BUCKET
+    )
 
 
 def _publish_file_synced_event(
@@ -2684,7 +2764,7 @@ async def _reconcile_idempotent_claude_ingest(
     await db.flush()
     from .dashboard_projection import refresh_dashboard_document_projection
 
-    await refresh_dashboard_document_projection(db, lifecycle_document)
+    projection, _ = await refresh_dashboard_document_projection(db, lifecycle_document)
     _stage_ingest_read_cache_invalidations(
         db,
         user_id,
@@ -2692,11 +2772,14 @@ async def _reconcile_idempotent_claude_ingest(
         daily=False,
         project=True,
     )
+    event_changes = {"conversation.metadata", "project"}
+    if _dashboard_projection_requires_event(projection):
+        event_changes.add("dashboard")
     _publish_file_synced_event(
         db,
         lifecycle_document,
         user_id,
-        changes={"conversation.metadata", "dashboard", "project"},
+        changes=event_changes,
     )
 
 
@@ -2918,7 +3001,11 @@ async def ingest_file(
                 relative_path,
                 machine_id,
                 user_id,
-            ).with_for_update(of=Document)
+            )
+            # The normal conversation DELTA never reads Document.content; a
+            # deferred body avoids decoding/loading an old multi-MB snapshot.
+            .options(_ingest_document_load_only())
+            .with_for_update(of=Document)
         )
     ).scalar_one_or_none()
     doc = path_doc
@@ -2931,7 +3018,11 @@ async def ingest_file(
                         stable_source_identity,
                         machine_id,
                         user_id,
-                    ).with_for_update(of=Document)
+                    )
+                    # Same canonical-document path: retain mutable ingest
+                    # fields but leave the raw source body deferred.
+                    .options(_ingest_document_load_only())
+                    .with_for_update(of=Document)
                 )
             )
             .scalars()
@@ -3564,7 +3655,16 @@ async def ingest_file(
     if category in _EMBEDDING_CATEGORIES:
         from .embedding_service import document_embedding_input
 
-        _, incoming_embedding_content_hash = await document_embedding_input(db, doc)
+        # A conversation DELTA changes normalized rows, not its retained raw
+        # snapshot. Use those rows directly so the deferred snapshot body is
+        # never fetched merely to derive the next embedding input hash.
+        _, incoming_embedding_content_hash = await document_embedding_input(
+            db,
+            doc,
+            prefer_conversation_messages=(
+                category == "conversation" and mode == "delta"
+            ),
+        )
         if is_new_document:
             doc.embedding_content_hash = incoming_embedding_content_hash
         else:
@@ -3600,12 +3700,23 @@ async def ingest_file(
     # visibility, and category have reached their final current values.
     from .dashboard_projection import refresh_dashboard_document_projection
 
-    await refresh_dashboard_document_projection(db, doc)
+    dashboard_projection, _ = await refresh_dashboard_document_projection(db, doc)
+    dashboard_changed = _dashboard_projection_requires_event(
+        dashboard_projection,
+        is_new_document=is_new_document,
+    )
+    enriched_dashboard_changed = False
     if (
         enriched_claude_child is not None
         and enriched_claude_child.id != doc.id
     ):
-        await refresh_dashboard_document_projection(db, enriched_claude_child)
+        enriched_dashboard_projection, _ = await refresh_dashboard_document_projection(
+            db,
+            enriched_claude_child,
+        )
+        enriched_dashboard_changed = _dashboard_projection_requires_event(
+            enriched_dashboard_projection,
+        )
 
     # Update sync state
     await _update_sync_state(
@@ -3686,9 +3797,12 @@ async def ingest_file(
                 or _interaction_event_signature(document_metadata(doc))
                 != previous_interaction_signature
             ),
+            dashboard_changed=dashboard_changed,
         )
     else:
-        event_changes = ["dashboard", "project"]
+        event_changes = ["project"]
+        if dashboard_changed:
+            event_changes.append("dashboard")
     _publish_file_synced_event(
         db,
         doc,
@@ -3699,11 +3813,14 @@ async def ingest_file(
         enriched_claude_child is not None
         and enriched_claude_child.id != doc.id
     ):
+        enriched_event_changes = {"conversation.metadata", "project"}
+        if enriched_dashboard_changed:
+            enriched_event_changes.add("dashboard")
         _publish_file_synced_event(
             db,
             enriched_claude_child,
             user_id,
-            changes={"conversation.metadata", "dashboard", "project"},
+            changes=enriched_event_changes,
         )
 
     # Generate embeddings + extract knowledge graph (async, non-blocking)
@@ -4374,6 +4491,17 @@ async def _extract_messages(
             (
                 await db.execute(
                     select(ConversationMessage)
+                    # Delta-tail reconciliation needs these fields to compare
+                    # or update rows, not the full ORM row payload.
+                    .options(load_only(
+                        ConversationMessage.id,
+                        ConversationMessage.line_number,
+                        ConversationMessage.message_type,
+                        ConversationMessage.role,
+                        ConversationMessage.content,
+                        ConversationMessage.metadata_,
+                        ConversationMessage.timestamp,
+                    ))
                     .where(ConversationMessage.document_id == doc.id)
                     .order_by(ConversationMessage.line_number.desc())
                     .limit(32)
@@ -4406,6 +4534,14 @@ async def _extract_messages(
                 (
                     await db.execute(
                         select(ConversationMessage)
+                        # Queue matching only reads content/metadata and may
+                        # update metadata; defer unrelated message columns.
+                        .options(load_only(
+                            ConversationMessage.id,
+                            ConversationMessage.line_number,
+                            ConversationMessage.content,
+                            ConversationMessage.metadata_,
+                        ))
                         .where(
                             ConversationMessage.document_id == doc.id,
                             ConversationMessage.message_type.in_(
@@ -4491,6 +4627,17 @@ async def _extract_messages(
             (
                 await db.execute(
                     select(ConversationMessage)
+                    # Cursor updates reconcile a bounded identity set. Keep
+                    # only comparison/canvas fields out of full-row hydration.
+                    .options(load_only(
+                        ConversationMessage.id,
+                        ConversationMessage.line_number,
+                        ConversationMessage.message_type,
+                        ConversationMessage.role,
+                        ConversationMessage.content,
+                        ConversationMessage.metadata_,
+                        ConversationMessage.timestamp,
+                    ))
                     .where(
                         ConversationMessage.document_id == doc.id,
                         ConversationMessage.metadata_["source_id"].astext.in_(
@@ -4734,7 +4881,19 @@ async def _extract_messages(
                     existing_block = (
                         (
                             await db.execute(
-                                select(ConversationMessage).where(
+                                select(ConversationMessage)
+                                # Full/rebase suffix comparison updates rows in
+                                # place, so load only the fields it compares.
+                                .options(load_only(
+                                    ConversationMessage.id,
+                                    ConversationMessage.line_number,
+                                    ConversationMessage.message_type,
+                                    ConversationMessage.role,
+                                    ConversationMessage.content,
+                                    ConversationMessage.metadata_,
+                                    ConversationMessage.timestamp,
+                                ))
+                                .where(
                                     ConversationMessage.document_id == doc.id,
                                     ConversationMessage.line_number >= line_num,
                                     ConversationMessage.line_number <= block_end,
@@ -4916,19 +5075,25 @@ async def _extract_messages(
         existing_history = (
             (
                 await db.execute(
-                    select(ConversationMessage).where(
+                    # History dedup uses just stable source IDs and negative
+                    # line slots; extract JSONB text rather than decode rows.
+                    select(
+                        ConversationMessage.line_number,
+                        ConversationMessage.metadata_["source_id"].astext.label(
+                            "source_id"
+                        ),
+                    ).where(
                         ConversationMessage.document_id == doc.id,
                         ConversationMessage.message_type == "history_user_message",
                     )
                 )
             )
-            .scalars()
             .all()
         )
         existing_source_ids = {
-            str((row.metadata_ or {}).get("source_id"))
+            str(row.source_id)
             for row in existing_history
-            if (row.metadata_ or {}).get("source_id")
+            if row.source_id
         }
         used_history_lines = {
             row.line_number for row in existing_history if row.line_number < 0

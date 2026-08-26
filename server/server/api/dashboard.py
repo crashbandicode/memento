@@ -29,7 +29,7 @@ from ..db.models import (
     Tool,
     User,
 )
-from ..db.session import get_db
+from ..db.session import get_search_db
 from ..middleware.auth import get_current_user
 from ..services.conversation_activity import (
     is_low_activity_summary,
@@ -255,7 +255,7 @@ def _row_metadata(row) -> dict:
 async def get_dashboard(
     device_id: str | None = None,
     tz_offset: int = Query(0),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_search_db),
     _user: User = Depends(get_current_user),
 ) -> dict:
     """Aggregated dashboard data for home page."""

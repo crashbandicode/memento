@@ -66,15 +66,18 @@ export default function Dashboard() {
   const requestRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const pendingRefreshRef = useRef(false);
+  const pendingSseRefreshRef = useRef(false);
+  const lastSseRefreshCompletedAtRef = useRef<number | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const maxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { t } = useI18n();
   const { selectedDeviceId } = useDevice();
   const now = useNow();
 
-  const fetchData = useCallback(() => {
+  const fetchData = useCallback((refreshSource: "immediate" | "sse" = "immediate") => {
     if (abortRef.current && !abortRef.current.signal.aborted) {
       pendingRefreshRef.current = true;
+      pendingSseRefreshRef.current ||= refreshSource === "sse";
       return;
     }
     const requestId = ++requestRef.current;
@@ -98,9 +101,23 @@ export default function Dashboard() {
       .finally(() => {
         if (abortRef.current === controller) abortRef.current = null;
         if (requestId === requestRef.current) setLoading(false);
+        if (refreshSource === "sse") {
+          lastSseRefreshCompletedAtRef.current = Date.now();
+        }
         if (pendingRefreshRef.current && document.visibilityState !== "hidden") {
+          const pendingSseRefresh = pendingSseRefreshRef.current;
           pendingRefreshRef.current = false;
-          debounceTimerRef.current = setTimeout(fetchData, 250);
+          pendingSseRefreshRef.current = false;
+          const waitForSseInterval = pendingSseRefresh
+            ? Math.max(
+              250,
+              (lastSseRefreshCompletedAtRef.current ?? 0) + 20_000 - Date.now(),
+            )
+            : 250;
+          debounceTimerRef.current = setTimeout(
+            () => fetchData(pendingSseRefresh ? "sse" : "immediate"),
+            waitForSseInterval,
+          );
         }
       });
   }, [selectedDeviceId]);
@@ -112,6 +129,24 @@ export default function Dashboard() {
     maxWaitTimerRef.current = null;
   }, []);
 
+  const runScheduledSseRefresh = useCallback(() => {
+    const waitForSseInterval = Math.max(
+      0,
+      (lastSseRefreshCompletedAtRef.current ?? 0) + 20_000 - Date.now(),
+    );
+    if (waitForSseInterval > 0) {
+      clearScheduledRefresh();
+      debounceTimerRef.current = setTimeout(() => {
+        pendingRefreshRef.current = false;
+        fetchData("sse");
+      }, waitForSseInterval);
+      return;
+    }
+    clearScheduledRefresh();
+    pendingRefreshRef.current = false;
+    fetchData("sse");
+  }, [clearScheduledRefresh, fetchData]);
+
   const scheduleRefresh = useCallback(() => {
     pendingRefreshRef.current = true;
     if (document.visibilityState === "hidden") {
@@ -120,18 +155,10 @@ export default function Dashboard() {
     }
 
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-    debounceTimerRef.current = setTimeout(() => {
-      clearScheduledRefresh();
-      pendingRefreshRef.current = false;
-      fetchData();
-    }, 1_500);
+    debounceTimerRef.current = setTimeout(runScheduledSseRefresh, 1_500);
 
-    maxWaitTimerRef.current ??= setTimeout(() => {
-      clearScheduledRefresh();
-      pendingRefreshRef.current = false;
-      fetchData();
-    }, 10_000);
-  }, [clearScheduledRefresh, fetchData]);
+    maxWaitTimerRef.current ??= setTimeout(runScheduledSseRefresh, 10_000);
+  }, [clearScheduledRefresh, runScheduledSseRefresh]);
 
   useEffect(() => {
     fetchData();
@@ -140,7 +167,10 @@ export default function Dashboard() {
         clearScheduledRefresh();
         return;
       }
-      if (pendingRefreshRef.current) scheduleRefresh();
+      clearScheduledRefresh();
+      pendingRefreshRef.current = false;
+      pendingSseRefreshRef.current = false;
+      fetchData();
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {

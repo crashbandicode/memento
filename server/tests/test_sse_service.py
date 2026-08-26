@@ -198,10 +198,10 @@ def test_tool_only_delta_does_not_refresh_prompt_search_or_inbox() -> None:
         search_text="",
         title_changed=False,
         interactions_changed=False,
+        dashboard_changed=False,
     ) == [
         "conversation.messages",
         "conversation.metadata",
-        "dashboard",
         "project",
     ]
 
@@ -212,6 +212,7 @@ def test_user_interaction_delta_scopes_all_affected_read_models() -> None:
         search_text="[user] choose one\n",
         title_changed=False,
         interactions_changed=True,
+        dashboard_changed=True,
     ) == [
         "conversation.messages",
         "conversation.metadata",
