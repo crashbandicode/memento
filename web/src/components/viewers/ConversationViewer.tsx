@@ -5022,10 +5022,32 @@ function MessageCopyFrame({
   const [status, setStatus] = useState<ClipboardFormat | "error" | null>(null);
   const [slackSheetOpen, setSlackSheetOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
+  const topControlRef = useRef<HTMLDivElement>(null);
   const showBottomCopy = useOverflowsVisibleScrollport(contentRef);
   const resetTimer = useRef<number | null>(null);
   const usesManagedControls = typeof children === "function";
   const androidHost = typeof navigator !== "undefined" && isAndroidClipboardHost();
+  const [topControlSize, setTopControlSize] = useState({ width: 72, height: 34 });
+
+  useLayoutEffect(() => {
+    if (usesManagedControls) return;
+    const control = topControlRef.current;
+    if (!control) return;
+
+    const updateSize = () => {
+      const { width, height } = control.getBoundingClientRect();
+      setTopControlSize((current) => (
+        current.width === width && current.height === height
+          ? current
+          : { width, height }
+      ));
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(control);
+    return () => observer.disconnect();
+  }, [usesManagedControls]);
 
   const copy = async (format: ClipboardFormat) => {
     // Android cross-app clipboard support varies by browser. The sheet copies
@@ -5069,6 +5091,24 @@ function MessageCopyFrame({
   const bottomControl = showBottomCopy ? (
     <MessageCopyMenu position="bottom" status={status} onCopy={copy} t={t} compact={usesManagedControls} />
   ) : null;
+  const topControlRight = placement === "inset" ? 8 : 34;
+  const topControlTop = placement === "inset" ? 8 : 0;
+  const topControlClearance = !usesManagedControls ? (
+    <div
+      aria-hidden="true"
+      data-message-action-clearance
+      style={{
+        // Keep only the lines alongside the absolutely-positioned action chip
+        // short. The spacer includes the chip's measured width, its offset
+        // from this frame's edge, and a small gap before the text.
+        float: "right",
+        width: topControlSize.width + topControlRight + 8,
+        height: topControlSize.height + topControlTop,
+        shapeOutside: "inset(0)",
+        pointerEvents: "none",
+      }}
+    />
+  ) : null;
   return (
     <div
       data-message-copy-frame
@@ -5077,18 +5117,22 @@ function MessageCopyFrame({
       style={{ minWidth: 0, position: "relative" }}
     >
       {!usesManagedControls && (
-        <div style={{
-          position: "absolute",
-          zIndex: 20,
-          top: placement === "inset" ? 8 : 0,
-          right: placement === "inset" ? 8 : 34,
-          display: "flex",
-          alignItems: "center",
-        }}>
+        <div
+          ref={topControlRef}
+          style={{
+            position: "absolute",
+            zIndex: 20,
+            top: topControlTop,
+            right: topControlRight,
+            display: "flex",
+            alignItems: "center",
+          }}
+        >
           {topControl}
         </div>
       )}
       <div ref={contentRef} data-message-copy-content style={{ minWidth: 0 }}>
+        {topControlClearance}
         {usesManagedControls ? children({ top: topControl, bottom: bottomControl }) : children}
       </div>
       {showBottomCopy && !usesManagedControls && placement === "inset" && (
@@ -5789,7 +5833,7 @@ export const ChatBubble = memo(function ChatBubble({
             <div
               data-message-copy-surface
               style={{
-                padding: "12px 50px 12px 16px",
+                padding: "12px 16px",
                 borderRadius: 12,
                 background: "color-mix(in srgb, var(--aurora-accent) 5%, var(--aurora-surface-solid))",
                 color: "var(--aurora-fg1)",
@@ -5928,7 +5972,6 @@ export const ChatBubble = memo(function ChatBubble({
                   data-message-copy-surface
                   className="px-3 py-3 sm:px-4"
                   style={{
-                    paddingRight: 50,
                     color: "var(--aurora-fg1)",
                     fontSize: 13.5,
                     lineHeight: 1.55,
