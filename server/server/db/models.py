@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer,
+    BigInteger, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer,
     LargeBinary, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, TSVECTOR, UUID
@@ -112,8 +112,15 @@ class Document(Base):
 
     # Content
     title: Mapped[str | None] = mapped_column(Text)
-    content: Mapped[str | None] = mapped_column(Text)              # for files < 1MB
-    content_s3_key: Mapped[str | None] = mapped_column(String(500))  # for files > 1MB
+    # Keep the compatibility copy out of ordinary entity hydration. Callers
+    # that need raw source must use services.large_content_store instead.
+    content: Mapped[str | None] = mapped_column(Text, deferred=True)
+    content_s3_key: Mapped[str | None] = mapped_column(String(500))
+    content_object_sha256: Mapped[str | None] = mapped_column(String(64))
+    content_object_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    content_object_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # Full-text search index: space-joined jieba tokens of title + content,
@@ -198,6 +205,15 @@ class Document(Base):
         Index("idx_documents_machine", "machine_id"),
         Index("idx_documents_machine_tool", "machine_id", "tool_id"),
         Index("idx_documents_project_category", "project_id", "category"),
+        Index("uq_documents_content_s3_key", "content_s3_key", unique=True),
+        CheckConstraint(
+            "(content_s3_key IS NULL AND content_object_sha256 IS NULL "
+            "AND content_object_size_bytes IS NULL) OR "
+            "(content_s3_key IS NOT NULL AND content_object_sha256 IS NOT NULL "
+            "AND content_object_size_bytes IS NOT NULL "
+            "AND content_object_size_bytes >= 0)",
+            name="ck_documents_content_object_pointer",
+        ),
         # Unique per machine+tool+path
         Index("uq_documents_machine_tool_path", "machine_id", "tool_id", "relative_path", unique=True),
     )
@@ -222,6 +238,20 @@ class Document(Base):
         set_committed_value(self, "source_modified_at", state.source_modified_at)
         set_committed_value(self, "activity_at", state.activity_at)
         set_committed_value(self, "synced_at", state.synced_at)
+
+
+class DocumentContentGcCandidate(Base):
+    """Future delayed-GC state; no deletion job is enabled in this rollout."""
+
+    __tablename__ = "document_content_gc_candidates"
+
+    content_s3_key: Mapped[str] = mapped_column(String(500), primary_key=True)
+    first_unreferenced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 # ---------------------------------------------------------------------------

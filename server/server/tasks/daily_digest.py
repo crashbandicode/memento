@@ -13,6 +13,7 @@ from ..db.models import DailySummary, Document
 from ..db.session import async_session_factory
 from ..services.document_delivery import delivery_synced_expression
 from ..services.summary_service import generate_daily_summary
+from ..services.large_content_store import document_content_prefix
 
 
 async def _generate_digest(target_date: date) -> None:
@@ -45,10 +46,11 @@ async def _generate_digest(target_date: date) -> None:
         # Group by tool
         tool_summaries: dict[str, list[dict]] = {}
         for d in docs:
+            content = await document_content_prefix(db, d, max_chars=1_000)
             tool_summaries.setdefault(d.tool_id, []).append({
                 "title": d.title or d.relative_path,
                 "category": d.category,
-                "content": (d.content or "")[:1000],
+                "content": content or "",
                 "ai_summary": d.ai_summary,
             })
 

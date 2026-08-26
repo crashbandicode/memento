@@ -87,6 +87,7 @@ from ..services.document_delivery import (
     delivery_synced_expression,
     document_metadata,
 )
+from ..services.large_content_store import document_content, document_content_prefix
 from ..services.orchestration_events import orchestration_agent_summary
 from ..services.device_grouping import split_device_name
 from ..services.ingest_service import (
@@ -856,9 +857,7 @@ async def get_conversation(
         )
     ).scalar_one_or_none()
     if message_count == 0:
-        raw_content = (
-            await db.execute(select(Document.content).where(Document.id == doc_id))
-        ).scalar_one_or_none()
+        raw_content = await document_content(db, doc)
         if raw_content:
             message_count = count_conversation_messages(raw_content, doc.tool_id)
 
@@ -1174,7 +1173,11 @@ async def get_conversation(
                     "relative_path": p.relative_path,
                     "category": p.category,
                     "content_type": p.content_type,
-                    "content": p.content[:5000] if p.content else None,
+                    "content": await document_content_prefix(
+                        db,
+                        p,
+                        max_chars=5_000,
+                    ),
                     "file_size_bytes": p.file_size_bytes,
                     "synced_at": p.synced_at.isoformat(),
                 }
@@ -1437,9 +1440,7 @@ async def get_conversation_messages(
 
     # Legacy/imported documents without normalized rows retain the tolerant
     # raw parser as a compatibility fallback.
-    raw_content = (
-        await db.execute(select(Document.content).where(Document.id == doc_id))
-    ).scalar_one_or_none()
+    raw_content = await document_content(db, doc)
     if line_number is not None:
         offset = max(0, line_number - 1 - context_before)
     if raw_content:
@@ -2360,9 +2361,7 @@ async def get_latest_agent_message(
     if normalized_exists is not None:
         return {"line_number": None}
 
-    raw_content = (
-        await db.execute(select(Document.content).where(Document.id == doc_id))
-    ).scalar_one_or_none()
+    raw_content = await document_content(db, doc)
     if not raw_content:
         return {"line_number": None}
     messages = parse_conversation(raw_content, doc.tool_id)
@@ -2583,9 +2582,7 @@ async def get_conversation_prompts(
                 }
             )
     else:
-        raw_content = (
-            await db.execute(select(Document.content).where(Document.id == doc_id))
-        ).scalar_one_or_none()
+        raw_content = await document_content(db, doc)
         if raw_content:
             parsed = parse_conversation(raw_content, doc.tool_id)
             prompts = [

@@ -49,6 +49,7 @@ TABLES = [
     "tools",
     "projects",
     "documents",
+    "document_content_gc_candidates",
     "document_versions",
     "document_embeddings",
     "document_embeddings_fast",

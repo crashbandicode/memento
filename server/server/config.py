@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     s3_access_key: str = "minioadmin"
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "memento"
+    # Roll out immutable document-content objects independently from the
+    # already-existing legacy large-transcript store. False preserves the
+    # PostgreSQL compatibility path; true dual-writes and prefers verified
+    # document-content objects on reads.
+    document_content_minio_enabled: bool = False
 
     # Auth
     secret_key: str = "change-me-in-production"

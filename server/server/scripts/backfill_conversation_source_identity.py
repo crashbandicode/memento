@@ -27,7 +27,10 @@ from ..services.ingest_service import (
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
 )
-from ..services.large_content_store import read_large_content
+from ..services.large_content_store import (
+    read_large_content,
+    read_verified_document_content,
+)
 from .reparse_conversations import SUPPORTED_TOOLS, _connect
 
 
@@ -114,6 +117,18 @@ def legacy_snapshot_proof(
 
 
 async def _read_locked_payload(conn, row) -> str:
+    if (
+        row["content_s3_key"]
+        and row["content_object_sha256"]
+        and row["content_object_size_bytes"] is not None
+        and row["content_object_verified_at"] is not None
+    ):
+        return await asyncio.to_thread(
+            read_verified_document_content,
+            row["content_s3_key"],
+            sha256=row["content_object_sha256"],
+            size_bytes=int(row["content_object_size_bytes"]),
+        )
     if row["content_s3_key"]:
         return await asyncio.to_thread(
             read_large_content,
@@ -153,7 +168,8 @@ async def backfill(
                 row = await conn.fetchrow(
                     """
                     SELECT id, content_type, content, content_s3_key,
-                           content_hash, metadata
+                           content_object_sha256, content_object_size_bytes,
+                           content_object_verified_at, content_hash, metadata
                     FROM documents
                     WHERE id=$1
                     FOR UPDATE

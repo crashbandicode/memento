@@ -20,6 +20,7 @@ from ..db.models import (
     KnowledgeRelation,
     Machine,
 )
+from .large_content_store import document_content_prefix
 
 logger = logging.getLogger("graph_service")
 
@@ -276,7 +277,10 @@ async def extract_knowledge_from_document(
         doc.knowledge_status = "skipped"
         return 0
 
-    if doc.category != "conversation" and (not doc.content or len(doc.content) < 200):
+    raw_prefix = None
+    if doc.category != "conversation":
+        raw_prefix = await document_content_prefix(db, doc, max_chars=4_000)
+    if doc.category != "conversation" and (not raw_prefix or len(raw_prefix) < 200):
         doc.knowledge_status = "skipped"
         return 0
 
@@ -331,9 +335,9 @@ async def extract_knowledge_from_document(
         # Conversation has no parsed messages yet (very fresh ingest /
         # parse miss) — fall back to raw head so we still try.
         if not content:
-            content = (doc.content or "")[:4000]
+            content = (await document_content_prefix(db, doc, max_chars=4_000)) or ""
     else:
-        content = (doc.content or "")[:4000]
+        content = raw_prefix or ""
 
     if len(content) < 200:
         doc.knowledge_status = "skipped"

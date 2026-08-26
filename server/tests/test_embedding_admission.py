@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from server.api import memory
+from server.db.models import Document
 from server.services import embedding_service
 from server.services.ingest_service import _invalidate_embeddings_for_revision
 from server.tasks.post_ingest import process_document_post_ingest
@@ -125,13 +126,28 @@ async def test_whole_document_uses_one_admission_request(monkeypatch) -> None:
     ]
 
 
+_EMBEDDABLE_TEXT = "durable conversation text " * 20
+
+
 class _RecordingDB:
-    def __init__(self, rowcounts: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        rowcounts: list[int] | None = None,
+        *,
+        inline_content: str | None = _EMBEDDABLE_TEXT,
+    ) -> None:
         self.statements: list = []
         self.update_params: list[dict] = []
         self.rowcounts = list(rowcounts or [])
+        self.inline_content = inline_content
 
     async def execute(self, statement):
+        # document_content() explicitly selects the deferred Document.content;
+        # answer it without recording so claim/update assertions and rowcount
+        # sequencing keep their original meaning.
+        descriptions = getattr(statement, "column_descriptions", None) or []
+        if descriptions and descriptions[0].get("entity") is Document:
+            return SimpleNamespace(scalar_one_or_none=lambda: self.inline_content)
         self.statements.append(statement)
         self.update_params.append(statement.compile().params)
         rowcount = self.rowcounts.pop(0) if self.rowcounts else 1
@@ -345,11 +361,33 @@ class _MessageRows:
         return self._messages[: embedding_service.CONVERSATION_EMBEDDING_MESSAGE_LIMIT]
 
 
-class _MessageDB:
-    def __init__(self, messages: list[str]) -> None:
-        self.messages = messages
+class _InlineContentRow:
+    """Answer document_content()'s explicit inline-content fallback SELECT."""
 
-    async def execute(self, _statement) -> _MessageRows:
+    def __init__(self, value: str | None) -> None:
+        self._value = value
+
+    def scalar_one_or_none(self) -> str | None:
+        return self._value
+
+
+class _MessageDB:
+    def __init__(
+        self,
+        messages: list[str],
+        *,
+        inline_content: str | None = None,
+    ) -> None:
+        self.messages = messages
+        self.inline_content = inline_content
+
+    async def execute(self, statement) -> _MessageRows | _InlineContentRow:
+        # document_content() explicitly selects Document.content (the model
+        # attribute is deferred); everything else here is the conversation
+        # message-prefix SELECT.
+        descriptions = getattr(statement, "column_descriptions", None) or []
+        if descriptions and descriptions[0].get("entity") is Document:
+            return _InlineContentRow(self.inline_content)
         return _MessageRows(self.messages)
 
 

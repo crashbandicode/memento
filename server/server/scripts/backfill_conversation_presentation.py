@@ -49,6 +49,8 @@ from server.services.embedding_service import (
 )
 from server.services.conversation_activity import refresh_document_activity_at
 from server.services.large_content_store import (
+    document_content,
+    document_content_prefix,
     iter_large_content_lines,
     read_large_content_prefix,
 )
@@ -495,17 +497,14 @@ async def _repair_claude_context_batch(
     """Reclassify Claude's raw-metadata context rows without guessing by text."""
     stats = BackfillStats()
     rows = await db.execute(
-        select(
-            Document,
-            (func.coalesce(func.length(Document.content), 0) > 0).label(
-                "has_inline_embedding_content"
-            ),
-        )
+        select(Document)
         .options(load_only(
             Document.id,
             Document.title,
-            Document.content,
             Document.content_s3_key,
+            Document.content_object_sha256,
+            Document.content_object_size_bytes,
+            Document.content_object_verified_at,
         ))
         .where(Document.id.in_(document_ids))
         .with_for_update(of=Document)
@@ -513,17 +512,13 @@ async def _repair_claude_context_batch(
     documents: dict = {}
     identities_by_document: dict = {}
     inline_embedding_documents: set = set()
-    for document, has_inline_embedding_content in rows.all():
+    for document in rows.scalars().all():
         documents[document.id] = document
-        if has_inline_embedding_content:
+        raw_content = await document_content(db, document)
+        if raw_content:
             inline_embedding_documents.add(document.id)
-        raw_content = document.content or ""
         if raw_content:
             identities, record_count = _claude_context_identities(raw_content)
-        elif document.content_s3_key:
-            identities, record_count = await _externalized_claude_context(
-                document.content_s3_key
-            )
         else:
             identities, record_count = set(), 0
         identities_by_document[document.id] = identities
@@ -604,13 +599,7 @@ async def _set_batch_timeouts(db) -> None:
 async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
     stats = BackfillStats()
     rows = await db.execute(
-        select(
-            Document,
-            func.left(Document.content, SESSION_META_PREFIX_CHARS).label("content_prefix"),
-            (
-                func.coalesce(func.length(Document.content), 0) > 0
-            ).label("has_inline_embedding_content"),
-        )
+        select(Document)
         .options(load_only(
             Document.id,
             Document.tool_id,
@@ -619,16 +608,24 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
             Document.title,
             Document.metadata_,
             Document.content_s3_key,
+            Document.content_object_sha256,
+            Document.content_object_size_bytes,
+            Document.content_object_verified_at,
         ))
         .where(Document.id.in_(document_ids))
     )
     documents: dict = {}
     content_prefixes: dict = {}
     inline_embedding_documents: set = set()
-    for document, content_prefix, has_inline_embedding_content in rows.all():
+    for document in rows.scalars().all():
         documents[document.id] = document
+        content_prefix = await document_content_prefix(
+            db,
+            document,
+            max_chars=SESSION_META_PREFIX_CHARS,
+        )
         content_prefixes[document.id] = content_prefix or ""
-        if has_inline_embedding_content:
+        if content_prefix:
             inline_embedding_documents.add(document.id)
 
     message_rows = await db.execute(
@@ -704,8 +701,6 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
     for document_id, document in documents.items():
         messages = messages_by_document.get(document_id, [])
         prefix = content_prefixes.get(document_id, "")
-        if not prefix and document.content_s3_key:
-            prefix = await _externalized_prefix(document.content_s3_key)
         identity = extract_codex_session_metadata(prefix)
         existing_metadata = dict(document.metadata_ or {})
         if identity:

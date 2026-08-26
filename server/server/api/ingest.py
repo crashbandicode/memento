@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..db.models import Document, User
 from ..db.session import get_db
 from ..middleware.auth import verify_collector_token
@@ -780,7 +781,10 @@ async def ingest_file_upload(
             )
             mode = meta.get("mode", "full")
             content_s3_key = None
-            if mode == "full":
+            # Legacy deployments retain their job-keyed large-object behavior
+            # until the rollout flag is flipped. Once enabled, ingest_file's
+            # single transaction-owned finalizer owns the immutable key.
+            if mode == "full" and not settings.document_content_minio_enabled:
                 job_id = multipart_content_job_id(
                     user_id=str(_collector_user.id),
                     device_id=x_device_id,

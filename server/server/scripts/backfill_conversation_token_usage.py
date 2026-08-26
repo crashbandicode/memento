@@ -34,7 +34,10 @@ from server.services.conversation_usage import (
     normalize_token_usage,
     usage_observation_values,
 )
-from server.services.large_content_store import iter_large_content_lines
+from server.services.large_content_store import (
+    iter_large_content_lines,
+    read_verified_document_content,
+)
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,18 @@ def extract_assistant_identity_from_lines(
 
 def _scan_document(row: asyncpg.Record) -> TokenUsageUpdate | None:
     content_s3_key = row["content_s3_key"]
-    if content_s3_key:
+    if (
+        content_s3_key
+        and row["content_object_sha256"]
+        and row["content_object_size_bytes"] is not None
+        and row["content_object_verified_at"] is not None
+    ):
+        lines = read_verified_document_content(
+            content_s3_key,
+            sha256=row["content_object_sha256"],
+            size_bytes=int(row["content_object_size_bytes"]),
+        ).splitlines()
+    elif content_s3_key:
         lines = iter_large_content_lines(content_s3_key)
     else:
         lines = io.StringIO(str(row["content"] or ""))
@@ -378,7 +392,9 @@ async def run(*, apply: bool, limit: int | None) -> dict[str, Any]:
 
         statement = await conn.prepare(
             """
-            SELECT id, machine_id, tool_id, content, content_s3_key, content_hash
+            SELECT id, machine_id, tool_id, content, content_s3_key,
+                   content_object_sha256, content_object_size_bytes,
+                   content_object_verified_at, content_hash
             FROM documents
             WHERE category='conversation'
               AND tool_id=ANY($1::text[])

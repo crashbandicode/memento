@@ -13,6 +13,7 @@ from .celery_app import celery_app
 from ..db.models import Document
 from ..db.session import async_session_factory
 from ..services.summary_service import generate_document_summary
+from ..services.large_content_store import document_content_prefix
 
 
 async def _generate_summary(document_id: str) -> None:
@@ -21,7 +22,10 @@ async def _generate_summary(document_id: str) -> None:
             select(Document).where(Document.id == uuid.UUID(document_id))
         )
         doc = result.scalar_one_or_none()
-        if not doc or not doc.content:
+        if not doc:
+            return
+        content = await document_content_prefix(db, doc, max_chars=50_000)
+        if not content:
             return
 
         # Skip if already has a recent summary
@@ -32,7 +36,7 @@ async def _generate_summary(document_id: str) -> None:
 
         summary = generate_document_summary(
             title=doc.title or doc.relative_path,
-            content=doc.content[:50000],
+            content=content,
             tool_name=doc.tool_id,
             category=doc.category,
         )

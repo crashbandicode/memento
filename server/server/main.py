@@ -98,6 +98,48 @@ def _run_migrations(conn) -> None:
     # of silently dropped. Existing rows get 'ok' if they already have any
     # embedding rows, else 'pending' — the periodic retry task picks those up.
     doc_cols = {c["name"] for c in insp.get_columns("documents")}
+    # Immutable document-content pointers are additive. The backfill owns
+    # populating them; PostgreSQL content remains the compatibility source.
+    if "content_object_sha256" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN content_object_sha256 VARCHAR(64)"
+        ))
+    if "content_object_size_bytes" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN content_object_size_bytes BIGINT"
+        ))
+    if "content_object_verified_at" not in doc_cols:
+        conn.execute(text(
+            "ALTER TABLE documents ADD COLUMN content_object_verified_at TIMESTAMPTZ"
+        ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_content_s3_key "
+        "ON documents (content_s3_key)"
+    ))
+    # Existing installations can contain legacy raw/... keys without the new
+    # integrity columns. NOT VALID keeps the expand migration non-rewriting;
+    # it still enforces the all-or-none invariant for all new/updated rows.
+    conn.execute(text(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'ck_documents_content_object_pointer') THEN "
+        "ALTER TABLE documents ADD CONSTRAINT ck_documents_content_object_pointer "
+        "CHECK ((content_s3_key IS NULL AND content_object_sha256 IS NULL "
+        "AND content_object_size_bytes IS NULL) OR "
+        "(content_s3_key IS NOT NULL AND content_object_sha256 IS NOT NULL "
+        "AND content_object_size_bytes IS NOT NULL "
+        "AND content_object_size_bytes >= 0)) NOT VALID; "
+        "END IF; END $$"
+    ))
+    # Reserve durable candidate state now. GC wiring and object deletion are
+    # deliberately deferred until after the rollout observation window.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS document_content_gc_candidates ("
+        "content_s3_key VARCHAR(500) PRIMARY KEY, "
+        "first_unreferenced_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ")"
+    ))
     if "activity_at" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN activity_at TIMESTAMPTZ"

@@ -197,6 +197,7 @@ async def memory_recall(
 
     # Direct DB mode
     from sqlalchemy import select
+    from sqlalchemy.orm import undefer
     from .db import Document, Project
     async with _session_factory() as db:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -540,7 +541,13 @@ async def memory_open(doc_id: str) -> str:
     except ValueError:
         return f"Invalid doc_id: {doc_id}"
     async with _session_factory() as db:
-        doc = (await db.execute(select(Document).where(Document.id == did))).scalar_one_or_none()
+        doc = (
+            await db.execute(
+                select(Document)
+                .options(undefer(Document.content))
+                .where(Document.id == did)
+            )
+        ).scalar_one_or_none()
         if not doc:
             return f"Document {doc_id} not found."
         header = (

@@ -31,6 +31,7 @@ from .document_delivery import (
     current_revision_predicate,
     delivery_synced_expression,
 )
+from .large_content_store import document_content
 
 logger = logging.getLogger("embedding_service")
 
@@ -589,7 +590,7 @@ async def document_embedding_input(
     embedding_content = (
         ""
         if prefer_conversation_messages and doc.category == "conversation"
-        else doc.content or ""
+        else (await document_content(db, doc)) or ""
     )
     if not embedding_content and doc.category == "conversation":
         rows = (

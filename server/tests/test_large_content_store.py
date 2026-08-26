@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from botocore.exceptions import ClientError
 
@@ -24,6 +27,10 @@ from server.services.ingest_service import (  # noqa: E402
     _prepare_document_metadata,
 )
 from server.services.large_content_store import (  # noqa: E402
+    DocumentContentIntegrityError,
+    document_content,
+    document_content_key,
+    finalize_document_content,
     iter_large_content_lines,
     read_large_content_prefix,
     store_large_content,
@@ -89,7 +96,111 @@ class _StreamingS3:
         return {"Body": self.body}
 
 
+class _ImmutableS3:
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.put_calls = 0
+
+    def get_object(self, *, Bucket, Key):
+        try:
+            payload = self.objects[Key]
+        except KeyError as exc:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject") from exc
+        return {"Body": io.BytesIO(payload), "ContentLength": len(payload)}
+
+    def put_object(self, *, Bucket, Key, Body, **_kwargs):
+        self.put_calls += 1
+        self.objects[Key] = Body.read() if hasattr(Body, "read") else bytes(Body)
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class _FallbackDb:
+    async def execute(self, _statement):
+        return _ScalarResult("postgres compatibility text")
+
+
 class LargeContentStoreTests(unittest.TestCase):
+    def test_finalizer_puts_verifies_and_returns_transaction_pointer(self) -> None:
+        client = _ImmutableS3()
+        document_id = uuid.uuid4()
+
+        pointer = asyncio.run(
+            finalize_document_content(
+                document_id=document_id,
+                content="emoji 😀\n",
+                s3_client=client,
+            )
+        )
+
+        self.assertEqual(
+            pointer.key,
+            document_content_key(document_id=document_id, sha256=pointer.sha256),
+        )
+        self.assertEqual(client.objects[pointer.key], "emoji 😀\n".encode("utf-8"))
+        self.assertEqual(pointer.size_bytes, len("emoji 😀\n".encode("utf-8")))
+        self.assertIsNotNone(pointer.verified_at)
+
+    def test_finalizer_reuses_existing_exact_immutable_object(self) -> None:
+        client = _ImmutableS3()
+        document_id = uuid.uuid4()
+        first = asyncio.run(
+            finalize_document_content(
+                document_id=document_id,
+                content="same bytes",
+                s3_client=client,
+            )
+        )
+        second = asyncio.run(
+            finalize_document_content(
+                document_id=document_id,
+                content="same bytes",
+                s3_client=client,
+            )
+        )
+
+        self.assertEqual(first.key, second.key)
+        self.assertEqual(client.put_calls, 1)
+
+    def test_finalizer_refuses_mismatched_existing_content_addressed_key(self) -> None:
+        client = _ImmutableS3()
+        document_id = uuid.uuid4()
+        expected_hash = hashlib.sha256(b"expected").hexdigest()
+        client.objects[
+            document_content_key(document_id=document_id, sha256=expected_hash)
+        ] = b"corrupt"
+
+        with self.assertRaises(DocumentContentIntegrityError):
+            asyncio.run(
+                finalize_document_content(
+                    document_id=document_id,
+                    content="expected",
+                    s3_client=client,
+                )
+            )
+        self.assertEqual(client.put_calls, 0)
+
+    def test_dual_read_falls_back_to_postgres_when_object_is_missing(self) -> None:
+        document = SimpleNamespace(
+            id=uuid.uuid4(),
+            content_s3_key="document-content/v1/missing",
+            content_object_sha256=hashlib.sha256(b"expected").hexdigest(),
+            content_object_size_bytes=len(b"expected"),
+            content_object_verified_at=object(),
+        )
+        with patch.object(settings, "document_content_minio_enabled", True):
+            content = asyncio.run(
+                document_content(_FallbackDb(), document, s3_client=_ImmutableS3())
+            )
+
+        self.assertEqual(content, "postgres compatibility text")
+
     def test_large_content_lines_stream_without_whole_object_limit(self) -> None:
         client = _StreamingS3(b'{"first": 1}\n{"second": 2}\n')
 

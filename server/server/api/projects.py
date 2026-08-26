@@ -47,6 +47,7 @@ from ..services.document_delivery import (
     delivery_synced_expression,
     outerjoin_document_delivery,
 )
+from ..services.large_content_store import document_content, document_content_prefix
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -593,7 +594,7 @@ async def get_project(
     # always paginate via memory_conversation(doc_id).
     INLINE_CATEGORIES = {"identity", "memory", "plan", "learning", "note"}
 
-    def _doc_row(d: Document) -> dict:
+    async def _doc_row(d: Document) -> dict:
         row = {
             "id": str(d.id),
             "relative_path": d.relative_path,
@@ -603,7 +604,7 @@ async def get_project(
             "synced_at": d.synced_at.isoformat(),
         }
         if include_content and d.category in INLINE_CATEGORIES:
-            row["content"] = d.content
+            row["content"] = await document_content(db, d)
             if d.ai_summary:
                 row["ai_summary"] = d.ai_summary
         if d.category == "conversation":
@@ -634,7 +635,7 @@ async def get_project(
         "tool_id": project.tool_id,
         "source_path": project.source_path,
         "visibility": project.visibility,
-        "documents": [_doc_row(d) for d in docs],
+        "documents": [await _doc_row(d) for d in docs],
     }
 
 
@@ -1020,13 +1021,18 @@ async def get_project_timeline(
     plan_previews: dict = {}
     if page_plan_ids:
         plan_rows = await db.execute(
-            select(Document.id, Document.category, Document.content)
-            .where(Document.id.in_(page_plan_ids))
+            select(Document).where(Document.id.in_(page_plan_ids))
         )
-        for pid, pcat, pcontent in plan_rows.all():
+        for plan_document in plan_rows.scalars().all():
+            pid = plan_document.id
+            pcat = plan_document.category
+            pcontent = await document_content_prefix(
+                db,
+                plan_document,
+                max_chars=500 if pcat == "plan" else 300,
+            )
             if pcontent:
-                cap = 500 if pcat == "plan" else 300
-                plan_previews[pid] = pcontent[:cap]
+                plan_previews[pid] = pcontent
 
     # Stitch back onto page
     for ev in page:
@@ -1443,7 +1449,7 @@ async def get_project_conversations(
                 "id": str(p.id),
                 "title": p.title or doc_type,
                 "doc_type": doc_type,
-                "content": p.content[:5000] if p.content else None,
+                "content": await document_content_prefix(db, p, max_chars=5_000),
                 "file_size_bytes": p.file_size_bytes,
             })
 
@@ -1614,17 +1620,24 @@ async def export_project_markdown(
             # the full content is the point.
             if cat == "conversation" and d.ai_summary:
                 lines.append(d.ai_summary)
-            elif d.content:
+            else:
+                raw_content = await document_content(db, d)
+                if raw_content:
                 # Fence as plain text. Don't trust the source for
                 # well-formed markdown — but we DO trust it not to be
                 # binary because the model rejects binary content_types
                 # upstream. Cap per-doc to 200 KB so a single 1 MB
                 # conversation log doesn't dominate the file; the AI
                 # can call memory_open(id) for the rest.
-                blob = d.content if len(d.content) < 200_000 else d.content[:200_000] + "\n\n…(truncated; call memory_open() for full text)"
-                lines.append(blob)
-            else:
-                lines.append("*(empty)*")
+                    blob = (
+                        raw_content
+                        if len(raw_content) < 200_000
+                        else raw_content[:200_000]
+                        + "\n\n…(truncated; call memory_open() for full text)"
+                    )
+                    lines.append(blob)
+                else:
+                    lines.append("*(empty)*")
             lines.append("")
             lines.append("---")
             lines.append("")
@@ -1815,7 +1828,7 @@ async def get_project_blueprint(
                 "title": d.title,
                 "relative_path": d.relative_path,
                 "synced_at": d.synced_at.isoformat(),
-                "content": d.content,
+                "content": await document_content(db, d),
                 "ai_summary": d.ai_summary,
             }
             for d in curated_docs

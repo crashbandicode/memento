@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from ..config import settings
 from ..db.models import (
     ConversationMessage,
     ConversationUsageEvent,
@@ -60,6 +61,7 @@ from .history_recovery import (
     recovered_occurrence_anchors,
 )
 from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
+from .large_content_store import document_content, finalize_document_content
 from .subagent_lifecycle import (
     SUBAGENT_LIFECYCLE_AT_KEY,
     SUBAGENT_LIFECYCLE_EVIDENCE_KEY,
@@ -488,7 +490,10 @@ def _stored_source_is_current(
         return True
     metadata = document_metadata(doc)
     return bool(
-        (doc.content is not None or doc.content_s3_key)
+        # The raw compatibility TEXT is deferred on normal ingest reads. The
+        # durable source proof is sufficient to establish that a snapshot is
+        # present without hydrating a multi-megabyte attribute.
+        (doc.content_s3_key or metadata.get(STORED_SOURCE_HASH_KEY))
         and (not incoming_s3_key or doc.content_s3_key == incoming_s3_key)
         and metadata.get(STORED_SOURCE_REVISION_KEY) == revision_hash
         and metadata.get(STORED_SOURCE_HASH_KEY)
@@ -1758,7 +1763,6 @@ def _is_externalized_delta_update(
     """Return whether an incremental tail must keep the last full S3 source."""
     return (
         mode == "delta"
-        and doc.content is None
         and bool(doc.content_s3_key)
         and persist_content
     )
@@ -2411,6 +2415,9 @@ def _ingest_document_load_only():
         Document.content_type,
         Document.title,
         Document.content_s3_key,
+        Document.content_object_sha256,
+        Document.content_object_size_bytes,
+        Document.content_object_verified_at,
         Document.content_hash,
         Document.file_size_bytes,
         Document.metadata_,
@@ -2449,7 +2456,7 @@ async def _reconcile_claude_subagent_launch_metadata(
     if document.category == "state":
         evidence = _claude_subagent_sidecar_evidence(
             normalized_path,
-            document.content,
+            await document_content(db, document),
         )
         if evidence is None:
             return None
@@ -2494,7 +2501,7 @@ async def _reconcile_claude_subagent_launch_metadata(
             return None
         evidence = _claude_subagent_sidecar_evidence(
             sidecar_document.relative_path,
-            sidecar_document.content,
+            await document_content(db, sidecar_document),
         )
         if evidence is None:
             return None
@@ -2922,6 +2929,7 @@ async def ingest_file(
     authoritative_rebase: bool = False,
 ) -> Document:
     """Process and store an ingested file."""
+    content_store_enabled = settings.document_content_minio_enabled
     metadata = dict(metadata or {})
     category = normalize_ingest_category(tool_id, category, relative_path)
     cursor_projection_delta = (
@@ -2943,7 +2951,11 @@ async def ingest_file(
             raise ValueError("streamed conversation ingest must not include inline content")
         if not content_already_sanitized:
             raise ValueError("streamed conversation source must already be sanitized")
-        if mode == "full" and (persist_content or not content_s3_key):
+        if (
+            mode == "full"
+            and not content_store_enabled
+            and (persist_content or not content_s3_key)
+        ):
             raise ValueError(
                 "streamed full conversation must retain only its object-store key"
             )
@@ -3350,6 +3362,9 @@ async def ingest_file(
         if doc is not None
         else None
     )
+    # This remains the exact compatibility text. For a streamed FULL it is
+    # hydrated only after parsing, immediately before the dual-write pointer
+    # finalizer; DELTAs retain their existing FULL source pointer.
     stored_blob_content = content
     stored_revision_hash = content_hash if mode == "full" else None
     preserve_stored_source_identity = False
@@ -3374,6 +3389,9 @@ async def ingest_file(
         from .embedding_service import desired_embedding_tier
 
         doc = Document(
+            # Allocate before the immutable PUT so the final key is stable
+            # throughout the still-uncommitted ingest transaction.
+            id=uuid.uuid4(),
             tool_id=tool_id,
             project_id=project_id,
             machine_id=machine_id,
@@ -3381,12 +3399,8 @@ async def ingest_file(
             category=category,
             content_type=content_type,
             title=title,
-            content=(
-                content
-                if persist_content and conversation_source is None
-                else None
-            ),
-            content_s3_key=content_s3_key,
+            content=(content if persist_content and conversation_source is None else None),
+            content_s3_key=(None if content_store_enabled else content_s3_key),
             content_hash=content_hash,
             file_size_bytes=logical_file_size,
             metadata_=stored_metadata,
@@ -3408,7 +3422,7 @@ async def ingest_file(
             mode=mode,
             persist_content=persist_content,
         )
-        if not persist_content:
+        if not persist_content and not content_store_enabled:
             doc.content = None
             doc.content_s3_key = content_s3_key
         elif category == "conversation" and mode == "delta":
@@ -3420,11 +3434,13 @@ async def ingest_file(
             # messages until another FULL source snapshot arrives.
             preserve_stored_source_identity = True
         elif (
-            mode == "delta"
-            and doc.content
-            and conversation_source is None
+            mode == "delta" and conversation_source is None
         ):
-            doc.content = doc.content + "\n" + content
+            # Non-conversation DELTAs advance raw source. Fetch it through the
+            # dual-read accessor instead of accidentally lazy-loading deferred
+            # PostgreSQL TEXT; the finalizer publishes the exact concatenation.
+            previous_content = await document_content(db, doc)
+            doc.content = (previous_content + "\n" + content) if previous_content else content
             if previous_stored_revision == base_hash:
                 stored_revision_hash = content_hash
             else:
@@ -3432,7 +3448,7 @@ async def ingest_file(
             stored_blob_content = doc.content
         elif conversation_source is None:
             doc.content = content
-        if persist_content and not preserve_externalized_delta:
+        if persist_content and not preserve_externalized_delta and not content_store_enabled:
             doc.content_s3_key = None
         latest_source_modified_at = max(
             filter(None, (current_source_modified_at, source_modified_at))
@@ -3558,7 +3574,7 @@ async def ingest_file(
     if enriched_claude_child is not None and enriched_claude_child.id != doc.id:
         enriched_lifecycle_changed = _reconcile_subagent_document_lifecycle(
             enriched_claude_child,
-            enriched_claude_child.content,
+            await document_content(db, enriched_claude_child),
         )
     if (
         enriched_claude_child is not None
@@ -3652,6 +3668,38 @@ async def ingest_file(
 
         await reconcile_orchestration_for_document(db, doc)
 
+    # Every accepted FULL and every non-conversation DELTA publishes one
+    # immutable exact-byte object only after parser staging succeeded. The
+    # PUT/reuse + streamed-GET proof finishes before these pointer fields can
+    # commit with messages, sync state, and delivery state. Conversation
+    # DELTAs intentionally retain the last durable FULL pointer.
+    should_finalize_content = content_store_enabled and (
+        mode == "full" or category != "conversation"
+    )
+    if should_finalize_content:
+        if conversation_source is not None:
+            # Compatibility mode keeps PostgreSQL's exact logical text while
+            # the finalizer streams the sanitized source file to MinIO.
+            stored_blob_content = await asyncio.to_thread(
+                conversation_source.path.read_text,
+                encoding="utf-8",
+                errors="replace",
+            )
+            doc.content = stored_blob_content
+            pointer = await finalize_document_content(
+                document_id=doc.id,
+                payload_path=conversation_source.path,
+            )
+        else:
+            pointer = await finalize_document_content(
+                document_id=doc.id,
+                content=stored_blob_content,
+            )
+        doc.content_s3_key = pointer.key
+        doc.content_object_sha256 = pointer.sha256
+        doc.content_object_size_bytes = pointer.size_bytes
+        doc.content_object_verified_at = pointer.verified_at
+
     if category in _EMBEDDING_CATEGORIES:
         from .embedding_service import document_embedding_input
 
@@ -3686,7 +3734,7 @@ async def ingest_file(
     if category == "conversation":
         searchable_content = conversation_search_text
     else:
-        searchable_content = (doc.content or "")[:MAX_SEARCH_TEXT_CHARS]
+        searchable_content = stored_blob_content[:MAX_SEARCH_TEXT_CHARS]
     if refresh_content_tsv:
         tsv_input = _tok(f"{doc.title or ''} {searchable_content}")
         await db.execute(

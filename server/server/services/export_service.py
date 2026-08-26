@@ -43,6 +43,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .large_content_store import document_content
+
 from ..db.models import (
     AccessLog, ConversationMessage, DailySummary, Document, DocumentVersion,
     KnowledgeEntity, KnowledgeObservation, KnowledgeRelation, Machine,
@@ -180,6 +182,7 @@ async def build_export(
             doc_rows = []
             for d in docs:
                 doc_ids.add(d.id)
+                content = await document_content(db, d)
                 doc_rows.append({
                     "id": str(d.id),
                     "tool_id": d.tool_id,
@@ -189,7 +192,7 @@ async def build_export(
                     "category": d.category,
                     "content_type": d.content_type,
                     "title": d.title,
-                    "content": d.content,
+                    "content": content,
                     "content_hash": d.content_hash,
                     "file_size_bytes": d.file_size_bytes,
                     "ai_summary": d.ai_summary,

@@ -36,7 +36,10 @@ from server.services.ingest_service import (
     _bounded_message_text,
     iter_stored_conversation_messages,
 )
-from server.services.large_content_store import read_large_content
+from server.services.large_content_store import (
+    read_large_content,
+    read_verified_document_content,
+)
 from server.services.history_recovery import (
     UserOccurrence,
     partition_recovered_occurrences,
@@ -65,6 +68,9 @@ class SourceRevision:
     stored_source_revision: str | None
     stored_source_hash: str | None
     stored_source_size: int | None
+    content_object_sha256: str | None = None
+    content_object_size_bytes: int | None = None
+    content_object_verified_at: object | None = None
 
 
 def _database_dsn() -> str:
@@ -280,6 +286,8 @@ async def _source_revision(
     row = await conn.fetchrow(
         """
         SELECT id, tool_id, content_s3_key, content_hash, file_size_bytes
+             , content_object_sha256, content_object_size_bytes
+             , content_object_verified_at
              , metadata->>$3 AS stored_source_revision
              , metadata->>$4 AS stored_source_hash
              , (metadata->>$5)::bigint AS stored_source_size
@@ -307,6 +315,13 @@ async def _source_revision(
             if row["stored_source_size"] is not None
             else None
         ),
+        content_object_sha256=row["content_object_sha256"],
+        content_object_size_bytes=(
+            int(row["content_object_size_bytes"])
+            if row["content_object_size_bytes"] is not None
+            else None
+        ),
+        content_object_verified_at=row["content_object_verified_at"],
     )
 
 
@@ -314,6 +329,18 @@ async def _source_payload(
     conn: asyncpg.Connection,
     source: SourceRevision,
 ) -> str:
+    if (
+        source.content_s3_key
+        and source.content_object_sha256
+        and source.content_object_size_bytes is not None
+        and source.content_object_verified_at is not None
+    ):
+        return await asyncio.to_thread(
+            read_verified_document_content,
+            source.content_s3_key,
+            sha256=source.content_object_sha256,
+            size_bytes=source.content_object_size_bytes,
+        )
     if source.content_s3_key:
         if source.stored_source_size is None:
             raise ValueError("stored source size is not recorded")

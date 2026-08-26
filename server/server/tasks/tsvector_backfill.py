@@ -15,6 +15,7 @@ from sqlalchemy import func, select, update
 from ..db.models import ConversationMessage, Document
 from ..db.session import async_session_factory
 from ..services.tokenize import tokenize_for_index
+from ..services.large_content_store import document_content_prefix
 from .celery_app import celery_app
 
 logger = logging.getLogger("tsvector_backfill")
@@ -32,21 +33,22 @@ async def _run() -> dict:
         while True:
             rows = (
                 await db.execute(
-                    select(
-                        Document.id,
-                        Document.title,
-                        Document.category,
-                        func.left(Document.content, MAX_SEARCH_TEXT_CHARS),
-                    )
+                    select(Document)
                     .where(Document.content_tsv.is_(None))
                     .limit(BATCH_SIZE)
                 )
             ).all()
             if not rows:
                 break
-            for did, title, category, content in rows:
+            for (document,) in rows:
                 total += 1
-                if category == "conversation":
+                did = document.id
+                content = await document_content_prefix(
+                    db,
+                    document,
+                    max_chars=MAX_SEARCH_TEXT_CHARS,
+                )
+                if document.category == "conversation":
                     message_rows = (
                         (
                             await db.execute(
@@ -72,7 +74,9 @@ async def _run() -> dict:
                     )[:MAX_SEARCH_TEXT_CHARS]
                     if normalized_content:
                         content = normalized_content
-                tsv_input = tokenize_for_index(f"{title or ''} {content or ''}")
+                tsv_input = tokenize_for_index(
+                    f"{document.title or ''} {content or ''}"
+                )
                 await db.execute(
                     update(Document)
                     .where(Document.id == did)

@@ -2,19 +2,44 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import boto3
 from botocore.client import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from ..config import settings
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
 
 DATABASE_CONTENT_MAX_BYTES = 1024 * 1024
+DOCUMENT_CONTENT_PREFIX = "document-content/v1"
+_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+class DocumentContentIntegrityError(RuntimeError):
+    """An immutable object is absent or does not match its recorded proof."""
+
+
+class DocumentContentUnavailableError(RuntimeError):
+    """Neither a verified object nor the compatibility PG copy is readable."""
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentContentPointer:
+    key: str
+    sha256: str
+    size_bytes: int
+    verified_at: datetime
 
 
 def _client():
@@ -26,6 +51,309 @@ def _client():
         config=Config(signature_version="s3v4"),
         region_name="us-east-1",
     )
+
+
+def document_content_key(*, document_id: object, sha256: str) -> str:
+    """Return the deterministic immutable key for one exact document value."""
+    if len(sha256) != 64:
+        raise ValueError("document content SHA-256 must be 64 hexadecimal characters")
+    return f"{DOCUMENT_CONTENT_PREFIX}/{document_id}/{sha256}"
+
+
+def _is_missing_object_error(exc: BaseException) -> bool:
+    if not isinstance(exc, ClientError):
+        return False
+    code = str(exc.response.get("Error", {}).get("Code", ""))
+    return code in {"404", "NoSuchKey", "NoSuchObject", "NotFound"}
+
+
+def _payload_proof(
+    *,
+    content: str | None = None,
+    payload_path: Path | None = None,
+) -> tuple[str, int, bytes | None]:
+    """Hash exactly one sanitized text payload without changing its bytes."""
+    if (content is None) == (payload_path is None):
+        raise ValueError("provide exactly one of content or payload_path")
+    if content is not None:
+        payload = content.encode("utf-8")
+        return hashlib.sha256(payload).hexdigest(), len(payload), payload
+
+    assert payload_path is not None
+    digest = hashlib.sha256()
+    size = 0
+    with payload_path.open("rb", buffering=0) as stream:
+        while chunk := stream.read(_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size, None
+
+
+def _stream_verified_object(
+    key: str,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    s3_client=None,
+    collect: bool,
+) -> bytes | None:
+    """GET an object once and prove its actual streamed bytes before use."""
+    client = s3_client or _client()
+    response = client.get_object(Bucket=settings.s3_bucket, Key=key)
+    body = response["Body"]
+    digest = hashlib.sha256()
+    size = 0
+    chunks: list[bytes] | None = [] if collect else None
+    try:
+        while chunk := body.read(_STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+            size += len(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+
+    actual_sha256 = digest.hexdigest()
+    if size != expected_size or actual_sha256 != expected_sha256:
+        raise DocumentContentIntegrityError(
+            "document content object integrity mismatch "
+            f"for {key}: expected {expected_size}/{expected_sha256}, "
+            f"got {size}/{actual_sha256}"
+        )
+    return b"".join(chunks) if chunks is not None else None
+
+
+def verify_document_content_object(
+    key: str,
+    *,
+    sha256: str,
+    size_bytes: int,
+    s3_client=None,
+) -> None:
+    """Stream-GET and verify one immutable document-content object."""
+    _stream_verified_object(
+        key,
+        expected_sha256=sha256,
+        expected_size=size_bytes,
+        s3_client=s3_client,
+        collect=False,
+    )
+
+
+def read_verified_document_content(
+    key: str,
+    *,
+    sha256: str,
+    size_bytes: int,
+    s3_client=None,
+) -> str:
+    """Read text only after the immutable object's streamed integrity proof."""
+    payload = _stream_verified_object(
+        key,
+        expected_sha256=sha256,
+        expected_size=size_bytes,
+        s3_client=s3_client,
+        collect=True,
+    )
+    assert payload is not None
+    return payload.decode("utf-8")
+
+
+def _put_or_reuse_document_content(
+    *,
+    document_id: object,
+    sha256: str,
+    size_bytes: int,
+    content: str | None = None,
+    payload_path: Path | None = None,
+    s3_client=None,
+) -> DocumentContentPointer:
+    """Publish only verified immutable bytes; a conflicting key is fatal."""
+    client = s3_client or _client()
+    key = document_content_key(document_id=document_id, sha256=sha256)
+    try:
+        verify_document_content_object(
+            key,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            s3_client=client,
+        )
+    except ClientError as exc:
+        if not _is_missing_object_error(exc):
+            raise
+        extra_args = {
+            "Bucket": settings.s3_bucket,
+            "Key": key,
+            "ContentType": "text/plain; charset=utf-8",
+            "Metadata": {
+                "memento-document-id": str(document_id),
+                "memento-content-sha256": sha256,
+                "memento-content-size": str(size_bytes),
+            },
+        }
+        try:
+            if content is not None:
+                extra_args["Body"] = content.encode("utf-8")
+                client.put_object(**extra_args)
+            else:
+                assert payload_path is not None
+                with payload_path.open("rb") as stream:
+                    extra_args["Body"] = stream
+                    extra_args["ContentLength"] = size_bytes
+                    client.put_object(**extra_args)
+        except Exception as put_error:
+            # An object-store timeout is ambiguous. Probe the deterministic
+            # key before reporting failure: a matching completed PUT may be
+            # reused, but an absent or mismatched object is never overwritten.
+            try:
+                verify_document_content_object(
+                    key,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    s3_client=client,
+                )
+            except DocumentContentIntegrityError:
+                raise
+            except Exception:
+                raise put_error
+    except DocumentContentIntegrityError:
+        # The key is content-addressed. A mismatch is corruption or a hostile
+        # overwrite; never replace it with this request's bytes.
+        raise
+
+    # A timed-out PUT can still have succeeded. Reusing the deterministic key
+    # is safe only after this GET hashes the exact local proof.
+    verify_document_content_object(
+        key,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        s3_client=client,
+    )
+    return DocumentContentPointer(
+        key=key,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        verified_at=datetime.now(timezone.utc),
+    )
+
+
+async def finalize_document_content(
+    *,
+    document_id: object,
+    content: str | None = None,
+    payload_path: Path | None = None,
+    s3_client=None,
+) -> DocumentContentPointer:
+    """Run the write-path PUT/reuse/GET verification before pointer commit.
+
+    The caller owns the still-uncommitted SQLAlchemy transaction. It computes
+    the sanitized payload proof here, stages normalized rows first, calls this
+    finalizer, then assigns the returned pointer and commits everything once.
+    """
+    sha256, size_bytes, _ = await asyncio.to_thread(
+        _payload_proof,
+        content=content,
+        payload_path=payload_path,
+    )
+    return await asyncio.to_thread(
+        _put_or_reuse_document_content,
+        document_id=document_id,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        content=content,
+        payload_path=payload_path,
+        s3_client=s3_client,
+    )
+
+
+async def _inline_document_content(db: "AsyncSession", document_id: object) -> str | None:
+    """Explicitly hydrate the deferred compatibility copy only on fallback."""
+    from sqlalchemy import select
+
+    from ..db.models import Document
+
+    return (
+        await db.execute(select(Document.content).where(Document.id == document_id))
+    ).scalar_one_or_none()
+
+
+def _pointer_is_verified(document: object) -> bool:
+    return bool(
+        getattr(document, "content_s3_key", None)
+        and getattr(document, "content_object_sha256", None)
+        and getattr(document, "content_object_size_bytes", None) is not None
+        and getattr(document, "content_object_verified_at", None) is not None
+    )
+
+
+async def document_content(
+    db: "AsyncSession",
+    document: object,
+    *,
+    s3_client=None,
+) -> str | None:
+    """Return the exact logical text, preferring a verified object on rollout.
+
+    In compatibility mode every object transport or integrity failure falls
+    back to the explicit PostgreSQL copy. It never reconstructs raw source
+    from normalized conversation messages.
+    """
+    document_id = getattr(document, "id")
+    if settings.document_content_minio_enabled and _pointer_is_verified(document):
+        try:
+            return await asyncio.to_thread(
+                read_verified_document_content,
+                getattr(document, "content_s3_key"),
+                sha256=getattr(document, "content_object_sha256"),
+                size_bytes=int(getattr(document, "content_object_size_bytes")),
+                s3_client=s3_client,
+            )
+        except (
+            BotoCoreError,
+            ClientError,
+            DocumentContentIntegrityError,
+            OSError,
+            UnicodeError,
+        ):
+            # PostgreSQL remains authoritative during dual-read. The caller
+            # sees the historical text, never a corrupt object body.
+            pass
+
+    inline = await _inline_document_content(db, document_id)
+    if inline is not None:
+        return inline
+    if settings.document_content_minio_enabled and _pointer_is_verified(document):
+        raise DocumentContentUnavailableError(
+            f"verified document content for {document_id} is unavailable"
+        )
+    return None
+
+
+async def document_content_prefix(
+    db: "AsyncSession",
+    document: object,
+    *,
+    max_chars: int,
+    s3_client=None,
+) -> str | None:
+    """Return the same character-prefix callers previously sliced from TEXT."""
+    if max_chars <= 0:
+        return ""
+    content = await document_content(db, document, s3_client=s3_client)
+    return None if content is None else content[:max_chars]
+
+
+async def document_content_lines(
+    db: "AsyncSession",
+    document: object,
+    *,
+    s3_client=None,
+) -> list[str]:
+    """Expose raw source lines through the single dual-read abstraction."""
+    content = await document_content(db, document, s3_client=s3_client)
+    return [] if content is None else content.splitlines()
 
 
 def large_content_key(*, user_id: str, device_id: str, job_id: str) -> str:
@@ -169,3 +497,31 @@ def read_large_content(
     if len(payload) > max_bytes:
         raise ValueError("externalized transcript exceeds repair limit")
     return payload.decode("utf-8", errors="replace")
+
+
+def copy_legacy_large_content_to_path(
+    key: str,
+    target_path: Path,
+    *,
+    s3_client=None,
+) -> Path:
+    """Stream a legacy ``raw/`` object into a local finalizer payload file.
+
+    Legacy keys have no recorded SHA/size proof, so this routine deliberately
+    makes no trust claim about them. The document-content finalizer computes a
+    new proof and verifies the copied immutable object before switching the DB
+    pointer. It avoids the old whole-object repair cap while migrating large
+    historical transcripts.
+    """
+    client = s3_client or _client()
+    response = client.get_object(Bucket=settings.s3_bucket, Key=key)
+    body = response["Body"]
+    try:
+        with target_path.open("wb", buffering=0) as target:
+            while chunk := body.read(_STREAM_CHUNK_BYTES):
+                target.write(chunk)
+    finally:
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
+    return target_path

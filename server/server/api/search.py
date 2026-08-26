@@ -39,6 +39,7 @@ from ..services.document_delivery import (
     delivery_source_modified_expression,
     delivery_synced_expression,
 )
+from ..services.large_content_store import document_content
 from ..services.user_filter import user_machine_ids, apply_user_filter
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -452,22 +453,6 @@ async def search(
     if tsquery:
         conds.append(Document.content_tsv.op("@@")(func.to_tsquery("simple", tsquery)))
 
-    content_match_position = func.strpos(func.lower(Document.content), q.lower())
-    bounded_content_snippet = case(
-        (
-            and_(
-                Document.category != "conversation",
-                Document.content.is_not(None),
-                content_match_position > 0,
-            ),
-            func.substr(
-                Document.content,
-                func.greatest(content_match_position - 100, 1),
-                len(q) + 200,
-            ),
-        ),
-        else_="",
-    ).label("content_snippet")
     query = select(*_search_document_columns()).where(or_(*conds))
 
     if tool:
@@ -622,17 +607,19 @@ async def search(
     ]
     content_snippets: dict = {}
     if non_conversation_ids:
-        snippet_rows = (
+        snippet_documents = (
             await db.execute(
-                select(Document.id, bounded_content_snippet).where(
-                    Document.id.in_(non_conversation_ids)
-                )
+                select(Document).where(Document.id.in_(non_conversation_ids))
             )
-        ).all()
-        content_snippets = {
-            document_id: snippet or ""
-            for document_id, snippet in snippet_rows
-        }
+        ).scalars().all()
+        for document in snippet_documents:
+            content = (await document_content(db, document)) or ""
+            position = content.casefold().find(q.casefold())
+            if position >= 0:
+                start = max(position - 100, 0)
+                content_snippets[document.id] = content[start : start + len(q) + 200]
+            else:
+                content_snippets[document.id] = ""
 
     # Fetch at most one bounded matching normalized message per conversation
     # result. The main page query selects metadata plus a SQL-bounded snippet,

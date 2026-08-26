@@ -58,6 +58,7 @@ from ..services.conversation_markdown import (
     safe_markdown_filename,
     write_conversation_markdown,
 )
+from ..services.large_content_store import document_content
 from ..services.conversation_parser import parse_conversation
 from ..services.message_search import (
     build_message_search_expressions,
@@ -111,6 +112,10 @@ class _ExportDocument:
     project_title: str | None
     machine_name: str | None
     project_id: uuid.UUID | None
+    content_s3_key: str | None
+    content_object_sha256: str | None
+    content_object_size_bytes: int | None
+    content_object_verified_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,11 +346,7 @@ async def _message_stream(
             )
         return
 
-    raw_content = (
-        await db.execute(
-            select(Document.content).where(Document.id == document.id)
-        )
-    ).scalar_one_or_none()
+    raw_content = await document_content(db, document)
     if not raw_content:
         return
     user_role_origin = conversation_user_role_origin(
@@ -481,6 +482,10 @@ async def _load_document(
             delivery_source_modified_expression(),
             delivery_synced_expression(),
             Document.project_id,
+            Document.content_s3_key,
+            Document.content_object_sha256,
+            Document.content_object_size_bytes,
+            Document.content_object_verified_at,
             Project.title.label("project_title"),
             Machine.name.label("machine_name"),
         )
@@ -520,6 +525,10 @@ def _row_document(row: Mapping[str, Any]) -> _ExportDocument:
         project_title=row["project_title"],
         machine_name=row["machine_name"],
         project_id=row["project_id"],
+        content_s3_key=row["content_s3_key"],
+        content_object_sha256=row["content_object_sha256"],
+        content_object_size_bytes=row["content_object_size_bytes"],
+        content_object_verified_at=row["content_object_verified_at"],
     )
 
 
@@ -540,6 +549,10 @@ async def _all_documents(
             delivery_source_modified_expression(),
             delivery_synced_expression(),
             Document.project_id,
+            Document.content_s3_key,
+            Document.content_object_sha256,
+            Document.content_object_size_bytes,
+            Document.content_object_verified_at,
             Project.title.label("project_title"),
             Machine.name.label("machine_name"),
         )

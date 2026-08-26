@@ -22,6 +22,7 @@ from server.db.models import ConversationMessage, Document
 from server.db.session import async_session_factory, engine
 from server.services.document_delivery import delivery_metadata_expression
 from server.services.ingest_service import _claude_subagent_sidecar_evidence
+from server.services.large_content_store import document_content
 from server.services.subagent_lifecycle import (
     SUBAGENT_TERMINAL_STATUSES,
     child_lifecycle_evidence,
@@ -313,7 +314,7 @@ async def backfill_subagent_lifecycle(
     for sidecar in sidecars:
         evidence = _claude_subagent_sidecar_evidence(
             sidecar.relative_path,
-            sidecar.content,
+            await document_content(db, sidecar),
         )
         if evidence is None:
             continue
@@ -388,7 +389,7 @@ async def backfill_subagent_lifecycle(
         lifecycle = child_lifecycle_evidence(
             child.tool_id,
             merged_metadata,
-            child.content,
+            await document_content(db, child),
             source_timestamp=child.source_modified_at,
         )
         merged_metadata, _ = reconcile_child_lifecycle_metadata(

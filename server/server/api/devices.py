@@ -27,6 +27,7 @@ from ..services.agent_control import (
     record_capabilities,
 )
 from ..services.document_delivery import delivery_synced_expression
+from ..services.large_content_store import document_content
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
 
@@ -159,11 +160,15 @@ async def get_device_discovery(
     )
     doc = doc_result.scalar_one_or_none()
 
-    if not doc or not doc.content:
+    if not doc:
+        return {"device_id": str(device_db_id), "tools": {}}
+
+    content = await document_content(db, doc)
+    if not content:
         return {"device_id": str(device_db_id), "tools": {}}
 
     try:
-        tools = json.loads(doc.content)
+        tools = json.loads(content)
     except Exception:
         tools = {}
 

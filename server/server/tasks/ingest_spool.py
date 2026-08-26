@@ -12,6 +12,7 @@ from uuid import UUID
 from billiard.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select, text
 
+from ..config import settings
 from ..db.models import Document, SyncState
 from ..db.session import async_session_factory
 from ..services.content_sanitizer import sanitize_content_file
@@ -95,6 +96,9 @@ async def _ingest_ready_job(
         payload_bytes > DATABASE_CONTENT_MAX_BYTES
         and meta.get("category") == "conversation"
         and meta.get("mode", "full") == "full"
+        # Flag-off preserves the existing job-keyed externalization behavior.
+        # Flag-on routes every source through ingest_service's finalizer.
+        and not settings.document_content_minio_enabled
     )
     # Device registration/heartbeat is its own short transaction. Holding the
     # machine row lock through a multi-minute transcript parse starves normal
@@ -179,7 +183,11 @@ async def _ingest_ready_job(
     stream_conversation = (
         meta.get("category") == "conversation"
         and meta.get("content_type") == "jsonl"
-        and (externalize_content or meta.get("mode", "full") == "delta")
+        and (
+            externalize_content
+            or settings.document_content_minio_enabled
+            or meta.get("mode", "full") == "delta"
+        )
     )
     if externalize_content or stream_conversation:
         sanitized_name = (

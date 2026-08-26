@@ -13,6 +13,7 @@ from ..db.session import get_db
 from ..middleware.access_log import log_access
 from ..middleware.auth import get_current_user, get_optional_user
 from ..services.permission_service import can_view_document
+from ..services.large_content_store import document_content
 from ..services.user_filter import user_machine_ids
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -44,6 +45,7 @@ async def get_document(
     mids = await user_machine_ids(db, _user)
     doc = await _get_doc_with_permission(doc_id, db, user, mids)
     await log_access(db, request, "view_document", user.id if user else None, doc.id)
+    content = await document_content(db, doc)
 
     return {
         "id": str(doc.id),
@@ -53,7 +55,7 @@ async def get_document(
         "category": doc.category,
         "content_type": doc.content_type,
         "title": doc.title,
-        "content": doc.content,
+        "content": content,
         "content_hash": doc.content_hash,
         "file_size_bytes": doc.file_size_bytes,
         "metadata": doc.metadata_,
@@ -73,7 +75,10 @@ async def get_document_raw(
 ) -> dict:
     mids = await user_machine_ids(db, _user)
     doc = await _get_doc_with_permission(doc_id, db, user, mids)
-    return {"content": doc.content, "content_type": doc.content_type}
+    return {
+        "content": await document_content(db, doc),
+        "content_type": doc.content_type,
+    }
 
 
 @router.get("/{doc_id}/history")

@@ -66,12 +66,14 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..db.models import (
     AccessLog, ConversationMessage, DailySummary, Document, DocumentVersion,
     KnowledgeEntity, KnowledgeObservation, KnowledgeRelation, Machine,
     Project, ShareLink, Tool, User,
 )
 from ..tool_catalog import tool_display_name
+from .large_content_store import finalize_document_content
 
 logger = logging.getLogger("memento.import")
 
@@ -423,6 +425,14 @@ async def run_import(
         proj_id = project_id_map.get(old_proj) if old_proj else None
         content = r.get("content") or ""
         tsv_input = tokenize_for_index((r.get("title") or "") + " " + content)
+        pointer = None
+        if settings.document_content_minio_enabled:
+            # The imported UUID is allocated before its immutable object key;
+            # an import rollback can only leave an unreferenced safe orphan.
+            pointer = await finalize_document_content(
+                document_id=new_id,
+                content=content,
+            )
         await db.execute(
             pg_insert(Document).values(
                 id=new_id,
@@ -434,6 +444,10 @@ async def run_import(
                 content_type=r.get("content_type") or "text",
                 title=r.get("title"),
                 content=content,
+                content_s3_key=pointer.key if pointer else None,
+                content_object_sha256=pointer.sha256 if pointer else None,
+                content_object_size_bytes=pointer.size_bytes if pointer else None,
+                content_object_verified_at=pointer.verified_at if pointer else None,
                 content_hash=(r.get("content_hash") or hashlib.sha256(content.encode()).hexdigest()),
                 file_size_bytes=int(r.get("file_size_bytes") or len(content)),
                 content_tsv=func.to_tsvector("simple", tsv_input) if tsv_input else None,
