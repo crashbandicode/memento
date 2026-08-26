@@ -172,8 +172,14 @@ export function useSSE(
       if (stopped || documentIsHidden()) return;
       const now = Date.now();
       // visibilitychange, focus, pageshow, and online can arrive together.
-      // One reconnect/catch-up is sufficient for the whole resume transition.
-      if (now - lastResumeAt < 750) return;
+      // Coalesce only while a live attempt still exists. A mobile browser can
+      // deliver focus -> hidden -> visible in the same task; hidden closes the
+      // first attempt and clears its retry. Suppressing the final visible
+      // event in that state leaves the stream permanently dead.
+      const hasLiveAttempt = connecting
+        || es?.readyState === EventSource.OPEN
+        || es?.readyState === EventSource.CONNECTING;
+      if (now - lastResumeAt < 750 && hasLiveAttempt) return;
       lastResumeAt = now;
       // A deliberate resume (focus/visibility/online) should reconnect promptly,
       // not at a backed-off delay from earlier failures.
@@ -199,7 +205,16 @@ export function useSSE(
     }
 
     function handlePageShow(event: PageTransitionEvent) {
-      if (event.persisted) resume();
+      if (!event.persisted) return;
+      // A bfcache restore can preserve a stale React tree even when the SSE
+      // cursor reconnects successfully. Force every data consumer to fetch a
+      // current snapshot before relying on replayed events.
+      onEventRef.current({
+        type: "realtime_reset",
+        data: { reason: "bfcache_restore" },
+        timestamp: Date.now() / 1_000,
+      });
+      resume();
     }
 
     function handleBlur() {

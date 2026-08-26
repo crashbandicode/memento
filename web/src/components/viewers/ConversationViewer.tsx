@@ -478,7 +478,11 @@ export default function ConversationViewer({
   artifacts?: Artifact[];
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
-  const [loading, setLoading] = useState(false);
+  // This state is intentionally restricted to reader-driven work (the first
+  // page, historical paging, and an explicit prompt jump). Live SSE tail
+  // reconciliation has its own ref below and must never borrow this state:
+  // doing so makes the bottom reader indicator flash on every file_synced.
+  const [isUserLoading, setIsUserLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [hasEarlier, setHasEarlier] = useState(false);
   const [knownTotal, setKnownTotal] = useState(totalMessages);
@@ -775,7 +779,7 @@ export default function ConversationViewer({
   const loadMore = async ({ force = false }: { force?: boolean } = {}) => {
     if (loadingRef.current || (!force && !hasMore)) return;
     loadingRef.current = true;
-    setLoading(true);
+    setIsUserLoading(true);
     try {
       const res = await api.getMessagesAfter(
         documentId,
@@ -809,7 +813,7 @@ export default function ConversationViewer({
     } catch (e) {
       console.error("Failed to load messages:", e);
     } finally {
-      setLoading(false);
+      setIsUserLoading(false);
       loadingRef.current = false;
     }
   };
@@ -820,7 +824,7 @@ export default function ConversationViewer({
     if (beforeLine === null) return;
 
     loadingRef.current = true;
-    setLoading(true);
+    setIsUserLoading(true);
     try {
       const res = await api.getMessagesBefore(
         documentId,
@@ -839,7 +843,7 @@ export default function ConversationViewer({
     } catch (error) {
       console.error("Failed to load earlier messages:", error);
     } finally {
-      setLoading(false);
+      setIsUserLoading(false);
       loadingRef.current = false;
     }
   };
@@ -1214,7 +1218,7 @@ export default function ConversationViewer({
       if (!promptAlreadyLoaded) {
       loadedTargetWindow = true;
       loadingRef.current = true;
-      setLoading(true);
+      setIsUserLoading(true);
       try {
         const promptGap = containingPromptLine !== null
           ? Math.max(0, scrollLine - containingPromptLine)
@@ -1318,7 +1322,7 @@ export default function ConversationViewer({
         setNavigatingPromptLine(null);
         return;
       } finally {
-        setLoading(false);
+        setIsUserLoading(false);
         loadingRef.current = false;
       }
       }
@@ -1770,6 +1774,7 @@ export default function ConversationViewer({
         data-contiguous-end={offsetRef.current}
         data-detached-start={detachedTail?.offset}
         data-detached-end={detachedTail?.endOffset}
+        data-conversation-loading={isUserLoading ? "true" : "false"}
         onScroll={handleScroll}
         onWheel={enablePassiveAnchorTracking}
         onTouchStart={enablePassiveAnchorTracking}
@@ -1795,7 +1800,7 @@ export default function ConversationViewer({
                 type="button"
                 data-load-earlier-messages
                 onClick={loadEarlier}
-                disabled={loading}
+                disabled={isUserLoading}
                 style={{
                   padding: "7px 12px",
                   borderRadius: 999,
@@ -1803,8 +1808,8 @@ export default function ConversationViewer({
                   background: "var(--aurora-chip)",
                   color: "var(--aurora-fg3)",
                   fontSize: 12,
-                  cursor: loading ? "wait" : "pointer",
-                  opacity: loading ? 0.7 : 1,
+                  cursor: isUserLoading ? "wait" : "pointer",
+                  opacity: isUserLoading ? 0.7 : 1,
                 }}
               >
                 {t.conversation.loadEarlier}
@@ -1832,7 +1837,7 @@ export default function ConversationViewer({
               <button
                 type="button"
                 onClick={() => void loadMore({ force: true })}
-                disabled={loading}
+                disabled={isUserLoading}
                 style={{
                   padding: "7px 11px",
                   borderRadius: 999,
@@ -1840,10 +1845,10 @@ export default function ConversationViewer({
                   background: "var(--aurora-chip)",
                   color: "var(--aurora-fg3)",
                   fontSize: 11,
-                  cursor: loading ? "wait" : "pointer",
+                  cursor: isUserLoading ? "wait" : "pointer",
                 }}
               >
-                {loading
+                {isUserLoading
                   ? t.loading
                   : fmt(t.conversation.loadMessageGap, {
                       count: Math.max(0, detachedTail.offset - offsetRef.current),
@@ -1887,7 +1892,7 @@ export default function ConversationViewer({
           )}
         </div>
 
-        {loading && (
+        {isUserLoading && (
           <div style={{ textAlign: "center", padding: 12, color: "var(--aurora-fg4)", fontSize: 13 }}>{t.conversation.loadingMore}</div>
         )}
         {!hasMore && !hasEarlier && messages.length > 0 && (
