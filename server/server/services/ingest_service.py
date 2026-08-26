@@ -4567,13 +4567,17 @@ async def _extract_messages(
                 (
                     await db.execute(
                         select(ConversationMessage)
-                        # Queue matching only reads content/metadata and may
-                        # update metadata; defer unrelated message columns.
+                        # Queue matching reads content/metadata AND timestamp
+                        # (pop_matching_claude_queue_user compares candidate
+                        # timestamps); a deferred timestamp lazy-loads outside
+                        # the greenlet and 500s the delta (MissingGreenlet,
+                        # seen live ~8x/30min on claude_code deltas).
                         .options(load_only(
                             ConversationMessage.id,
                             ConversationMessage.line_number,
                             ConversationMessage.content,
                             ConversationMessage.metadata_,
+                            ConversationMessage.timestamp,
                         ))
                         .where(
                             ConversationMessage.document_id == doc.id,
