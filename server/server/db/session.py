@@ -74,9 +74,27 @@ class TransactionalAsyncSession(AsyncSession):
 # Compatibility for callers and tests introduced with resumable realtime.
 RealtimeAsyncSession = TransactionalAsyncSession
 
+# SQLAlchemy decodes every JSON/JSONB column through this hook. The default is
+# stdlib json; py-spy showed json.raw_decode at ~8% of api CPU under live
+# ingest purely from metadata_ hydration. orjson.loads is a drop-in for
+# deserialization; the serializer must still return str (orjson emits bytes).
+def _json_deserializer(value):
+    import orjson
+
+    return orjson.loads(value)
+
+
+def _json_serializer(value) -> str:
+    import orjson
+
+    return orjson.dumps(value).decode("utf-8")
+
+
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
+    json_deserializer=_json_deserializer,
+    json_serializer=_json_serializer,
     # docker-compose.yml bumps Postgres max_connections to 200, so we have
     # ~50 connection budget per service across api / celery-worker /
     # celery-beat + admin/migration headroom. Pool 30+30=60 gives the
@@ -98,6 +116,8 @@ if _search_database_url and _search_database_url != settings.database_url:
     search_engine = create_async_engine(
         _search_database_url,
         echo=False,
+        json_deserializer=_json_deserializer,
+        json_serializer=_json_serializer,
         pool_size=10,
         max_overflow=5,
         pool_recycle=3600,
@@ -119,6 +139,8 @@ else:
 post_ingest_engine = create_async_engine(
     settings.database_url,
     echo=False,
+    json_deserializer=_json_deserializer,
+    json_serializer=_json_serializer,
     pool_size=12,
     max_overflow=8,
     pool_recycle=3600,
