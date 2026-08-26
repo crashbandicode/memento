@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import UUID
 
+import orjson
+
 from .ingest_revision import (
     bounded_source_timestamp,
     full_snapshot_revision,
@@ -237,11 +239,11 @@ def chunk_commit_status(
     if failed_path.is_file():
         error_type = None
         try:
-            payload = json.loads(failed_path.read_text(encoding="utf-8"))
+            payload = orjson.loads(failed_path.read_text(encoding="utf-8"))
             value = payload.get("error_type")
             if isinstance(value, str) and value:
                 error_type = value[:128]
-        except (OSError, json.JSONDecodeError):
+        except (OSError, orjson.JSONDecodeError):
             pass
         return ChunkCommitStatus(
             job_id=job_id,
@@ -424,8 +426,8 @@ def stage_chunk(
         ).encode("utf-8")
         if manifest_path.exists():
             try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                existing = orjson.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, orjson.JSONDecodeError) as exc:
                 raise ChunkValidationError(
                     "existing spool manifest is unreadable"
                 ) from exc
@@ -544,8 +546,8 @@ def ready_manifest_metadata(
     if manifest_path.stat().st_size > _MAX_MANIFEST_BYTES:
         raise ChunkValidationError("spool manifest exceeds 1 MiB")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = orjson.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, orjson.JSONDecodeError) as exc:
         raise ChunkValidationError("spool manifest is unreadable") from exc
     if not isinstance(manifest, dict) or manifest.get("job_id") != job_id:
         raise ChunkValidationError("spool manifest job id does not match")
@@ -1248,7 +1250,7 @@ def record_job_attempt(
                 previous = max(
                     0,
                     int(
-                        json.loads(attempt_path.read_text(encoding="utf-8"))["attempts"]
+                        orjson.loads(attempt_path.read_text(encoding="utf-8"))["attempts"]
                     ),
                 )
             except (KeyError, OSError, TypeError, ValueError):

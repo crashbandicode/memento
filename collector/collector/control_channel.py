@@ -109,6 +109,7 @@ class ControlChannel:
         self._version = collector_version()
         self._client = httpx.Client(
             base_url=config.server.url,
+            http2=True,
             # Read timeout must exceed the server-side long-poll hold.
             timeout=httpx.Timeout(self._wait_seconds + 15.0, connect=10.0),
             verify=SSL_CONTEXT,

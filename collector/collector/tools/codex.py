@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+import orjson
 
 from ..config import TOOL_PATHS
 from .base import (
@@ -66,7 +67,7 @@ def _load_history(
                         line = line.strip()
                         if not line:
                             continue
-                        obj = json.loads(line)
+                        obj = orjson.loads(line)
                         sid = obj.get("session_id", "")
                         text = obj.get("text", "")
                         ts = obj.get("ts", 0)
@@ -123,8 +124,8 @@ def _load_explicit_thread_titles(codex_home: Path) -> dict[str, dict]:
         with index_path.open("r", encoding="utf-8", errors="ignore") as handle:
             for line in handle:
                 try:
-                    record = json.loads(line)
-                except (TypeError, json.JSONDecodeError):
+                    record = orjson.loads(line)
+                except (TypeError, orjson.JSONDecodeError):
                     continue
                 if not isinstance(record, dict):
                     continue
@@ -573,7 +574,7 @@ class CodexTool(BaseTool):
                     line = line.strip()
                     if not line:
                         continue
-                    obj = json.loads(line)
+                    obj = orjson.loads(line)
                     if obj.get("type") != "session_meta":
                         return {}
                     payload = obj.get("payload")

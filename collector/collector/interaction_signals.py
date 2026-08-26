@@ -8,12 +8,13 @@ the canonical transcript ingest later replaces.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import orjson
 
 _TAIL_BYTES = 512 * 1024
 _MAX_SIGNALS = 64
@@ -110,8 +111,8 @@ def _mapping(value: object) -> dict[str, Any]:
     if not isinstance(value, str):
         return {}
     try:
-        decoded = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+        decoded = orjson.loads(value)
+    except (TypeError, orjson.JSONDecodeError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
 
@@ -242,8 +243,8 @@ def extract_conversation_interaction_updates(
 
     for raw_line in lines:
         try:
-            record = json.loads(raw_line)
-        except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            record = orjson.loads(raw_line)
+        except (TypeError, orjson.JSONDecodeError):
             continue
         if not isinstance(record, dict):
             continue
@@ -446,8 +447,8 @@ def _extract_shell_activity_updates(
     activities: dict[str, dict[str, Any]] = {}
     for raw_line in lines:
         try:
-            record = json.loads(raw_line)
-        except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            record = orjson.loads(raw_line)
+        except (TypeError, orjson.JSONDecodeError):
             continue
         if not isinstance(record, dict):
             continue

@@ -25,6 +25,9 @@ hidden = (
     + ["collector.parsers.antigravity_pb_decoder",
        "collector.parsers.antigravity_vscdb",
        "collector.parsers.antigravity_export"]
+    # httpx imports HTTP/2 support lazily at client construction time.
+    + ["h2", "h2.config", "h2.connection", "h2.events", "h2.exceptions",
+       "h2.settings", "hpack", "hyperframe"]
     # `memento-brain-memory` is a dep of the collector but used at MCP
     # mount time, not by the daemon. Excluded to keep the binary small.
 )
@@ -44,7 +47,7 @@ compiler_script = (
 )
 extra_datas.append((str(compiler_script), "collector"))
 for pkg in ("tomli", "pydantic", "pydantic_core", "watchdog", "cryptography",
-            "httpx", "httpcore"):
+            "httpx", "httpcore", "orjson"):
     try:
         d, b, h = collect_all(pkg)
         extra_datas.extend(d)

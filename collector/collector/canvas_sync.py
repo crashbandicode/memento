@@ -88,6 +88,7 @@ def sync_pending_canvases(
     }
     with httpx.Client(
         base_url=config.server.url,
+        http2=True,
         headers=_headers(config),
         timeout=httpx.Timeout(30.0, connect=10.0),
         verify=SSL_CONTEXT,

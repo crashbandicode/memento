@@ -171,16 +171,16 @@ def setup() -> None:
     print(f"\nRegistering device with {url}...")
     try:
         import httpx
-        resp = httpx.post(
-            f"{url}/api/ingest/heartbeat",
-            headers={
-                "X-Collector-Token": token,
-                "X-Device-Id": config.device_id,
-                "X-Device-Name": config.device_name,
-                "X-Device-Platform": config.platform,
-            },
-            timeout=10,
-        )
+        with httpx.Client(http2=True, timeout=10) as client:
+            resp = client.post(
+                f"{url}/api/ingest/heartbeat",
+                headers={
+                    "X-Collector-Token": token,
+                    "X-Device-Id": config.device_id,
+                    "X-Device-Name": config.device_name,
+                    "X-Device-Platform": config.platform,
+                },
+            )
         if resp.status_code == 200:
             print("Device registered successfully!")
         else:
@@ -812,7 +812,8 @@ def status() -> None:
     print()
     try:
         import httpx
-        resp = httpx.get(f"{config.server.url}/api/ingest/status", timeout=5)
+        with httpx.Client(http2=True, timeout=5) as client:
+            resp = client.get(f"{config.server.url}/api/ingest/status")
         print(f"Server:  connected ({resp.status_code})")
     except Exception:
         print("Server:  unreachable")

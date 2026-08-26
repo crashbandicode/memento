@@ -10,6 +10,8 @@ import uuid
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
+import orjson
+
 from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -301,8 +303,8 @@ def _claude_subagent_sidecar_evidence(
         return None
     sidecar_path, filename_agent_id = identity
     try:
-        payload = json.loads(content)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = orjson.loads(content)
+    except (TypeError, orjson.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -624,7 +626,7 @@ def _preserve_interaction_entry_provenance(
             # Exact legacy backfill restores only bounded JSON mappings. Keep
             # that fingerprint input with the origin when the old collector
             # re-emits the exact same hook event without it.
-            next_interaction["tool_input"] = json.loads(
+            next_interaction["tool_input"] = orjson.loads(
                 json.dumps(prior_interaction["tool_input"])
             )
         merged["interaction"] = next_interaction
@@ -666,7 +668,7 @@ def _preserve_interaction_entry_provenance(
         # later authoritative replay must not erase the proven answer.  This
         # deliberately does not carry responses across a new timestamp/state
         # or over a newly recorded non-empty native response.
-        merged["response"] = json.loads(json.dumps(prior_response))
+        merged["response"] = orjson.loads(json.dumps(prior_response))
         merged["response_backfill"] = EXACT_PERMISSION_RESPONSE_BACKFILL
     return merged
 
@@ -925,8 +927,8 @@ def iter_claude_lineage_records(
 
     for raw_line in content.splitlines():
         try:
-            record = json.loads(raw_line)
-        except (TypeError, ValueError, json.JSONDecodeError):
+            record = orjson.loads(raw_line)
+        except (TypeError, orjson.JSONDecodeError):
             continue
         if isinstance(record, dict):
             yield record

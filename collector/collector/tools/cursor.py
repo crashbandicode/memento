@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Callable, Iterator
 from urllib.parse import unquote
 
+import orjson
+
 from ..config import TOOL_PATHS
 from .claude_code import _extract_cwd_from_jsonl
 from .base import (
@@ -108,8 +110,8 @@ def _cursor_model_from_blob(value: object) -> str:
     if not isinstance(value, str) or "modelName" not in value:
         return ""
     try:
-        decoded = json.loads(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = orjson.loads(value)
+    except (TypeError, orjson.JSONDecodeError):
         return ""
     for item in _json_mappings(decoded):
         provider_options = item.get("providerOptions")
@@ -131,8 +133,8 @@ def _cursor_agent_message_count(path: Path) -> int:
         with path.open("rb") as stream:
             for raw_line in stream:
                 try:
-                    record = json.loads(raw_line.decode("utf-8", "replace"))
-                except (TypeError, ValueError, json.JSONDecodeError):
+                    record = orjson.loads(raw_line)
+                except (TypeError, orjson.JSONDecodeError):
                     continue
                 if isinstance(record, dict) and record.get("role") in {
                     "user",
@@ -159,8 +161,8 @@ class _CursorAgentTranscriptLineEnricher:
 
     def __call__(self, line: str) -> str:
         try:
-            record = json.loads(line)
-        except (TypeError, ValueError, json.JSONDecodeError):
+            record = orjson.loads(line)
+        except (TypeError, orjson.JSONDecodeError):
             return line
         if not isinstance(record, dict) or record.get("role") not in {
             "user",
@@ -234,7 +236,7 @@ def _load_workspace_storage_map() -> dict[str, str]:
         if not wj.exists():
             continue
         try:
-            data = json.loads(wj.read_text(encoding="utf-8"))
+            data = orjson.loads(wj.read_text(encoding="utf-8"))
             folder = data.get("folder", "")
             if folder.startswith("file:///"):
                 decoded = unquote(folder[7:] if system != "Windows" else folder[8:])
@@ -707,8 +709,8 @@ class CursorTool(BaseTool):
     @staticmethod
     def _chats_store_timestamp(meta_path: Path, field: str) -> str:
         try:
-            payload = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+            payload = orjson.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, UnicodeError, orjson.JSONDecodeError):
             return ""
         if not isinstance(payload, dict):
             return ""

@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 _HOOK_SPECS = {
     "PreToolUse": ("AskUserQuestion", "Bash", "PowerShell", "Shell"),
     "PostToolUse": ("AskUserQuestion", "Bash", "PowerShell", "Shell"),
@@ -493,8 +495,8 @@ def _permission_interaction_origin(
     # that record, without reading the unbounded transcript history.
     for raw_line in reversed(payload.splitlines()[-_TRANSCRIPT_TAIL_RECORD_LIMIT:]):
         try:
-            record = json.loads(raw_line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            record = orjson.loads(raw_line)
+        except orjson.JSONDecodeError:
             continue
         if not isinstance(record, dict):
             continue
@@ -550,8 +552,8 @@ def _permission_interaction_origin(
 
 def _read_mapping(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        value = orjson.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, orjson.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -646,7 +648,7 @@ def _read_stdin_payload(stream: object | None = None) -> object:
             if isinstance(raw_payload, bytes)
             else str(raw_payload)
         )
-    return json.loads(text)
+    return orjson.loads(text)
 
 
 def _process_payload_unlocked(payload: object) -> None:
@@ -1198,7 +1200,7 @@ def _hook_main() -> int:
     try:
         try:
             payload = _read_stdin_payload()
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (OSError, UnicodeError, TypeError, ValueError):
             payload = {}
         process_payload(payload)
     except Exception:  # noqa: BLE001, S110 -- hooks must never block Claude

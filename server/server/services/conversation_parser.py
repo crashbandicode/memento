@@ -651,7 +651,7 @@ def extract_codex_session_metadata(raw_content: str) -> dict:
     if first is not None:
         try:
             obj = orjson.loads(first)
-        except (json.JSONDecodeError, TypeError):
+        except (orjson.JSONDecodeError, TypeError):
             obj = None
         if isinstance(obj, dict) and obj.get("type") == "session_meta":
             payload = obj.get("payload")
@@ -674,7 +674,7 @@ def extract_codex_session_metadata(raw_content: str) -> dict:
             return None
         try:
             return orjson.loads(f'"{match.group(1)}"')
-        except json.JSONDecodeError:
+        except orjson.JSONDecodeError:
             return None
 
     payload = {
@@ -1688,7 +1688,7 @@ def parse_conversation_line(raw_line: str, tool_id: str) -> NormalizedMessage | 
     """Parse a single JSONL line into a NormalizedMessage, or None if it should be skipped."""
     try:
         obj = orjson.loads(raw_line)
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         return None
 
     identity = AssistantIdentityState()
@@ -2210,7 +2210,7 @@ def parse_conversation_object(
             if isinstance(raw_msg, str):
                 try:
                     msg_dict = orjson.loads(raw_msg)
-                except json.JSONDecodeError:
+                except orjson.JSONDecodeError:
                     try:
                         msg_dict = eval(raw_msg)  # noqa: S307 — OpenClaw uses repr format
                     except Exception:
@@ -2779,7 +2779,7 @@ def _json_mapping(value: object) -> dict:
         return {}
     try:
         parsed = orjson.loads(value)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (orjson.JSONDecodeError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -2808,7 +2808,7 @@ def _bounded_permission_tool_input(value: object) -> dict | None:
         return None
     if len(encoded) > _MAX_PERMISSION_TOOL_INPUT_BYTES:
         return None
-    return json.loads(encoded)
+    return orjson.loads(encoded)
 
 
 _NESTED_CODEX_UPDATE_PLAN_RE = re.compile(
@@ -2920,8 +2920,8 @@ def _simple_js_object_mapping(value: str) -> dict:
         index += 1
 
     try:
-        parsed = json.loads("".join(out))
-    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed = orjson.loads("".join(out))
+    except (orjson.JSONDecodeError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -5139,7 +5139,7 @@ def _format_hermes_tool_content(content_str: str) -> str:
     """
     try:
         outer = orjson.loads(content_str)
-    except (json.JSONDecodeError, TypeError):
+    except (orjson.JSONDecodeError, TypeError):
         return content_str
     if not isinstance(outer, dict):
         return content_str
@@ -5179,7 +5179,7 @@ def _parse_hermes_session(
     """Hermes stores a whole session as a single top-level JSON, not JSONL."""
     try:
         d = orjson.loads(raw_content)
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         return []
     if not isinstance(d, dict):
         return []
@@ -5241,7 +5241,7 @@ def _parse_hermes_session(
 def _count_hermes_messages(raw_content: str) -> int:
     try:
         d = orjson.loads(raw_content)
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         return 0
     if not isinstance(d, dict):
         return 0

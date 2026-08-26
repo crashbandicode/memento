@@ -26,6 +26,8 @@ classifiers = [
 dependencies = [
     "watchdog>=4.0",
     "httpx>=0.27",
+    "h2>=4",
+    "orjson>=3.10",
     "concurrent-log-handler>=0.9.29",
     # Imported directly by collector/tls.py — not just relied on transitively
     # through httpx — so PyInstaller's analyzer bundles cacert.pem for the

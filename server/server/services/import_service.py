@@ -62,6 +62,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterator
 
+import orjson
+
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -198,8 +200,8 @@ def _iter_jsonl(blob: bytes) -> Iterator[dict[str, Any]]:
         if len(line) > MAX_LINE_BYTES:
             raise ImportError(f"json line too large ({len(line)} bytes, cap {MAX_LINE_BYTES})")
         try:
-            yield json.loads(line)
-        except json.JSONDecodeError as e:
+            yield orjson.loads(line)
+        except orjson.JSONDecodeError as e:
             raise ImportError(f"malformed JSONL line: {e}") from e
 
 
@@ -290,8 +292,8 @@ async def run_import(
     # Manifest first — used for version gate.
     manifest_blob = _read_member(zf, "manifest.json", total_left)
     try:
-        manifest = json.loads(manifest_blob)
-    except json.JSONDecodeError as e:
+        manifest = orjson.loads(manifest_blob)
+    except orjson.JSONDecodeError as e:
         raise ImportError(f"manifest.json malformed: {e}") from e
     fmt_version = str(manifest.get("format_version", ""))
     major = fmt_version.split(".")[0] if fmt_version else ""

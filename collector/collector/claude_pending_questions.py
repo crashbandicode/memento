@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import orjson
+
 from .interaction_signals import _activity_record, _signal_record
 
 if TYPE_CHECKING:
@@ -108,8 +110,8 @@ def _is_nested_subagent_path(parts: tuple[str, ...]) -> bool:
 
 def _read_side_file(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        value = orjson.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, orjson.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -182,8 +184,8 @@ def _transcript_has_assistant_continuation(
 
     for raw_line in payload.splitlines():
         try:
-            record = json.loads(raw_line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            record = orjson.loads(raw_line)
+        except orjson.JSONDecodeError:
             continue
         if not isinstance(record, dict) or record.get("isSidechain") is True:
             continue

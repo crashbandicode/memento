@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Callable
+
+import orjson
 
 from .base import BaseParser, ParseResult
 
@@ -119,8 +120,8 @@ class JsonlParser(BaseParser):
                 parsed_object = None
                 if not terminated:
                     try:
-                        parsed_object = json.loads(line)
-                    except (json.JSONDecodeError, TypeError):
+                        parsed_object = orjson.loads(line)
+                    except (orjson.JSONDecodeError, TypeError):
                         new_offset = line_start
                         break
 
@@ -144,7 +145,7 @@ class JsonlParser(BaseParser):
 
                 # Lightweight metadata extraction (only parse first 100 chars for type/timestamp)
                 try:
-                    obj = parsed_object if parsed_object is not None else json.loads(line)
+                    obj = parsed_object if parsed_object is not None else orjson.loads(line)
                     if not isinstance(obj, dict):
                         continue
                     msg_type = str(obj.get("type") or "unknown")
@@ -165,7 +166,7 @@ class JsonlParser(BaseParser):
                         if not first_timestamp:
                             first_timestamp = ts
                         last_timestamp = ts
-                except (json.JSONDecodeError, TypeError):
+                except (orjson.JSONDecodeError, TypeError):
                     continue
 
         content = "\n".join(content_parts) if write is None else ""

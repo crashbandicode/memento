@@ -152,6 +152,7 @@ class SyncClient:
 
         self._client = httpx.Client(
             base_url=config.server.url,
+            http2=True,
             timeout=httpx.Timeout(60.0, connect=10.0),
             verify=SSL_CONTEXT,
             limits=httpx.Limits(

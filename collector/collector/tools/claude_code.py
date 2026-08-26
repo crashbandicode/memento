@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+
+import orjson
 
 from ..config import TOOL_PATHS
 from .base import (
@@ -21,7 +22,7 @@ def _extract_cwd_from_jsonl(project_dir: Path) -> str | None:
                     line = line.strip()
                     if not line or '"cwd"' not in line:
                         continue
-                    obj = json.loads(line)
+                    obj = orjson.loads(line)
                     cwd = obj.get("cwd")
                     if cwd:
                         return cwd

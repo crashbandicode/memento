@@ -22,7 +22,10 @@ block_cipher = None
 # (FastMCP tool registration, openai async client variants, asyncpg
 # native extension, jsonschema validators). Use collect_all to grab the
 # full transitive pile, otherwise the runtime imports fail downstream.
-hidden = collect_submodules("mcp_server")
+hidden = collect_submodules("mcp_server") + [
+    "h2", "h2.config", "h2.connection", "h2.events", "h2.exceptions",
+    "h2.settings", "hpack", "hyperframe",
+]
 
 extra_datas = []
 extra_binaries = []

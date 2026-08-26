@@ -9,7 +9,6 @@ watching: a candidate must be an existing regular file directly below
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -20,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
+
+import orjson
 
 
 MAX_REFERENCES_PER_PAYLOAD = 64
@@ -125,8 +126,8 @@ def extract_canvas_references(payload: str | bytes) -> list[str]:
         if ".canvas.tsx" not in line.casefold():
             continue
         try:
-            parsed = json.loads(line)
-        except (TypeError, json.JSONDecodeError):
+            parsed = orjson.loads(line)
+        except (TypeError, orjson.JSONDecodeError):
             strings.append(line)
         else:
             strings.extend(_walk_strings(parsed))

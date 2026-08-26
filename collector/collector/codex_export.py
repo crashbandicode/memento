@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 
 THREAD_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -400,7 +402,7 @@ def read_session_meta(path: Path) -> dict[str, Any]:
                 line = raw_line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                obj = orjson.loads(line)
                 if obj.get("type") == "session_meta":
                     payload = obj.get("payload", {})
                     if isinstance(payload, dict):
@@ -443,8 +445,8 @@ def parse_session_file(thread: dict[str, Any]) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
+                obj = orjson.loads(line)
+            except orjson.JSONDecodeError:
                 continue
             if not isinstance(obj, dict):
                 continue
@@ -974,8 +976,8 @@ def extract_code_mode_shell_command(tool_name: str, tool_input: str) -> str | No
     raw = match.group(1)
     # Undo JS string escaping (\\ -> \, \" -> ", \n -> newline, ...).
     try:
-        return json.loads(f'"{raw}"')
-    except (ValueError, json.JSONDecodeError):
+        return orjson.loads(f'"{raw}"')
+    except ValueError:
         return raw.replace('\\"', '"').replace("\\\\", "\\")
 
 

@@ -6,6 +6,8 @@ import json
 import re
 from dataclasses import dataclass
 
+import orjson
+
 # Regex patterns for common secrets
 _PATTERNS: list[tuple[re.Pattern, str]] = [
     # API keys
@@ -98,11 +100,11 @@ def sanitize_json(
     count = 0
 
     try:
-        data = json.loads(text)
+        data = orjson.loads(text)
         data, key_count = _strip_keys(data, sensitive_keys)
         count += key_count
         text = json.dumps(data, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, TypeError):
+    except (orjson.JSONDecodeError, TypeError):
         pass
 
     # Also apply regex patterns
@@ -129,11 +131,11 @@ def sanitize_jsonl(
         if not line.strip():
             continue
         try:
-            data = json.loads(line)
+            data = orjson.loads(line)
             data, key_count = _strip_keys(data, sensitive_keys)
             count += key_count
             lines.append(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
-        except (json.JSONDecodeError, TypeError):
+        except (orjson.JSONDecodeError, TypeError):
             lines.append(line)
 
     result = sanitize_text("\n".join(lines))
@@ -158,10 +160,10 @@ def sanitize_jsonl_line(
 
     count = 0
     try:
-        data = json.loads(line)
+        data = orjson.loads(line)
         data, count = _strip_keys(data, sensitive_keys)
         line = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    except (json.JSONDecodeError, TypeError):
+    except (orjson.JSONDecodeError, TypeError):
         pass
     result = sanitize_text(line)
     total = count + result.redaction_count

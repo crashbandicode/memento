@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import orjson
 
 from ..config import CollectorConfig
 from ..tls import SSL_CONTEXT
@@ -138,9 +139,9 @@ class ControlEventSpool:
 
     def _load_state(self) -> None:
         try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            payload = orjson.loads(self.state_path.read_text(encoding="utf-8"))
             self._offset = max(0, int(payload.get("offset", 0)))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except (OSError, TypeError, ValueError):
             self._offset = 0
 
     def read_pending(self) -> PendingBatch | None:
@@ -163,8 +164,8 @@ class ControlEventSpool:
                         consumed += len(line)
                         end_offset = source.tell()
                         try:
-                            event = json.loads(line)
-                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            event = orjson.loads(line)
+                        except orjson.JSONDecodeError:
                             logger.warning("Skipping malformed control spool line")
                             continue
                         if isinstance(event, dict) and event.get("schema_version") == SCHEMA_VERSION:
@@ -223,6 +224,7 @@ class ControlEventUploader:
         self._collector_version = collector_version
         self._client = httpx.Client(
             base_url=config.server.url,
+            http2=True,
             timeout=httpx.Timeout(30.0, connect=10.0),
             verify=SSL_CONTEXT,
             headers={

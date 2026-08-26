@@ -206,14 +206,17 @@ def _send_discovery(config: CollectorConfig, logger: logging.Logger) -> None:
         discovery = discover_all_tools()
         if discovery:
             logger.info("Discovered tools: %s", ", ".join(discovery.keys()))
-            httpx.post(
-                f"{config.server.url}/api/ingest/discovery",
-                json={"device_id": config.device_id, "device_name": config.device_name,
-                      "platform": config.platform, "tools": discovery},
-                headers={"X-Collector-Token": config.server.token},
+            with httpx.Client(
+                http2=True,
                 timeout=DISCOVERY_TIMEOUT,
                 verify=SSL_CONTEXT,
-            )
+            ) as client:
+                client.post(
+                    f"{config.server.url}/api/ingest/discovery",
+                    json={"device_id": config.device_id, "device_name": config.device_name,
+                          "platform": config.platform, "tools": discovery},
+                    headers={"X-Collector-Token": config.server.token},
+                )
     except Exception:
         pass
 

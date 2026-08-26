@@ -24,6 +24,8 @@ import threading
 from collections.abc import Callable
 from typing import IO, Any
 
+import orjson
+
 logger = logging.getLogger("collector.agents.rpc")
 
 _MAX_LINE_BYTES = 8 * 1024 * 1024  # generous; app-server lines are bounded
@@ -163,8 +165,8 @@ class JsonlRpcClient:
                 if not line:
                     continue
                 try:
-                    message = json.loads(line)
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    message = orjson.loads(line)
+                except orjson.JSONDecodeError:
                     logger.warning("%s: skipping malformed protocol line", self._name)
                     continue
                 if not isinstance(message, dict):

@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import orjson
+
 from .interaction_signals import CursorActivityProjection
 from .tools.base import Category, ContentType
 from .tools.cursor import CursorTool
@@ -120,8 +122,8 @@ def _decode_json(value: object) -> object:
     if isinstance(value, (dict, list)):
         return value
     try:
-        return json.loads(_coerce_text(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
+        return orjson.loads(_coerce_text(value))
+    except (TypeError, ValueError):
         return None
 
 
