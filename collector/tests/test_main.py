@@ -190,7 +190,7 @@ def test_update_command_honors_disabled_auto_update():
     assert detail == {"skipped": "auto_update_disabled"}
 
 
-def test_canvas_polling_backs_off_when_idle_and_resets_after_upload():
+def test_canvas_polling_backs_off_when_idle_and_wakes_only_for_canvas_signals():
     schedule = _CanvasPollSchedule(minimum=5, maximum=20)
     empty = {"requested": 0, "failed": 0}
 
@@ -204,9 +204,36 @@ def test_canvas_polling_backs_off_when_idle_and_resets_after_upload():
     schedule.complete(generation, empty, now=10)
     assert schedule.claim_due(29.9) is None
 
-    schedule.notify_upload(SimpleNamespace(category="conversation"), now=11)
+    schedule.notify_upload(
+        SimpleNamespace(category="conversation", relative_path="sessions/a.jsonl"),
+        now=11,
+    )
+    assert schedule.claim_due(29.9) is None
+
+    schedule.notify_upload(
+        SimpleNamespace(
+            category="conversation",
+            relative_path="canvases/live.canvas.tsx",
+        ),
+        now=11,
+    )
     assert schedule.claim_due(12.9) is None
     assert schedule.claim_due(13) == 1
+
+
+def test_canvas_sync_control_command_wakes_the_existing_poll_schedule():
+    woke: list[bool] = []
+
+    status, error_code, detail = execute_control_command(
+        "canvas.sync",
+        {},
+        **_executor_deps(on_canvas_sync=lambda: woke.append(True)),
+    )
+
+    assert status == "completed"
+    assert error_code is None
+    assert detail == {"scheduled": True}
+    assert woke == [True]
 
 
 def test_unchanged_heartbeat_does_not_query_queue_again():

@@ -149,6 +149,7 @@ async def reconcile_message_canvases(
 
     projected = 0
     removed = 0
+    notified_message_ids: set[int] = set()
     for message in messages:
         if message.id is None:
             continue
@@ -186,18 +187,70 @@ async def reconcile_message_canvases(
                 )
             )
             projected += 1
+            if eligible:
+                notified_message_ids.add(int(message.id))
     if projected or removed:
         await db.flush()
+    if notified_message_ids:
+        await _enqueue_canvas_sync_notifications(
+            db,
+            document=document,
+            message_ids=notified_message_ids,
+        )
     return projected
 
 
-async def inventory_machine_canvases(
+async def _enqueue_canvas_sync_notifications(
+    db: AsyncSession,
+    *,
+    document: Document,
+    message_ids: set[int],
+) -> None:
+    """Wake a capable owner-side collector after new local Canvas references.
+
+    The notification is a tiny durable control command, delivered through the
+    collector's existing long-poll channel.  It is created in the same outer
+    transaction as the reference rows, so a rolled-back ingest can never wake
+    a collector for nonexistent work.  Older collectors simply do not declare
+    this capability and retain their bounded periodic fallback.
+    """
+    if document.machine_id is None:
+        return
+    machine = await db.get(Machine, document.machine_id)
+    if machine is None or machine.user_id is None:
+        return
+
+    from .agent_control import (
+        KIND_CANVAS_SYNC,
+        UnsupportedCommandKind,
+        admit_command,
+    )
+
+    for message_id in message_ids:
+        identity = f"{document.id}:{message_id}".encode("utf-8")
+        idempotency_key = (
+            "canvas-sync:" + hashlib.sha256(identity).hexdigest()
+        )
+        try:
+            await admit_command(
+                db,
+                machine=machine,
+                user_id=machine.user_id,
+                kind=KIND_CANVAS_SYNC,
+                payload={"schema_version": 1},
+                idempotency_key=idempotency_key,
+                document_id=document.id,
+            )
+        except UnsupportedCommandKind:
+            # A pre-0.0.50 collector cannot consume this notification.  Its
+            # existing bounded pending-artifact poll remains the fallback.
+            continue
+
+
+async def _inventory_state(
     db: AsyncSession,
     machine_id: uuid.UUID,
-) -> dict[str, int]:
-    """Discover a bounded set of exact references without reading source paths."""
-    await _repair_serialized_canvas_references(db, machine_id)
-    await _remove_non_reference_canvas_rows(db, machine_id)
+) -> CanvasArtifactInventoryState:
     await db.execute(
         pg_insert(CanvasArtifactInventoryState)
         .values(machine_id=machine_id, last_message_id=0)
@@ -205,15 +258,27 @@ async def inventory_machine_canvases(
             index_elements=[CanvasArtifactInventoryState.machine_id]
         )
     )
-    state = (
+    return (
         await db.execute(
             select(CanvasArtifactInventoryState)
             .where(CanvasArtifactInventoryState.machine_id == machine_id)
             .with_for_update()
         )
     ).scalar_one()
+
+
+async def inventory_machine_canvases(
+    db: AsyncSession,
+    machine_id: uuid.UUID,
+    *,
+    state: CanvasArtifactInventoryState | None = None,
+) -> dict[str, int]:
+    """Discover a bounded set of exact references without reading source paths."""
+    state = state or await _inventory_state(db, machine_id)
     if state.last_message_id < 0:
         return {"discovered": 0, "unsupported": 0}
+    await _repair_serialized_canvas_references(db, machine_id)
+    await _remove_non_reference_canvas_rows(db, machine_id)
     rows = (
         await db.execute(
             select(ConversationMessage, Document.tool_id)
@@ -396,7 +461,9 @@ async def pending_machine_canvases(
     *,
     refresh_before: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    await inventory_machine_canvases(db, machine_id)
+    state = await _inventory_state(db, machine_id)
+    if state.last_message_id >= 0:
+        await inventory_machine_canvases(db, machine_id, state=state)
     refresh_before = refresh_before or (
         datetime.now(timezone.utc) - CANVAS_REFRESH_INTERVAL
     )

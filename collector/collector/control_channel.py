@@ -43,6 +43,7 @@ SUPPORTED_COMMANDS = (
     "device.resync",
     "conversation.repair",
     "collector.update",
+    "canvas.sync",
 )
 
 # (status, error_code, detail) — status must be completed/failed/cancelled.

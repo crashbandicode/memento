@@ -55,7 +55,7 @@ _logging_setup_lock = threading.Lock()
 
 
 class _CanvasPollSchedule:
-    """Back off empty network polls and reset promptly after conversation sync."""
+    """Back off empty polls and wake promptly only for Canvas-bearing signals."""
 
     def __init__(self, *, minimum: float = 5.0, maximum: float = 300.0) -> None:
         self._minimum = minimum
@@ -66,14 +66,23 @@ class _CanvasPollSchedule:
         self._generation = 0
         self._lock = threading.Lock()
 
-    def notify_upload(self, item, now: float | None = None) -> None:
-        if getattr(item, "category", "") != "conversation":
-            return
+    def _notify_canvas_signal(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self._lock:
             self._generation += 1
             self._delay = self._minimum
             self._next_due = min(self._next_due, now + 2.0)
+
+    def notify_upload(self, item, now: float | None = None) -> None:
+        """Wake for an uploaded Canvas path, never for ordinary conversations."""
+        relative_path = str(getattr(item, "relative_path", ""))
+        if ".canvas.tsx" not in relative_path.casefold():
+            return
+        self._notify_canvas_signal(now)
+
+    def notify_control_notification(self, now: float | None = None) -> None:
+        """Wake after the server projects a newly discovered Canvas reference."""
+        self._notify_canvas_signal(now)
 
     def claim_due(self, now: float | None = None) -> int | None:
         now = time.monotonic() if now is None else now
@@ -303,6 +312,7 @@ def execute_control_command(
     sync_client: SyncClient,
     logger: logging.Logger,
     on_resync: Callable[[], None] | None = None,
+    on_canvas_sync: Callable[[], None] | None = None,
 ) -> tuple[str, str | None, dict]:
     """Execute one durable control command and return its terminal outcome.
 
@@ -369,6 +379,12 @@ def execute_control_command(
         logger.info("Received update command from server")
         threading.Thread(target=_check_and_update, args=(logger,), daemon=True).start()
         return "completed", None, {"initiated": True}
+
+    if kind == "canvas.sync":
+        if on_canvas_sync is not None:
+            on_canvas_sync()
+        logger.info("Received Canvas notification; scheduling pending-artifact sync")
+        return "completed", None, {"scheduled": True}
 
     logger.warning("Unsupported control command kind: %s", kind)
     return "failed", "capability.unsupported", {"kind": kind}
@@ -835,6 +851,7 @@ def main() -> None:
             sync_client=sync_client,
             logger=logger,
             on_resync=_invalidate_source_pollers,
+            on_canvas_sync=canvas_schedule.notify_control_notification,
         )
 
     def _control_capabilities() -> dict:

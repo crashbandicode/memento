@@ -6,4 +6,4 @@ Hatch also reads this value when building the wheel, so packaged and frozen
 collectors share one source of truth.
 """
 
-__version__ = "0.0.49"
+__version__ = "0.0.50"

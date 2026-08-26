@@ -197,13 +197,12 @@ async def memory_recall(
 
     # Direct DB mode
     from sqlalchemy import select
-    from sqlalchemy.orm import undefer
+    from .content_store import document_content
     from .db import Document, Project
     async with _session_factory() as db:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         q = (
-            select(Document.title, Document.tool_id, Document.relative_path,
-                   Document.content, Document.synced_at)
+            select(Document)
             .where(Document.category == category, Document.synced_at >= cutoff)
             .order_by(Document.synced_at.desc())
             .limit(limit)
@@ -211,17 +210,18 @@ async def memory_recall(
         if project:
             q = q.join(Project, Document.project_id == Project.id).where(
                 Project.title.ilike(f"%{project}%")
-            )
+        )
         result = await db.execute(q)
-        rows = result.all()
+        rows = result.scalars().all()
         if not rows:
             return f"No {category} memories found in the last {days} days."
         parts = []
-        for title, tool_id, path, content, synced_at in rows:
+        for document in rows:
+            content = await document_content(db, document)
             preview = (content or "")[:500]
             parts.append(
-                f"### {title or path} ({tool_id})\n"
-                f"*{synced_at.strftime('%Y-%m-%d %H:%M')}*\n\n"
+                f"### {document.title or document.relative_path} ({document.tool_id})\n"
+                f"*{document.synced_at.strftime('%Y-%m-%d %H:%M')}*\n\n"
                 f"{preview}{'...' if len(content or '') > 500 else ''}\n"
             )
         return "\n---\n\n".join(parts)
@@ -534,6 +534,7 @@ async def memory_open(doc_id: str) -> str:
         return f"{header}\n---\n{content}"
 
     from sqlalchemy import select
+    from .content_store import document_content
     from .db import Document
     import uuid as _uuid
     try:
@@ -544,7 +545,6 @@ async def memory_open(doc_id: str) -> str:
         doc = (
             await db.execute(
                 select(Document)
-                .options(undefer(Document.content))
                 .where(Document.id == did)
             )
         ).scalar_one_or_none()
@@ -559,7 +559,8 @@ async def memory_open(doc_id: str) -> str:
         )
         if doc.ai_summary:
             header += f"\n**AI summary**: {doc.ai_summary}\n"
-        return f"{header}\n---\n{doc.content or '(empty)'}"
+        content = await document_content(db, doc)
+        return f"{header}\n---\n{content or '(empty)'}"
 
 
 @mcp.tool()
@@ -983,10 +984,11 @@ async def get_identity(tool: str) -> str:
         return "\n\n---\n\n".join(parts)
 
     from sqlalchemy import select
+    from .content_store import document_content
     from .db import Document
     async with _session_factory() as db:
         result = await db.execute(
-            select(Document.title, Document.content)
+            select(Document)
             .where(Document.tool_id == tool, Document.category == "identity")
             .order_by(Document.synced_at.desc())
         )
@@ -994,8 +996,9 @@ async def get_identity(tool: str) -> str:
         if not rows:
             return f"No identity files found for {tool}."
         parts = []
-        for title, content in rows:
-            parts.append(f"## {title}\n\n{content or '(empty)'}")
+        for (document,) in rows:
+            content = await document_content(db, document)
+            parts.append(f"## {document.title}\n\n{content or '(empty)'}")
         return "\n\n---\n\n".join(parts)
 
 

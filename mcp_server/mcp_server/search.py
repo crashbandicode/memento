@@ -418,14 +418,13 @@ async def _fulltext_search(
     db: AsyncSession, query: str, limit: int, user_machine_ids: list[uuid.UUID] | None,
     tool_filter: str | None, cutoff: datetime | None,
 ) -> list[dict]:
-    """Search via PostgreSQL LIKE (simple but effective)."""
+    """Search lightweight candidates, then hydrate verified text for snippets."""
     pattern = f"%{query}%"
     q = (
-        select(Document.title, Document.tool_id, Document.relative_path,
-               Document.content, Document.synced_at)
+        select(Document)
         .where(
             or_(
-                Document.content.ilike(pattern),
+                Document.content_tsv.op("@@")(func.plainto_tsquery("simple", query)),
                 Document.title.ilike(pattern),
             )
         )
@@ -441,9 +440,11 @@ async def _fulltext_search(
 
     result = await db.execute(q)
     results = []
-    for row in result.all():
+    from .content_store import document_content
+
+    for document in result.scalars().all():
         # Extract relevant snippet around the match
-        content = row.content or ""
+        content = (await document_content(db, document)) or ""
         idx = content.lower().find(query.lower())
         if idx >= 0:
             start = max(0, idx - 200)
@@ -454,10 +455,10 @@ async def _fulltext_search(
 
         results.append({
             "content": snippet,
-            "title": row.title or row.relative_path,
-            "tool_id": row.tool_id,
-            "relative_path": row.relative_path,
-            "date": row.synced_at.strftime("%Y-%m-%d") if row.synced_at else "",
+            "title": document.title or document.relative_path,
+            "tool_id": document.tool_id,
+            "relative_path": document.relative_path,
+            "date": document.synced_at.strftime("%Y-%m-%d") if document.synced_at else "",
             "score": 0.5,  # Fixed score for full-text matches
             "source": "fulltext",
         })

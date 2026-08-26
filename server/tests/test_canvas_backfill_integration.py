@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.api.conversations import _conversation_canvas_summaries
 from server.db.models import (
+    AgentControlCommand,
     Base,
     CanvasArtifact,
     CanvasArtifactBlob,
@@ -273,6 +274,7 @@ async def test_new_messages_project_canvas_references_without_inventory_scan(
             name="projected-source",
             collector_token_hash=uuid4().hex,
             user_id=user.id,
+            capabilities={"control": {"commands": ["canvas.sync"]}},
         )
         session.add_all([user, machine])
         await session.flush()
@@ -293,6 +295,15 @@ async def test_new_messages_project_canvas_references_without_inventory_scan(
             )
         ).scalar_one()
         assert reference.status == "discovered"
+        command = (
+            await session.execute(
+                select(AgentControlCommand).where(
+                    AgentControlCommand.machine_id == machine.id,
+                    AgentControlCommand.kind == "canvas.sync",
+                )
+            )
+        ).scalar_one()
+        assert command.document_id == document.id
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .content_store import document_content
 from .db import (
     Document, KnowledgeEntity, KnowledgeObservation, KnowledgeRelation,
     Machine, Project,
@@ -62,7 +63,7 @@ async def get_entity_context(
 
         # Get memory/plan files
         memory_docs = await db.execute(
-            select(Document.title, Document.content, Document.category)
+            select(Document)
             .where(
                 Document.project_id == project.id,
                 Document.category.in_(["memory", "plan", "identity"]),
@@ -70,8 +71,9 @@ async def get_entity_context(
             .order_by(Document.synced_at.desc())
             .limit(5)
         )
-        for title, content, cat in memory_docs.all():
-            parts.append(f"\n## {cat.title()}: {title}")
+        for (document,) in memory_docs.all():
+            parts.append(f"\n## {document.category.title()}: {document.title}")
+            content = await document_content(db, document)
             parts.append((content or "")[:1000])
 
     # 2. Knowledge graph entities matching the project name
