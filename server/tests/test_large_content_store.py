@@ -9,7 +9,6 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from botocore.exceptions import ClientError
 
@@ -28,6 +27,7 @@ from server.services.ingest_service import (  # noqa: E402
 )
 from server.services.large_content_store import (  # noqa: E402
     DocumentContentIntegrityError,
+    DocumentContentUnavailableError,
     document_content,
     document_content_key,
     finalize_document_content,
@@ -113,19 +113,6 @@ class _ImmutableS3:
         self.objects[Key] = Body.read() if hasattr(Body, "read") else bytes(Body)
 
 
-class _ScalarResult:
-    def __init__(self, value):
-        self.value = value
-
-    def scalar_one_or_none(self):
-        return self.value
-
-
-class _FallbackDb:
-    async def execute(self, _statement):
-        return _ScalarResult("postgres compatibility text")
-
-
 class LargeContentStoreTests(unittest.TestCase):
     def test_finalizer_puts_verifies_and_returns_transaction_pointer(self) -> None:
         client = _ImmutableS3()
@@ -186,7 +173,7 @@ class LargeContentStoreTests(unittest.TestCase):
             )
         self.assertEqual(client.put_calls, 0)
 
-    def test_dual_read_falls_back_to_postgres_when_object_is_missing(self) -> None:
+    def test_verified_pointer_missing_object_raises_unavailable(self) -> None:
         document = SimpleNamespace(
             id=uuid.uuid4(),
             content_s3_key="document-content/v1/missing",
@@ -194,12 +181,8 @@ class LargeContentStoreTests(unittest.TestCase):
             content_object_size_bytes=len(b"expected"),
             content_object_verified_at=object(),
         )
-        with patch.object(settings, "document_content_minio_enabled", True):
-            content = asyncio.run(
-                document_content(_FallbackDb(), document, s3_client=_ImmutableS3())
-            )
-
-        self.assertEqual(content, "postgres compatibility text")
+        with self.assertRaises(DocumentContentUnavailableError):
+            asyncio.run(document_content(object(), document, s3_client=_ImmutableS3()))
 
     def test_large_content_lines_stream_without_whole_object_limit(self) -> None:
         client = _StreamingS3(b'{"first": 1}\n{"second": 2}\n')

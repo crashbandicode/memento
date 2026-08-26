@@ -14,7 +14,7 @@ class _Document:
         self.tool_id = "codex"
         self.relative_path = "memory.md"
         self.category = "memory"
-        self.content = content
+        self._test_content = content
         self.content_hash = "raw-revision-1"
         self.machine_id = None
         self.metadata_: dict = {}
@@ -49,6 +49,11 @@ def _configured_provider(monkeypatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("MEMENTO_ANTHROPIC_API_KEY", raising=False)
 
+    async def content_prefix(_db, document, *, max_chars: int) -> str:
+        return document._test_content[:max_chars]
+
+    monkeypatch.setattr(graph_service, "document_content_prefix", content_prefix)
+
 
 @pytest.mark.asyncio
 async def test_late_append_skips_same_bounded_successful_input(monkeypatch) -> None:
@@ -67,7 +72,7 @@ async def test_late_append_skips_same_bounded_successful_input(monkeypatch) -> N
     assert doc.knowledge_status == "ok"
     assert doc.knowledge_failure_kind is None
 
-    doc.content += "late append outside the model window"
+    doc._test_content += "late append outside the model window"
     doc.content_hash = "raw-revision-2"
     assert await graph_service.extract_knowledge_from_document(db, doc) == 0
 

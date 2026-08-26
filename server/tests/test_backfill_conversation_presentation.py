@@ -467,7 +467,9 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
             ),
             timestamp=None,
         )
-        document_result = SimpleNamespace(all=lambda: [(document, False)])
+        document_result = SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: [document])
+        )
         message_result = SimpleNamespace(scalars=lambda: [message])
         db = SimpleNamespace(
             execute=AsyncMock(side_effect=[document_result, message_result]),

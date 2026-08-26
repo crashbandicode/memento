@@ -643,9 +643,9 @@ async def _repair_codex_batch(db, document_ids: list) -> BackfillStats:
     for message in message_rows.scalars():
         messages_by_document[message.document_id].append(message)
 
-    # Inline transcripts are embedded directly from Document.content, which
-    # this presentation repair never changes. For externalized/empty
-    # conversations, read only the same first 100 bounded rows used at runtime.
+    # Raw transcript objects are unchanged by this presentation repair. For a
+    # document without raw source, read only the same first 100 bounded rows
+    # used at runtime.
     fallback_embedding_documents = set(documents) - inline_embedding_documents
     embedding_content_before = await _conversation_embedding_content_by_document(
         db,
@@ -785,12 +785,7 @@ async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
     """
     stats = BackfillStats(cursor_candidate_documents=len(document_ids))
     rows = await db.execute(
-        select(
-            Document,
-            (
-                func.coalesce(func.length(Document.content), 0) > 0
-            ).label("has_inline_embedding_content"),
-        )
+        select(Document)
         .options(load_only(
             Document.id,
             Document.tool_id,
@@ -804,9 +799,9 @@ async def _repair_cursor_batch(db, document_ids: list) -> BackfillStats:
     )
     documents: dict = {}
     inline_embedding_documents: set = set()
-    for document, has_inline_embedding_content in rows.all():
+    for document in rows.scalars().all():
         documents[document.id] = document
-        if has_inline_embedding_content:
+        if await document_content_prefix(db, document, max_chars=1):
             inline_embedding_documents.add(document.id)
 
     message_rows = await db.execute(

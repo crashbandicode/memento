@@ -55,6 +55,18 @@ class _Session:
         self.entities[(type(value), identity)] = value
 
 
+@pytest.fixture(autouse=True)
+def _mock_document_content_accessor():
+    async def read_content(_db, document):
+        return getattr(document, "_test_content", None)
+
+    with patch(
+        "server.services.ingest_service.document_content",
+        new=AsyncMock(side_effect=read_content),
+    ):
+        yield
+
+
 def _sidecar_payload(
     *,
     agent_id: str = AGENT_ID,
@@ -75,7 +87,7 @@ def _document(
     content: str,
     metadata: dict | None = None,
 ) -> Document:
-    return Document(
+    document = Document(
         id=uuid.uuid4(),
         tool_id="claude_code",
         machine_id=uuid.uuid4(),
@@ -83,12 +95,13 @@ def _document(
         category=category,
         content_type="json" if category == "state" else "jsonl",
         title=path.rsplit("/", 1)[-1],
-        content=content,
         content_hash="a" * 64,
         file_size_bytes=len(content),
         metadata_=metadata or {},
         needs_review=False,
     )
+    document._test_content = content
+    return document
 
 
 def _sidecar() -> Document:
@@ -331,7 +344,7 @@ async def test_child_terminal_reconciliation_publishes_parent_companion_event() 
         machine_id=str(transcript.machine_id),
         user_id="user-id",
     )
-    transcript.content = json.dumps({
+    transcript._test_content = json.dumps({
         "type": "assistant",
         "timestamp": "2026-08-01T12:05:00Z",
         "message": {

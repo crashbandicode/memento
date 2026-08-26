@@ -54,7 +54,7 @@ ONLINE_INDEX_MIGRATIONS = (
             "ON conversation_messages (document_id, (metadata ->> 'source_id'))"
         ),
     ),
-    # No query uses documents.content ILIKE after the bounded tsvector path
+    # No query uses raw document-body ILIKE after the bounded tsvector path
     # landed, so this large GIN index only adds ingest/update maintenance.
     OnlineIndexMigration(
         name="idx_documents_content_trgm",

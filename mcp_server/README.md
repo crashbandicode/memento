@@ -11,8 +11,8 @@ memento-memory --db-url postgresql+asyncpg://user:pass@host:port/memento
 
 ### Direct-mode MinIO content reads
 
-Direct mode keeps reading `documents.content` from PostgreSQL unless all of
-these variables are set on the machine running the MCP sidecar:
+Direct mode reads verified immutable document-content objects when these
+variables are set on the machine running the MCP sidecar:
 
 ```text
 MEMENTO_S3_ENDPOINT=https://minio.example.internal
@@ -22,9 +22,9 @@ MEMENTO_S3_BUCKET=memento
 ```
 
 With that complete configuration, the sidecar streams and SHA-256-verifies a
-document's verified object before using it. Any missing configuration,
-transport failure, or proof mismatch falls back to PostgreSQL during the
-dual-read rollout. Remote mode does not need these variables.
+document's object before using it. If a sidecar is temporarily pointed at an
+older server, it may use that server's legacy inline body; a dropped column is
+treated as no fallback. Remote mode does not need these variables.
 
 ## Claude Code Configuration
 

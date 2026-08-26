@@ -623,7 +623,7 @@ async def search(
 
     # Fetch at most one bounded matching normalized message per conversation
     # result. The main page query selects metadata plus a SQL-bounded snippet,
-    # never a potentially 64 MiB Document.content value.
+    # never a potentially 64 MiB raw document object.
     conversation_ids = [
         match["id"]
         for _presentation, match in page_rows

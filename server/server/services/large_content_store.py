@@ -31,7 +31,7 @@ class DocumentContentIntegrityError(RuntimeError):
 
 
 class DocumentContentUnavailableError(RuntimeError):
-    """Neither a verified object nor the compatibility PG copy is readable."""
+    """A verified document-content object could not be read safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +244,7 @@ async def finalize_document_content(
     document_id: object,
     content: str | None = None,
     payload_path: Path | None = None,
+    db: "AsyncSession | None" = None,
     s3_client=None,
 ) -> DocumentContentPointer:
     """Run the write-path PUT/reuse/GET verification before pointer commit.
@@ -257,6 +258,19 @@ async def finalize_document_content(
         content=content,
         payload_path=payload_path,
     )
+    if db is not None:
+        # GC takes this same transaction-scoped key before its final
+        # live-pointer recheck and delete.  Holding it through the caller's
+        # pointer commit means a GC winner can only delete before a writer
+        # re-verifies/recreates the immutable key, never between verification
+        # and publication.
+        from sqlalchemy import text
+
+        key = document_content_key(document_id=document_id, sha256=sha256)
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": key},
+        )
     return await asyncio.to_thread(
         _put_or_reuse_document_content,
         document_id=document_id,
@@ -266,17 +280,6 @@ async def finalize_document_content(
         payload_path=payload_path,
         s3_client=s3_client,
     )
-
-
-async def _inline_document_content(db: "AsyncSession", document_id: object) -> str | None:
-    """Explicitly hydrate the deferred compatibility copy only on fallback."""
-    from sqlalchemy import select
-
-    from ..db.models import Document
-
-    return (
-        await db.execute(select(Document.content).where(Document.id == document_id))
-    ).scalar_one_or_none()
 
 
 def _pointer_is_verified(document: object) -> bool:
@@ -294,14 +297,14 @@ async def document_content(
     *,
     s3_client=None,
 ) -> str | None:
-    """Return the exact logical text, preferring a verified object on rollout.
+    """Return exact text from a verified immutable pointer, or logical NULL.
 
-    In compatibility mode every object transport or integrity failure falls
-    back to the explicit PostgreSQL copy. It never reconstructs raw source
-    from normalized conversation messages.
+    PostgreSQL no longer has an inline fallback.  A pointer read failure is a
+    recoverable operational error (restore or reprocess the client source),
+    never a reason to synthesize source from normalized messages.
     """
     document_id = getattr(document, "id")
-    if settings.document_content_minio_enabled and _pointer_is_verified(document):
+    if _pointer_is_verified(document):
         try:
             return await asyncio.to_thread(
                 read_verified_document_content,
@@ -316,18 +319,10 @@ async def document_content(
             DocumentContentIntegrityError,
             OSError,
             UnicodeError,
-        ):
-            # PostgreSQL remains authoritative during dual-read. The caller
-            # sees the historical text, never a corrupt object body.
-            pass
-
-    inline = await _inline_document_content(db, document_id)
-    if inline is not None:
-        return inline
-    if settings.document_content_minio_enabled and _pointer_is_verified(document):
-        raise DocumentContentUnavailableError(
-            f"verified document content for {document_id} is unavailable"
-        )
+        ) as exc:
+            raise DocumentContentUnavailableError(
+                f"verified document content for {document_id} is unavailable"
+            ) from exc
     return None
 
 

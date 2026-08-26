@@ -1760,12 +1760,8 @@ def _is_externalized_delta_update(
     mode: str,
     persist_content: bool,
 ) -> bool:
-    """Return whether an incremental tail must keep the last full S3 source."""
-    return (
-        mode == "delta"
-        and bool(doc.content_s3_key)
-        and persist_content
-    )
+    """Compatibility predicate for callers that retain a FULL object on DELTA."""
+    return mode == "delta" and bool(doc.content_s3_key) and persist_content
 
 
 def _history_line_number(index: int) -> int:
@@ -2764,9 +2760,8 @@ async def _reconcile_idempotent_claude_ingest(
     lifecycle_document = enriched_child or document
     lifecycle_changed = _reconcile_subagent_document_lifecycle(
         lifecycle_document,
-        # Document.content is deferred; a bare attribute access here lazy-loads
-        # outside the greenlet (MissingGreenlet, seen live on the idempotent
-        # discovery path). Go through the dual-read accessor instead.
+        # Go through the verified pointer accessor; raw source has no ORM body
+        # after the contract migration.
         await document_content(db, lifecycle_document),
     )
     if enriched_child is None and not lifecycle_changed:
@@ -2954,14 +2949,9 @@ async def ingest_file(
             raise ValueError("streamed conversation ingest must not include inline content")
         if not content_already_sanitized:
             raise ValueError("streamed conversation source must already be sanitized")
-        if (
-            mode == "full"
-            and not content_store_enabled
-            and (persist_content or not content_s3_key)
-        ):
-            raise ValueError(
-                "streamed full conversation must retain only its object-store key"
-            )
+        # With the contract column gone, flag-off is deliberately only an
+        # emergency write bypass. The source is still parsed, but no raw body
+        # is committed; recovery is reprocessing it from the client source.
         file_size = conversation_source.size
     content_preview = (
         conversation_source.prefix if conversation_source is not None else content
@@ -3017,8 +3007,8 @@ async def ingest_file(
                 machine_id,
                 user_id,
             )
-            # The normal conversation DELTA never reads Document.content; a
-            # deferred body avoids decoding/loading an old multi-MB snapshot.
+            # The normal conversation DELTA never reads raw source; load only
+            # the immutable pointer and mutable ingest state.
             .options(_ingest_document_load_only())
             .with_for_update(of=Document)
         )
@@ -3365,9 +3355,9 @@ async def ingest_file(
         if doc is not None
         else None
     )
-    # This remains the exact compatibility text. For a streamed FULL it is
-    # hydrated only after parsing, immediately before the dual-write pointer
-    # finalizer; DELTAs retain their existing FULL source pointer.
+    # This is the exact transient source value. For a streamed FULL the
+    # finalizer reads the sanitized file directly; conversation DELTAs retain
+    # their existing durable FULL pointer.
     stored_blob_content = content
     stored_revision_hash = content_hash if mode == "full" else None
     preserve_stored_source_identity = False
@@ -3387,8 +3377,8 @@ async def ingest_file(
             doc.embedding_content_hash = previous_embedding_content_hash
 
     if doc is None:
-        # Very large conversations keep their raw source in object storage.
-        # They are still fully parsed into ConversationMessage rows below.
+        # Raw source is persisted only through a verified immutable pointer;
+        # conversations are still fully parsed into ConversationMessage rows.
         from .embedding_service import desired_embedding_tier
 
         doc = Document(
@@ -3402,8 +3392,6 @@ async def ingest_file(
             category=category,
             content_type=content_type,
             title=title,
-            content=(content if persist_content and conversation_source is None else None),
-            content_s3_key=(None if content_store_enabled else content_s3_key),
             content_hash=content_hash,
             file_size_bytes=logical_file_size,
             metadata_=stored_metadata,
@@ -3420,39 +3408,37 @@ async def ingest_file(
         doc.content_type = content_type
         if identity_relocation:
             doc.relative_path = relative_path
-        preserve_externalized_delta = _is_externalized_delta_update(
-            doc,
-            mode=mode,
-            persist_content=persist_content,
-        )
-        if not persist_content and not content_store_enabled:
-            doc.content = None
-            doc.content_s3_key = content_s3_key
-        elif category == "conversation" and mode == "delta":
-            # Raw conversation blobs are immutable snapshots. The old code
-            # rebuilt Document.content for every append, forcing PostgreSQL to
-            # rewrite a multi-megabyte TOAST value and its indexes even though
-            # reads use normalized ConversationMessage rows. Keep the last FULL
-            # snapshot (inline or in object storage) and append only normalized
-            # messages until another FULL source snapshot arrives.
+        if category == "conversation" and mode == "delta":
+            # Raw conversation blobs are immutable snapshots. Keep the last
+            # FULL pointer and append only normalized messages until another
+            # FULL source snapshot arrives.
             preserve_stored_source_identity = True
         elif (
             mode == "delta" and conversation_source is None
         ):
-            # Non-conversation DELTAs advance raw source. Fetch it through the
-            # dual-read accessor instead of accidentally lazy-loading deferred
-            # PostgreSQL TEXT; the finalizer publishes the exact concatenation.
+            # Non-conversation DELTAs advance raw source. Fetch the existing
+            # immutable object, construct the exact old+newline+delta value,
+            # and let the finalizer publish a new immutable object. Never
+            # mirror that value into PostgreSQL.
             previous_content = await document_content(db, doc)
-            doc.content = (previous_content + "\n" + content) if previous_content else content
+            stored_blob_content = (
+                previous_content + "\n" + content
+                if previous_content
+                else content
+            )
             if previous_stored_revision == base_hash:
                 stored_revision_hash = content_hash
             else:
                 stored_revision_hash = None
-            stored_blob_content = doc.content
-        elif conversation_source is None:
-            doc.content = content
-        if persist_content and not preserve_externalized_delta and not content_store_enabled:
+        elif not content_store_enabled:
+            # This is intentionally not a read rollback: after the cutover no
+            # inline body exists. Clearing a stale pointer makes the emergency
+            # S3-bypass's loss of raw persistence explicit and recoverable by
+            # client-source reprocessing rather than serving old bytes.
             doc.content_s3_key = None
+            doc.content_object_sha256 = None
+            doc.content_object_size_bytes = None
+            doc.content_object_verified_at = None
         latest_source_modified_at = max(
             filter(None, (current_source_modified_at, source_modified_at))
         )
@@ -3681,22 +3667,16 @@ async def ingest_file(
     )
     if should_finalize_content:
         if conversation_source is not None:
-            # Compatibility mode keeps PostgreSQL's exact logical text while
-            # the finalizer streams the sanitized source file to MinIO.
-            stored_blob_content = await asyncio.to_thread(
-                conversation_source.path.read_text,
-                encoding="utf-8",
-                errors="replace",
-            )
-            doc.content = stored_blob_content
             pointer = await finalize_document_content(
                 document_id=doc.id,
                 payload_path=conversation_source.path,
+                db=db,
             )
         else:
             pointer = await finalize_document_content(
                 document_id=doc.id,
                 content=stored_blob_content,
+                db=db,
             )
         doc.content_s3_key = pointer.key
         doc.content_object_sha256 = pointer.sha256

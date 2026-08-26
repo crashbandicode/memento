@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ from server.db.models import (
     User,
 )
 from server.db.session import TransactionalAsyncSession
+from server.config import settings
 from server.services import cache, sse_service
 from server.services.content_sanitizer import sanitize_content_file
 from server.services.conversation_stream import ConversationFileSource
@@ -33,6 +35,10 @@ from server.services.ingest_service import (
     STORED_SOURCE_REVISION_KEY,
     STORED_SOURCE_SIZE_KEY,
     ingest_file,
+)
+from server.services.large_content_store import (
+    DocumentContentPointer,
+    document_content_key,
 )
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -271,6 +277,42 @@ async def test_streamed_ingest_projects_transactionally_and_rebases(
 
         monkeypatch.setattr(cache, "_client", redis)
         monkeypatch.setattr(sse_service, "publish_event", publish_event)
+        monkeypatch.setattr(settings, "document_content_minio_enabled", True)
+
+        async def finalize_content(
+            *,
+            document_id,
+            content=None,
+            payload_path=None,
+            **_kwargs,
+        ) -> DocumentContentPointer:
+            payload = (
+                content.encode("utf-8")
+                if content is not None
+                else payload_path.read_bytes()
+            )
+            sha256 = hashlib.sha256(payload).hexdigest()
+            return DocumentContentPointer(
+                key=document_content_key(document_id=document_id, sha256=sha256),
+                sha256=sha256,
+                size_bytes=len(payload),
+                verified_at=datetime.now(timezone.utc),
+            )
+
+        monkeypatch.setattr(
+            "server.services.ingest_service.finalize_document_content",
+            finalize_content,
+        )
+
+        async def no_raw_object_read(*_args, **_kwargs) -> str:
+            # This fixture verifies normalized projections; raw-object bytes
+            # are represented by the finalizer pointer above, not a live MinIO.
+            return ""
+
+        monkeypatch.setattr(
+            "server.services.embedding_service.document_content",
+            no_raw_object_read,
+        )
 
         async with session_factory() as session:
             user = User(
@@ -359,8 +401,13 @@ async def test_streamed_ingest_projects_transactionally_and_rebases(
                 )
             ).scalars().all()
 
-            assert document.content is None
-            assert document.content_s3_key == "raw/private/streamed.txt"
+            initial_content_key = document.content_s3_key
+            assert initial_content_key == document_content_key(
+                document_id=document.id,
+                sha256=source.sha256,
+            )
+            assert document.content_object_sha256 == source.sha256
+            assert document.content_object_size_bytes == source.size
             assert document.needs_review is True
             assert document.metadata_[STORED_SOURCE_REVISION_KEY] == revision_hash
             assert document.metadata_[STORED_SOURCE_HASH_KEY] == source.sha256
@@ -428,8 +475,7 @@ async def test_streamed_ingest_projects_transactionally_and_rebases(
             await session.refresh(delivery_state)
             await session.refresh(read_model)
 
-            assert document.content is None
-            assert document.content_s3_key == "raw/private/streamed.txt"
+            assert document.content_s3_key == initial_content_key
             assert document.content_hash == revision_hash
             assert delivery_state.revision_hash == delta_revision_hash
             assert document.metadata_[STORED_SOURCE_REVISION_KEY] == revision_hash

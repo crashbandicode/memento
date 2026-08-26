@@ -98,8 +98,8 @@ def _run_migrations(conn) -> None:
     # of silently dropped. Existing rows get 'ok' if they already have any
     # embedding rows, else 'pending' — the periodic retry task picks those up.
     doc_cols = {c["name"] for c in insp.get_columns("documents")}
-    # Immutable document-content pointers are additive. The backfill owns
-    # populating them; PostgreSQL content remains the compatibility source.
+    # Immutable document-content pointers are the sole raw-source storage
+    # contract. The retired PostgreSQL body is dropped below.
     if "content_object_sha256" not in doc_cols:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN content_object_sha256 VARCHAR(64)"
@@ -131,8 +131,11 @@ def _run_migrations(conn) -> None:
         "AND content_object_size_bytes >= 0)) NOT VALID; "
         "END IF; END $$"
     ))
-    # Reserve durable candidate state now. GC wiring and object deletion are
-    # deliberately deferred until after the rollout observation window.
+    # Contract phase: all production inline values were independently
+    # verified/nulled before this deployment. This is deliberately idempotent
+    # for nodes that start after another node performed the short DDL.
+    conn.execute(text("ALTER TABLE documents DROP COLUMN IF EXISTS content"))
+    # Durable delayed-GC state for immutable superseded/orphan objects.
     conn.execute(text(
         "CREATE TABLE IF NOT EXISTS document_content_gc_candidates ("
         "content_s3_key VARCHAR(500) PRIMARY KEY, "
@@ -144,8 +147,8 @@ def _run_migrations(conn) -> None:
         conn.execute(text(
             "ALTER TABLE documents ADD COLUMN activity_at TIMESTAMPTZ"
         ))
-        # No startup backfill: existing rows retain the legacy read fallback
-        # and acquire projection activity lazily on their next meaningful
+        # No startup backfill: existing rows acquire projection activity
+        # lazily on their next meaningful
         # normalized ingest. Rewriting documents here would recreate the WAL
         # and dead-tuple incident this migration is intended to stop.
     # Append-heavy conversation state lives outside the canonical documents
@@ -1098,7 +1101,7 @@ def _run_migrations(conn) -> None:
         # Do not build a raw-content trigram index here. Document body search
         # uses ``content_tsv`` and conversation fuzzy search uses the bounded,
         # role-filtered ``conversation_messages`` trigram index. The raw
-        # ``documents.content`` index was therefore unused, while creating it
+        # The retired raw-body index was therefore unused, while creating it
         # during startup took a table lock for many minutes on the production
         # corpus and blocked collector writes. Large optional indexes belong in
         # an explicit concurrent migration, never the API lifespan transaction.

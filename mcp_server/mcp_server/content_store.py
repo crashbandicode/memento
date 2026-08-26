@@ -1,9 +1,8 @@
 """Verified document-content reads for direct MCP database mode.
 
-This deliberately mirrors the server's rollout reader without importing the
-server package: the MCP sidecar is deployed independently and may run on the
-collector's machine.  Object storage is opt-in here.  With no complete S3
-configuration, direct mode retains its historical PostgreSQL-only behavior.
+The server contract has no inline body.  A narrow legacy SQL fallback remains
+only for a sidecar temporarily pointed at an older server; it treats a dropped
+column as no fallback so mixed-version rollout cannot fail the request path.
 """
 
 from __future__ import annotations
@@ -16,6 +15,8 @@ from dataclasses import dataclass
 import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 
 _STREAM_CHUNK_BYTES = 64 * 1024
@@ -26,7 +27,7 @@ class DocumentContentIntegrityError(RuntimeError):
 
 
 class DocumentContentUnavailableError(RuntimeError):
-    """Neither verified object storage nor PostgreSQL has readable content."""
+    """A verified document-content object could not be read safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,15 +111,29 @@ def read_verified_document_content(
     return b"".join(chunks).decode("utf-8")
 
 
-async def _inline_document_content(db, document_id: object) -> str | None:
-    """Hydrate the deferred compatibility column only after object fallback."""
-    from sqlalchemy import select
-
-    from .db import Document
-
+def _is_undefined_column(error: DBAPIError) -> bool:
+    """Recognize PostgreSQL SQLSTATE 42703 without coupling to asyncpg."""
+    original = error.orig
     return (
-        await db.execute(select(Document.content).where(Document.id == document_id))
-    ).scalar_one_or_none()
+        getattr(original, "sqlstate", None) == "42703"
+        or getattr(original, "pgcode", None) == "42703"
+        or "undefined column" in str(original).lower()
+    )
+
+
+async def _legacy_inline_document_content(db, document_id: object) -> str | None:
+    """Read an old-server inline body, tolerating the dropped new schema."""
+    try:
+        return (
+            await db.execute(
+                text("SELECT content FROM documents WHERE id = :document_id"),
+                {"document_id": document_id},
+            )
+        ).scalar_one_or_none()
+    except DBAPIError as exc:
+        if _is_undefined_column(exc):
+            return None
+        raise
 
 
 async def document_content(
@@ -128,7 +143,7 @@ async def document_content(
     s3_config: DocumentContentS3Config | None = None,
     s3_client=None,
 ) -> str | None:
-    """Prefer a verified object, preserving PostgreSQL as the exact fallback."""
+    """Read a verified object; query legacy inline data only for old servers."""
     document_id = getattr(document, "id")
     config = s3_config if s3_config is not None else document_content_s3_config()
     if config is not None and _pointer_is_verified(document):
@@ -152,10 +167,10 @@ async def document_content(
             # optional client-side object-store path is unavailable or corrupt.
             pass
 
-    inline = await _inline_document_content(db, document_id)
+    inline = await _legacy_inline_document_content(db, document_id)
     if inline is not None:
         return inline
-    if config is not None and _pointer_is_verified(document):
+    if _pointer_is_verified(document):
         raise DocumentContentUnavailableError(
             f"verified document content for {document_id} is unavailable"
         )

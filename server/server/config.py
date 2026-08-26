@@ -23,11 +23,15 @@ class Settings(BaseSettings):
     s3_access_key: str = "minioadmin"
     s3_secret_key: str = "minioadmin"
     s3_bucket: str = "memento"
-    # Roll out immutable document-content objects independently from the
-    # already-existing legacy large-transcript store. False preserves the
-    # PostgreSQL compatibility path; true dual-writes and prefers verified
-    # document-content objects on reads.
+    # Require immutable object-store writes. All deployed data has had the
+    # former PostgreSQL body nulled and the contract migration drops that
+    # column, so turning this off is *not* a read rollback: readers always use
+    # verified pointers. It is only an emergency S3-bypass for new writes,
+    # whose raw source can then be recovered by reprocessing client sources.
     document_content_minio_enabled: bool = False
+    # Delayed object-GC grace period. Candidates are timed from first observed
+    # unreferenced, never from mutable object-storage timestamps.
+    document_content_gc_grace_hours: int = 48
 
     # Auth
     secret_key: str = "change-me-in-production"

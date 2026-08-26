@@ -25,7 +25,6 @@ def _document(now: datetime) -> Document:
         category="conversation",
         content_type="jsonl",
         title="Thread",
-        content="full snapshot",
         content_hash="full-revision",
         file_size_bytes=100,
         metadata_={"session_id": "thread"},

@@ -432,6 +432,7 @@ async def run_import(
             pointer = await finalize_document_content(
                 document_id=new_id,
                 content=content,
+                db=db,
             )
         await db.execute(
             pg_insert(Document).values(
@@ -443,7 +444,6 @@ async def run_import(
                 category=r.get("category") or "memory",
                 content_type=r.get("content_type") or "text",
                 title=r.get("title"),
-                content=content,
                 content_s3_key=pointer.key if pointer else None,
                 content_object_sha256=pointer.sha256 if pointer else None,
                 content_object_size_bytes=pointer.size_bytes if pointer else None,

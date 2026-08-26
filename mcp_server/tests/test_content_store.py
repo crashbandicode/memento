@@ -4,6 +4,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from mcp_server.content_store import document_content
 
@@ -14,12 +15,21 @@ class _ScalarResult:
 
 
 class _FallbackDb:
-    async def execute(self, _statement):
+    async def execute(self, _statement, _parameters):
         return _ScalarResult()
 
 
+class _UndefinedColumn(Exception):
+    sqlstate = "42703"
+
+
+class _DroppedColumnDb:
+    async def execute(self, statement, parameters):
+        raise DBAPIError(statement, parameters, _UndefinedColumn(), False)
+
+
 @pytest.mark.asyncio
-async def test_no_s3_configuration_preserves_postgres_content(monkeypatch) -> None:
+async def test_old_server_without_s3_configuration_uses_legacy_content(monkeypatch) -> None:
     for name in (
         "MEMENTO_S3_ENDPOINT",
         "MEMENTO_S3_ACCESS_KEY",
@@ -38,3 +48,10 @@ async def test_no_s3_configuration_preserves_postgres_content(monkeypatch) -> No
     content = await document_content(_FallbackDb(), document)
 
     assert content == "postgres compatibility text"
+
+
+@pytest.mark.asyncio
+async def test_dropped_legacy_column_is_treated_as_no_fallback() -> None:
+    document = SimpleNamespace(id=uuid.uuid4())
+
+    assert await document_content(_DroppedColumnDb(), document) is None

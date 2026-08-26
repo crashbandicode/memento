@@ -112,9 +112,9 @@ class Document(Base):
 
     # Content
     title: Mapped[str | None] = mapped_column(Text)
-    # Keep the compatibility copy out of ordinary entity hydration. Callers
-    # that need raw source must use services.large_content_store instead.
-    content: Mapped[str | None] = mapped_column(Text, deferred=True)
+    # Raw document bytes live only in the immutable object named by this
+    # verified pointer.  Do not add a PostgreSQL compatibility body here: the
+    # schema contract deliberately drops documents.content after nulling it.
     content_s3_key: Mapped[str | None] = mapped_column(String(500))
     content_object_sha256: Mapped[str | None] = mapped_column(String(64))
     content_object_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
@@ -241,7 +241,7 @@ class Document(Base):
 
 
 class DocumentContentGcCandidate(Base):
-    """Future delayed-GC state; no deletion job is enabled in this rollout."""
+    """First-seen state for delayed immutable document-content collection."""
 
     __tablename__ = "document_content_gc_candidates"
 

@@ -166,9 +166,9 @@ def test_cutover_can_preserve_only_accounted_unverified_sources() -> None:
 
 
 def test_stored_source_identity_fences_full_snapshot_revision() -> None:
+    stored_text = "sanitized transcript"
     document = SimpleNamespace(
         category="conversation",
-        content="sanitized transcript",
         content_s3_key=None,
         metadata_={},
     )
@@ -177,16 +177,16 @@ def test_stored_source_identity_fences_full_snapshot_revision() -> None:
 
     _set_stored_source_identity(
         document,
-        document.content,
+        stored_text,
         revision_hash="raw-revision",
     )
 
     assert _stored_source_is_current(document, "raw-revision")
     assert not _stored_source_is_current(document, "newer-revision")
     assert document.metadata_[STORED_SOURCE_REVISION_KEY] == "raw-revision"
-    assert document.metadata_[STORED_SOURCE_SIZE_KEY] == len(document.content)
+    assert document.metadata_[STORED_SOURCE_SIZE_KEY] == len(stored_text)
     assert document.metadata_[STORED_SOURCE_HASH_KEY] == hashlib.sha256(
-        document.content.encode("utf-8")
+        stored_text.encode("utf-8")
     ).hexdigest()
 
 

@@ -53,7 +53,6 @@ def _document(*, content_hash: str, timestamp: float, offset: int = 100) -> Docu
         relative_path="sessions/thread.jsonl",
         category="conversation",
         content_type="jsonl",
-        content="full",
         content_hash=content_hash,
         file_size_bytes=offset,
         metadata_={},
@@ -62,7 +61,7 @@ def _document(*, content_hash: str, timestamp: float, offset: int = 100) -> Docu
     )
     _set_stored_source_identity(
         document,
-        document.content,
+        "full",
         revision_hash=content_hash,
     )
     return document
@@ -548,7 +547,6 @@ class IngestOrderingTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         doc = _document(content_hash="same-hash", timestamp=100.0)
-        doc.content = None
         doc.content_s3_key = "raw/user/device/old-full.txt"
         sync = _sync_state(doc, offset=100)
         db = _OrderedSession(None, sync, doc)

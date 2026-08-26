@@ -565,7 +565,7 @@ async def get_project(
         .limit(50)
     )
     if not include_content:
-        # The default endpoint is a metadata view.  Document.content and
+        # The default endpoint is a metadata view. Raw object bodies and
         # rendered_html can each be megabytes, and selecting the ORM entity
         # without load_only hydrated those payloads only to discard them in
         # _doc_row below.
@@ -1125,8 +1125,8 @@ async def get_project_conversations(
         raise HTTPException(status_code=404)
 
     # Phase 1: scan only metadata columns to figure out pagination + subagent
-    # grouping. Pulling Document.content (TOAST'd, can be 500 KB+ per doc)
-    # for every doc in the project just to discard 90% of them blew up
+    # grouping. Hydrating raw object bodies for every document just to discard
+    # 90% of them blew up
     # cold-start time on chunky projects (favorite_chat hit 24 s with 152
     # conversations). load_only here ~halves wall time on big projects and
     # dramatically reduces TOAST reads.

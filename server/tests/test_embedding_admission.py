@@ -7,9 +7,9 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from unittest.mock import AsyncMock
 
 from server.api import memory
-from server.db.models import Document
 from server.services import embedding_service
 from server.services.ingest_service import _invalidate_embeddings_for_revision
 from server.tasks.post_ingest import process_document_post_ingest
@@ -133,21 +133,12 @@ class _RecordingDB:
     def __init__(
         self,
         rowcounts: list[int] | None = None,
-        *,
-        inline_content: str | None = _EMBEDDABLE_TEXT,
     ) -> None:
         self.statements: list = []
         self.update_params: list[dict] = []
         self.rowcounts = list(rowcounts or [])
-        self.inline_content = inline_content
 
     async def execute(self, statement):
-        # document_content() explicitly selects the deferred Document.content;
-        # answer it without recording so claim/update assertions and rowcount
-        # sequencing keep their original meaning.
-        descriptions = getattr(statement, "column_descriptions", None) or []
-        if descriptions and descriptions[0].get("entity") is Document:
-            return SimpleNamespace(scalar_one_or_none=lambda: self.inline_content)
         self.statements.append(statement)
         self.update_params.append(statement.compile().params)
         rowcount = self.rowcounts.pop(0) if self.rowcounts else 1
@@ -169,7 +160,6 @@ def _document(*, attempts: int = 4) -> SimpleNamespace:
         embedding_tier="quality",
         content_hash="a" * 64,
         content_type="text/plain",
-        content="durable conversation text " * 20,
         category="conversation",
         relative_path="sessions/test.jsonl",
         tool_id="codex",
@@ -182,6 +172,11 @@ async def test_busy_document_stays_pending_without_consuming_attempt(monkeypatch
         raise embedding_service.EmbeddingServerBusy("busy")
 
     monkeypatch.setattr(embedding_service, "_call_embedding_server", _busy)
+    monkeypatch.setattr(
+        embedding_service,
+        "document_content",
+        AsyncMock(return_value=_EMBEDDABLE_TEXT),
+    )
     db = _RecordingDB()
 
     result = await embedding_service.generate_document_embeddings(db, _document())
@@ -205,6 +200,11 @@ async def test_real_embedding_failure_consumes_attempt(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(embedding_service, "_call_embedding_server", _failed)
+    monkeypatch.setattr(
+        embedding_service,
+        "document_content",
+        AsyncMock(return_value=_EMBEDDABLE_TEXT),
+    )
     db = _RecordingDB()
 
     result = await embedding_service.generate_document_embeddings(db, _document())
@@ -224,6 +224,11 @@ async def test_stale_revision_cannot_claim_or_call_embedding_server(monkeypatch)
         pytest.fail("stale revision reached the embedding server")
 
     monkeypatch.setattr(embedding_service, "_call_embedding_server", _unexpected)
+    monkeypatch.setattr(
+        embedding_service,
+        "document_content",
+        AsyncMock(return_value=_EMBEDDABLE_TEXT),
+    )
     db = _RecordingDB(rowcounts=[0])
 
     result = await embedding_service.generate_document_embeddings(db, _document())
@@ -361,33 +366,12 @@ class _MessageRows:
         return self._messages[: embedding_service.CONVERSATION_EMBEDDING_MESSAGE_LIMIT]
 
 
-class _InlineContentRow:
-    """Answer document_content()'s explicit inline-content fallback SELECT."""
-
-    def __init__(self, value: str | None) -> None:
-        self._value = value
-
-    def scalar_one_or_none(self) -> str | None:
-        return self._value
-
-
 class _MessageDB:
-    def __init__(
-        self,
-        messages: list[str],
-        *,
-        inline_content: str | None = None,
-    ) -> None:
+    def __init__(self, messages: list[str]) -> None:
         self.messages = messages
-        self.inline_content = inline_content
 
-    async def execute(self, statement) -> _MessageRows | _InlineContentRow:
-        # document_content() explicitly selects Document.content (the model
-        # attribute is deferred); everything else here is the conversation
-        # message-prefix SELECT.
-        descriptions = getattr(statement, "column_descriptions", None) or []
-        if descriptions and descriptions[0].get("entity") is Document:
-            return _InlineContentRow(self.inline_content)
+    async def execute(self, statement) -> _MessageRows:
+        del statement
         return _MessageRows(self.messages)
 
 
@@ -397,7 +381,6 @@ async def test_externalized_conversation_hash_ignores_message_101() -> None:
     db = _MessageDB(messages)
     doc = SimpleNamespace(
         id=uuid4(),
-        content=None,
         category="conversation",
         content_type="jsonl",
     )
@@ -418,7 +401,6 @@ async def test_externalized_conversation_hash_changes_with_bounded_prefix() -> N
     db = _MessageDB(messages)
     doc = SimpleNamespace(
         id=uuid4(),
-        content=None,
         category="conversation",
         content_type="jsonl",
     )
@@ -437,10 +419,6 @@ async def test_delta_conversation_embedding_input_uses_normalized_rows() -> None
         category = "conversation"
         content_type = "jsonl"
 
-        @property
-        def content(self):
-            raise AssertionError("DELTA input must not fetch the raw snapshot")
-
     chunks, _ = await embedding_service.document_embedding_input(
         _MessageDB(["normalized delta message " + ("x" * 120)]),
         _DeferredConversation(),
@@ -455,7 +433,6 @@ async def test_embedding_hash_changes_when_short_input_becomes_embeddable() -> N
     db = _MessageDB(["too short"])
     doc = SimpleNamespace(
         id=uuid4(),
-        content=None,
         category="conversation",
         content_type="jsonl",
     )

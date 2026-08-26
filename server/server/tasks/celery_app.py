@@ -61,6 +61,7 @@ celery_app = Celery(
         "server.tasks.activity_rollup_task",
         "server.tasks.dashboard_category_rollup_task",
         "server.tasks.dashboard_conversation_message_rollup_task",
+        "server.tasks.document_content_gc",
     ],
 )
 
@@ -85,6 +86,10 @@ celery_app.conf.update(
 
 # Scheduled tasks
 celery_app.conf.beat_schedule = {
+    "document-content-gc": {
+        "task": "server.tasks.document_content_gc.collect_document_content_gc",
+        "schedule": crontab(minute=11),
+    },
     # Recover durably staged uploads if Redis/API/worker restarted between
     # final-chunk acknowledgement and task completion.
     "ingest-spool-recovery": {

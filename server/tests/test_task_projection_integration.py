@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -411,7 +412,6 @@ async def test_cursor_projection_delta_updates_stable_rows_in_place(
         )
         base_hash = hashlib.sha256(full_snapshot.encode()).hexdigest()
         base_offset = len(full_snapshot.encode())
-        document.content = full_snapshot
         document.content_hash = base_hash
         document.file_size_bytes = base_offset
         _set_stored_source_identity(
@@ -600,7 +600,6 @@ async def test_cursor_projection_delta_inserts_before_bounded_mutable_tail(
         )
         base_hash = hashlib.sha256(full_snapshot.encode()).hexdigest()
         base_offset = len(full_snapshot.encode())
-        document.content = full_snapshot
         document.content_hash = base_hash
         document.file_size_bytes = base_offset
         _set_stored_source_identity(
@@ -780,7 +779,6 @@ async def test_cursor_projection_delta_inserts_before_bounded_mutable_tail(
         assert mutable.line_number == 10
         assert mutable.content == "Tail completed."
         assert refreshed_document is not None
-        assert refreshed_document.content == full_snapshot
         assert refreshed_document.content_hash == base_hash
         assert refreshed_document.file_size_bytes == base_offset
         assert delivery_state is not None
@@ -1612,6 +1610,7 @@ async def test_metadata_inbox_replays_across_cursor_path_promotion(
 @pytest.mark.asyncio
 async def test_conversation_delta_keeps_immutable_raw_snapshot(
     session_factory,
+    monkeypatch,
 ) -> None:
     async with session_factory() as session:
         document = await _conversation(session)
@@ -1621,7 +1620,14 @@ async def test_conversation_delta_keeps_immutable_raw_snapshot(
             source_id="snapshot",
         )
         base_hash = "a" * 64
-        document.content = raw_snapshot
+        raw_snapshot_sha256 = hashlib.sha256(raw_snapshot.encode("utf-8")).hexdigest()
+        raw_snapshot_key = (
+            f"document-content/v1/{document.id}/{raw_snapshot_sha256}"
+        )
+        document.content_s3_key = raw_snapshot_key
+        document.content_object_sha256 = raw_snapshot_sha256
+        document.content_object_size_bytes = len(raw_snapshot.encode("utf-8"))
+        document.content_object_verified_at = datetime.now(timezone.utc)
         document.content_hash = base_hash
         document.file_size_bytes = len(raw_snapshot.encode("utf-8"))
         _set_stored_source_identity(
@@ -1651,6 +1657,14 @@ async def test_conversation_delta_keeps_immutable_raw_snapshot(
             source_id="delta",
         )
         new_offset = document.file_size_bytes + len(delta.encode("utf-8"))
+
+        async def read_raw_snapshot(_db, _document) -> str:
+            return raw_snapshot
+
+        monkeypatch.setattr(
+            "server.services.embedding_service.document_content",
+            read_raw_snapshot,
+        )
         await ingest_file(
             session,
             tool_id=document.tool_id,
@@ -1672,7 +1686,8 @@ async def test_conversation_delta_keeps_immutable_raw_snapshot(
         )
         await session.commit()
 
-        assert document.content == raw_snapshot
+        assert document.content_s3_key == raw_snapshot_key
+        assert document.content_object_sha256 == raw_snapshot_sha256
         assert document.content_hash == "b" * 64
         assert (
             await session.scalar(

@@ -518,7 +518,7 @@ class BrowseActivityApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         docs_sql = str(db.statements[2].compile())
-        self.assertIn("documents.content,", docs_sql)
+        self.assertNotIn("documents.content,", docs_sql)
         self.assertIn("documents.rendered_html", docs_sql)
 
     async def test_project_detail_requires_a_document_visible_to_the_user(self) -> None:

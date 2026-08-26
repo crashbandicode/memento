@@ -73,7 +73,6 @@ class Document(Base):
     category: Mapped[str] = mapped_column(String(50))
     content_type: Mapped[str] = mapped_column(String(50))
     title: Mapped[str | None] = mapped_column(Text)
-    content: Mapped[str | None] = mapped_column(Text, deferred=True)
     content_tsv: Mapped[object | None] = mapped_column(TSVECTOR)
     content_s3_key: Mapped[str | None] = mapped_column(String(500))
     content_object_sha256: Mapped[str | None] = mapped_column(String(64))
