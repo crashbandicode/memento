@@ -103,6 +103,14 @@ celery_app.conf.beat_schedule = {
         "task": "server.tasks.activity_rollup_task.refresh_activity_rollup",
         "schedule": crontab(minute="*/5"),
     },
+    # Daily full recompute: the 5-minute refresh above is incremental (trailing
+    # 48h window), so this safety net picks up backfills/reparses that write
+    # messages with timestamps older than the window.
+    "activity-rollup-full-refresh": {
+        "task": "server.tasks.activity_rollup_task.refresh_activity_rollup",
+        "schedule": crontab(hour=3, minute=17),
+        "kwargs": {"full": True},
+    },
     # Refresh the compact dashboard tool/category counts off the request path.
     # It uses the same five-minute cadence as the daily activity rollup.
     "dashboard-category-rollup-refresh": {

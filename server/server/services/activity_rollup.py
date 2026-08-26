@@ -7,10 +7,13 @@ into a tiny table refreshed in the background (celery-beat), so the endpoint
 reads a few thousand rows and applies the user's timezone offset itself. The
 hourly grain keeps timezone-boundary counts exact (unlike a UTC-day rollup).
 
-The rollup is a full recompute (DELETE + INSERT in one transaction) — the
-source is essentially append-only, the result is small, and MVCC lets readers
-see the previous snapshot until commit. A missing/empty rollup is not fatal:
-the endpoint falls back to the live aggregation.
+The 5-minute refresh is INCREMENTAL: it recomputes only a trailing 48-hour
+window (an indexed timestamp range scan) instead of re-aggregating all 3.3M+
+messages every beat. The full recompute path remains for the first populate
+and for a daily safety-net refresh that picks up late backfills/reparses
+older than the window. DELETE + INSERT run in one transaction, so MVCC lets
+readers see the previous snapshot until commit. A missing/empty rollup is not
+fatal: the endpoint falls back to the live aggregation.
 """
 
 from __future__ import annotations
@@ -47,15 +50,49 @@ _INSERT_SQL = text(
     """
 )
 
-
-async def refresh_activity_hourly(db: AsyncSession) -> int:
-    """Recompute the hourly rollup. Returns the row count written.
-
-    DELETE + INSERT run in one transaction so readers see the previous
-    snapshot (MVCC) until the single commit.
+# Incremental variants: recompute only hours at/after the window boundary.
+# now() is transaction-stable in PostgreSQL, so both statements agree on the
+# boundary within the refresh transaction. The window is generous (48h) so
+# ordinary late-arriving syncs land inside it; anything older is caught by the
+# daily full refresh.
+_WINDOW_BOUNDARY = "date_trunc('hour', now() - interval '48 hours')"
+_WINDOW_DELETE_SQL = text(
+    f"DELETE FROM conversation_activity_hourly WHERE hour >= {_WINDOW_BOUNDARY}"
+)
+_WINDOW_INSERT_SQL = text(
+    f"""
+    INSERT INTO conversation_activity_hourly (hour, machine_id, tool_id, message_count)
+    SELECT date_trunc('hour', m.timestamp) AS hour,
+           COALESCE(d.machine_id, '00000000-0000-0000-0000-000000000000'::uuid) AS machine_id,
+           d.tool_id,
+           count(*) AS message_count
+    FROM conversation_messages m
+    JOIN documents d ON m.document_id = d.id
+    WHERE {_COUNTABLE}
+      AND m.timestamp >= {_WINDOW_BOUNDARY}
+    GROUP BY 1, 2, 3
     """
-    await db.execute(_DELETE_SQL)
-    await db.execute(_INSERT_SQL)
+)
+
+
+async def refresh_activity_hourly(db: AsyncSession, *, full: bool = False) -> int:
+    """Refresh the hourly rollup. Returns the rollup's total row count.
+
+    Incremental by default: only the trailing 48-hour window is recomputed
+    (indexed timestamp range scan), so the 5-minute beat stops re-aggregating
+    the entire conversation_messages table. ``full=True`` — used for the first
+    populate (empty rollup) and the daily safety-net refresh — recomputes
+    everything, catching backfills/reparses older than the window. DELETE +
+    INSERT run in one transaction so readers see the previous snapshot (MVCC)
+    until the single commit.
+    """
+    do_full = full or not await rollup_is_populated(db)
+    if do_full:
+        await db.execute(_DELETE_SQL)
+        await db.execute(_INSERT_SQL)
+    else:
+        await db.execute(_WINDOW_DELETE_SQL)
+        await db.execute(_WINDOW_INSERT_SQL)
     await db.commit()
     n = await db.scalar(text("SELECT count(*) FROM conversation_activity_hourly"))
     return int(n or 0)

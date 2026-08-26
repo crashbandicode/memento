@@ -170,6 +170,53 @@ async def test_machine_scoping_and_admin_unscoped(session_factory):
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_incremental_refresh_updates_window_and_full_catches_backfills(
+    session_factory,
+):
+    """The 5-minute refresh only recomputes the trailing 48h window; a
+    full refresh picks up backfills older than the window."""
+    now = datetime.now(UTC)
+    recent = now - timedelta(hours=1)
+    old = now - timedelta(days=10)
+    async with session_factory() as s:
+        _user, machine, doc = await _seed(s)
+        s.add_all([
+            _msg(doc.id, 1, "user", "recent", recent),
+            _msg(doc.id, 2, "user", "old", old),
+        ])
+        await s.flush()
+        await s.commit()
+
+        async def total() -> int:
+            rows = await daily_dates_from_rollup(
+                s, machine_ids=[machine.id],
+                cutoff=now - timedelta(days=30), tz_offset=0,
+            )
+            return sum(r["message_count"] for r in rows)
+
+        # First refresh on an empty rollup takes the full path: both counted.
+        await refresh_activity_hourly(s)
+        assert await total() == 2
+
+        # New in-window message + a late backfill older than the window.
+        s.add_all([
+            _msg(doc.id, 3, "assistant", "fresh", now),
+            _msg(doc.id, 4, "user", "late-backfill", old),
+        ])
+        await s.flush()
+        await s.commit()
+
+        # Incremental (default): sees the in-window message only.
+        await refresh_activity_hourly(s)
+        assert await total() == 3
+
+        # Daily full refresh catches the out-of-window backfill.
+        await refresh_activity_hourly(s, full=True)
+        assert await total() == 4
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_rollup_is_populated_flag(session_factory):
     async with session_factory() as s:
         assert await rollup_is_populated(s) is False

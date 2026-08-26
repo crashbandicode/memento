@@ -23,7 +23,7 @@ logger = logging.getLogger("activity_rollup")
 LOCK_KEY = 0x41435456524F4C4C
 
 
-async def _run() -> dict:
+async def _run(*, full: bool = False) -> dict:
     async with engine.connect() as lock_connection:
         acquired = await lock_connection.scalar(
             text("SELECT pg_try_advisory_lock(:key)"), {"key": LOCK_KEY}
@@ -33,8 +33,8 @@ async def _run() -> dict:
             return {"refreshed": False, "locked": True}
         try:
             async with async_session_factory() as db:
-                rows = await refresh_activity_hourly(db)
-            return {"refreshed": True, "rows": rows}
+                rows = await refresh_activity_hourly(db, full=full)
+            return {"refreshed": True, "full": full, "rows": rows}
         finally:
             await lock_connection.execute(
                 text("SELECT pg_advisory_unlock(:key)"), {"key": LOCK_KEY}
@@ -47,9 +47,14 @@ async def _run() -> dict:
     acks_late=True,
     time_limit=300,
 )
-def refresh_activity_rollup() -> dict:
+def refresh_activity_rollup(full: bool = False) -> dict:
+    """Refresh the rollup — incremental (trailing window) unless ``full``.
+
+    The 5-minute beat runs incremental; a daily beat passes ``full=True`` to
+    catch backfills/reparses older than the incremental window.
+    """
     try:
-        return asyncio.run(_run())
+        return asyncio.run(_run(full=full))
     except Exception as e:  # noqa: BLE001
         logger.warning("refresh_activity_rollup errored: %s", e)
         return {"refreshed": False, "error": str(e)[:200]}
