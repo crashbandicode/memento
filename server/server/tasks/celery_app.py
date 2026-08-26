@@ -60,6 +60,7 @@ celery_app = Celery(
         "server.tasks.post_ingest",
         "server.tasks.activity_rollup_task",
         "server.tasks.dashboard_category_rollup_task",
+        "server.tasks.dashboard_conversation_message_rollup_task",
     ],
 )
 
@@ -108,6 +109,15 @@ celery_app.conf.beat_schedule = {
         "task": (
             "server.tasks.dashboard_category_rollup_task."
             "refresh_dashboard_category_rollup"
+        ),
+        "schedule": crontab(minute="*/5"),
+    },
+    # Keep the legacy dashboard conversation activity fallback off the request
+    # path while a projection-version upgrade is in progress.
+    "dashboard-conversation-message-rollup-refresh": {
+        "task": (
+            "server.tasks.dashboard_conversation_message_rollup_task."
+            "refresh_dashboard_conversation_message_rollup"
         ),
         "schedule": crontab(minute="*/5"),
     },

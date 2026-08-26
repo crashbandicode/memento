@@ -51,6 +51,10 @@ from ..services.dashboard_category_rollup import (
     dashboard_categories_from_rollup,
     dashboard_category_rollup_is_populated,
 )
+from ..services.dashboard_conversation_message_rollup import (
+    dashboard_conversation_message_rollup_is_populated,
+    dashboard_message_activity_from_rollup,
+)
 from ..services.device_grouping import resolve_device_scope_ids
 from ..services.document_delivery import (
     delivery_activity_expression,
@@ -533,31 +537,39 @@ async def get_dashboard(
     }
     legacy_ids = [row.id for row in convos_rows if not row.projected]
     if legacy_ids:
-        legacy_message_q = (
-            select(
-                ConversationMessage.document_id,
-                func.count().label("message_count"),
-                func.count().filter(
-                    ConversationMessage.role == "user"
-                ).label("user_count"),
-                func.count().filter(
-                    ConversationMessage.role == "assistant"
-                ).label("assistant_count"),
-                func.coalesce(
-                    func.sum(func.length(ConversationMessage.content)).filter(
-                        ConversationMessage.role.in_(("user", "assistant"))
-                    ),
-                    0,
-                ).label("human_character_count"),
+        if await dashboard_conversation_message_rollup_is_populated(db):
+            message_activity.update(
+                await dashboard_message_activity_from_rollup(
+                    db,
+                    document_ids=legacy_ids,
+                )
             )
-            .where(ConversationMessage.document_id.in_(legacy_ids))
-            .group_by(ConversationMessage.document_id)
-        )
-        message_activity.update({
-            document_id: (total, users, assistants, characters)
-            for document_id, total, users, assistants, characters
-            in (await db.execute(legacy_message_q)).all()
-        })
+        else:
+            legacy_message_q = (
+                select(
+                    ConversationMessage.document_id,
+                    func.count().label("message_count"),
+                    func.count().filter(
+                        ConversationMessage.role == "user"
+                    ).label("user_count"),
+                    func.count().filter(
+                        ConversationMessage.role == "assistant"
+                    ).label("assistant_count"),
+                    func.coalesce(
+                        func.sum(func.length(ConversationMessage.content)).filter(
+                            ConversationMessage.role.in_(("user", "assistant"))
+                        ),
+                        0,
+                    ).label("human_character_count"),
+                )
+                .where(ConversationMessage.document_id.in_(legacy_ids))
+                .group_by(ConversationMessage.document_id)
+            )
+            message_activity.update({
+                document_id: (total, users, assistants, characters)
+                for document_id, total, users, assistants, characters
+                in (await db.execute(legacy_message_q)).all()
+            })
 
     recent_conversations = []
     for row in convos_rows:

@@ -964,6 +964,16 @@ def _run_migrations(conn) -> None:
         "PRIMARY KEY (machine_id, tool_id, category))",
         "CREATE INDEX IF NOT EXISTS idx_dashboard_category_rollup_tool_category "
         "ON dashboard_document_category_rollups (tool_id, category)",
+        # Legacy dashboard rows need transcript activity until the dashboard
+        # projection upgrade completes. Refresh this compact per-document
+        # snapshot in Celery instead of grouping message bodies on every page
+        # load; see dashboard_conversation_message_rollup.py.
+        "CREATE TABLE IF NOT EXISTS dashboard_conversation_message_rollups ("
+        "document_id UUID PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE, "
+        "message_count BIGINT NOT NULL DEFAULT 0, "
+        "user_message_count BIGINT NOT NULL DEFAULT 0, "
+        "assistant_message_count BIGINT NOT NULL DEFAULT 0, "
+        "human_character_count BIGINT NOT NULL DEFAULT 0)",
         # These append/update-heavy tables need vacuum/analyze decisions based
         # on a small absolute fraction of the table. PostgreSQL's default 20%
         # scale factor leaves hundreds of thousands of dead message tuples

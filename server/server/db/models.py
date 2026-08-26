@@ -1220,6 +1220,32 @@ class DashboardDocumentCategoryRollup(Base):
 
 
 # ---------------------------------------------------------------------------
+# Dashboard conversation-message rollup
+# ---------------------------------------------------------------------------
+class DashboardConversationMessageRollup(Base):
+    """Precomputed activity counts for legacy dashboard conversation rows."""
+
+    __tablename__ = "dashboard_conversation_message_rollups"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    message_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    user_message_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    assistant_message_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    human_character_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard document projection
 # ---------------------------------------------------------------------------
 class DashboardDocumentProjection(Base):
