@@ -8,11 +8,12 @@ import json
 import re
 import uuid
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import orjson
 
-from sqlalchemy import delete, func, inspect, select, text, update
+from sqlalchemy import delete, func, inspect, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -142,6 +143,24 @@ PENDING_QUESTION_RECONCILIATION_VERSION_KEY = (
     "_pending_question_reconciliation_version"
 )
 PENDING_QUESTION_RECONCILIATION_VERSION = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedConversationMessage:
+    """Plain compatibility value for projections that need a generated ID.
+
+    Phase 1 deliberately keeps Canvas reconciliation in the existing session
+    flow.  Core inserts return only the identifiers it needs, so this adapter
+    avoids recreating mapped ``ConversationMessage`` instances merely to call
+    that unchanged compatibility projector.
+    """
+
+    id: int
+    document_id: uuid.UUID
+    line_number: int
+    role: str | None
+    content: str
+    metadata_: dict
 
 _ESSENTIAL_METADATA_KEYS = {
     "agent_depth",
@@ -2927,6 +2946,7 @@ async def ingest_file(
     base_hash: str | None = None,
     base_offset: int | None = None,
     authoritative_rebase: bool = False,
+    use_core_delta_message_staging: bool = True,
 ) -> Document:
     """Process and store an ingested file."""
     content_store_enabled = settings.document_content_minio_enabled
@@ -3608,6 +3628,7 @@ async def ingest_file(
             # part of the same transaction; retaining the incremental model can
             # otherwise preserve stale lifecycle/task state corrected above.
             force_projection_rebuild=authoritative_rebase,
+            use_core_delta_message_staging=use_core_delta_message_staging,
         )
         from .conversation_activity import refresh_document_activity_at
 
@@ -4281,6 +4302,131 @@ async def _apply_cursor_projection_order(
     return insert_lines, dirty_lines
 
 
+def _conversation_message_insert_values(
+    *,
+    document_id: uuid.UUID,
+    line_number: int,
+    message_type: str | None,
+    role: str | None,
+    content: str,
+    metadata: dict,
+    timestamp: datetime | None,
+) -> dict[str, object]:
+    """Return the plain row shape used by DELTA Core staging.
+
+    Keep the column spelling here (``metadata`` rather than the ORM attribute
+    ``metadata_``) so the values may be passed directly to the mapped table's
+    SQLAlchemy Core insert.
+    """
+    return {
+        "document_id": document_id,
+        "line_number": line_number,
+        "message_type": message_type,
+        "role": role,
+        "content": content,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    }
+
+
+def _conversation_message_from_values(
+    values: dict[str, object],
+) -> ConversationMessage:
+    """Build the retained legacy staging object for the Phase 0 comparator."""
+    return ConversationMessage(
+        document_id=values["document_id"],
+        line_number=values["line_number"],
+        message_type=values["message_type"],
+        role=values["role"],
+        content=values["content"],
+        metadata_=values["metadata"],
+        timestamp=values["timestamp"],
+    )
+
+
+async def _stage_new_conversation_messages(
+    db: AsyncSession,
+    document: Document,
+    values: list[dict[str, object]],
+    *,
+    use_core: bool,
+) -> None:
+    """Persist one semantic batch without changing its projection sequence.
+
+    DELTAs take the Core branch by default.  The legacy branch exists only for
+    Phase 0's current-path golden gate, making the comparison exercise the
+    same surrounding transaction, tail mutations, projections, and SSE
+    staging as the shipped path.
+    """
+    if not values:
+        return
+
+    from .canvas_artifact_store import (
+        canvas_message_can_have_reference,
+        project_message_canvases,
+    )
+
+    if not use_core:
+        legacy_batch = [_conversation_message_from_values(value) for value in values]
+        db.add_all(legacy_batch)
+        await db.flush()
+        await project_message_canvases(db, document, legacy_batch)
+        return
+
+    # The unchanged Canvas compatibility projector only needs generated IDs
+    # for rows that can actually name a Canvas.  Avoid a RETURNING payload,
+    # adapter allocation, and no-op reconciliation query for the normal batch
+    # that cannot affect this projection.
+    canvas_values = [
+        value
+        for value in values
+        if canvas_message_can_have_reference(
+            value["role"],
+            value["metadata"],
+        )
+        and ".canvas.tsx" in str(value["content"]).casefold()
+    ]
+    message_table = ConversationMessage.__table__
+    if not canvas_values:
+        await db.execute(insert(message_table), values)
+        return
+
+    canvas_line_numbers = {
+        int(value["line_number"])
+        for value in canvas_values
+    }
+    ordinary_values = [
+        value
+        for value in values
+        if int(value["line_number"]) not in canvas_line_numbers
+    ]
+    if ordinary_values:
+        await db.execute(insert(message_table), ordinary_values)
+    result = await db.execute(
+        insert(message_table).returning(
+            message_table.c.id,
+            message_table.c.line_number,
+        ),
+        canvas_values,
+    )
+    inserted_ids = {
+        int(row.line_number): int(row.id)
+        for row in result
+    }
+    projection_batch = [
+        _StagedConversationMessage(
+            id=inserted_ids[int(value["line_number"])],
+            document_id=value["document_id"],
+            line_number=int(value["line_number"]),
+            role=value["role"],
+            content=value["content"],
+            metadata_=value["metadata"],
+        )
+        for value in canvas_values
+    ]
+    await project_message_canvases(db, document, projection_batch)
+
+
 async def _extract_messages(
     db: AsyncSession,
     doc: Document,
@@ -4292,6 +4438,7 @@ async def _extract_messages(
     conversation_source: ConversationFileSource | None = None,
     cursor_projection_order: object | None = None,
     force_projection_rebuild: bool = False,
+    use_core_delta_message_staging: bool = True,
 ) -> str:
     """Store bounded normalized messages and return bounded FTS source text."""
     from .conversation_parser import (
@@ -4509,7 +4656,11 @@ async def _extract_messages(
     terminal_tool_call_ids: set[str] = set()
     clear_live_interaction_signals = False
     line_num = start_line
-    batch: list[ConversationMessage] = []
+    # New DELTA rows are deliberately kept as dictionaries until Core inserts
+    # them.  Existing rows participating in tail/queue/source reconciliation
+    # remain ORM instances in this phase.
+    use_core_batch_staging = mode == "delta" and use_core_delta_message_staging
+    batch: list[dict[str, object]] = []
     batch_bytes = 0
     usage_event_rows: list[dict[str, object]] = []
     delta_tail = None
@@ -5006,13 +5157,13 @@ async def _extract_messages(
                 "Cursor projection ordering hint omitted a new source identity"
             )
         batch.append(
-            ConversationMessage(
+            _conversation_message_insert_values(
                 document_id=doc.id,
                 line_number=target_line,
                 message_type=message_type,
                 role=normalized.role,
                 content=clean_content,
-                metadata_=meta,
+                metadata=meta,
                 timestamp=ts,
             )
         )
@@ -5026,9 +5177,12 @@ async def _extract_messages(
 
         # Flush in batches to avoid memory issues with large files
         if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
-            db.add_all(batch)
-            await db.flush()
-            await project_message_canvases(db, doc, batch)
+            await _stage_new_conversation_messages(
+                db,
+                doc,
+                batch,
+                use_core=use_core_batch_staging,
+            )
             batch = []
             batch_bytes = 0
 
@@ -5064,9 +5218,12 @@ async def _extract_messages(
     _store_assistant_identity(doc, assistant_identity)
 
     if batch:
-        db.add_all(batch)
-        await db.flush()
-        await project_message_canvases(db, doc, batch)
+        await _stage_new_conversation_messages(
+            db,
+            doc,
+            batch,
+            use_core=use_core_batch_staging,
+        )
     if canvas_reconcile_rows:
         await reconcile_message_canvases(db, doc, canvas_reconcile_rows)
 
