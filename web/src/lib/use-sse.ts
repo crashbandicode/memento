@@ -46,10 +46,39 @@ export function useSSE(
     const MIN_RETRY_MS = 5000;
     const MAX_RETRY_MS = 60000;
     let retryDelay = MIN_RETRY_MS;
+    // Liveness watchdog: mobile networks silently drop the SSE socket (carrier
+    // NAT / radio sleep) WITHOUT firing onerror, so a dead stream still reports
+    // "open" and no reconnect is scheduled — the user sees stale data until a
+    // manual refresh. The server sends a keepalive every ~25s precisely so a
+    // client can notice this; if we go quiet past STALE_MS, force a
+    // resume-from-cursor reconnect so buffered events replay.
+    const STALE_MS = 45000;
+    let lastActivityAt = Date.now();
+    let livenessTimer: ReturnType<typeof setInterval> | null = null;
+    function markActivity() { lastActivityAt = Date.now(); }
 
     function clearReconnectTimer() {
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+
+    function clearLivenessTimer() {
+      if (livenessTimer !== null) clearInterval(livenessTimer);
+      livenessTimer = null;
+    }
+
+    function startLivenessWatchdog() {
+      clearLivenessTimer();
+      livenessTimer = setInterval(() => {
+        if (stopped || documentIsHidden() || !es) return;
+        if (Date.now() - lastActivityAt > STALE_MS) {
+          // Reports open but silent past the keepalive window → treat as dead
+          // and reconnect, resuming from lastEventId so missed events replay.
+          closeStream();
+          retryDelay = MIN_RETRY_MS;
+          void connect();
+        }
+      }, 15000);
     }
 
     function closeStream() {
@@ -94,11 +123,12 @@ export function useSSE(
         const next = new EventSource(buildEventStreamUrl(base, lastEventId, streamToken), {
           withCredentials: true,
         });
-        next.onopen = () => { retryDelay = MIN_RETRY_MS; };
+        next.onopen = () => { retryDelay = MIN_RETRY_MS; markActivity(); };
         streamAttempted = true;
         es = next;
 
         const handleEvent = (e: MessageEvent<string>) => {
+          markActivity();
           try {
             const event: SSEEvent = JSON.parse(e.data);
             if (e.lastEventId) {
@@ -115,11 +145,14 @@ export function useSSE(
         next.addEventListener("file_synced", handleEvent);
         next.addEventListener("realtime_reset", handleEvent);
         next.addEventListener("stream_ready", (e) => {
+          markActivity();
           if (e.lastEventId) lastEventId = e.lastEventId;
         });
 
         next.addEventListener("keepalive", () => {
-          // ignore keepalives
+          // Keepalives carry no data, but they are the watchdog's heartbeat:
+          // receiving one proves the stream is still alive.
+          markActivity();
         });
 
         next.onerror = () => {
@@ -180,6 +213,7 @@ export function useSSE(
     }
 
     void connect();
+    startLivenessWatchdog();
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("pageshow", handlePageShow);
     window.addEventListener("online", resume);
@@ -189,6 +223,7 @@ export function useSSE(
     return () => {
       stopped = true;
       closeStream();
+      clearLivenessTimer();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("pageshow", handlePageShow);
       window.removeEventListener("online", resume);
