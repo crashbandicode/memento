@@ -25,6 +25,7 @@ def test_online_plan_creates_required_index_before_concurrent_drops() -> None:
         "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
+        "idx_conv_msg_content_trgm",
     ]
     assert plan[0] == {
         "name": "idx_documents_content_tsv",
@@ -309,6 +310,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
         {
             "idx_documents_content_trgm": True,
             "idx_conv_msg_document": True,
+            "idx_conv_msg_content_trgm": True,
         }
     )
 
@@ -329,6 +331,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
         "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
+        "idx_conv_msg_content_trgm",
     ]
     assert first["skipped"] == []
     assert first_ddl == [
@@ -342,6 +345,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
         ),
         "DROP INDEX CONCURRENTLY IF EXISTS idx_documents_content_trgm",
         "DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_document",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_content_trgm",
     ]
     assert second["locked"] is False
     assert second["applied"] == []
@@ -350,6 +354,7 @@ async def test_online_runner_is_autocommit_and_idempotent() -> None:
         "idx_conv_msg_doc_source_id",
         "idx_documents_content_trgm",
         "idx_conv_msg_document",
+        "idx_conv_msg_content_trgm",
     ]
     assert second_ddl == []
     assert {

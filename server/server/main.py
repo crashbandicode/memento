@@ -1037,9 +1037,11 @@ def _run_migrations(conn) -> None:
         "ON conversation_messages USING gin "
         "(to_tsvector('simple', content)) "
         "WHERE role IN ('user', 'assistant')",
-        "CREATE INDEX IF NOT EXISTS idx_conv_msg_content_trgm "
-        "ON conversation_messages USING gin (content gin_trgm_ops) "
-        "WHERE role IN ('user', 'assistant')",
+        # idx_conv_msg_content_trgm is intentionally NOT created anymore. The
+        # fuzzy body path (include_body_fuzzy) has no production caller, so the
+        # 1.5 GB trigram GIN index had zero scans while every transcript ingest
+        # paid its maintenance. Online index migrations drop it concurrently on
+        # existing installs; message search keeps idx_conv_msg_content_fts.
         "CREATE INDEX IF NOT EXISTS idx_documents_project_category ON documents (project_id, category)",
         # Cursor can relocate one stable thread from empty-window to its real
         # project, or promote a nested subagent transcript to a root path.

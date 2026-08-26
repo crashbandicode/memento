@@ -11,6 +11,9 @@ from ..db.session import async_session_factory, engine
 from ..services.dashboard_conversation_message_rollup import (
     refresh_dashboard_conversation_message_rollup,
 )
+from ..services.dashboard_projection import (
+    dashboard_projection_backfill_complete,
+)
 from .celery_app import celery_app
 
 logger = logging.getLogger("dashboard_conversation_message_rollup")
@@ -20,6 +23,15 @@ LOCK_KEY = 0x4453484D5347
 
 
 async def _run() -> dict:
+    # This rollup only feeds the dashboard's LEGACY (non-projected) rows. Once
+    # the projection backfill is complete the endpoint serves projections only,
+    # legacy_ids is always empty, and the rollup is never read — so skip the
+    # full conversation_messages aggregation (a multi-second seq scan) instead
+    # of re-running it every beat. The gate reopens automatically whenever a
+    # projection version bump makes the backfill incomplete again.
+    async with async_session_factory() as gate_db:
+        if await dashboard_projection_backfill_complete(gate_db):
+            return {"refreshed": False, "skipped": "projection backfill complete"}
     async with engine.connect() as lock_connection:
         acquired = await lock_connection.scalar(
             text("SELECT pg_try_advisory_lock(:key)"), {"key": LOCK_KEY}

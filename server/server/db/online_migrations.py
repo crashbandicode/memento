@@ -68,6 +68,15 @@ ONLINE_INDEX_MIGRATIONS = (
         operation="drop",
         ddl="DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_document",
     ),
+    # The fuzzy body-search path (include_body_fuzzy) has no production caller,
+    # so this 1.5 GB trigram GIN index over 3.3M transcript rows recorded zero
+    # scans while every ingest paid its write amplification. Message search is
+    # served by the bounded tsvector index (idx_conv_msg_content_fts).
+    OnlineIndexMigration(
+        name="idx_conv_msg_content_trgm",
+        operation="drop",
+        ddl="DROP INDEX CONCURRENTLY IF EXISTS idx_conv_msg_content_trgm",
+    ),
 )
 
 _INDEX_VALIDITY_SQL = text(
