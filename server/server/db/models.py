@@ -1189,6 +1189,37 @@ class ConversationActivityHourly(Base):
 
 
 # ---------------------------------------------------------------------------
+# Dashboard category rollup
+# ---------------------------------------------------------------------------
+class DashboardDocumentCategoryRollup(Base):
+    """Precomputed document counts per machine, tool, and category.
+
+    ``machine_id`` uses the same non-null sentinel as the daily activity
+    rollup when a legacy document has no machine. That keeps the composite
+    primary key compact while preserving owner/admin visibility of those rows.
+    """
+
+    __tablename__ = "dashboard_document_category_rollups"
+
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True
+    )
+    tool_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    category: Mapped[str] = mapped_column(String(50), primary_key=True)
+    document_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_dashboard_category_rollup_tool_category",
+            "tool_id",
+            "category",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dashboard document projection
 # ---------------------------------------------------------------------------
 class DashboardDocumentProjection(Base):

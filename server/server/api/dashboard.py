@@ -47,6 +47,10 @@ from ..services.dashboard_projection import (
     DASHBOARD_PROJECTION_VERSION,
     dashboard_projection_backfill_complete,
 )
+from ..services.dashboard_category_rollup import (
+    dashboard_categories_from_rollup,
+    dashboard_category_rollup_is_populated,
+)
 from ..services.device_grouping import resolve_device_scope_ids
 from ..services.document_delivery import (
     delivery_activity_expression,
@@ -76,6 +80,23 @@ def _apply_device_filter(query, machine_ids, machine_column):
     if machine_ids is None:
         return query
     return query.where(machine_column.in_(machine_ids))
+
+
+def _effective_machine_scope(
+    user_machine_ids,
+    selected_machine_ids,
+):
+    """Return the exact intersection applied by ``scoped`` below."""
+    if selected_machine_ids is None:
+        return user_machine_ids
+    if user_machine_ids is None:
+        return selected_machine_ids
+    allowed = set(user_machine_ids)
+    return [
+        machine_id
+        for machine_id in selected_machine_ids
+        if machine_id in allowed
+    ]
 
 
 def _legacy_is_archived_expression(metadata):
@@ -262,12 +283,29 @@ async def get_dashboard(
     tools_result = await db.execute(select(Tool).order_by(Tool.display_name))
     tool_records = list(tools_result.scalars().all())
 
-    cat_agg_q = scoped(
-        select(source.c.tool_id, source.c.category, func.count().label("n"))
-    ).group_by(source.c.tool_id, source.c.category)
-    categories_by_tool: dict[str, dict[str, int]] = {}
-    for tid, cat, count in (await db.execute(cat_agg_q)).all():
-        categories_by_tool.setdefault(tid, {})[cat] = count
+    # The all-document tool/category GROUP BY was the dashboard's dominant
+    # cold-request cost. Prefer its precomputed per-machine snapshot once the
+    # dashboard projection itself is fully backfilled. During either rollout
+    # (or before the first beat refresh), run the original live query so this
+    # endpoint never serves a partial aggregate.
+    if (
+        not include_legacy
+        and await dashboard_category_rollup_is_populated(db)
+    ):
+        categories_by_tool = await dashboard_categories_from_rollup(
+            db,
+            machine_ids=_effective_machine_scope(
+                mids,
+                selected_machine_ids,
+            ),
+        )
+    else:
+        cat_agg_q = scoped(
+            select(source.c.tool_id, source.c.category, func.count().label("n"))
+        ).group_by(source.c.tool_id, source.c.category)
+        categories_by_tool: dict[str, dict[str, int]] = {}
+        for tid, cat, count in (await db.execute(cat_agg_q)).all():
+            categories_by_tool.setdefault(tid, {})[cat] = count
 
     today_q = scoped(
         select(source.c.tool_id, func.count().label("n")).where(

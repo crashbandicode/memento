@@ -953,6 +953,17 @@ def _run_migrations(conn) -> None:
         "PRIMARY KEY (hour, machine_id, tool_id))",
         "CREATE INDEX IF NOT EXISTS idx_activity_hourly_machine_hour "
         "ON conversation_activity_hourly (machine_id, hour)",
+        # Dashboard tool cards used to GROUP BY every dashboard document row
+        # on each cold refresh. A background task maintains this compact
+        # machine/tool/category snapshot; see dashboard_category_rollup.py.
+        "CREATE TABLE IF NOT EXISTS dashboard_document_category_rollups ("
+        "machine_id UUID NOT NULL, "
+        "tool_id VARCHAR(50) NOT NULL, "
+        "category VARCHAR(50) NOT NULL, "
+        "document_count BIGINT NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (machine_id, tool_id, category))",
+        "CREATE INDEX IF NOT EXISTS idx_dashboard_category_rollup_tool_category "
+        "ON dashboard_document_category_rollups (tool_id, category)",
         # These append/update-heavy tables need vacuum/analyze decisions based
         # on a small absolute fraction of the table. PostgreSQL's default 20%
         # scale factor leaves hundreds of thousands of dead message tuples

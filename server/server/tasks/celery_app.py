@@ -59,6 +59,7 @@ celery_app = Celery(
         "server.tasks.ingest_spool",
         "server.tasks.post_ingest",
         "server.tasks.activity_rollup_task",
+        "server.tasks.dashboard_category_rollup_task",
     ],
 )
 
@@ -99,6 +100,15 @@ celery_app.conf.beat_schedule = {
     # changes.
     "activity-rollup-refresh": {
         "task": "server.tasks.activity_rollup_task.refresh_activity_rollup",
+        "schedule": crontab(minute="*/5"),
+    },
+    # Refresh the compact dashboard tool/category counts off the request path.
+    # It uses the same five-minute cadence as the daily activity rollup.
+    "dashboard-category-rollup-refresh": {
+        "task": (
+            "server.tasks.dashboard_category_rollup_task."
+            "refresh_dashboard_category_rollup"
+        ),
         "schedule": crontab(minute="*/5"),
     },
     "daily-digest": {
