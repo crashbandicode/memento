@@ -2764,7 +2764,10 @@ async def _reconcile_idempotent_claude_ingest(
     lifecycle_document = enriched_child or document
     lifecycle_changed = _reconcile_subagent_document_lifecycle(
         lifecycle_document,
-        lifecycle_document.content,
+        # Document.content is deferred; a bare attribute access here lazy-loads
+        # outside the greenlet (MissingGreenlet, seen live on the idempotent
+        # discovery path). Go through the dual-read accessor instead.
+        await document_content(db, lifecycle_document),
     )
     if enriched_child is None and not lifecycle_changed:
         return
