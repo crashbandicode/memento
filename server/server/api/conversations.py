@@ -83,6 +83,7 @@ from ..services.claude_lineage import (
     normalize_interaction_origin,
 )
 from ..services.document_delivery import (
+    delivery_activity_expression,
     delivery_metadata_expression,
     delivery_synced_expression,
     document_metadata,
@@ -892,9 +893,11 @@ async def _handoff_successor_reference(
         # Most-recently-ACTIVE successor wins: a re-done handoff leaves
         # abandoned successor threads behind (sometimes created after the
         # live one), and the thread that kept working is the real
-        # continuation. The pointer self-heals as activity accrues.
+        # continuation. The pointer self-heals as activity accrues. Activity
+        # must come from the delivery projection: conversation DELTAs advance
+        # document_delivery_state.activity_at, not the canonical column.
         .order_by(
-            Document.activity_at.desc().nulls_last(),
+            delivery_activity_expression().desc().nulls_last(),
             Document.created_at.desc(),
             ConversationMessage.line_number.asc(),
             Document.id.desc(),
