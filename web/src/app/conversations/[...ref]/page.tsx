@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import {
   api,
@@ -146,17 +147,54 @@ export default function ConversationPage() {
           <div className="text-gray-400 text-center">{t.loading}</div>
         ) : (
           <>
-            <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 6 }}>
+            <div style={{ display: "flex", alignItems: "flex-start", flexWrap: "wrap", gap: 12, marginBottom: 6 }}>
               <ToolGlyph id={currentMeta.tool_id} size={32} />
-              <h2 style={{ margin: 0, minWidth: 0, flex: "1 1 280px", fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
-                {currentMeta.title || currentMeta.relative_path}
-              </h2>
+              <div style={{ minWidth: 0, flex: "1 1 280px" }}>
+                <h2 style={{ margin: 0, fontSize: "clamp(20px, 3vw, 26px)", fontWeight: 600, color: "var(--aurora-fg1)", letterSpacing: "-0.02em" }}>
+                  {currentMeta.title || currentMeta.relative_path}
+                </h2>
+                {currentMeta.handoff_predecessor && (
+                  <Link
+                    data-handoff-predecessor
+                    href={currentMeta.handoff_predecessor.canonical_url || `/conversations/${currentMeta.handoff_predecessor.document_id}`}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      maxWidth: "100%",
+                      marginTop: 6,
+                      color: "var(--aurora-accent)",
+                      fontSize: 12,
+                      textDecoration: "none",
+                    }}
+                  >
+                    <Icon name="arrow_left" size={13} />
+                    <span style={{ flex: "0 0 auto" }}>Continued from</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {currentMeta.handoff_predecessor.title}
+                    </span>
+                  </Link>
+                )}
+              </div>
               <Btn size="sm" variant="glass" icon="arrow_down" onClick={() => setShowExport(true)}>
                 Export
               </Btn>
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, fontSize: 12, color: "var(--aurora-fg3)" }}>
               <Chip>{currentMeta.tool_id}</Chip>
+              {currentMeta.handoff_successor && (
+                <Link
+                  data-handoff-successor
+                  href={currentMeta.handoff_successor.canonical_url || `/conversations/${currentMeta.handoff_successor.document_id}`}
+                  style={{ display: "inline-flex", minWidth: 0, maxWidth: "min(100%, 360px)", textDecoration: "none" }}
+                >
+                  <Chip tone="accent" icon="arrow_right" style={{ minWidth: 0, maxWidth: "100%" }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      Handed off → {currentMeta.handoff_successor.title}
+                    </span>
+                  </Chip>
+                </Link>
+              )}
               {Boolean(currentMeta.pending_question_count) && (
                 <Chip tone="warn" icon="message">{t.conversation.awaitingResponse}</Chip>
               )}
@@ -306,6 +344,7 @@ export default function ConversationPage() {
         totalMessages={currentMeta?.message_count}
         activeTaskState={currentMeta?.active_task_state}
         artifacts={plans}
+        handoffSuccessor={currentMeta?.handoff_successor}
       />
       {showExport && (
         <MarkdownExportDialog documentId={currentMeta?.id || docId} onClose={() => setShowExport(false)} />

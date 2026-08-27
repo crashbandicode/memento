@@ -15,6 +15,7 @@ import Link from "next/link";
 import {
   api,
   ConversationAgentEvent,
+  ConversationHandoffLink,
   ConversationMessage,
   ConversationPrompt,
   ConversationSearchHit,
@@ -465,6 +466,7 @@ export default function ConversationViewer({
   totalMessages,
   activeTaskState,
   artifacts,
+  handoffSuccessor,
 }: {
   documentId: string;
   prompts: ConversationPrompt[];
@@ -476,6 +478,7 @@ export default function ConversationViewer({
   totalMessages?: number;
   activeTaskState?: ConversationTaskState | null;
   artifacts?: Artifact[];
+  handoffSuccessor?: ConversationHandoffLink | null;
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   // This state is intentionally restricted to reader-driven work (the first
@@ -1889,6 +1892,33 @@ export default function ConversationViewer({
                 <ArtifactBubble key={art.id} artifact={art} />
               ))}
             </>
+          )}
+
+          {!hasMore && messages.length > 0 && handoffSuccessor && (
+            <Link
+              data-handoff-continue-reading
+              href={handoffSuccessor.canonical_url || `/conversations/${handoffSuccessor.document_id}`}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                minHeight: 48,
+                padding: "10px 13px",
+                borderRadius: 12,
+                border: "1px solid color-mix(in srgb, var(--aurora-accent) 28%, var(--aurora-border))",
+                background: "color-mix(in srgb, var(--aurora-accent-soft) 62%, var(--aurora-surface-solid))",
+                color: "var(--aurora-accent)",
+                fontSize: 12,
+                fontWeight: 600,
+                textDecoration: "none",
+              }}
+            >
+              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                Continue reading → {handoffSuccessor.title}
+              </span>
+              <Icon name="arrow_right" size={16} />
+            </Link>
           )}
         </div>
 

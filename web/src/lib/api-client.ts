@@ -351,12 +351,21 @@ export interface ConversationMeta {
   reasoning_effort?: string | null;
   service_tier?: string | null;
   token_usage?: ConversationTokenUsage | null;
+  handoff_predecessor?: ConversationHandoffLink | null;
+  handoff_successor?: ConversationHandoffLink | null;
   message_count: number;
   subagent_count?: number;
   is_subagent_orphan?: boolean;
   subagents?: ConversationSubagentSummary[];
   activity_at?: string | null;
   synced_at: string;
+}
+
+export interface ConversationHandoffLink {
+  document_id: string;
+  tool_id: string;
+  title: string;
+  canonical_url: string;
 }
 
 export interface ConversationMarkdownExportSettings {

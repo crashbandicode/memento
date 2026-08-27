@@ -120,6 +120,21 @@ _NATIVE_CONVERSATION_REF = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
 
+_HANDOFF_MARKER_PREFIX = "MEMENTO-HANDOFF-FROM:"
+_HANDOFF_MARKER_RE = re.compile(
+    r"\AMEMENTO-HANDOFF-FROM:\s*(?P<session_id>"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\r?\n|\Z)"
+)
+_CLAUDE_SESSION_PATH_RE = re.compile(
+    r"(?:\A|[\\/])(?P<session_id>"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl\Z"
+)
+# Claude JSONL files begin with a small fixed set of non-user records before
+# the first prompt. Keep the reverse FTS probe bounded to that opening window.
+_HANDOFF_EARLY_USER_LINE_LIMIT = 3
+
 _SHELL_TOOL_NAMES = {
     "bash",
     "execcommand",
@@ -731,6 +746,182 @@ async def _get_conversation_identity(
     return row, None
 
 
+def _handoff_marker_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message handoff marker."""
+    if not isinstance(content, str):
+        return None
+    match = _HANDOFF_MARKER_RE.match(content)
+    if match is None:
+        return None
+    try:
+        return str(uuid.UUID(match.group("session_id")))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _claude_session_id_from_relative_path(relative_path: object) -> str | None:
+    """Return the Claude Code session UUID encoded by a transcript filename."""
+    if not isinstance(relative_path, str):
+        return None
+    match = _CLAUDE_SESSION_PATH_RE.search(relative_path)
+    if match is None:
+        return None
+    try:
+        return str(uuid.UUID(match.group("session_id")))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _handoff_conversation_reference(document: Document) -> dict:
+    """Serialize a small, navigable linked-thread reference for detail views."""
+    title = conversation_display_title(
+        document.tool_id,
+        document.relative_path,
+        document.metadata_,
+        document.title,
+    )
+    return {
+        "document_id": str(document.id),
+        "tool_id": document.tool_id,
+        "title": title or document.relative_path or "Untitled conversation",
+        "canonical_url": (
+            native_conversation_url(
+                document.tool_id,
+                "conversation",
+                document.metadata_,
+            )
+            or f"/conversations/{document.id}"
+        ),
+    }
+
+
+async def _handoff_predecessor_reference(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict | None:
+    """Resolve a Claude handoff marker in this thread's first user prompt."""
+    first_user_content = (
+        await db.execute(
+            select(ConversationMessage.content)
+            .where(
+                ConversationMessage.document_id == document.id,
+                ConversationMessage.role == "user",
+            )
+            .order_by(
+                ConversationMessage.line_number.asc(),
+                ConversationMessage.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    predecessor_session_id = _handoff_marker_session_id(first_user_content)
+    if predecessor_session_id is None:
+        return None
+
+    normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
+    predecessor_path = f"{predecessor_session_id}.jsonl"
+    statement = (
+        select(Document)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            or_(
+                normalized_path == predecessor_path,
+                normalized_path.like(f"%/{predecessor_path}"),
+            ),
+        )
+        .order_by(Document.id)
+        .limit(1)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+    predecessor = (await db.execute(statement)).scalars().first()
+    return _handoff_conversation_reference(predecessor) if predecessor is not None else None
+
+
+async def _handoff_successor_reference(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict | None:
+    """Find a linked successor with one bounded indexed full-text probe."""
+    session_id = _claude_session_id_from_relative_path(document.relative_path)
+    if session_id is None:
+        return None
+
+    # This expression deliberately matches idx_conv_msg_content_fts exactly.
+    # Its partial-index predicate is implied by role == "user" below.
+    content_vector = func.to_tsvector("simple", ConversationMessage.content)
+    session_query = func.plainto_tsquery("simple", session_id)
+    statement = (
+        select(Document, ConversationMessage.content)
+        .join(ConversationMessage, ConversationMessage.document_id == Document.id)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.id != document.id,
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            ConversationMessage.role == "user",
+            ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+            ConversationMessage.content.startswith(_HANDOFF_MARKER_PREFIX),
+            content_vector.op("@@")(session_query),
+        )
+        # Newest successor wins: a re-done handoff (an abandoned successor
+        # thread followed by the real one) must resolve to the live thread.
+        .order_by(
+            Document.created_at.desc(),
+            ConversationMessage.line_number.asc(),
+            Document.id.desc(),
+        )
+        .limit(64)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+    for successor, content in (await db.execute(statement)).all():
+        if _handoff_marker_session_id(content) == session_id:
+            return _handoff_conversation_reference(successor)
+    return None
+
+
+async def _handoff_thread_links(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict:
+    """Return detail-only handoff links without changing stored conversation data."""
+    if document.tool_id != "claude_code":
+        return {}
+
+    predecessor = await _handoff_predecessor_reference(db, document, machine_ids)
+    successor = await _handoff_successor_reference(db, document, machine_ids)
+    links: dict[str, dict] = {}
+    if predecessor is not None:
+        links["handoff_predecessor"] = predecessor
+    if successor is not None:
+        links["handoff_successor"] = successor
+    return links
+
+
 def _message_question_interactions(metadata: object) -> list[dict]:
     """Return every normalized question carried by one message row."""
     if not isinstance(metadata, dict):
@@ -1212,6 +1403,7 @@ async def get_conversation(
     if token_usage:
         runtime["token_usage"] = token_usage
     usage_models = await conversation_usage_models(db, doc.id)
+    handoff_links = await _handoff_thread_links(db, doc, mids)
 
     return {
         "id": str(doc.id),
@@ -1272,6 +1464,7 @@ async def get_conversation(
         "activity_at": activity_at.isoformat() if activity_at else None,
         "synced_at": doc.synced_at.isoformat(),
         "related_plans": related_plans,
+        **handoff_links,
     }
 
 
