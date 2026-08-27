@@ -9,14 +9,14 @@ test("Codex and Cursor use their real marks at mobile size", async ({ page }) =>
   const cursor = page.locator('[data-brand-mark="cursor"]').first();
 
   await expect(codex).toBeVisible();
-  await expect(codex).toHaveAttribute("data-brand-source", "bundled-official");
+  await expect(codex).toHaveAttribute("data-brand-source", "codex-product");
   await expect(cursor).toBeVisible();
   await expect(cursor).toHaveAttribute("data-brand-source", "cursor-brand-kit");
 
-  // Guard the two exact regression paths: Memento's old Codex wireframe and
-  // faceted Cursor fallback both had multiple paths/groups. These marks are
-  // the single-path OpenAI and official Cursor 2D cube assets respectively.
-  await expect(codex.locator("path")).toHaveCount(1);
+  // Guard regression paths: Codex uses the cloud-terminal product mark (not
+  // bundled react-icons); Cursor uses the official 2D cube from the brand kit.
+  await expect(codex.locator('[data-codex-product-mark="cloud-terminal"]')).toBeVisible();
+  await expect(codex.locator("path")).toHaveCount(2);
   await expect(cursor.locator("path")).toHaveCount(1);
   await expect(cursor.locator("path")).toHaveAttribute("d", /^M457\.43 125\.94/);
 });
