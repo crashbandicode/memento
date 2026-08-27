@@ -577,10 +577,22 @@ def _history_metadata_is_already_committed(
 
     # Legacy's gate selects any persisted user row, including recovered rows;
     # non-delete user mutations commit in this raw transaction before legacy
-    # fallback would run, so each proves its injection would be a no-op.
+    # fallback would run, so each proves its injection would be a no-op. A
+    # committed user row only counts if this frame does not update it to a
+    # non-user role: legacy re-checks AFTER the frame applies.
+    superseded_ids = {
+        int(mutation.existing_id)
+        for mutation in prospective_mutations
+        if mutation.operation == "update"
+        and mutation.existing_id is not None
+        and mutation.role != "user"
+    }
     return (
-        bool(state.ordinary_user_rows)
-        or any(row.role == "user" for row in state.recovered_history)
+        any(int(row.id) not in superseded_ids for row in state.ordinary_user_rows)
+        or any(
+            row.role == "user" and int(row.id) not in superseded_ids
+            for row in state.recovered_history
+        )
         or any(
             mutation.role == "user" and mutation.operation != "delete"
             for mutation in prospective_mutations
