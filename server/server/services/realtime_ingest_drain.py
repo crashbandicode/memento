@@ -12,7 +12,6 @@ import logging
 import signal
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
 
 from ..config import settings
 from ..services.ingest_service import DeltaBaseMismatch
@@ -236,6 +235,10 @@ class RealtimeIngestDrain:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     drain = RealtimeIngestDrain()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

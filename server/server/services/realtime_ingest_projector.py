@@ -586,6 +586,10 @@ class RealtimeIngestProjector:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     projector = RealtimeIngestProjector()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
