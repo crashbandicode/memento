@@ -108,6 +108,90 @@ async def test_drain_exits_when_another_process_owns_global_lock(
 
 
 @pytest.mark.asyncio
+async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RawWriterUnsupported must route the chain through the legacy path, not
+    retry forever (observed live: an authoritative history rebuild looped the
+    drain 144 times at ~32% CPU)."""
+    from types import SimpleNamespace
+
+    from server.db import session as session_module
+    from server.services import ingest_service as ingest_module
+    from server.services import realtime_raw_writer as raw_module
+    from server.tasks import ingest_spool as task_module
+
+    job_ids = ("a" * 64, "b" * 64)
+    manifests = {job_id: {"meta": {"file_size": 10}} for job_id in job_ids}
+
+    def read_bytes(job_id, *, manifest):
+        del manifest
+        return (
+            {
+                "meta": {
+                    "tool": "codex",
+                    "category": "conversation",
+                    "content_type": "jsonl",
+                    "relative_path": "sessions/x.jsonl",
+                    "hash": f"hash-{job_id[:6]}",
+                    "file_size": 10,
+                    "mode": "delta",
+                    "offset": 0,
+                    "metadata": {},
+                }
+            },
+            b'{"line": 1}',
+        )
+
+    monkeypatch.setattr(task_module, "read_ready_job_bytes", read_bytes)
+
+    async def unsupported_chain(**_kwargs):
+        raise raw_module.RawWriterUnsupported("history rebuild needs legacy")
+
+    monkeypatch.setattr(
+        raw_module, "ingest_conversation_raw_chain", unsupported_chain
+    )
+
+    legacy_calls: list[dict] = []
+
+    async def fake_ingest_file(*, db, writer=None, **frame):
+        del db
+        legacy_calls.append({"writer": writer, **frame})
+        return SimpleNamespace(id="doc-1")
+
+    monkeypatch.setattr(ingest_module, "ingest_file", fake_ingest_file)
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(
+        session_module, "async_session_factory", lambda: _FakeSession()
+    )
+
+    result = await task_module._ingest_realtime_delta_chain(
+        payload_jobs=tuple((job_id, manifests[job_id]) for job_id in job_ids),
+        machine_id="machine-1",
+        user_id=__import__("uuid").uuid4(),
+    )
+
+    assert result["status"] == "committed"
+    assert result["writer"] == "legacy"
+    assert result["coalesced_frames"] == 2
+    assert [call["writer"] for call in legacy_calls] == ["legacy", "legacy"]
+    assert [call["content_hash"] for call in legacy_calls] == [
+        f"hash-{job_ids[0][:6]}",
+        f"hash-{job_ids[1][:6]}",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_terminal_chain_disposition_fails_every_constituent_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -74,7 +74,10 @@ async def _ingest_realtime_delta_chain(
     user_id: UUID,
 ) -> dict:
     """Use the Phase 2 raw writer once for every admitted DELTA chain."""
-    from ..services.realtime_raw_writer import ingest_conversation_raw_chain
+    from ..services.realtime_raw_writer import (
+        RawWriterUnsupported,
+        ingest_conversation_raw_chain,
+    )
     from ..services.sse_service import publish_event
 
     frames: list[dict] = []
@@ -104,10 +107,43 @@ async def _ingest_realtime_delta_chain(
                 "base_offset": source_meta.get("base_offset"),
             }
         )
-    document, event = await ingest_conversation_raw_chain(
-        frames=frames,
-        database_url=settings.database_url,
-    )
+    try:
+        document, event = await ingest_conversation_raw_chain(
+            frames=frames,
+            database_url=settings.database_url,
+        )
+    except RawWriterUnsupported as unsupported:
+        # The design's binding rule: an unhandled mutation shape retries
+        # through the OLD path before any raw commit. Without this, the drain
+        # re-scanned the same head forever (observed live: an authoritative
+        # history rebuild looped 144 times at ~32% CPU). Apply the chain
+        # frames in order through the legacy writer; one commit per frame
+        # keeps per-frame receipt semantics.
+        logger.warning(
+            "Realtime chain unsupported by raw writer (%s); applying %d "
+            "frame(s) via the legacy path",
+            unsupported,
+            len(frames),
+        )
+        from ..db.session import async_session_factory
+        from ..services.ingest_service import ingest_file
+
+        document = None
+        async with async_session_factory() as db:
+            for frame in frames:
+                document = await ingest_file(db=db, writer="legacy", **frame)
+                await db.commit()
+        return {
+            "status": "committed",
+            "writer": "legacy",
+            "job_id": payload_jobs[0][0],
+            "document_id": str(document.id),
+            "bytes": sum(
+                int(manifest["meta"]["file_size"])
+                for _, manifest in payload_jobs
+            ),
+            "coalesced_frames": len(payload_jobs),
+        }
     if event is not None:
         # The transaction has already committed.  A failed Redis publish is an
         # acceleration failure only; recovered receipts remain authoritative.
