@@ -147,11 +147,15 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
     monkeypatch.setattr(task_module, "read_ready_job_bytes", read_bytes)
 
     async def unsupported_chain(**_kwargs):
-        raise raw_module.RawWriterUnsupported("history rebuild needs legacy")
+        raise raw_module.RawWriterUnsupported(
+            "Claude transcript/sidecar pairing needs the legacy reducer"
+        )
 
     monkeypatch.setattr(
         raw_module, "ingest_conversation_raw_chain", unsupported_chain
     )
+    outcomes = task_module._RealtimeWriterOutcomeCounters()
+    monkeypatch.setattr(task_module, "_realtime_writer_outcomes", outcomes)
 
     legacy_calls: list[dict] = []
 
@@ -190,6 +194,9 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
         f"hash-{job_ids[0][:6]}",
         f"hash-{job_ids[1][:6]}",
     ]
+    assert outcomes.legacy_fallback_chains == {
+        "Claude transcript/sidecar pairing needs the legacy reducer": 1
+    }
 
 
 def test_raw_writer_outcome_counters_log_bounded_per_reason_metrics(

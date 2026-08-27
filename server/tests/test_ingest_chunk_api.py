@@ -161,7 +161,6 @@ class ChunkIngestApiTests(unittest.TestCase):
             ),
             patch.object(ingest_api, "stage_delta_payload", return_value=staged) as stage,
             patch.object(settings, "realtime_ingest_spool_deltas", True),
-            patch.object(settings, "realtime_ingest_raw_writer_tools", "codex"),
             patch.object(ingest_api, "ingest_file", new_callable=AsyncMock) as ingest,
         ):
             response = self.client.post(
@@ -466,8 +465,13 @@ class ChunkIngestApiTests(unittest.TestCase):
         self.assertEqual(ingest.await_count, 2)
         stage.assert_not_called()
 
-    def test_guarded_delta_waits_behind_durable_pending_base(self) -> None:
+    def test_capable_openclaw_delta_is_admitted_outside_raw_writer_allowlist(
+        self,
+    ) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        payload = self._delta_payload()
+        payload["tool"] = "openclaw"
+        staged = StagedChunk("b" * 64, complete=True, should_enqueue=True)
         headers = {
             "x-device-id": "device-1",
             "x-device-name": "Yoga",
@@ -483,47 +487,24 @@ class ChunkIngestApiTests(unittest.TestCase):
             ),
             patch.object(
                 ingest_api,
-                "ingest_file",
-                new_callable=AsyncMock,
-                side_effect=ingest_api.DeltaBaseMismatch(
-                    expected_hash="server-hash",
-                    expected_offset=5,
-                ),
-            ),
-            patch.object(
-                ingest_api,
-                "pending_source_revision_job_id",
-                return_value="b" * 64,
-            ) as find_pending,
-            patch.object(
-                ingest_api,
-                "stage_chunk",
-                side_effect=self._stage_in_test_spool,
-            ),
-            patch(
-                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
-            ) as enqueue,
+                "stage_delta_payload",
+                return_value=staged,
+            ) as stage,
+            patch.object(settings, "realtime_ingest_spool_deltas", True),
+            patch.object(settings, "realtime_ingest_raw_writer_tools", "codex"),
+            patch.object(ingest_api, "ingest_file", new_callable=AsyncMock) as ingest,
         ):
             response = self.client.post(
                 "/api/ingest/file",
-                json=self._delta_payload(),
+                json=payload,
                 headers=headers,
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "accepted")
-        self.assertTrue(response.json()["document_id"].startswith("accepted:"))
-        self.assertEqual(response.json()["receipt_id"], response.json()["document_id"][9:])
-        self.assertIn("pending revision", response.json()["message"])
-        find_pending.assert_called_once_with(
-            user_id="11111111-1111-1111-1111-111111111111",
-            device_id="device-1",
-            tool="codex",
-            relative_path="sessions/thread.jsonl",
-            content_hash="base-hash",
-            offset=10,
-        )
-        enqueue.assert_called_once()
+        self.assertEqual(response.json()["receipt_id"], "b" * 64)
+        stage.assert_called_once()
+        ingest.assert_not_awaited()
 
     def test_noncapable_delta_never_treats_pending_spool_as_committed(self) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
@@ -559,10 +540,11 @@ class ChunkIngestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         stage.assert_not_called()
 
-    def test_multipart_guarded_delta_uses_same_pending_base_queue(self) -> None:
+    def test_multipart_capable_delta_is_spooled(self) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
         payload = self._delta_payload()
         content = payload.pop("content")
+        staged = StagedChunk("c" * 64, complete=True, should_enqueue=True)
         with (
             patch.object(
                 ingest_api,
@@ -572,26 +554,11 @@ class ChunkIngestApiTests(unittest.TestCase):
             ),
             patch.object(
                 ingest_api,
-                "ingest_file",
-                new_callable=AsyncMock,
-                side_effect=ingest_api.DeltaBaseMismatch(
-                    expected_hash="server-hash",
-                    expected_offset=5,
-                ),
-            ),
-            patch.object(
-                ingest_api,
-                "pending_source_revision_job_id",
-                return_value="b" * 64,
-            ),
-            patch.object(
-                ingest_api,
-                "stage_chunk",
-                side_effect=self._stage_in_test_spool,
-            ),
-            patch(
-                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
-            ) as enqueue,
+                "stage_delta_payload",
+                return_value=staged,
+            ) as stage,
+            patch.object(settings, "realtime_ingest_spool_deltas", True),
+            patch.object(ingest_api, "ingest_file", new_callable=AsyncMock) as ingest,
         ):
             response = self.client.post(
                 "/api/ingest/file/upload",
@@ -605,8 +572,9 @@ class ChunkIngestApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "accepted")
-        self.assertTrue(response.json()["document_id"].startswith("accepted:"))
-        enqueue.assert_called_once()
+        self.assertEqual(response.json()["receipt_id"], "c" * 64)
+        stage.assert_called_once()
+        ingest.assert_not_awaited()
 
 
 if __name__ == "__main__":
