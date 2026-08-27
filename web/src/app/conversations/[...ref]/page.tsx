@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, usePathname, useRouter } from "next/navigation";
 import {
   api,
   ConversationMeta,
@@ -40,6 +40,8 @@ interface ConversationMetaWithPlans extends ConversationMeta {
 
 export default function ConversationPage() {
   const params = useParams();
+  const pathname = usePathname();
+  const router = useRouter();
   const routeParts = Array.isArray(params.ref) ? params.ref : [params.ref].filter(Boolean);
   const docId = routeParts.length === 1
     ? String(routeParts[0])
@@ -105,13 +107,15 @@ export default function ConversationPage() {
     const canonicalUrl = currentMeta?.canonical_url;
     if (!canonicalUrl || typeof window === "undefined") return;
     const currentPath = window.location.pathname.replace(/\/$/, "");
+    const isConversationPath = (path: string) => path === "/conversations" || path.startsWith("/conversations/");
+    // A raw History API replacement leaves the App Router's route tree on the
+    // legacy catch-all params. Its next Link navigation can then update only
+    // the browser URL. Keep canonicalization router-aware, and do not start a
+    // replacement after a navigation away has already updated location.
+    if (!isConversationPath(pathname) || !isConversationPath(currentPath)) return;
     if (currentPath === canonicalUrl) return;
-    window.history.replaceState(
-      window.history.state,
-      "",
-      `${canonicalUrl}${window.location.search}${window.location.hash}`,
-    );
-  }, [currentMeta?.canonical_url]);
+    router.replace(`${canonicalUrl}${window.location.search}${window.location.hash}`, { scroll: false });
+  }, [currentMeta?.canonical_url, pathname, router]);
 
   const plans = currentMeta?.related_plans || [];
   const diagnostics = (currentMeta?.metadata?.export_diagnostics as ExportDiagnostics | undefined) || null;
