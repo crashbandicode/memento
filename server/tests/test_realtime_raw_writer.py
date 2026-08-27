@@ -372,6 +372,41 @@ def test_first_user_message_is_noop_when_current_frame_adds_user() -> None:
     ) is True
 
 
+def test_first_user_message_requires_legacy_when_frame_flips_sole_user_row() -> None:
+    ordinary_user = SimpleNamespace(
+        id=3,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="user_message",
+        role="user",
+        content="A later ordinary user message.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+    role_flip = MessageMutation(
+        ordinal=0,
+        operation="update",
+        line_number=1,
+        message_type="assistant_message",
+        role="assistant",
+        content="Rewritten as assistant transport.",
+        metadata={},
+        timestamp=_OBSERVED_AT,
+        existing_id=3,
+        previous_role="user",
+    )
+
+    # Legacy re-checks AFTER the frame applies: with the sole user row
+    # rewritten to a non-user role, it would inject the fallback prompt.
+    assert _history_metadata_is_already_committed(
+        _codex_history_state(None, ordinary_user_rows=(ordinary_user,)),
+        tool_id="codex",
+        history=[],
+        first_user_message="Use Core staging.",
+        prospective_mutations=[role_flip],
+    ) is False
+
+
 def test_existing_first_user_message_is_already_committed() -> None:
     stored_first_user = SimpleNamespace(
         id=4,
