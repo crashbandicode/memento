@@ -18,6 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from ..config import settings
 
 if TYPE_CHECKING:
+    import asyncpg
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -245,6 +246,7 @@ async def finalize_document_content(
     content: str | None = None,
     payload_path: Path | None = None,
     db: "AsyncSession | None" = None,
+    connection: "asyncpg.Connection | None" = None,
     s3_client=None,
 ) -> DocumentContentPointer:
     """Run the write-path PUT/reuse/GET verification before pointer commit.
@@ -258,6 +260,8 @@ async def finalize_document_content(
         content=content,
         payload_path=payload_path,
     )
+    if db is not None and connection is not None:
+        raise ValueError("provide at most one transaction connection")
     if db is not None:
         # GC takes this same transaction-scoped key before its final
         # live-pointer recheck and delete.  Holding it through the caller's
@@ -270,6 +274,15 @@ async def finalize_document_content(
         await db.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
             {"key": key},
+        )
+    elif connection is not None:
+        # Phase 2 owns a raw asyncpg transaction.  This is the identical
+        # transaction-scoped content-key lock used by the SQLAlchemy caller;
+        # it must be held on the connection which later publishes the pointer.
+        key = document_content_key(document_id=document_id, sha256=sha256)
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            key,
         )
     return await asyncio.to_thread(
         _put_or_reuse_document_content,

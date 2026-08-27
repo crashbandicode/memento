@@ -39,6 +39,7 @@ from ..services.ingest_service import (
     DeltaBaseMismatch,
     _get_ingest_semaphore,
     ingest_file,
+    raw_realtime_writer_enabled,
 )
 from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
@@ -662,6 +663,18 @@ async def ingest_file_endpoint(
         user_id=_collector_user.id,
     )
     measured_size = len(req.content.encode("utf-8"))
+    writer = None
+    if raw_realtime_writer_enabled(
+        owner_id=str(_collector_user.id),
+        device_id=x_device_id,
+        tool_id=req.tool,
+        category=req.category,
+    ):
+        # Device creation is deliberately outside the raw ingest transaction.
+        # Commit it before acquiring the asyncpg connection so the raw FK and
+        # authenticated owner scope are both visible on first contact.
+        await db.commit()
+        writer = "raw"
 
     return await _ingest_or_stage_dependent_delta(
         db=db,
@@ -683,6 +696,7 @@ async def ingest_file_endpoint(
             "base_hash": req.base_hash,
             "base_offset": req.base_offset,
             "authoritative_rebase": req.authoritative_rebase,
+            "writer": writer,
         },
         spool_meta=req.model_dump(exclude={"content"}),
         content_bytes=req.content.encode("utf-8"),
@@ -732,6 +746,14 @@ async def ingest_file_upload(
             x_device_platform,
             user_id=_collector_user.id,
         )
+        raw_writer = raw_realtime_writer_enabled(
+            owner_id=str(_collector_user.id),
+            device_id=x_device_id,
+            tool_id=str(meta.get("tool") or ""),
+            category=str(meta.get("category") or ""),
+        )
+        if raw_writer:
+            await db.commit()
         with tempfile.TemporaryDirectory(prefix="memento-multipart-") as temporary:
             temporary_root = Path(temporary)
             raw_path = temporary_root / "payload.bin"
@@ -761,6 +783,7 @@ async def ingest_file_upload(
                         "base_hash": meta.get("base_hash"),
                         "base_offset": meta.get("base_offset"),
                         "authoritative_rebase": _validated_authoritative_rebase(meta),
+                        "writer": "raw" if raw_writer else None,
                     },
                     spool_meta=meta,
                     content_bytes=file_content.encode("utf-8"),
@@ -838,6 +861,14 @@ async def ingest_file_upload(
     machine = await ensure_device(
         db, x_device_id, x_device_name, x_device_platform, user_id=_collector_user.id
     )
+    raw_writer = raw_realtime_writer_enabled(
+        owner_id=str(_collector_user.id),
+        device_id=x_device_id,
+        tool_id=str(meta.get("tool") or ""),
+        category=str(meta.get("category") or ""),
+    )
+    if raw_writer:
+        await db.commit()
 
     return await _ingest_or_stage_dependent_delta(
         db=db,
@@ -859,6 +890,7 @@ async def ingest_file_upload(
             "base_hash": meta.get("base_hash"),
             "base_offset": meta.get("base_offset"),
             "authoritative_rebase": _validated_authoritative_rebase(meta),
+            "writer": "raw" if raw_writer else None,
         },
         spool_meta=meta,
         content_bytes=file_content.encode("utf-8"),

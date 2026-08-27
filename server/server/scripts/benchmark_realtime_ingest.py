@@ -8,6 +8,7 @@ for example:
       'postgresql+asyncpg://postgres:test@localhost:55437/postgres'
     python -m server.scripts.benchmark_realtime_ingest --writer legacy
     python -m server.scripts.benchmark_realtime_ingest --writer core
+    python -m server.scripts.benchmark_realtime_ingest --writer raw
 
 The setup FULL is deliberately outside the measurement.  Each timed sample
 therefore reports one real, exact-base DELTA sync over a fresh fixture document.
@@ -135,6 +136,7 @@ async def _run_delta(
     relative_path: str,
     session_id: str,
     use_core_delta_message_staging: bool,
+    writer: str,
 ) -> None:
     await ingest_file(
         session,
@@ -155,6 +157,7 @@ async def _run_delta(
         user_id=str(user.id),
         schedule_post_ingest=False,
         use_core_delta_message_staging=use_core_delta_message_staging,
+        writer=writer,
     )
     await session.commit()
 
@@ -165,6 +168,7 @@ async def _timed_sample(
     *,
     sample: int,
     use_core_delta_message_staging: bool,
+    writer: str,
 ) -> dict[str, int]:
     async with session_factory() as session:
         user, machine, relative_path, session_id = await _seed_document(
@@ -183,6 +187,7 @@ async def _timed_sample(
             relative_path=relative_path,
             session_id=session_id,
             use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
         )
         return {
             "wall_ns": time.perf_counter_ns() - wall_started,
@@ -196,6 +201,7 @@ async def _allocation_sample(
     *,
     sample: int,
     use_core_delta_message_staging: bool,
+    writer: str,
 ) -> dict[str, int]:
     async with session_factory() as session:
         user, machine, relative_path, session_id = await _seed_document(
@@ -214,6 +220,7 @@ async def _allocation_sample(
             relative_path=relative_path,
             session_id=session_id,
             use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
         )
         after = tracemalloc.take_snapshot()
         _current, peak = tracemalloc.get_traced_memory()
@@ -253,6 +260,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 fixture,
                 sample=warmup,
                 use_core_delta_message_staging=use_core,
+                writer=args.writer,
             )
         timed = [
             await _timed_sample(
@@ -260,6 +268,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 fixture,
                 sample=sample,
                 use_core_delta_message_staging=use_core,
+                writer=args.writer,
             )
             for sample in range(args.iterations)
         ]
@@ -269,6 +278,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 fixture,
                 sample=sample,
                 use_core_delta_message_staging=use_core,
+                writer=args.writer,
             )
             for sample in range(args.allocation_samples)
         ]
@@ -309,7 +319,7 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--writer", choices=("legacy", "core"), required=True)
+    parser.add_argument("--writer", choices=("legacy", "core", "raw"), required=True)
     parser.add_argument("--messages", type=int, default=200)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)

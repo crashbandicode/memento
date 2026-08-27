@@ -15,6 +15,15 @@ class Settings(BaseSettings):
     # database only when its replication lag is acceptable for search.
     search_database_url: str = ""
 
+    # Phase 2 raw realtime-ingest canary.  The writer is off unless at least
+    # one selector matches; selectors are comma-separated authenticated owner
+    # UUIDs, collector device IDs, or tool IDs respectively.  Keeping this
+    # opt-in lets an operator roll out one source domain at a time while the
+    # synchronous SQLAlchemy writer remains the safe fallback.
+    realtime_ingest_raw_writer_owners: str = ""
+    realtime_ingest_raw_writer_devices: str = ""
+    realtime_ingest_raw_writer_tools: str = ""
+
     # Redis
     redis_url: str = "redis://localhost:6380/0"
 

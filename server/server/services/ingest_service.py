@@ -460,6 +460,33 @@ class CursorProjectionOrderMismatch(DeltaBaseMismatch):
         self.args = (reason,)
 
 
+def raw_realtime_writer_enabled(
+    *,
+    owner_id: str | None,
+    device_id: str | None,
+    tool_id: str,
+    category: str,
+) -> bool:
+    """Return whether an authenticated source is in the Phase 2 canary.
+
+    Empty selectors mean disabled.  Each selector is independently useful so
+    rollout can begin with one owner, a single collector, or one tool family.
+    Caller-supplied metadata never participates in this decision.
+    """
+    if category != "conversation":
+        return False
+
+    def selected(value: str, candidate: str | None) -> bool:
+        values = {item.strip() for item in value.split(",") if item.strip()}
+        return bool(candidate and candidate in values)
+
+    return (
+        selected(settings.realtime_ingest_raw_writer_owners, owner_id)
+        or selected(settings.realtime_ingest_raw_writer_devices, device_id)
+        or selected(settings.realtime_ingest_raw_writer_tools, tool_id)
+    )
+
+
 def _committed_delta_base(
     doc: Document | None,
     sync_row: SyncState | None,
@@ -2947,8 +2974,84 @@ async def ingest_file(
     base_offset: int | None = None,
     authoritative_rebase: bool = False,
     use_core_delta_message_staging: bool = True,
-) -> Document:
+    writer: str | None = None,
+) -> Document | object:
     """Process and store an ingested file."""
+    if writer == "raw" and conversation_source is not None:
+        # The stream-backed FULL path retains its bounded parser/source handle;
+        # Phase 2's inline raw reducer must not accidentally treat it as an
+        # empty body.  This is an unhandled shape, so select the old writer
+        # before a raw transaction is opened.
+        writer = "legacy"
+    if writer == "raw":
+        # The raw implementation owns one asyncpg transaction and has no
+        # mapped instances/session work in that transaction.  Unsupported
+        # reducers and every pre-commit raw failure are deliberately retried
+        # through this unchanged writer before this call returns.
+        from .realtime_raw_writer import (
+            RawWriterFailure,
+            RawWriterUnsupported,
+            ingest_conversation_raw,
+        )
+
+        try:
+            raw_document, raw_event = await ingest_conversation_raw(
+                tool_id=tool_id,
+                category=category,
+                content_type=content_type,
+                relative_path=relative_path,
+                content=content,
+                content_hash=content_hash,
+                file_size=file_size,
+                mode=mode,
+                offset=offset,
+                metadata=metadata,
+                timestamp=timestamp,
+                machine_id=machine_id,
+                user_id=user_id,
+                base_hash=base_hash,
+                base_offset=base_offset,
+                authoritative_rebase=authoritative_rebase,
+                database_url=db.get_bind().url.render_as_string(
+                    hide_password=False
+                ),
+                content_already_sanitized=content_already_sanitized,
+                content_had_sensitive=content_had_sensitive,
+            )
+        except (RawWriterUnsupported, RawWriterFailure):
+            # The asyncpg transaction is rolled back before either exception
+            # can escape.  Never run this fallback after a raw commit.
+            writer = "legacy"
+        else:
+            if raw_event is not None:
+                from ..db.session import queue_realtime_event
+
+                cache_scope = raw_event.get("cache") or {}
+                _stage_ingest_read_cache_invalidations(
+                    db,
+                    raw_event["user_id"],
+                    cache_scope.get("project_id"),
+                    daily=bool(cache_scope.get("daily")),
+                    project=bool(cache_scope.get("project")),
+                )
+                queue_realtime_event(
+                    db,
+                    raw_event["event_type"],
+                    raw_event["data"],
+                    user_id=raw_event["user_id"],
+                )
+            if (
+                schedule_post_ingest
+                and raw_document._memento_ingest_disposition == "committed"
+            ):
+                await _schedule_post_ingest_work(
+                    document_id=raw_document.id,
+                    tool_id=tool_id,
+                    category=category,
+                    file_size_bytes=raw_document.file_size_bytes,
+                    revision=content_hash,
+                )
+            return raw_document
     content_store_enabled = settings.document_content_minio_enabled
     metadata = dict(metadata or {})
     category = normalize_ingest_category(tool_id, category, relative_path)
@@ -3877,42 +3980,54 @@ async def ingest_file(
             changes=enriched_event_changes,
         )
 
-    # Generate embeddings + extract knowledge graph (async, non-blocking)
-    # Must keep a reference to the task to prevent GC
     if schedule_post_ingest:
-        import asyncio
-
-        try:
-            # Configured direct/multipart conversations obey the same durable
-            # quiet window as chunked spool ingestion. Deployments without
-            # Celery can keep a positive size threshold so small uploads retain
-            # the lightweight in-process development path.
-            from ..tasks.post_ingest import (
-                initial_post_ingest_countdown,
-                schedule_coalesced_post_ingest,
-            )
-
-            countdown = initial_post_ingest_countdown(
-                category,
-                int(doc.file_size_bytes),
-            )
-            if countdown is not None:
-                await schedule_coalesced_post_ingest(
-                    doc.id,
-                    str(doc.tool_id),
-                    category,
-                    str(doc.content_hash),
-                    countdown=countdown,
-                )
-            else:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(_run_post_ingest(doc.id, doc.tool_id, category))
-                _background_tasks.add(task)
-                task.add_done_callback(_background_tasks.discard)
-        except Exception:
-            pass
+        await _schedule_post_ingest_work(
+            document_id=doc.id,
+            tool_id=str(doc.tool_id),
+            category=category,
+            file_size_bytes=int(doc.file_size_bytes),
+            revision=str(doc.content_hash),
+        )
 
     return doc
+
+
+async def _schedule_post_ingest_work(
+    *,
+    document_id,
+    tool_id: str,
+    category: str,
+    file_size_bytes: int,
+    revision: str,
+) -> None:
+    """Preserve the existing best-effort post-ingest scheduling contract."""
+    try:
+        # Configured direct/multipart conversations obey the same durable
+        # quiet window as chunked spool ingestion. Deployments without Celery
+        # can retain the lightweight in-process development path.
+        from ..tasks.post_ingest import (
+            initial_post_ingest_countdown,
+            schedule_coalesced_post_ingest,
+        )
+
+        countdown = initial_post_ingest_countdown(category, int(file_size_bytes))
+        if countdown is not None:
+            await schedule_coalesced_post_ingest(
+                document_id,
+                tool_id,
+                category,
+                revision,
+                countdown=countdown,
+            )
+        else:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                _run_post_ingest(document_id, tool_id, category)
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+    except Exception:
+        pass
 
 
 async def _run_post_ingest(doc_id, tool_id: str, category: str) -> None:

@@ -1,4 +1,4 @@
-"""Phase 0 golden gate for the Phase 1 conversation DELTA writer.
+"""Field-level golden gate for legacy, Core, and Phase 2 raw writers.
 
 The recorded source shapes below are copied from the parser/integration fixtures
 for Claude queue rows, Codex transport mirrors, and Cursor state projections.
@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from server.db.models import (
@@ -31,6 +31,7 @@ from server.db.models import (
     ConversationTaskState,
     ConversationUsageEvent,
     DashboardDocumentProjection,
+    Document,
     DocumentDeliveryState,
     Machine,
     SyncState,
@@ -525,6 +526,7 @@ async def _run_sequence(
     sequence: RecordedDeltaSequence,
     *,
     use_core_delta_message_staging: bool,
+    writer: str | None = None,
 ) -> dict[str, object]:
     async with session_factory() as session:
         user = User(
@@ -580,6 +582,7 @@ async def _run_sequence(
                 schedule_post_ingest=False,
                 authoritative_rebase=authoritative_rebase,
                 use_core_delta_message_staging=use_core_delta_message_staging,
+                writer=writer,
             )
 
         full = sequence.full
@@ -698,23 +701,32 @@ async def _run_sequence(
                 base_hash="0" * 64,
                 base_offset=final_offset,
             )
-        # Phase 0 captures the current synchronous fence exactly: the
-        # document remains the last verified FULL source even while delivery
-        # and sync projections reflect its DELTA tail.
-        assert mismatch.value.expected_hash == full_hash
-        assert mismatch.value.expected_offset == len(full.encode("utf-8"))
+        # The raw writer fences from the current delivery projection. The ORM
+        # paths retain their in-session Phase 0 view of the last FULL here;
+        # a fresh production request reloads that same delivery projection.
+        expected_hash = final_hash if writer == "raw" else full_hash
+        expected_offset = (
+            final_offset if writer == "raw" else len(full.encode("utf-8"))
+        )
+        assert mismatch.value.expected_hash == expected_hash
+        assert mismatch.value.expected_offset == expected_offset
         await session.rollback()
         return snapshot
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("use_core_delta_message_staging", "path_name"),
-    ((False, "current_orm"), (True, "phase1_core")),
+    ("use_core_delta_message_staging", "writer", "path_name"),
+    (
+        (False, "legacy", "current_orm"),
+        (True, "core", "phase1_core"),
+        (True, "raw", "phase2_raw"),
+    ),
 )
 async def test_recorded_delta_sequences_match_phase0_golden(
     session_factory,
     use_core_delta_message_staging: bool,
+    writer: str,
     path_name: str,
 ) -> None:
     """Both writer paths must reproduce the current path's semantic output."""
@@ -723,6 +735,7 @@ async def test_recorded_delta_sequences_match_phase0_golden(
             session_factory,
             sequence,
             use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
         )
         for sequence in RECORDED_DELTA_SEQUENCES
     }
@@ -732,3 +745,190 @@ async def test_recorded_delta_sequences_match_phase0_golden(
         f"{path_name} drifted from the Phase 0 golden at {difference[0]}: "
         f"expected {difference[1]!r}, got {difference[2]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_raw_ambiguous_commit_rereads_fence_and_retry_is_idempotent(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost commit response converges from delivery/sync state, never rows."""
+    from server.services import realtime_raw_writer
+    from server.services.realtime_raw_writer import (
+        RawWriterCommitUncertain,
+        ingest_conversation_raw,
+    )
+
+    sequence = next(item for item in RECORDED_DELTA_SEQUENCES if item.tool_id == "codex")
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(), email=f"raw-ambiguous-{uuid.uuid4()}@example.test",
+            role="viewer", status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(), name="raw-ambiguous",
+            collector_token_hash=str(uuid.uuid4()), user_id=user.id,
+        )
+        session.add_all((user, machine))
+        if await session.get(Tool, "codex") is None:
+            session.add(Tool(id="codex", display_name="codex"))
+        await session.commit()
+        path = f"phase2/ambiguous-{uuid.uuid4()}.jsonl"
+        full_hash = _hash(sequence.full)
+        document, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=path, content=sequence.full, content_hash=full_hash,
+            file_size=len(sequence.full.encode("utf-8")), mode="full",
+            offset=len(sequence.full.encode("utf-8")), metadata=dict(sequence.metadata),
+            timestamp=1_785_672_000.0, machine_id=machine.id, user_id=user.id,
+            base_hash=None, base_offset=None, database_url=TEST_DATABASE_URL,
+        )
+        final = f"{sequence.full}\n{sequence.delta}"
+        final_hash = _hash(final)
+        final_offset = len(final.encode("utf-8"))
+        committed, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=path, content=sequence.delta, content_hash=final_hash,
+            file_size=len(sequence.delta.encode("utf-8")), mode="delta",
+            offset=final_offset, metadata=dict(sequence.metadata),
+            timestamp=1_785_672_001.0, machine_id=machine.id, user_id=user.id,
+            base_hash=full_hash, base_offset=len(sequence.full.encode("utf-8")),
+            database_url=TEST_DATABASE_URL, simulate_ambiguous_commit=True,
+        )
+        assert committed.id == document.id
+        retry, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=path, content=sequence.delta, content_hash=final_hash,
+            file_size=len(sequence.delta.encode("utf-8")), mode="delta",
+            offset=final_offset, metadata=dict(sequence.metadata),
+            timestamp=1_785_672_001.0, machine_id=machine.id, user_id=user.id,
+            base_hash=full_hash, base_offset=len(sequence.full.encode("utf-8")),
+            database_url=TEST_DATABASE_URL,
+        )
+        assert retry.disposition == "idempotent"
+        assert await session.scalar(
+            select(func.count()).select_from(ConversationMessage).where(
+                ConversationMessage.document_id == document.id
+            )
+        ) == 2
+        second_delta = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T11:00:04Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "The chained raw delivery committed once.",
+                },
+            }
+        )
+        second_final = f"{final}\n{second_delta}"
+        second_hash = _hash(second_final)
+        second_offset = len(second_final.encode("utf-8"))
+        chained, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=path, content=second_delta, content_hash=second_hash,
+            file_size=len(second_delta.encode("utf-8")), mode="delta",
+            offset=second_offset, metadata=dict(sequence.metadata),
+            timestamp=1_785_672_002.0, machine_id=machine.id, user_id=user.id,
+            base_hash=final_hash, base_offset=final_offset,
+            database_url=TEST_DATABASE_URL,
+        )
+        assert chained.id == document.id
+        assert await session.scalar(
+            select(func.count()).select_from(ConversationMessage).where(
+                ConversationMessage.document_id == document.id
+            )
+        ) == 3
+        delivery = await session.get(DocumentDeliveryState, document.id)
+        sync = await session.scalar(
+            select(SyncState).where(
+                SyncState.machine_id == machine.id,
+                SyncState.tool_id == "codex",
+                SyncState.relative_path == path,
+            )
+        )
+        assert delivery is not None and delivery.revision_hash == second_hash
+        assert sync is not None and sync.last_hash == second_hash
+        assert sync.last_offset == second_offset
+
+        async def uncertain_commit(**_kwargs):
+            raise RawWriterCommitUncertain("unknown commit result")
+
+        monkeypatch.setattr(
+            realtime_raw_writer,
+            "ingest_conversation_raw",
+            uncertain_commit,
+        )
+        with pytest.raises(RawWriterCommitUncertain):
+            await ingest_file(
+                session,
+                tool_id="codex",
+                category="conversation",
+                content_type="jsonl",
+                relative_path=path,
+                content=second_delta,
+                content_hash=second_hash,
+                file_size=len(second_delta.encode("utf-8")),
+                mode="delta",
+                offset=second_offset,
+                metadata=dict(sequence.metadata),
+                timestamp=1_785_672_002.0,
+                machine_id=machine.id,
+                user_id=str(user.id),
+                base_hash=final_hash,
+                base_offset=final_offset,
+                schedule_post_ingest=False,
+                writer="raw",
+            )
+
+
+@pytest.mark.asyncio
+async def test_raw_full_minio_ambiguous_put_never_commits_a_pointer(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed/ambiguous verified PUT leaves no document pointer to expose."""
+    from botocore.exceptions import ClientError
+    from server.config import settings
+    from server.services import large_content_store
+    from server.services.realtime_raw_writer import RawWriterFailure, ingest_conversation_raw
+
+    class AmbiguousPutClient:
+        def get_object(self, *, Bucket, Key):
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+        def put_object(self, **_kwargs):
+            raise TimeoutError("ambiguous PUT")
+
+    monkeypatch.setattr(settings, "document_content_minio_enabled", True)
+    monkeypatch.setattr(large_content_store, "_client", lambda: AmbiguousPutClient())
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(), email=f"raw-minio-{uuid.uuid4()}@example.test",
+            role="viewer", status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(), name="raw-minio", collector_token_hash=str(uuid.uuid4()),
+            user_id=user.id,
+        )
+        session.add_all((user, machine))
+        if await session.get(Tool, "cursor") is None:
+            session.add(Tool(id="cursor", display_name="cursor"))
+        await session.commit()
+        path = f"phase2/minio-{uuid.uuid4()}.jsonl"
+        content = _json_line({"type": "user", "role": "user", "id": "u", "message": {"content": "safe"}})
+        with pytest.raises(RawWriterFailure):
+            await ingest_conversation_raw(
+                tool_id="cursor", category="conversation", content_type="jsonl",
+                relative_path=path, content=content, content_hash=_hash(content),
+                file_size=len(content.encode("utf-8")), mode="full",
+                offset=len(content.encode("utf-8")), metadata={"session_id": "raw-minio"},
+                timestamp=1_785_672_000.0, machine_id=machine.id, user_id=user.id,
+                base_hash=None, base_offset=None, database_url=TEST_DATABASE_URL,
+            )
+        assert await session.scalar(
+            select(func.count()).select_from(Document).where(
+                Document.machine_id == machine.id,
+                Document.relative_path == path,
+            )
+        ) == 0
