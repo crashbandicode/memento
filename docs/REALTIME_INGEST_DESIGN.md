@@ -502,9 +502,20 @@ match the golden output, and projector restart/replay is idempotent.
 
 ### Phase 5 — retire the old conversation DELTA path
 
-- After a full operational interval with no fallback and a successful
-  restart/recovery drill, make the spool/raw writer the only conversation
-  DELTA path.
+- Make durable spool admission the only admission path for
+  capability-negotiated conversation DELTAs. The drain fallback bridge is
+  load-bearing by design: it attempts raw ingest, then applies an unsupported
+  frame chain through the legacy reducer.
+- The retirement gate is a full operational interval (at least a 60-minute
+  steady-state soak plus a restart/recovery drill) in which raw-writer
+  fallbacks are limited to the explicit legacy-forever set: Claude subagent
+  transcript/sidecar pairing, Cursor projection reordering, stable-identity
+  relocation/alias, and delta-without-committed-base. Each shape must remain
+  below 1 fallback/minute and below 2% of drained frames. See the
+  [unsupported-shapes report §5](raw-writer-unsupported-shapes-report.md#5-recommended-phase-5-gate-definition).
+- Phase 5 hard-requires `DEFERRED_PROJECTIONS=true` and a running projector.
+  Turning the spool flag off does not restore synchronous projections; see the
+  [deferred-projections one-way door](realtime-ingest-phase45-handoff.md#rollback-constraint).
 - Keep FULL and non-conversation migration explicit; do not delete the old
   implementation merely because DELTA is stable.
 
