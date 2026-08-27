@@ -229,7 +229,11 @@ async def _apply_canvas(db: AsyncSession, document_id: uuid.UUID) -> bool:
 async def _apply_search(db: AsyncSession, document_id: uuid.UUID) -> bool:
     from sqlalchemy import update as sql_update
 
-    from ..db.models import ConversationMessage, Document
+    from ..db.models import (
+        ConversationMessage,
+        Document,
+        IngestProjectionCandidate,
+    )
     from .ingest_service import MAX_SEARCH_TEXT_CHARS, _bounded_message_text
     from .message_search import (
         MAX_LEXICON_TERMS_PER_INGEST,
@@ -242,6 +246,23 @@ async def _apply_search(db: AsyncSession, document_id: uuid.UUID) -> bool:
     if document is None:
         return False
     before = await _content_tsv_text(db, document_id)
+    # A new document's synchronous FULL ingest admits lexicon terms across
+    # its complete parsed transcript.  Reproduce that once, before this
+    # document has a completed/superseded search candidate.  Later DELTAs
+    # keep the regular bounded last-200 scan so a hot large transcript never
+    # pays this full-document read on every projection apply.
+    first_search_apply = not await db.scalar(
+        select(IngestProjectionCandidate.id)
+        .where(
+            IngestProjectionCandidate.document_id == document_id,
+            IngestProjectionCandidate.kind == KIND_SEARCH,
+            or_(
+                IngestProjectionCandidate.completed_at.is_not(None),
+                IngestProjectionCandidate.superseded_at.is_not(None),
+            ),
+        )
+        .limit(1)
+    )
     latest_search_rows = (
         (
             await db.execute(
@@ -267,7 +288,23 @@ async def _apply_search(db: AsyncSession, document_id: uuid.UUID) -> bool:
         .values(content_tsv=func.to_tsvector("simple", tsv_input))
     )
     terms: set[str] = set()
-    for row in latest_search_rows:
+    lexicon_rows = latest_search_rows
+    if first_search_apply:
+        lexicon_rows = (
+            (
+                await db.execute(
+                    select(func.left(ConversationMessage.content, 2_048))
+                    .where(
+                        ConversationMessage.document_id == document_id,
+                        ConversationMessage.role.in_(("user", "assistant")),
+                    )
+                    .order_by(ConversationMessage.line_number.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    for row in lexicon_rows:
         if len(terms) >= MAX_LEXICON_TERMS_PER_INGEST:
             break
         remaining = MAX_LEXICON_TERMS_PER_INGEST - len(terms)

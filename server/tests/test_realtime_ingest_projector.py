@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.config import settings
@@ -32,6 +32,7 @@ from server.services.realtime_ingest_projector import (
     KIND_SEARCH,
     RealtimeIngestProjector,
     deferred_projections_enabled,
+    process_pending_candidates,
 )
 
 
@@ -114,6 +115,33 @@ def _cursor_transcript(*contents: str) -> str:
                 "id": f"phase4-{role}-{index}",
                 "timestamp": f"2026-08-27T12:00:0{index}Z",
                 "message": {"content": content},
+            }
+        )
+    return "\n".join(_json_line(row) for row in rows)
+
+
+def _large_cursor_transcript(
+    *,
+    prefix: str,
+    early_nonce: str,
+    late_nonce: str,
+    messages: int = 240,
+) -> str:
+    rows = []
+    for index in range(1, messages + 1):
+        role = "user" if index % 2 else "assistant"
+        terms = [f"{prefix}term{index:03d}"]
+        if index == 1:
+            terms.append(early_nonce)
+        if index == messages:
+            terms.append(late_nonce)
+        rows.append(
+            {
+                "type": role,
+                "role": role,
+                "id": f"{prefix}-message-{index}",
+                "timestamp": "2026-08-27T12:00:00Z",
+                "message": {"content": " ".join(terms)},
             }
         )
     return "\n".join(_json_line(row) for row in rows)
@@ -212,6 +240,18 @@ async def _pending_candidates(session, document_id: uuid.UUID):
         )
         .scalars()
         .all()
+    )
+
+
+async def _lexicon_terms_with_prefix(session, prefix: str) -> set[str]:
+    return set(
+        (
+            await session.scalars(
+                select(ConversationSearchTerm.term).where(
+                    ConversationSearchTerm.term.like(f"{prefix}%")
+                )
+            )
+        ).all()
     )
 
 
@@ -324,6 +364,74 @@ async def test_deferred_canvas_search_matches_synchronous_after_projector(
     assert projected["content_tsv"]
     assert projected["lexicon_term"] == nonce
     assert synchronous["lexicon_term"] == nonce
+
+
+@pytest.mark.asyncio
+async def test_first_deferred_search_apply_matches_full_lexicon_for_large_transcript(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = f"phase4large{uuid.uuid4().hex[:12]}"
+    early_nonce = f"{prefix}earlynounce"
+    late_nonce = f"{prefix}latenounce"
+    full = _large_cursor_transcript(
+        prefix=prefix,
+        early_nonce=early_nonce,
+        late_nonce=late_nonce,
+    )
+
+    async def run(*, deferred: bool) -> tuple[set[str], str | None]:
+        monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", deferred)
+        async with session_factory() as session:
+            user, machine = await _seed_owner(
+                session, suffix=f"large-{'deferred' if deferred else 'sync'}"
+            )
+            path = f"phase4/{prefix}-large.jsonl"
+            document = await ingest_file(
+                session,
+                tool_id="cursor",
+                category="conversation",
+                content_type="jsonl",
+                relative_path=path,
+                content=full,
+                content_hash=_hash(full),
+                file_size=len(full.encode("utf-8")),
+                mode="full",
+                offset=len(full.encode("utf-8")),
+                metadata={"session_id": f"phase4-{prefix}"},
+                timestamp=1_785_672_000.0,
+                machine_id=machine.id,
+                user_id=str(user.id),
+                schedule_post_ingest=False,
+                writer="legacy",
+            )
+            await session.commit()
+            document_id = document.id
+        if deferred:
+            projector = RealtimeIngestProjector(session_factory=session_factory)
+            await projector.run_until_quiescent(document_ids=(document_id,))
+        async with session_factory() as session:
+            terms = await _lexicon_terms_with_prefix(session, prefix)
+            tsv = await session.scalar(
+                text("SELECT content_tsv::text FROM documents WHERE id = :id"),
+                {"id": document_id},
+            )
+            return terms, tsv
+
+    synchronous_terms, synchronous_tsv = await run(deferred=False)
+    async with session_factory() as session:
+        await session.execute(
+            delete(ConversationSearchTerm).where(
+                ConversationSearchTerm.term.like(f"{prefix}%")
+            )
+        )
+        await session.commit()
+    deferred_terms, deferred_tsv = await run(deferred=True)
+
+    assert early_nonce in deferred_terms
+    assert late_nonce in deferred_terms
+    assert deferred_terms == synchronous_terms
+    assert deferred_tsv == synchronous_tsv
 
 
 @pytest.mark.asyncio
@@ -441,6 +549,94 @@ async def test_projector_restart_replay_is_idempotent(
             ).scalar_one()
             assert refs == 1
     assert replayed == snapshots
+
+
+@pytest.mark.asyncio
+async def test_projector_replays_after_apply_before_outer_commit_crash_window(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    nonce = f"phase4crash{uuid.uuid4().hex[:12]}"
+    full = _cursor_transcript(
+        f"Crash-window {nonce} [phase4needle.canvas.tsx]({CANVAS_PATH})",
+        "Projection writes must replay cleanly after the rollback.",
+    )
+    path = f"phase4/crash-window-{uuid.uuid4()}.jsonl"
+    async with session_factory() as session:
+        crash_user, crash_machine = await _seed_owner(session, suffix="crash")
+        clean_user, clean_machine = await _seed_owner(session, suffix="clean")
+        crash_document = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=full,
+            content_hash=_hash(full),
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata={"session_id": f"crash-{path}"},
+            timestamp=1_785_672_000.0,
+            machine_id=crash_machine.id,
+            user_id=str(crash_user.id),
+            schedule_post_ingest=False,
+            writer="legacy",
+        )
+        clean_document = await ingest_file(
+            session,
+            tool_id="cursor",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=full,
+            content_hash=_hash(full),
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata={"session_id": f"clean-{path}"},
+            timestamp=1_785_672_000.0,
+            machine_id=clean_machine.id,
+            user_id=str(clean_user.id),
+            schedule_post_ingest=False,
+            writer="legacy",
+        )
+        await session.commit()
+        crash_document_id = crash_document.id
+        clean_document_id = clean_document.id
+
+    async with session_factory() as session:
+        applied = await process_pending_candidates(
+            session, document_ids=(crash_document_id,)
+        )
+        assert {result["kind"] for result in applied} == {KIND_CANVAS, KIND_SEARCH}
+        await session.rollback()
+
+    async with session_factory() as session:
+        pending = await _pending_candidates(session, crash_document_id)
+        assert {row.kind for row in pending} == {KIND_CANVAS, KIND_SEARCH}
+
+    clean_projector = RealtimeIngestProjector(session_factory=session_factory)
+    await clean_projector.run_until_quiescent(document_ids=(clean_document_id,))
+    crash_projector = RealtimeIngestProjector(session_factory=session_factory)
+    await crash_projector.run_until_quiescent(document_ids=(crash_document_id,))
+
+    async with session_factory() as session:
+        crash_snapshot = await _projection_snapshot(
+            session, crash_document_id, lexicon_term=nonce
+        )
+        clean_snapshot = await _projection_snapshot(
+            session, clean_document_id, lexicon_term=nonce
+        )
+        assert crash_snapshot == clean_snapshot
+        references = await session.scalar(
+            select(func.count())
+            .select_from(CanvasArtifactReference)
+            .where(CanvasArtifactReference.document_id == crash_document_id)
+        )
+        assert references == 1
+        assert await _pending_candidates(session, crash_document_id) == []
 
 
 @pytest.mark.asyncio

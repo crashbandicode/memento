@@ -70,6 +70,8 @@ class MessageMutation:
     timestamp: datetime | None
     existing_id: int | None = None
     projection_dirty: bool = False
+    previous_role: str | None = None
+    previous_metadata: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -652,6 +654,8 @@ def reduce_writer_state(
                 line_number=existing_cursor.line_number, message_type=message_type,
                 role=normalized.role, content=clean_content, metadata=row_metadata,
                 timestamp=row_timestamp, projection_dirty=True,
+                previous_role=existing_cursor.role,
+                previous_metadata=dict(existing_cursor.metadata_),
             ))
             ordinal += 1
             if delta_tail is existing_cursor:
@@ -674,6 +678,8 @@ def reduce_writer_state(
                     line_number=queue_row.line_number, message_type=queue_row.message_type,
                     role=queue_row.role, content=queue_row.content, metadata=next_metadata,
                     timestamp=queue_row.timestamp,
+                    previous_role=queue_row.role,
+                    previous_metadata=dict(queue_row.metadata_),
                 ))
                 ordinal += 1
                 continue
@@ -699,6 +705,8 @@ def reduce_writer_state(
                     line_number=delta_tail.line_number, message_type=next_type,
                     role=delta_tail.role, content=next_content, metadata=next_metadata,
                     timestamp=next_timestamp, projection_dirty=True,
+                    previous_role=delta_tail.role,
+                    previous_metadata=dict(delta_tail.metadata_),
                 ))
                 ordinal += 1
                 delta_tail = None
@@ -723,24 +731,43 @@ def reduce_writer_state(
     from .ingest_service import _conversation_search_index_needs_refresh
     from .realtime_ingest_projector import message_is_canvas_projection_candidate
 
-    # Inserts enqueue only when the new body can name a Canvas. Updates of a
-    # canvas-capable row also enqueue so a later revision that drops the link
-    # still reconciles (legacy collects every mutated existing row).
+    # Inserts enqueue only when the new body can name a Canvas. Updates also
+    # retain the pre-update role/metadata so a replacement which removes a
+    # Canvas-capable or indexed row still reconciles the stale projection.
+    candidate_has_search_text = has_search_text or any(
+        item.operation == "update"
+        and item.previous_role in {"user", "assistant"}
+        for item in mutations
+    )
+    candidate_has_user_search_text = has_user_search_text or any(
+        item.operation == "update" and item.previous_role == "user"
+        for item in mutations
+    )
     canvas_candidate = any(
         message_is_canvas_projection_candidate(
             item.role, item.metadata, item.content
         )
         or (
             item.operation == "update"
-            and canvas_message_can_have_reference(item.role, item.metadata)
+            and (
+                canvas_message_can_have_reference(item.role, item.metadata)
+                or canvas_message_can_have_reference(
+                    item.previous_role, item.previous_metadata
+                )
+            )
         )
         for item in mutations
     )
     search_text = "[user]" if has_user_search_text else ("[assistant]" if has_search_text else "")
+    candidate_search_text = (
+        "[user]"
+        if candidate_has_user_search_text
+        else ("[assistant]" if candidate_has_search_text else "")
+    )
     search_candidate = _conversation_search_index_needs_refresh(
         is_new_document=new_document,
         mode=mode,
-        new_search_text=search_text,
+        new_search_text=candidate_search_text,
         previous_title=title,
         current_title=title,
     )
