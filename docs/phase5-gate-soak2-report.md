@@ -76,3 +76,35 @@ legacy_fallback_chains_by_reason={})
 2026-08-27 22:41:28,024 INFO ingest_spool Realtime raw-writer outcomes over 64.2s: total_handled_chains=8 total_handled_frames=9 raw_committed_chains=8 raw_committed_frames=9 legacy_fallback_chains_by_reason={} legacy_fallback_frames_by_reason={}
 2026-08-27 22:42:37,305 INFO ingest_spool Realtime raw-writer outcomes over 66.1s: total_handled_chains=14 total_handled_frames=17 raw_committed_chains=14 raw_committed_frames=17 legacy_fallback_chains_by_reason={} legacy_fallback_frames_by_reason={}
 ```
+
+## Shape attribution (per-document forensics, added 2026-08-27 ~23:20Z)
+
+Method: one completion receipt exists per drained frame (receipt.document_id);
+878 receipts fall in [21:42, 22:47)Z across exactly NINE documents. Joined
+against Postgres and the drain log (fallback WARNINGs carry per-chain frame
+counts; each legacy ingest of a sub-threshold doc logs a Post-ingest line
+naming tool/doc). Counter total was 850 frames — ~3% window-edge skew between
+receipt timestamps and counter-window boundaries; ratios unaffected.
+
+### Fallback volume: 114 frames, 4 reasons, THREE documents, zero unexplained
+| Reason | Frames/chains | Document(s) | Evidence | Why allowed |
+|---|---|---|---|---|
+| Claude transcript/sidecar pairing | 87 / 51 | ONE doc: 068761ac — the Phase 5 Plan agent subagent transcript (fe4bdc0b.../subagents/agent-a8219f353e7676f9c.jsonl, butterbridge) | receipts(doc)=87 = counter bucket EXACTLY; all 87 Post-ingest lines name this doc; reason string has a single raise site, fired iff path matches the subagent transcript/sidecar pattern | Intentional legacy-forever: cross-file transcript+sidecar pairing is outside the raw writer single-source transaction by design (shapes report Shape C) |
+| authoritative rebuild/history | 19 / 13 | ONE doc: 84a3e717 — the Aug-13 yoga codex rollout (261MB) during post-rebase catch-up | receipts(doc)=19 = counter bucket EXACTLY; the 13 WARNINGs' per-chain frame counts sum to exactly 19; mutation fingerprint: its recovered history rows went 178 -> 10 in-window (only legacy reconcile deletes recovered rows) | Shape A(b): user_history reconcile on a doc carrying legacy-era recovered rows — the full raw port was explicitly deferred as optional (shapes report §4) |
+| Cursor projection reordering | 7 / 7 | ONE doc: 28bc8f69 — yoga Grok composer transcript ("Codex permission issues") | every WARNING immediately adjacent to a Post-ingest line naming this doc | Enumerated legacy-forever guard (row reorder) |
+| stable-identity relocation/alias | 1 / 1 | same doc 28bc8f69 | WARNING at 21:55:47.985 adjacent to its Post-ingest at 21:55:48.057 | Enumerated legacy-forever guard |
+
+### Positive control for today's FUM fix
+The three fresh exec/MCP-driven codex sessions (terra-phase5 be18cf36 143
+frames, sol-review-phase5 547cbfbd 110, "Count farm UI link sharers" 39cdeaab
+371) all attach first_user_message metadata on every emission — the exact
+shape that fell back on EVERY delta before commits f4197a3d16/cbd13e8575 —
+and raw-committed 100% of their 624 frames (zero legacy evidence). The
+claude_code main-session transcripts (2ec78baa 69, 050540a9 49, a1366e1b 21)
+also raw-committed 100%.
+
+### Conclusion
+The 10.2% pairing share was ONE busy subagent transcript (the Plan agent
+writing a long report), not a distributed coverage failure; the 2.2% history
+share was ONE recovery-day doc. Every fallback frame maps to a deliberately
+unsupported or explicitly deferred shape; there are zero unexplained shapes.
