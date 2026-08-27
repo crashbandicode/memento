@@ -513,7 +513,8 @@ match the golden output, and projector restart/replay is idempotent.
   relocation/alias, and delta-without-committed-base. Each shape must remain
   below 1 fallback/minute and below 2% of drained frames. See the
   [unsupported-shapes report §5](raw-writer-unsupported-shapes-report.md#5-recommended-phase-5-gate-definition).
-- Phase 5 hard-requires `DEFERRED_PROJECTIONS=true` and a running projector.
+- Phase 5 hard-requires
+  `MEMENTO_REALTIME_INGEST_DEFERRED_PROJECTIONS=true` and a running projector.
   Turning the spool flag off does not restore synchronous projections; see the
   [deferred-projections one-way door](realtime-ingest-phase45-handoff.md#rollback-constraint).
 - Keep FULL and non-conversation migration explicit; do not delete the old

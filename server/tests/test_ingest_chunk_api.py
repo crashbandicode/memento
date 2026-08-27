@@ -506,6 +506,66 @@ class ChunkIngestApiTests(unittest.TestCase):
         stage.assert_called_once()
         ingest.assert_not_awaited()
 
+    def test_spool_kill_switch_routes_capable_delta_behind_pending_base(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        headers = {
+            "x-device-id": "device-1",
+            "x-device-name": "Yoga",
+            "x-device-platform": "Windows",
+            "x-collector-capabilities": "realtime_ingest_async_admission_v1",
+        }
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(settings, "realtime_ingest_spool_deltas", False),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=ingest_api.DeltaBaseMismatch(
+                    expected_hash="server-hash",
+                    expected_offset=5,
+                ),
+            ),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value="b" * 64,
+            ) as find_pending,
+            patch.object(
+                ingest_api,
+                "stage_chunk",
+                side_effect=self._stage_in_test_spool,
+            ),
+            patch(
+                "server.tasks.ingest_spool.process_spooled_ingest.apply_async"
+            ) as enqueue,
+        ):
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertTrue(response.json()["document_id"].startswith("accepted:"))
+        self.assertEqual(response.json()["receipt_id"], response.json()["document_id"][9:])
+        self.assertIn("pending revision", response.json()["message"])
+        find_pending.assert_called_once_with(
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            tool="codex",
+            relative_path="sessions/thread.jsonl",
+            content_hash="base-hash",
+            offset=10,
+        )
+        enqueue.assert_called_once()
+
     def test_noncapable_delta_never_treats_pending_spool_as_committed(self) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
         with (
