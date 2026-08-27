@@ -3018,9 +3018,18 @@ async def ingest_file(
                 content_already_sanitized=content_already_sanitized,
                 content_had_sensitive=content_had_sensitive,
             )
-        except (RawWriterUnsupported, RawWriterFailure):
+        except (RawWriterUnsupported, RawWriterFailure) as raw_error:
             # The asyncpg transaction is rolled back before either exception
             # can escape.  Never run this fallback after a raw commit.
+            # Canary observability: fallbacks MUST be visible in logs or the
+            # rollout cannot be monitored.
+            logging.getLogger("realtime_ingest").warning(
+                "raw writer fallback to legacy for %s/%s (%s): %s",
+                tool_id,
+                relative_path,
+                type(raw_error).__name__,
+                str(raw_error)[:200],
+            )
             writer = "legacy"
         else:
             if raw_event is not None:
