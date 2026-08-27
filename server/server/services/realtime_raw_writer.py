@@ -85,6 +85,8 @@ class IngestMutation:
     search_text: str = ""
     interactions_changed: bool = False
     disposition: str = "committed"
+    canvas_candidate: bool = False
+    search_candidate: bool = False
 
 
 _pools: dict[tuple[int, str], asyncpg.Pool] = {}
@@ -717,6 +719,31 @@ def reduce_writer_state(
     _store_pending_question_ids(view, pending_ids)
     _store_latest_human_timestamp(view, latest_human)
     _store_assistant_identity(view, assistant_identity)
+    from .canvas_artifacts import canvas_message_can_have_reference
+    from .ingest_service import _conversation_search_index_needs_refresh
+    from .realtime_ingest_projector import message_is_canvas_projection_candidate
+
+    # Inserts enqueue only when the new body can name a Canvas. Updates of a
+    # canvas-capable row also enqueue so a later revision that drops the link
+    # still reconciles (legacy collects every mutated existing row).
+    canvas_candidate = any(
+        message_is_canvas_projection_candidate(
+            item.role, item.metadata, item.content
+        )
+        or (
+            item.operation == "update"
+            and canvas_message_can_have_reference(item.role, item.metadata)
+        )
+        for item in mutations
+    )
+    search_text = "[user]" if has_user_search_text else ("[assistant]" if has_search_text else "")
+    search_candidate = _conversation_search_index_needs_refresh(
+        is_new_document=new_document,
+        mode=mode,
+        new_search_text=search_text,
+        previous_title=title,
+        current_title=title,
+    )
     sync_values = {"last_hash": content_hash, "last_offset": offset, "last_synced_at": received_at}
     return IngestMutation(
         document_id=document_id, new_document=new_document, mode=mode,
@@ -736,11 +763,13 @@ def reduce_writer_state(
         sync_values=sync_values, messages=mutations, usage_rows=usage_rows,
         # The raw path currently needs only the event namespace signal, not a
         # second in-memory copy of the bounded search corpus.
-        search_text="[user]" if has_user_search_text else ("[assistant]" if has_search_text else ""),
+        search_text=search_text,
         # Claude's raw UUID lineage may change on semantic records that do not
         # emit a visible message.  The existing writer includes that namespace
         # in the post-commit union; retain the same conservative invalidation.
         interactions_changed=interactions_changed or tool_id == "claude_code",
+        canvas_candidate=canvas_candidate,
+        search_candidate=search_candidate,
     )
 
 
@@ -1148,6 +1177,16 @@ async def _apply(
     )
     if mutation.document_values["project_id"] is None:
         changes = [change for change in changes if change != "project"]
+    if settings.realtime_ingest_deferred_projections:
+        from .realtime_ingest_projector import enqueue_projection_candidates_raw
+
+        await enqueue_projection_candidates_raw(
+            connection,
+            document_id=mutation.document_id,
+            revision_hash=content_hash,
+            canvas=mutation.canvas_candidate,
+            search=mutation.search_candidate,
+        )
     return RawDocument(
         mutation.document_id,
         file_size_bytes=mutation.delivery_values["file_size_bytes"],

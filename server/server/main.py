@@ -176,6 +176,30 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_document_delivery_project_activity "
         "ON document_delivery_state (project_id, activity_at DESC)"
     ))
+    # Phase 4 durable Canvas/search projector outbox. Written in the same
+    # ingest commit as messages; recovered by scanning pending rows, never by
+    # a volatile queue. Unique fence identity is (document_id, revision, kind).
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS ingest_projection_candidates ("
+        "id BIGSERIAL PRIMARY KEY, "
+        "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+        "revision_hash VARCHAR(64) NOT NULL, "
+        "kind VARCHAR(32) NOT NULL, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "claimed_at TIMESTAMPTZ, "
+        "completed_at TIMESTAMPTZ, "
+        "superseded_at TIMESTAMPTZ, "
+        "CONSTRAINT uq_ingest_projection_candidate_fence "
+        "UNIQUE (document_id, revision_hash, kind), "
+        "CONSTRAINT ck_ingest_projection_candidate_kind "
+        "CHECK (kind IN ('canvas', 'search'))"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_ingest_projection_candidates_pending "
+        "ON ingest_projection_candidates (document_id, kind, created_at) "
+        "WHERE completed_at IS NULL AND superseded_at IS NULL"
+    ))
     # Pins are personal bookmarks. Keep them normalized so a user's note never
     # modifies the shared transcript or document metadata. They anchor to a
     # message's STABLE native id (metadata->>'source_id'), with the document

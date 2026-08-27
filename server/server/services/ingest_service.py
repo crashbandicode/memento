@@ -3762,10 +3762,11 @@ async def ingest_file(
             previous_title=previous_title,
             current_title=doc.title,
         )
-        if refresh_content_tsv:
+        if refresh_content_tsv and not settings.realtime_ingest_deferred_projections:
             # Build FTS from bounded normalized rows, never from a multi-
             # hundred-megabyte transcript. Tool-only DELTAs leave the indexed
             # user/assistant text unchanged and skip both this read and write.
+            # Phase 4 deferred mode leaves this to the revision-fenced projector.
             latest_search_rows = (
                 (
                     await db.execute(
@@ -3854,7 +3855,9 @@ async def ingest_file(
         searchable_content = conversation_search_text
     else:
         searchable_content = stored_blob_content[:MAX_SEARCH_TEXT_CHARS]
-    if refresh_content_tsv:
+    if refresh_content_tsv and not (
+        category == "conversation" and settings.realtime_ingest_deferred_projections
+    ):
         tsv_input = _tok(f"{doc.title or ''} {searchable_content}")
         await db.execute(
             _update(Document)
@@ -3997,6 +4000,25 @@ async def ingest_file(
             category=category,
             file_size_bytes=int(doc.file_size_bytes),
             revision=str(doc.content_hash),
+        )
+
+    if (
+        category == "conversation"
+        and settings.realtime_ingest_deferred_projections
+    ):
+        from .realtime_ingest_projector import enqueue_projection_candidates
+
+        fence = (
+            delivery_state.revision_hash
+            if delivery_state is not None and delivery_state.revision_hash
+            else doc.content_hash
+        )
+        await enqueue_projection_candidates(
+            db,
+            document_id=doc.id,
+            revision_hash=str(fence),
+            canvas=bool(getattr(doc, "_memento_canvas_projection_candidate", False)),
+            search=bool(refresh_content_tsv),
         )
 
     return doc
@@ -4490,18 +4512,8 @@ async def _stage_new_conversation_messages(
         canvas_message_can_have_reference,
         project_message_canvases,
     )
+    from .realtime_ingest_projector import deferred_projections_enabled
 
-    if not use_core:
-        legacy_batch = [_conversation_message_from_values(value) for value in values]
-        db.add_all(legacy_batch)
-        await db.flush()
-        await project_message_canvases(db, document, legacy_batch)
-        return
-
-    # The unchanged Canvas compatibility projector only needs generated IDs
-    # for rows that can actually name a Canvas.  Avoid a RETURNING payload,
-    # adapter allocation, and no-op reconciliation query for the normal batch
-    # that cannot affect this projection.
     canvas_values = [
         value
         for value in values
@@ -4511,8 +4523,25 @@ async def _stage_new_conversation_messages(
         )
         and ".canvas.tsx" in str(value["content"]).casefold()
     ]
+    if canvas_values:
+        setattr(document, "_memento_canvas_projection_candidate", True)
+    defer_canvas = deferred_projections_enabled()
+
+    if not use_core:
+        legacy_batch = [_conversation_message_from_values(value) for value in values]
+        db.add_all(legacy_batch)
+        await db.flush()
+        if not defer_canvas:
+            await project_message_canvases(db, document, legacy_batch)
+        return
+
+    # The unchanged Canvas compatibility projector only needs generated IDs
+    # for rows that can actually name a Canvas.  Avoid a RETURNING payload,
+    # adapter allocation, and no-op reconciliation query for the normal batch
+    # that cannot affect this projection.  Phase 4 deferred mode also skips
+    # RETURNING: the projector re-reads current rows by document revision.
     message_table = ConversationMessage.__table__
-    if not canvas_values:
+    if defer_canvas or not canvas_values:
         await db.execute(insert(message_table), values)
         return
 
@@ -4581,6 +4610,10 @@ async def _extract_messages(
         project_message_canvases,
         reconcile_message_canvases,
     )
+    from .realtime_ingest_projector import (
+        deferred_projections_enabled,
+        message_is_canvas_projection_candidate,
+    )
 
     search_parts: list[str] = []
     search_bytes = 0
@@ -4645,20 +4678,37 @@ async def _extract_messages(
             if len(batch) >= 100 or batch_bytes >= MAX_MESSAGE_BATCH_CHARS:
                 db.add_all(batch)
                 await db.flush()
-                await project_message_canvases(db, doc, batch)
+                if any(
+                    message_is_canvas_projection_candidate(
+                        item.role, item.metadata_, item.content
+                    )
+                    for item in batch
+                ):
+                    setattr(doc, "_memento_canvas_projection_candidate", True)
+                if not deferred_projections_enabled():
+                    await project_message_canvases(db, doc, batch)
                 batch = []
                 batch_bytes = 0
         if batch:
             db.add_all(batch)
             await db.flush()
-            await project_message_canvases(db, doc, batch)
+            if any(
+                message_is_canvas_projection_candidate(
+                    item.role, item.metadata_, item.content
+                )
+                for item in batch
+            ):
+                setattr(doc, "_memento_canvas_projection_candidate", True)
+            if not deferred_projections_enabled():
+                await project_message_canvases(db, doc, batch)
         await refresh_conversation_read_model(
             db,
             doc,
             mode="full",
             force_full=True,
         )
-        await upsert_search_terms(db, search_terms)
+        if not deferred_projections_enabled():
+            await upsert_search_terms(db, search_terms)
         return "".join(search_parts)
 
     tool_id = doc.tool_id
@@ -5350,7 +5400,9 @@ async def _extract_messages(
             use_core=use_core_batch_staging,
         )
     if canvas_reconcile_rows:
-        await reconcile_message_canvases(db, doc, canvas_reconcile_rows)
+        setattr(doc, "_memento_canvas_projection_candidate", True)
+        if not deferred_projections_enabled():
+            await reconcile_message_canvases(db, doc, canvas_reconcile_rows)
 
     # Codex user messages: supplement from history.jsonl and state_5.sqlite.
     # history.jsonl has ALL user inputs with timestamps; state_5.sqlite has first prompt.
@@ -5580,7 +5632,8 @@ async def _extract_messages(
         dirty_line_numbers=dirty_projection_lines,
         force_full=(force_projection_rebuild or recovered_history_changed),
     )
-    await upsert_search_terms(db, search_terms)
+    if not deferred_projections_enabled():
+        await upsert_search_terms(db, search_terms)
     setattr(doc, "_memento_interactions_changed", interactions_changed)
     return "".join(search_parts)
 

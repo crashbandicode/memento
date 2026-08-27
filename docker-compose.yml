@@ -269,6 +269,9 @@ services:
       MEMENTO_POST_INGEST_LARGE_CONVERSATION_BYTES: ${MEMENTO_POST_INGEST_LARGE_CONVERSATION_BYTES:-0}
       MEMENTO_GEOIP_DB: /data/geoip/GeoLite2-City.mmdb
       MEMENTO_DOCUMENT_CONTENT_MINIO_ENABLED: ${MEMENTO_DOCUMENT_CONTENT_MINIO_ENABLED:-false}
+      MEMENTO_REALTIME_INGEST_SPOOL_DELTAS: ${MEMENTO_REALTIME_INGEST_SPOOL_DELTAS:-false}
+      MEMENTO_REALTIME_INGEST_RAW_WRITER_OWNERS: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_OWNERS:-}
+      MEMENTO_REALTIME_INGEST_RAW_WRITER_DEVICES: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_DEVICES:-}
       MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS:-}
     # Linux Docker (non-Docker-Desktop) doesn't auto-resolve
     # host.docker.internal — embedding server runs on the host at :8002,
@@ -417,6 +420,41 @@ services:
       MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - ingest_spool:/data/ingest-spool
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  # Phase 3's high-volume DELTA path is deliberately not a Celery task per
+  # frame.  This persistent process scans fsynced ready markers on startup and
+  # throughout its lifetime, applies the 1.25s quiet/2.0s max policy, and
+  # receipts every constituent frame after one raw transaction.
+  realtime-ingest-drain:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    container_name: memento_realtime_ingest_drain
+    restart: unless-stopped
+    command: python -m server.services.realtime_ingest_drain
+    environment:
+      MEMENTO_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/memento
+      MEMENTO_REDIS_URL: redis://redis:6379/0
+      MEMENTO_INGEST_SPOOL_DIR: /data/ingest-spool
+      MEMENTO_REALTIME_INGEST_SPOOL_DELTAS: ${MEMENTO_REALTIME_INGEST_SPOOL_DELTAS:-false}
+      MEMENTO_REALTIME_INGEST_DRAIN_POLL_SECONDS: ${MEMENTO_REALTIME_INGEST_DRAIN_POLL_SECONDS:-0.10}
+      MEMENTO_REALTIME_INGEST_RAW_WRITER_OWNERS: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_OWNERS:-}
+      MEMENTO_REALTIME_INGEST_RAW_WRITER_DEVICES: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_DEVICES:-}
+      MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS: ${MEMENTO_REALTIME_INGEST_RAW_WRITER_TOOLS:-}
+      MEMENTO_S3_ENDPOINT: http://minio:9000
+      MEMENTO_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MEMENTO_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - ingest_spool:/data/ingest-spool
     depends_on:

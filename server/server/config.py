@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     realtime_ingest_spool_deltas: bool = False
     realtime_ingest_drain_poll_seconds: float = 0.10
 
+    # Phase 4 deferred Canvas/search projector.  When false (the default),
+    # ingest still reconciles Canvas references and refreshes conversation
+    # FTS/lexicon inside the same commit as messages.  When true, ingest
+    # writes durable revision-fenced candidates in that commit and the
+    # long-lived projector applies Canvas/search after commit.
+    realtime_ingest_deferred_projections: bool = False
+    realtime_ingest_projector_poll_seconds: float = 0.10
+
     # Redis
     redis_url: str = "redis://localhost:6380/0"
 

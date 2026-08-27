@@ -254,6 +254,52 @@ class DocumentContentGcCandidate(Base):
     )
 
 
+class IngestProjectionCandidate(Base):
+    """Durable outbox for deferred Canvas and conversation-search projections.
+
+    Identity is ``(document_id, revision_hash, kind)``.  The ingest commit
+    inserts only real candidates; the projector fences on the current
+    delivery revision and collapses older rows for the same document/kind.
+    """
+
+    __tablename__ = "ingest_projection_candidates"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "revision_hash",
+            "kind",
+            name="uq_ingest_projection_candidate_fence",
+        ),
+        CheckConstraint(
+            "kind IN ('canvas', 'search')",
+            name="ck_ingest_projection_candidate_kind",
+        ),
+        Index(
+            "idx_ingest_projection_candidates_pending",
+            "document_id",
+            "kind",
+            "created_at",
+            postgresql_where=text(
+                "completed_at IS NULL AND superseded_at IS NULL"
+            ),
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hot conversation delivery state
 # ---------------------------------------------------------------------------
