@@ -24,11 +24,10 @@ class Settings(BaseSettings):
     realtime_ingest_raw_writer_devices: str = ""
     realtime_ingest_raw_writer_tools: str = ""
 
-    # Phase 3 is a separate switch from the raw-writer canary.  When false,
-    # an opted-in source still uses the synchronous raw writer above.  This
-    # gives rollout an immediate, database-writing fallback without changing
-    # collector compatibility or the delivery fence.
-    realtime_ingest_spool_deltas: bool = False
+    # Phase 5 defaults capability-negotiated conversation DELTAs to durable
+    # spool admission. Setting this false is the kill-switch that reverts them
+    # to the synchronous path (full revert with env change plus recreate).
+    realtime_ingest_spool_deltas: bool = True
     realtime_ingest_drain_poll_seconds: float = 0.10
 
     # Phase 4 deferred Canvas/search projector.  When false (the default),
