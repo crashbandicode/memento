@@ -122,9 +122,12 @@ _NATIVE_CONVERSATION_REF = re.compile(
 
 _HANDOFF_MARKER_PREFIX = "MEMENTO-HANDOFF-FROM:"
 _HANDOFF_MARKER_RE = re.compile(
+    # The \A anchor plus exact prefix make trailing same-line text safe to
+    # allow: operators sometimes paste the marker inline with instructions
+    # rather than on its own line. Require only a boundary after the UUID.
     r"\AMEMENTO-HANDOFF-FROM:\s*(?P<session_id>"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\r?\n|\Z)"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=\s|\Z)"
 )
 _CLAUDE_SESSION_PATH_RE = re.compile(
     r"(?:\A|[\\/])(?P<session_id>"
