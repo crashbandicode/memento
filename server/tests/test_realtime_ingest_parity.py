@@ -14,7 +14,7 @@ import os
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ from server.db.models import (
     DashboardDocumentProjection,
     Document,
     DocumentDeliveryState,
+    IngestProjectionCandidate,
     Machine,
     SyncState,
     Tool,
@@ -888,6 +889,399 @@ async def test_coalesced_raw_chain_matches_same_frames_one_by_one(
             resumed_snapshot["dashboard_projection"]["relative_path"] = "<path>"
             resumed_snapshot["dashboard_projection"]["title"] = "<path-title>"
         assert resumed_snapshot == individual
+
+
+@pytest.mark.asyncio
+async def test_raw_history_repeat_commits_and_title_matches_legacy_with_search_candidate(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 4.5 keeps redundant Codex history raw and ports title precedence."""
+    from server.config import settings
+    from server.services.realtime_raw_writer import ingest_conversation_raw
+
+    monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(), email=f"phase45-{uuid.uuid4()}@example.test",
+            role="viewer", status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(), name="phase45",
+            collector_token_hash=str(uuid.uuid4()), user_id=user.id,
+        )
+        session.add_all((user, machine))
+        await session.commit()
+
+        codex_full = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:00Z",
+                "payload": {"type": "agent_message", "message": "Seed response."},
+            }
+        )
+        codex_full_hash = _hash(codex_full)
+        codex_path = f"phase45/history-{uuid.uuid4()}.jsonl"
+        codex_document, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=codex_path, content=codex_full,
+            content_hash=codex_full_hash,
+            file_size=len(codex_full.encode("utf-8")), mode="full",
+            offset=len(codex_full.encode("utf-8")),
+            metadata={"session_id": "phase45-history"}, timestamp=1_785_672_000.0,
+            machine_id=machine.id, user_id=user.id, base_hash=None, base_offset=None,
+            database_url=TEST_DATABASE_URL,
+        )
+        history_at = datetime.fromtimestamp(1_785_672_000.0, tz=timezone.utc)
+        session.add(
+            ConversationMessage(
+                document_id=codex_document.id,
+                line_number=2,
+                message_type="history_user_message",
+                role="user",
+                content="Use the raw writer.",
+                metadata_={"source_id": "codex-history:0"},
+                timestamp=history_at,
+            )
+        )
+        await session.commit()
+        codex_delta = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {"type": "agent_message", "message": "Raw commit."},
+            }
+        )
+        codex_final = f"{codex_full}\n{codex_delta}"
+        codex_committed, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=codex_path, content=codex_delta,
+            content_hash=_hash(codex_final), file_size=len(codex_delta.encode("utf-8")),
+            mode="delta", offset=len(codex_final.encode("utf-8")),
+            metadata={
+                "session_id": "phase45-history",
+                "user_history": [{"text": "Use the raw writer.", "ts": 1_785_672_000}],
+                "first_user_message": "Use the raw writer.",
+            },
+            timestamp=1_785_672_001.0, machine_id=machine.id, user_id=user.id,
+            base_hash=codex_full_hash, base_offset=len(codex_full.encode("utf-8")),
+            database_url=TEST_DATABASE_URL,
+        )
+        assert codex_committed.id == codex_document.id
+        assert codex_committed.disposition == "committed"
+
+        claude_full = _json_line(
+            {
+                "type": "assistant",
+                "uuid": "phase45-claude-full",
+                "timestamp": "2026-08-27T12:00:00Z",
+                "message": {"role": "assistant", "content": "Seed title."},
+            }
+        )
+        claude_delta = _json_line(
+            {
+                "type": "assistant",
+                "uuid": "phase45-claude-delta",
+                "timestamp": "2026-08-27T12:00:01Z",
+                "message": {"role": "assistant", "content": "Updated title."},
+            }
+        )
+        claude_full_hash = _hash(claude_full)
+        initial_metadata = {
+            "session_id": "phase45-title",
+            "source_title_kind": "claude_ai_title",
+            "title": "Initial Claude title",
+        }
+        raw_path = f"phase45/title-raw-{uuid.uuid4()}.jsonl"
+        legacy_path = f"phase45/title-legacy-{uuid.uuid4()}.jsonl"
+        raw_document, _ = await ingest_conversation_raw(
+            tool_id="claude_code", category="conversation", content_type="jsonl",
+            relative_path=raw_path, content=claude_full,
+            content_hash=claude_full_hash,
+            file_size=len(claude_full.encode("utf-8")), mode="full",
+            offset=len(claude_full.encode("utf-8")), metadata=initial_metadata,
+            timestamp=1_787_500_800.0, machine_id=machine.id, user_id=user.id,
+            base_hash=None, base_offset=None, database_url=TEST_DATABASE_URL,
+        )
+        legacy_document = await ingest_file(
+            session, tool_id="claude_code", category="conversation",
+            content_type="jsonl", relative_path=legacy_path, content=claude_full,
+            content_hash=claude_full_hash, file_size=len(claude_full.encode("utf-8")),
+            mode="full", offset=len(claude_full.encode("utf-8")),
+            metadata=initial_metadata, timestamp=1_787_500_800.0,
+            machine_id=machine.id, user_id=str(user.id), base_hash=None,
+            base_offset=None, schedule_post_ingest=False, writer="legacy",
+        )
+        await session.commit()
+        updated_metadata = {
+            "session_id": "phase45-title",
+            "source_title_kind": "claude_ai_title",
+            "title": "Selected Claude title",
+        }
+        claude_final = f"{claude_full}\n{claude_delta}"
+        raw_committed, _ = await ingest_conversation_raw(
+            tool_id="claude_code", category="conversation", content_type="jsonl",
+            relative_path=raw_path, content=claude_delta,
+            content_hash=_hash(claude_final),
+            file_size=len(claude_delta.encode("utf-8")), mode="delta",
+            offset=len(claude_final.encode("utf-8")), metadata=updated_metadata,
+            timestamp=1_787_500_801.0, machine_id=machine.id, user_id=user.id,
+            base_hash=claude_full_hash, base_offset=len(claude_full.encode("utf-8")),
+            database_url=TEST_DATABASE_URL,
+        )
+        await ingest_file(
+            session, tool_id="claude_code", category="conversation",
+            content_type="jsonl", relative_path=legacy_path, content=claude_delta,
+            content_hash=_hash(claude_final),
+            file_size=len(claude_delta.encode("utf-8")), mode="delta",
+            offset=len(claude_final.encode("utf-8")), metadata=updated_metadata,
+            timestamp=1_787_500_801.0, machine_id=machine.id, user_id=str(user.id),
+            base_hash=claude_full_hash, base_offset=len(claude_full.encode("utf-8")),
+            schedule_post_ingest=False, writer="legacy",
+        )
+        await session.commit()
+        raw_title = await session.scalar(
+            select(Document.title).where(Document.id == raw_committed.id)
+        )
+        legacy_title = await session.scalar(
+            select(Document.title).where(Document.id == legacy_document.id)
+        )
+        assert raw_title == legacy_title == "Selected Claude title"
+        search_candidate = await session.scalar(
+            select(IngestProjectionCandidate).where(
+                IngestProjectionCandidate.document_id == raw_document.id,
+                IngestProjectionCandidate.revision_hash == _hash(claude_final),
+                IngestProjectionCandidate.kind == "search",
+            )
+        )
+        assert search_candidate is not None
+
+
+@pytest.mark.asyncio
+async def test_history_noop_proof_matches_legacy_source_dedup_cases(
+    session_factory,
+) -> None:
+    """The raw shortcut defers whenever legacy history reconciliation mutates."""
+    from server.services.realtime_raw_writer import (
+        RawWriterUnsupported,
+        ingest_conversation_raw,
+    )
+
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(), email=f"phase45-history-{uuid.uuid4()}@example.test",
+            role="viewer", status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(), name="phase45-history",
+            collector_token_hash=str(uuid.uuid4()), user_id=user.id,
+        )
+        session.add_all((user, machine))
+        await session.commit()
+
+        async def seed_pair(
+            *,
+            full: str,
+            metadata: dict[str, object],
+            stem: str,
+        ) -> tuple[Document, Document, str, str, str]:
+            full_hash = _hash(full)
+            raw_path = f"phase45/{stem}-raw-{uuid.uuid4()}.jsonl"
+            legacy_path = f"phase45/{stem}-legacy-{uuid.uuid4()}.jsonl"
+            raw_document, _ = await ingest_conversation_raw(
+                tool_id="codex", category="conversation", content_type="jsonl",
+                relative_path=raw_path, content=full, content_hash=full_hash,
+                file_size=len(full.encode("utf-8")), mode="full",
+                offset=len(full.encode("utf-8")), metadata=metadata,
+                timestamp=1_785_672_000.0, machine_id=machine.id, user_id=user.id,
+                base_hash=None, base_offset=None, database_url=TEST_DATABASE_URL,
+            )
+            legacy_document = await ingest_file(
+                session, tool_id="codex", category="conversation",
+                content_type="jsonl", relative_path=legacy_path, content=full,
+                content_hash=full_hash, file_size=len(full.encode("utf-8")),
+                mode="full", offset=len(full.encode("utf-8")), metadata=metadata,
+                timestamp=1_785_672_000.0, machine_id=machine.id,
+                user_id=str(user.id), base_hash=None, base_offset=None,
+                schedule_post_ingest=False, writer="legacy",
+            )
+            await session.commit()
+            return raw_document, legacy_document, raw_path, legacy_path, full_hash
+
+        async def snapshot_live_state(
+            *,
+            document_id: uuid.UUID,
+            path: str,
+        ) -> dict[str, object]:
+            snapshot = await _snapshot(
+                session,
+                document_id=document_id,
+                user_id=user.id,
+                relative_path=path,
+            )
+            return {
+                "messages": snapshot["messages"],
+                "read_model": snapshot["read_model"],
+                "prompt_projections": snapshot["prompt_projections"],
+            }
+
+        prompt = "Deduplicate this recovered prompt."
+        recovered_full = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:00Z",
+                "payload": {"type": "agent_message", "message": "Seed response."},
+            }
+        )
+        recovered_metadata = {"session_id": "phase45-recovered-match"}
+        raw_document, legacy_document, raw_path, legacy_path, full_hash = await seed_pair(
+            full=recovered_full,
+            metadata=recovered_metadata,
+            stem="recovered-match",
+        )
+        history_at = datetime.fromtimestamp(1_785_672_000.0, tz=timezone.utc)
+        for document in (raw_document, legacy_document):
+            session.add(
+                ConversationMessage(
+                    document_id=document.id,
+                    line_number=2,
+                    message_type="history_user_message",
+                    role="user",
+                    content=prompt,
+                    metadata_={"source_id": "codex-history:0"},
+                    timestamp=history_at,
+                )
+            )
+        await session.commit()
+        matching_user_delta = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "phase45-history-user",
+                    "message": prompt,
+                },
+            }
+        )
+        matching_final = f"{recovered_full}\n{matching_user_delta}"
+        matching_metadata = {
+            "session_id": "phase45-recovered-match",
+            "user_history": [{"text": prompt, "ts": 1_785_672_000}],
+            "first_user_message": prompt,
+        }
+        raw_delta_kwargs = {
+            "tool_id": "codex",
+            "category": "conversation",
+            "content_type": "jsonl",
+            "content": matching_user_delta,
+            "content_hash": _hash(matching_final),
+            "file_size": len(matching_user_delta.encode("utf-8")),
+            "mode": "delta",
+            "offset": len(matching_final.encode("utf-8")),
+            "metadata": matching_metadata,
+            "timestamp": 1_785_672_001.0,
+            "machine_id": machine.id,
+            "user_id": user.id,
+            "base_hash": full_hash,
+            "base_offset": len(recovered_full.encode("utf-8")),
+        }
+        with pytest.raises(RawWriterUnsupported):
+            await ingest_conversation_raw(
+                relative_path=raw_path,
+                database_url=TEST_DATABASE_URL,
+                **raw_delta_kwargs,
+            )
+        raw_fallback_document = await ingest_file(
+            session,
+            relative_path=raw_path,
+            schedule_post_ingest=False,
+            writer="raw",
+            **raw_delta_kwargs,
+        )
+        legacy_delta_kwargs = dict(raw_delta_kwargs)
+        legacy_delta_kwargs["user_id"] = str(user.id)
+        legacy_result = await ingest_file(
+            session,
+            relative_path=legacy_path,
+            schedule_post_ingest=False,
+            writer="legacy",
+            **legacy_delta_kwargs,
+        )
+        await session.commit()
+        raw_state = await snapshot_live_state(
+            document_id=raw_fallback_document.id,
+            path=raw_path,
+        )
+        legacy_state = await snapshot_live_state(
+            document_id=legacy_result.id,
+            path=legacy_path,
+        )
+        assert raw_state == legacy_state
+        assert len(raw_state["messages"]) == 2
+        assert [item["message_type"] for item in raw_state["messages"]] == [
+            "agent_message",
+            "user_message",
+        ]
+
+        represented_full = _json_line(
+            {
+                "type": "response_item",
+                "timestamp": "2026-08-02T12:00:00Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            }
+        )
+        represented_metadata = {"session_id": "phase45-ordinary-match"}
+        raw_document, legacy_document, raw_path, legacy_path, full_hash = await seed_pair(
+            full=represented_full,
+            metadata=represented_metadata,
+            stem="ordinary-match",
+        )
+        repeat_delta = _json_line(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-08-02T12:00:01Z",
+                "payload": {"type": "agent_message", "message": "Repeat committed."},
+            }
+        )
+        repeat_final = f"{represented_full}\n{repeat_delta}"
+        repeat_metadata = {
+            "session_id": "phase45-ordinary-match",
+            "user_history": [{"text": prompt, "ts": 1_785_672_000}],
+            "first_user_message": prompt,
+        }
+        raw_repeat_document, _ = await ingest_conversation_raw(
+            tool_id="codex", category="conversation", content_type="jsonl",
+            relative_path=raw_path, content=repeat_delta,
+            content_hash=_hash(repeat_final), file_size=len(repeat_delta.encode("utf-8")),
+            mode="delta", offset=len(repeat_final.encode("utf-8")),
+            metadata=repeat_metadata, timestamp=1_785_672_001.0,
+            machine_id=machine.id, user_id=user.id, base_hash=full_hash,
+            base_offset=len(represented_full.encode("utf-8")),
+            database_url=TEST_DATABASE_URL,
+        )
+        legacy_repeat_document = await ingest_file(
+            session, tool_id="codex", category="conversation",
+            content_type="jsonl", relative_path=legacy_path, content=repeat_delta,
+            content_hash=_hash(repeat_final), file_size=len(repeat_delta.encode("utf-8")),
+            mode="delta", offset=len(repeat_final.encode("utf-8")),
+            metadata=repeat_metadata, timestamp=1_785_672_001.0,
+            machine_id=machine.id, user_id=str(user.id), base_hash=full_hash,
+            base_offset=len(represented_full.encode("utf-8")),
+            schedule_post_ingest=False, writer="legacy",
+        )
+        await session.commit()
+        assert await snapshot_live_state(
+            document_id=raw_repeat_document.id,
+            path=raw_path,
+        ) == await snapshot_live_state(
+            document_id=legacy_repeat_document.id,
+            path=legacy_path,
+        )
 
 
 @pytest.mark.asyncio

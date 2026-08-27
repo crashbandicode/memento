@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections import Counter
+from collections.abc import Callable
 from copy import deepcopy
 from contextlib import nullcontext
 from uuid import UUID
@@ -60,6 +63,96 @@ from .celery_app import INGEST_RECOVERY_EXPIRES_SECONDS, celery_app
 logger = logging.getLogger("ingest_spool")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_FINALIZE_RETRIES = 12
+
+
+class _RealtimeWriterOutcomeCounters:
+    """Bounded, process-local Phase 5 fallback-gate telemetry.
+
+    The realtime drain is serialized, so these tiny counters need no external
+    storage or synchronization. Each process reports its own periodic window;
+    aggregate matching log records across drain processes if sharding is added.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        log_interval_seconds: float = 60.0,
+        log_every_chains: int = 100,
+        max_reasons: int = 16,
+    ) -> None:
+        self._clock = clock
+        self._log_interval_seconds = log_interval_seconds
+        self._log_every_chains = log_every_chains
+        self._max_reasons = max_reasons
+        self._window_started_at = clock()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.total_handled_chains = 0
+        self.total_handled_frames = 0
+        self.raw_committed_chains = 0
+        self.raw_committed_frames = 0
+        self.legacy_fallback_chains: Counter[str] = Counter()
+        self.legacy_fallback_frames: Counter[str] = Counter()
+
+    def _reason_key(self, reason: str) -> str:
+        if reason in self.legacy_fallback_chains:
+            return reason
+        if len(self.legacy_fallback_chains) < self._max_reasons:
+            return reason
+        return "other/raw-writer-unsupported"
+
+    def _record_handled(self, *, frames: int) -> None:
+        self.total_handled_chains += 1
+        self.total_handled_frames += frames
+
+    def record_raw_handled(self, *, disposition: str, frames: int) -> None:
+        self._record_handled(frames=frames)
+        if disposition == "committed":
+            self.raw_committed_chains += 1
+            self.raw_committed_frames += frames
+        self._maybe_log()
+
+    def record_raw_committed(self, *, frames: int) -> None:
+        """Compatibility helper for focused metrics tests."""
+        self.record_raw_handled(disposition="committed", frames=frames)
+
+    def record_legacy_fallback(self, *, reason: str, frames: int) -> None:
+        self._record_handled(frames=frames)
+        key = self._reason_key(reason)
+        self.legacy_fallback_chains[key] += 1
+        self.legacy_fallback_frames[key] += frames
+        self._maybe_log()
+
+    def _maybe_log(self) -> None:
+        elapsed = self._clock() - self._window_started_at
+        if (
+            elapsed < self._log_interval_seconds
+            and self.total_handled_chains < self._log_every_chains
+        ):
+            return
+        logger.info(
+            "Realtime raw-writer outcomes over %.1fs: "
+            "total_handled_chains=%d total_handled_frames=%d "
+            "raw_committed_chains=%d raw_committed_frames=%d "
+            "legacy_fallback_chains_by_reason=%s "
+            "legacy_fallback_frames_by_reason=%s",
+            elapsed,
+            self.total_handled_chains,
+            self.total_handled_frames,
+            self.raw_committed_chains,
+            self.raw_committed_frames,
+            dict(sorted(self.legacy_fallback_chains.items())),
+            dict(sorted(self.legacy_fallback_frames.items())),
+        )
+        self._window_started_at = self._clock()
+        self._reset()
+
+
+_realtime_writer_outcomes = _RealtimeWriterOutcomeCounters()
+
+
 class RetryLimitExceeded(RuntimeError):
     """Raised when a durable job exhausted its persisted attempt budget."""
 
@@ -119,10 +212,15 @@ async def _ingest_realtime_delta_chain(
         # history rebuild looped 144 times at ~32% CPU). Apply the chain
         # frames in order through the legacy writer; one commit per frame
         # keeps per-frame receipt semantics.
+        reason = str(unsupported)
+        _realtime_writer_outcomes.record_legacy_fallback(
+            reason=reason,
+            frames=len(frames),
+        )
         logger.warning(
             "Realtime chain unsupported by raw writer (%s); applying %d "
             "frame(s) via the legacy path",
-            unsupported,
+            reason,
             len(frames),
         )
         from ..db.session import async_session_factory
@@ -158,6 +256,10 @@ async def _ingest_realtime_delta_chain(
                 "Post-commit realtime event could not be published for %s",
                 document.id,
             )
+    _realtime_writer_outcomes.record_raw_handled(
+        disposition=document._memento_ingest_disposition,
+        frames=len(frames),
+    )
     return {
         "status": document._memento_ingest_disposition,
         "job_id": payload_jobs[0][0],

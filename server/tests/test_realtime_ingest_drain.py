@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -189,6 +190,45 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
         f"hash-{job_ids[0][:6]}",
         f"hash-{job_ids[1][:6]}",
     ]
+
+
+def test_raw_writer_outcome_counters_log_bounded_per_reason_metrics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from server.tasks import ingest_spool as task_module
+
+    now = [0.0]
+    counters = task_module._RealtimeWriterOutcomeCounters(
+        clock=lambda: now[0],
+        log_interval_seconds=60.0,
+        log_every_chains=100,
+        max_reasons=1,
+    )
+    with caplog.at_level(logging.INFO, logger="ingest_spool"):
+        counters.record_raw_committed(frames=3)
+        counters.record_legacy_fallback(
+            reason="Claude transcript/sidecar pairing needs the legacy reducer",
+            frames=2,
+        )
+        counters.record_legacy_fallback(
+            reason="Cursor projection reordering needs the legacy reducer",
+            frames=1,
+        )
+        counters.record_raw_handled(disposition="idempotent", frames=4)
+        now[0] = 60.0
+        counters.record_raw_committed(frames=1)
+
+    record = next(
+        item
+        for item in caplog.records
+        if "Realtime raw-writer outcomes" in item.getMessage()
+    )
+    message = record.getMessage()
+    assert "total_handled_chains=5 total_handled_frames=11" in message
+    assert "raw_committed_chains=2 raw_committed_frames=4" in message
+    assert "legacy_fallback_chains_by_reason" in message
+    assert "Claude transcript/sidecar pairing needs the legacy reducer" in message
+    assert "other/raw-writer-unsupported" in message
 
 
 @pytest.mark.asyncio

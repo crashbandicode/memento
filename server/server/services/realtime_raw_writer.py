@@ -56,6 +56,8 @@ class WriterState:
     tail: tuple[SimpleNamespace, ...] = ()
     queued_claude: tuple[SimpleNamespace, ...] = ()
     cursor_sources: tuple[SimpleNamespace, ...] = ()
+    recovered_history: tuple[SimpleNamespace, ...] = ()
+    ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
 
 
 @dataclass(slots=True)
@@ -86,6 +88,7 @@ class IngestMutation:
     usage_rows: list[dict[str, Any]] = field(default_factory=list)
     search_text: str = ""
     interactions_changed: bool = False
+    title_changed: bool = False
     disposition: str = "committed"
     canvas_candidate: bool = False
     search_candidate: bool = False
@@ -211,6 +214,7 @@ async def _load_state(
     tool_id: str,
     relative_path: str,
     cursor_state_delta: bool,
+    load_recovered_history: bool = False,
 ) -> WriterState:
     # Raw selection intentionally retains the normal path's machine/owner
     # scope.  The source advisory lock has already serialized this identity.
@@ -323,6 +327,35 @@ async def _load_state(
             document_id,
         )
         cursor_sources = [_message_view(row) for row in source_rows]
+    recovered_history: tuple[SimpleNamespace, ...] = ()
+    ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
+    if load_recovered_history:
+        recovered_rows = await connection.fetch(
+            """
+            SELECT id, document_id, line_number, message_type, role, content,
+                   metadata, timestamp
+            FROM conversation_messages
+            WHERE document_id = $1
+              AND message_type = ANY($2::text[])
+            ORDER BY line_number, id
+            """,
+            document_id,
+            ["history_user_message", "first_user_message"],
+        )
+        recovered_history = tuple(_message_view(row) for row in recovered_rows)
+        source_user_rows = await connection.fetch(
+            """
+            SELECT id, document_id, line_number, message_type, role, content,
+                   metadata, timestamp
+            FROM conversation_messages
+            WHERE document_id = $1
+              AND role = 'user'
+              AND message_type IS DISTINCT FROM 'history_user_message'
+            ORDER BY line_number, id
+            """,
+            document_id,
+        )
+        ordinary_user_rows = tuple(_message_view(row) for row in source_user_rows)
     return WriterState(
         doc,
         {
@@ -340,6 +373,8 @@ async def _load_state(
         tuple(_message_view(row) for row in reversed(tail_rows)),
         tuple(queued),
         tuple(cursor_sources),
+        recovered_history,
+        ordinary_user_rows,
     )
 
 
@@ -391,6 +426,153 @@ def _document_view(
         visibility=visibility,
         delivery_state=None,
     )
+
+
+def _legacy_history_timestamp(value: object) -> datetime | None:
+    """Normalize a history timestamp exactly as the legacy recovery branch."""
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
+def _history_metadata_is_already_committed(
+    state: WriterState,
+    *,
+    tool_id: str,
+    history: list[dict[str, Any]],
+    first_user_message: str,
+    prospective_mutations: list[MessageMutation],
+) -> bool:
+    """Prove a recovery payload is a no-op before omitting it from raw ingest.
+
+    Legacy first partitions missing history entries against ordinary user rows,
+    then reconciles *all* stored recovered rows against those same source rows.
+    This check runs after the raw frame was reduced, mirrors both partitions
+    with the shared helper, and accepts only when neither legacy step mutates.
+    """
+    if history:
+        from .ingest_service import MAX_STORED_MESSAGE_CHARS, _bounded_message_text
+        from .history_recovery import UserOccurrence, partition_recovered_occurrences
+
+        codex_normalizer = None
+        if tool_id == "codex":
+            from .conversation_parser import normalize_codex_user_payload
+
+            codex_normalizer = normalize_codex_user_payload
+
+        ordinary_by_id = {
+            int(row.id): UserOccurrence(
+                key=("stored-user", int(row.id)),
+                content=row.content,
+                timestamp=row.timestamp,
+                line_number=row.line_number,
+            )
+            for row in state.ordinary_user_rows
+        }
+        for mutation in prospective_mutations:
+            if mutation.operation == "update" and mutation.existing_id is not None:
+                ordinary_by_id.pop(int(mutation.existing_id), None)
+            if (
+                mutation.role == "user"
+                and mutation.message_type != "history_user_message"
+            ):
+                storage_key = (
+                    int(mutation.existing_id)
+                    if mutation.existing_id is not None
+                    else ("new-user", mutation.ordinal)
+                )
+                occurrence_key = (
+                    ("updated-user", int(mutation.existing_id))
+                    if mutation.existing_id is not None
+                    else storage_key
+                )
+                ordinary_by_id[storage_key] = UserOccurrence(
+                    key=occurrence_key,
+                    content=mutation.content,
+                    timestamp=mutation.timestamp,
+                    line_number=mutation.line_number,
+                )
+        ordinary_users = list(ordinary_by_id.values())
+        stored_by_source_id = {
+            str(row.metadata_.get("source_id") or ""): row
+            for row in state.recovered_history
+            if row.message_type == "history_user_message"
+            and row.metadata_.get("source_id")
+        }
+        missing_history: list[UserOccurrence] = []
+        usable_entries = 0
+        for history_index, entry in enumerate(history):
+            raw_text = str(entry.get("text", "") or "").strip()
+            if codex_normalizer is not None:
+                history_role, raw_text = codex_normalizer(raw_text)
+                if history_role != "user":
+                    continue
+            if not raw_text:
+                continue
+            usable_entries += 1
+            expected = _bounded_message_text(
+                raw_text.replace("\x00", ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            row = stored_by_source_id.get(f"codex-history:{history_index}")
+            expected_timestamp = _legacy_history_timestamp(entry.get("ts", 0))
+            if row is None:
+                missing_history.append(
+                    UserOccurrence(
+                        key=history_index,
+                        content=expected,
+                        timestamp=expected_timestamp,
+                    )
+                )
+                continue
+            if row.content != expected or row.timestamp != expected_timestamp:
+                return False
+        # Legacy must not insert a history gap: every source-ID-missing entry
+        # has to be one-to-one represented by an ordinary current/prospective
+        # user occurrence under the same bounded transport matching helper.
+        _matched_missing, unmatched_missing = partition_recovered_occurrences(
+            ordinary_users,
+            missing_history,
+        )
+        if not usable_entries or unmatched_missing:
+            return False
+
+        # The later legacy reconciliation independently reuses the source
+        # occurrence set against all stored history rows. Any match deletes a
+        # recovered row; any remaining negative row is repositioned. Either
+        # mutation means this shortcut is not a no-op.
+        stored_recovered = [
+            UserOccurrence(
+                key=int(row.id),
+                content=row.content,
+                timestamp=row.timestamp,
+                line_number=row.line_number,
+            )
+            for row in state.recovered_history
+            if row.message_type == "history_user_message"
+        ]
+        matched_recovered, _unmatched_recovered = partition_recovered_occurrences(
+            ordinary_users,
+            stored_recovered,
+        )
+        return not matched_recovered and not any(
+            row.line_number < 1
+            for row in state.recovered_history
+            if row.message_type == "history_user_message"
+        )
+    if first_user_message:
+        # The fallback prompt has no stable source ID. Its dedicated stored row
+        # is the only unambiguous proof that a repeat carries the same state.
+        return any(
+            row.message_type == "first_user_message"
+            and row.role == "user"
+            and row.content == first_user_message
+            for row in state.recovered_history
+        )
+    return False
 
 
 def reduce_writer_state(
@@ -447,6 +629,7 @@ def reduce_writer_state(
         _prepare_document_metadata,
         _reconcile_live_interaction_signals,
         _reconcile_live_shell_activities,
+        _select_updated_document_title,
         _store_assistant_identity,
         _store_latest_human_timestamp,
         _store_pending_question_ids,
@@ -456,12 +639,23 @@ def reduce_writer_state(
 
     if category != "conversation" or content_type != "jsonl":
         raise RawWriterUnsupported("raw writer is limited to conversation JSONL")
-    if authoritative_rebase or metadata.get("user_history") or metadata.get("first_user_message"):
+    if authoritative_rebase:
         raise RawWriterUnsupported("authoritative rebuild/history needs legacy reducer")
     if mode not in {"full", "delta"}:
         raise RawWriterUnsupported("unknown conversation mode")
     if mode == "delta" and (base_hash is None or base_offset is None):
         raise RawWriterUnsupported("raw DELTAs require an exact committed base")
+    collector_metadata = {
+        key: value
+        for key, value in dict(metadata or {}).items()
+        if key not in _PROTECTED_DOCUMENT_METADATA_KEYS
+    }
+    stored_metadata, incoming_history, incoming_first_user_message = (
+        _prepare_document_metadata(collector_metadata, tool_id=tool_id)
+    )
+    has_history_metadata = bool(
+        metadata.get("user_history") or metadata.get("first_user_message")
+    )
     if state.document is not None and mode == "full":
         current = state.delivery["revision_hash"] if state.delivery else state.document["content_hash"]
         if current == content_hash:
@@ -538,8 +732,6 @@ def reduce_writer_state(
                 raise DeltaBaseMismatch(expected_hash=expected_hash, expected_offset=expected_offset)
 
     sanitized = content.replace("\x00", "")
-    collector_metadata = {key: value for key, value in dict(metadata or {}).items() if key not in _PROTECTED_DOCUMENT_METADATA_KEYS}
-    stored_metadata, _history, _first = _prepare_document_metadata(collector_metadata, tool_id=tool_id)
     incoming_title_is_explicit = (
         stored_metadata.pop("source_title_kind", None) == "claude_ai_title"
     )
@@ -562,15 +754,20 @@ def reduce_writer_state(
         project_id = None
         visibility = "private"
         document_source_at = source_modified_at
+        previous_title = None
     else:
-        if incoming_title is not None or incoming_title_is_explicit:
-            raise RawWriterUnsupported(
-                "existing-document title selection needs the legacy reducer"
-            )
         document_id = doc_row["id"]
         document_metadata = _merge_delta_metadata(effective_metadata, stored_metadata) if mode == "delta" else dict(stored_metadata)
         new_document = False
-        title = doc_row["title"]
+        previous_title = doc_row["title"]
+        title = _select_updated_document_title(
+            previous_title,
+            incoming_title or relative_path.split("/")[-1],
+            category=category,
+            tool_id=tool_id,
+            metadata=document_metadata,
+            incoming_title_is_explicit=incoming_title_is_explicit,
+        )
         project_id = doc_row["project_id"]
         visibility = doc_row["visibility"] or "private"
         document_source_at = max(filter(None, ((delivery or {}).get("source_modified_at"), source_modified_at)))
@@ -727,6 +924,14 @@ def reduce_writer_state(
     _store_pending_question_ids(view, pending_ids)
     _store_latest_human_timestamp(view, latest_human)
     _store_assistant_identity(view, assistant_identity)
+    if has_history_metadata and not _history_metadata_is_already_committed(
+        state,
+        tool_id=tool_id,
+        history=incoming_history,
+        first_user_message=incoming_first_user_message,
+        prospective_mutations=mutations,
+    ):
+        raise RawWriterUnsupported("authoritative rebuild/history needs legacy reducer")
     from .canvas_artifacts import canvas_message_can_have_reference
     from .ingest_service import _conversation_search_index_needs_refresh
     from .realtime_ingest_projector import message_is_canvas_projection_candidate
@@ -768,8 +973,8 @@ def reduce_writer_state(
         is_new_document=new_document,
         mode=mode,
         new_search_text=candidate_search_text,
-        previous_title=title,
-        current_title=title,
+        previous_title=previous_title,
+        current_title=view.title,
     )
     sync_values = {"last_hash": content_hash, "last_offset": offset, "last_synced_at": received_at}
     return IngestMutation(
@@ -795,6 +1000,7 @@ def reduce_writer_state(
         # emit a visible message.  The existing writer includes that namespace
         # in the post-commit union; retain the same conservative invalidation.
         interactions_changed=interactions_changed or tool_id == "claude_code",
+        title_changed=not new_document and previous_title != view.title,
         canvas_candidate=canvas_candidate,
         search_candidate=search_candidate,
     )
@@ -1103,6 +1309,12 @@ async def _apply(
             "UPDATE documents SET metadata=$2, source_modified_at=$3, synced_at=$4, content_hash=$5, file_size_bytes=$6, content_s3_key=$7, content_object_sha256=$8, content_object_size_bytes=$9, content_object_verified_at=$10 WHERE id=$1",
             mutation.document_id, mutation.document_values["metadata"], mutation.document_values["source_modified_at"], mutation.document_values["synced_at"], content_hash, mutation.document_values["file_size_bytes"], pointer.key if pointer else None, pointer.sha256 if pointer else None, pointer.size_bytes if pointer else None, pointer.verified_at if pointer else None,
         )
+    if mutation.title_changed:
+        await connection.execute(
+            "UPDATE documents SET title=$2 WHERE id=$1 AND title IS DISTINCT FROM $2",
+            mutation.document_id,
+            mutation.document_values["title"],
+        )
     rows, dirty = await _stage_messages(connection, mutation.document_id, mutation.messages)
     if mutation.mode == "full" and not mutation.new_document:
         raise RawWriterUnsupported("replacement FULL must be rejected before staging")
@@ -1199,7 +1411,8 @@ async def _apply(
     from .ingest_service import _conversation_event_changes
     changes = _conversation_event_changes(
         mode=mutation.mode, search_text=mutation.search_text,
-        title_changed=False, interactions_changed=mutation.interactions_changed,
+        title_changed=mutation.title_changed,
+        interactions_changed=mutation.interactions_changed,
         dashboard_changed=dashboard_changed,
     )
     if mutation.document_values["project_id"] is None:
@@ -1374,6 +1587,10 @@ async def ingest_conversation_raw(
                     tool_id=tool_id,
                     relative_path=relative_path,
                     cursor_state_delta=cursor_state_delta,
+                    load_recovered_history=bool(
+                        metadata.get("user_history")
+                        or metadata.get("first_user_message")
+                    ),
                 )
                 mutation = reduce_writer_state(
                     state, tool_id=tool_id, category=category, content_type=content_type,
@@ -1524,6 +1741,11 @@ async def ingest_conversation_raw_chain(
     cursor_state_delta = (
         tool_id == "cursor" and prepared[0]["metadata"].get("source") == "cursor_state_v1"
     )
+    load_recovered_history = any(
+        frame["metadata"].get("user_history")
+        or frame["metadata"].get("first_user_message")
+        for frame in prepared
+    )
     # Most collector DELTAs in one quiet window have identical source
     # metadata.  They are plain append JSONL, so one reducer/application is
     # semantically equivalent to applying each envelope in order while it
@@ -1554,7 +1776,7 @@ async def ingest_conversation_raw_chain(
         )
         return combined
 
-    can_combine = all(
+    can_combine = not load_recovered_history and all(
         frame["metadata"] == prepared[0]["metadata"] for frame in prepared[1:]
     )
     if can_combine:
@@ -1598,6 +1820,7 @@ async def ingest_conversation_raw_chain(
                         tool_id=tool_id,
                         relative_path=relative_path,
                         cursor_state_delta=cursor_state_delta,
+                        load_recovered_history=load_recovered_history,
                     )
                     preloaded_state = initial_state
                     current_hash = (
@@ -1635,6 +1858,7 @@ async def ingest_conversation_raw_chain(
                             tool_id=tool_id,
                             relative_path=relative_path,
                             cursor_state_delta=cursor_state_delta,
+                            load_recovered_history=load_recovered_history,
                         )
                     last_state = state
                     mutation = reduce_writer_state(
