@@ -58,6 +58,27 @@ class ChunkValidationError(ValueError):
     """Raised when collector chunk metadata is unsafe or inconsistent."""
 
 
+class TerminalSpoolJobError(ChunkValidationError):
+    """A retained terminal job owns this upload identity.
+
+    The API translates guarded DELTA instances into the normal committed-base
+    conflict response.  Keeping this separate from ordinary validation errors
+    prevents retained forensic state from looking like malformed metadata.
+    """
+
+    def __init__(
+        self,
+        job_id: str,
+        *,
+        error_type: str | None = None,
+        blocked_reason: str | None = None,
+    ) -> None:
+        super().__init__("chunk upload conflicts with a terminal spool job")
+        self.job_id = job_id
+        self.error_type = error_type
+        self.blocked_reason = blocked_reason
+
+
 @dataclass(frozen=True)
 class StagedChunk:
     """Result of durably staging one chunk.
@@ -128,7 +149,9 @@ def _filesystem_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
             flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             fcntl.flock(stream.fileno(), flags)
             acquired = True
-            unlock = lambda: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+            def unlock() -> None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         except ModuleNotFoundError:
             import msvcrt
 
@@ -595,6 +618,123 @@ def _admission_conflicts_with_existing_payload(
         return existing_sha != payload_sha256
 
 
+def _terminal_spool_job_error(
+    job_dir: Path,
+    *,
+    job_id: str,
+) -> TerminalSpoolJobError | None:
+    """Return a typed terminal disposition without trusting marker contents."""
+
+    error_type = None
+    blocked_reason = None
+    failed_path = job_dir / "failed.json"
+    blocked_path = job_dir / "blocked.json"
+    if not failed_path.is_file() and not blocked_path.is_file():
+        return None
+    if failed_path.is_file():
+        try:
+            failed = orjson.loads(failed_path.read_text(encoding="utf-8"))
+            value = failed.get("error_type") if isinstance(failed, dict) else None
+            if isinstance(value, str) and value:
+                error_type = value[:128]
+        except (OSError, orjson.JSONDecodeError):
+            pass
+    if blocked_path.is_file():
+        try:
+            blocked = orjson.loads(blocked_path.read_text(encoding="utf-8"))
+            value = blocked.get("reason") if isinstance(blocked, dict) else None
+            if isinstance(value, str) and value:
+                blocked_reason = value[:128]
+        except (OSError, orjson.JSONDecodeError):
+            pass
+    return TerminalSpoolJobError(
+        job_id,
+        error_type=error_type,
+        blocked_reason=blocked_reason,
+    )
+
+
+def _archive_terminal_delta_job(
+    job_dir: Path,
+    *,
+    manifest: dict[str, Any],
+    root: Path,
+) -> None:
+    """Retain terminal diagnostics without leaving a live staging manifest."""
+
+    evidence: dict[str, Any] = {
+        "job_id": job_dir.name,
+        "archived_at": time.time(),
+        "manifest": manifest,
+    }
+    for marker in ("failed.json", "blocked.json"):
+        path = job_dir / marker
+        if not path.is_file():
+            continue
+        try:
+            payload = orjson.loads(path.read_text(encoding="utf-8"))
+        except (OSError, orjson.JSONDecodeError):
+            payload = {"unreadable": True}
+        evidence[marker] = payload
+
+    evidence_root = root / "terminal-evidence"
+    evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(evidence_root, 0o700)
+    evidence_path = evidence_root / f"{job_dir.name}-{uuid.uuid4().hex}.json"
+    _atomic_write(
+        evidence_path,
+        json.dumps(evidence, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+    )
+    shutil.rmtree(job_dir)
+    _fsync_directory(root)
+
+
+def _reclaim_terminal_deltas_for_source(
+    *,
+    root: Path,
+    job_id: str,
+    source: SourceIdentity,
+) -> None:
+    """Archive stale DELTA evidence once a later upload owns the source."""
+
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return
+    for candidate in candidates:
+        if (
+            candidate.name == job_id
+            or not candidate.is_dir()
+            or candidate.is_symlink()
+            or not _JOB_ID_RE.fullmatch(candidate.name)
+            or not (candidate / "blocked.json").is_file()
+        ):
+            continue
+        with spool_job_lock(
+            candidate.name,
+            root=root,
+            purpose="stage",
+            blocking=False,
+        ) as acquired:
+            if not acquired:
+                continue
+            manifest_path = candidate / "manifest.json"
+            try:
+                if manifest_path.stat().st_size > _MAX_MANIFEST_BYTES:
+                    continue
+                manifest = orjson.loads(manifest_path.read_text(encoding="utf-8"))
+                existing_source = source_identity(manifest)
+            except (OSError, orjson.JSONDecodeError, ChunkValidationError):
+                continue
+            meta = manifest.get("meta") if isinstance(manifest, dict) else None
+            if (
+                existing_source == source
+                and isinstance(meta, dict)
+                and meta.get("mode") == "delta"
+            ):
+                _archive_terminal_delta_job(candidate, manifest=manifest, root=root)
+
+
 def stage_chunk(
     *,
     meta: dict[str, Any],
@@ -627,6 +767,20 @@ def stage_chunk(
             _fsync_directory(completion_path.parent)
 
         job_dir = _job_dir(job_id, root)
+        terminal_error = _terminal_spool_job_error(job_dir, job_id=job_id)
+        if terminal_error is not None:
+            raise terminal_error
+        if chunk_index == 0:
+            _reclaim_terminal_deltas_for_source(
+                root=root,
+                job_id=job_id,
+                source=(
+                    user_id,
+                    device_id,
+                    str(meta["tool"]),
+                    str(meta["relative_path"]),
+                ),
+            )
         job_dir_created = not job_dir.exists()
         job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if job_dir_created:
@@ -683,7 +837,6 @@ def stage_chunk(
                 "file_size",
                 "sync_strategy",
                 "metadata",
-                "timestamp",
                 "base_hash",
                 "base_offset",
                 "authoritative_rebase",

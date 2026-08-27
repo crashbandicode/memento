@@ -19,7 +19,7 @@ from .outcomes import (
     UploadOutcome,
     UploadOutcomeState,
 )
-from .queue import QueueItem, SyncQueue
+from .queue import SOURCE_REPAIR_MAX_ATTEMPTS, QueueItem, SyncQueue
 
 logger = logging.getLogger("collector.sync")
 
@@ -428,6 +428,32 @@ class SyncClient:
                     )
                     if marked and self._full_resync_callback and item.source_path:
                         self._full_resync_callback(item.source_path)
+                elif (
+                    outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED
+                    and outcome.repair_action is None
+                    and item.retry_count + 1 >= SOURCE_REPAIR_MAX_ATTEMPTS
+                ):
+                    escalation = UploadOutcome.quarantine(
+                        outcome.diagnostic,
+                        diagnostic_code="source_repair_attempt_cap",
+                        http_status=outcome.http_status,
+                    )
+                    marker = getattr(self._queue, "mark_upload_outcome", None)
+                    marked = (
+                        marker(
+                            item,
+                            escalation,
+                            auth_fingerprint=getattr(
+                                self,
+                                "_auth_fingerprint",
+                                None,
+                            ),
+                        )
+                        if callable(marker)
+                        else self._queue.mark_failed(item, escalation.diagnostic)
+                    )
+                    if marked and self._full_resync_callback and item.source_path:
+                        self._full_resync_callback(item.source_path)
                 else:
                     marker = getattr(self._queue, "mark_upload_outcome", None)
                     if callable(marker):
@@ -519,7 +545,7 @@ class SyncClient:
                             outcome,
                             auth_fingerprint=getattr(self, "_auth_fingerprint", None),
                         )
-            except Exception as exc:
+            except Exception:
                 logger.exception(
                     "Commit receipt worker failed for %s/%s",
                     item.tool_name,
@@ -935,8 +961,7 @@ class SyncClient:
                             diagnostic_code="network_error",
                         )
                     else:
-                        if resp.status_code == 409 and payload.get("mode") == "delta":
-                            raise DeltaBaseConflict(payload["relative_path"])
+                        self._raise_delta_conflict(resp, payload)
                         response_outcome = _classify_http_response(
                             resp,
                             endpoint="/api/ingest/file/chunk",

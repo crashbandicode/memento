@@ -39,12 +39,14 @@ from ..services.ingest_service import (
     STORED_SOURCE_REVISION_KEY,
     DeltaBaseMismatch,
     _get_ingest_semaphore,
+    committed_delta_base_for_source,
     ingest_file,
     raw_realtime_writer_enabled,
 )
 from ..services.ingest_spool import (
     MAX_CHUNK_BYTES,
     ChunkValidationError,
+    TerminalSpoolJobError,
     chunk_commit_status,
     has_completion_receipt,
     pending_source_revision_job_id,
@@ -331,6 +333,39 @@ def _delta_mismatch_response(exc: DeltaBaseMismatch) -> HTTPException:
             "code": "delta_base_mismatch",
             "expected_hash": exc.expected_hash,
             "expected_offset": exc.expected_offset,
+        },
+    )
+
+
+async def _terminal_spool_job_response(
+    db: AsyncSession,
+    *,
+    machine_id: str,
+    user_id: str,
+    meta: dict,
+    error: TerminalSpoolJobError,
+) -> HTTPException:
+    """Translate retained terminal staging state into a collector action."""
+
+    if meta.get("mode") == "delta":
+        expected_hash, expected_offset = await committed_delta_base_for_source(
+            db,
+            tool_id=str(meta.get("tool") or ""),
+            relative_path=str(meta.get("relative_path") or ""),
+            machine_id=machine_id,
+            user_id=user_id,
+        )
+        return _delta_mismatch_response(
+            DeltaBaseMismatch(
+                expected_hash=expected_hash,
+                expected_offset=expected_offset,
+            )
+        )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "spool_job_terminal",
+            "reason": error.blocked_reason or error.error_type or "terminal",
         },
     )
 
@@ -689,8 +724,15 @@ def _admission_identity(*, meta: dict, user_id: str, device_id: str) -> str:
 
 
 async def _admit_realtime_delta(
-    *, meta: dict, payload: bytes, user_id: str, device_id: str,
-    device_name: str, device_platform: str,
+    *,
+    db: AsyncSession,
+    machine_id: str,
+    meta: dict,
+    payload: bytes,
+    user_id: str,
+    device_id: str,
+    device_name: str,
+    device_platform: str,
 ) -> IngestResponse:
     """Fsync a capability-negotiated guarded DELTA and return ACCEPTED only."""
     if not (
@@ -734,6 +776,14 @@ async def _admit_realtime_delta(
             device_name=device_name,
             device_platform=device_platform,
         )
+    except TerminalSpoolJobError as exc:
+        raise await _terminal_spool_job_response(
+            db,
+            machine_id=machine_id,
+            user_id=user_id,
+            meta=meta,
+            error=exc,
+        ) from exc
     except ChunkValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     status = "committed" if not staged.should_enqueue else "accepted"
@@ -793,6 +843,8 @@ async def ingest_file_endpoint(
         # request.  The actual source fence remains in the drain's raw tx.
         await db.commit()
         return await _admit_realtime_delta(
+            db=db,
+            machine_id=str(machine.id),
             meta=req.model_dump(exclude={"content"}),
             payload=req.content.encode("utf-8"),
             user_id=str(_collector_user.id),
@@ -903,6 +955,8 @@ async def ingest_file_upload(
                 and meta.get("mode") == "delta"
             ):
                 return await _admit_realtime_delta(
+                    db=db,
+                    machine_id=str(machine.id),
                     meta={**meta, "file_size": measured_size},
                     payload=raw_path.read_bytes(),
                     user_id=str(_collector_user.id),
@@ -1160,6 +1214,14 @@ async def ingest_file_chunk(
             device_platform=x_device_platform,
             force_reprocess=force_reprocess,
         )
+    except TerminalSpoolJobError as exc:
+        raise await _terminal_spool_job_response(
+            db,
+            machine_id=str(machine.id),
+            user_id=user_id,
+            meta=meta,
+            error=exc,
+        ) from exc
     except ChunkValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

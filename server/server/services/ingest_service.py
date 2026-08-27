@@ -51,7 +51,9 @@ from .conversation_usage import (
 )
 from .document_delivery import (
     attach_document_delivery,
+    delivery_file_size_expression,
     delivery_metadata_expression,
+    delivery_revision_expression,
     document_metadata,
     ensure_document_delivery_state,
     outerjoin_document_delivery,
@@ -507,6 +509,45 @@ def _committed_delta_base(
     if sync_row is not None and sync_row.last_hash == doc.content_hash:
         return doc.content_hash, max(0, int(sync_row.last_offset or 0))
     return doc.content_hash, max(0, int(doc.file_size_bytes or 0))
+
+
+async def committed_delta_base_for_source(
+    db: AsyncSession,
+    *,
+    tool_id: str,
+    relative_path: str,
+    machine_id: str,
+    user_id: str,
+) -> tuple[str | None, int]:
+    """Read the committed DELTA base advertised to a rejected spool upload."""
+
+    statement = select(
+        delivery_revision_expression(joined=True).label("content_hash"),
+        delivery_file_size_expression(joined=True).label("file_size_bytes"),
+    ).select_from(Document).where(
+        Document.tool_id == tool_id,
+        Document.relative_path == relative_path,
+        Document.machine_id == machine_id,
+        Document.machine_id.in_(
+            select(Machine.id).where(Machine.user_id == user_id)
+        ),
+    )
+    row = (await db.execute(outerjoin_document_delivery(statement))).one_or_none()
+    if row is None or not isinstance(row.content_hash, str) or not row.content_hash:
+        return None, 0
+    sync_row = (
+        await db.execute(
+            _scoped_sync_state_select(
+                tool_id,
+                relative_path,
+                machine_id,
+                user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if sync_row is not None and sync_row.last_hash == row.content_hash:
+        return row.content_hash, max(0, int(sync_row.last_offset or 0))
+    return row.content_hash, max(0, int(row.file_size_bytes or 0))
 
 
 def _logical_document_file_size(
@@ -970,8 +1011,6 @@ def iter_claude_lineage_records(
     if conversation_source is not None:
         yield from conversation_source.iter_objects()
         return
-    import json
-
     for raw_line in content.splitlines():
         try:
             record = orjson.loads(raw_line)

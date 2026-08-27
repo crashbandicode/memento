@@ -38,6 +38,7 @@ DEFAULT_TERMINAL_SPOOL_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TERMINAL_SPOOL_MAX_BYTES = 128 * 1024 * 1024
 LEGACY_FULL_RECONCILIATION_GATE = "legacy_full_reconciliation_active"
 MAX_ACCEPTED_DELTA_CHAIN = 32
+SOURCE_REPAIR_MAX_ATTEMPTS = 8
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1740,7 +1741,8 @@ class SyncQueue:
                 existing = None
                 if is_complete_snapshot:
                     existing = self._conn.execute(
-                        """SELECT id, payload_path FROM queue
+                        """SELECT id, payload_path, status, retry_count, available_at
+                           FROM queue
                            WHERE tool_name=? AND relative_path=?
                              AND status IN (
                                  'pending','auth_blocked',
@@ -1752,7 +1754,8 @@ class SyncQueue:
                     ).fetchone()
                 elif is_coalescible_delta:
                     existing = self._conn.execute(
-                        """SELECT id, payload_path FROM queue
+                        """SELECT id, payload_path, status, retry_count, available_at
+                           FROM queue
                            WHERE tool_name=? AND relative_path=?
                              AND status IN (
                                  'pending','auth_blocked',
@@ -1766,54 +1769,113 @@ class SyncQueue:
                 if existing:
                     item_id = int(existing[0])
                     old_payload_path = existing[1]
-                    self._conn.execute(
-                        """UPDATE queue SET category=?, content_type=?, content=?,
-                           content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
-                           offset=?, metadata=?, source_modified_at=?, retry_count=0,
-                           base_hash=?, base_offset=?, source_path=?,
-                           status=?, payload_path=?, payload_bytes=?,
-                           lease_token=NULL, lease_until=NULL, available_at=0,
-                           last_attempt_at=NULL, payload_discarded_at=NULL,
-                           last_error=CASE WHEN ?='pending' THEN NULL
-                                           ELSE 'credentials rejected by server' END,
-                           outcome_state=CASE WHEN ?='pending' THEN NULL
-                                              ELSE 'authentication_blocked' END,
-                           diagnostic_code=CASE WHEN ?='pending' THEN NULL
-                                                ELSE 'authentication_rejected' END,
-                           http_status=CASE WHEN ?='pending' THEN NULL ELSE http_status END,
-                           terminal_at=CASE WHEN ?='pending' THEN NULL ELSE ? END,
-                           blocked_config_fingerprint=?
-                           WHERE id=? AND status IN (
-                               'pending','auth_blocked',
-                               'repair_required','quarantined'
-                           )""",
-                        (
-                            category,
-                            content_type,
-                            inline_content,
-                            content_hash,
-                            payload_bytes,
-                            sync_strategy,
-                            int(is_partial),
-                            offset,
-                            metadata_json,
-                            source_modified_at,
-                            base_hash,
-                            int(base_offset),
-                            source_path,
-                            target_status,
-                            payload_path,
-                            payload_bytes,
-                            target_status,
-                            target_status,
-                            target_status,
-                            target_status,
-                            target_status,
-                            now,
-                            auth_fingerprint,
-                            item_id,
-                        ),
+                    existing_status = str(existing[2])
+                    existing_retry_count = int(existing[3] or 0)
+                    existing_available_at = float(existing[4] or 0)
+                    preserve_terminal_delta = is_coalescible_delta and (
+                        existing_status == "quarantined"
+                        or (
+                            existing_status == "repair_required"
+                            and (
+                                target_status != "pending"
+                                or existing_available_at > now
+                            )
+                        )
                     )
+                    revive_repair_delta = (
+                        is_coalescible_delta
+                        and existing_status == "repair_required"
+                        and not preserve_terminal_delta
+                    )
+                    if preserve_terminal_delta:
+                        self._conn.execute(
+                            """UPDATE queue SET category=?, content_type=?, content=?,
+                               content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
+                               offset=?, metadata=?, source_modified_at=?,
+                               base_hash=?, base_offset=?, source_path=?,
+                               payload_path=?, payload_bytes=?, payload_discarded_at=NULL
+                               WHERE id=? AND status IN (
+                                   'pending','auth_blocked',
+                                   'repair_required','quarantined'
+                               )""",
+                            (
+                                category,
+                                content_type,
+                                inline_content,
+                                content_hash,
+                                payload_bytes,
+                                sync_strategy,
+                                int(is_partial),
+                                offset,
+                                metadata_json,
+                                source_modified_at,
+                                base_hash,
+                                int(base_offset),
+                                source_path,
+                                payload_path,
+                                payload_bytes,
+                                item_id,
+                            ),
+                        )
+                    else:
+                        self._conn.execute(
+                            """UPDATE queue SET category=?, content_type=?, content=?,
+                               content_hash=?, file_size=?, sync_strategy=?, is_partial=?,
+                               offset=?, metadata=?, source_modified_at=?, retry_count=?,
+                               base_hash=?, base_offset=?, source_path=?,
+                               status=?, payload_path=?, payload_bytes=?,
+                               lease_token=NULL, lease_until=NULL, available_at=?,
+                               last_attempt_at=NULL, payload_discarded_at=NULL,
+                               last_error=CASE WHEN ?='pending' THEN NULL
+                                               ELSE 'credentials rejected by server' END,
+                               outcome_state=CASE WHEN ?='pending' THEN NULL
+                                                  ELSE 'authentication_blocked' END,
+                               diagnostic_code=CASE WHEN ?='pending' THEN NULL
+                                                    ELSE 'authentication_rejected' END,
+                               http_status=CASE WHEN ?='pending' THEN NULL ELSE http_status END,
+                               terminal_at=CASE WHEN ?='pending' THEN NULL ELSE ? END,
+                               blocked_config_fingerprint=?
+                               WHERE id=? AND status IN (
+                                   'pending','auth_blocked',
+                                   'repair_required','quarantined'
+                               )""",
+                            (
+                                category,
+                                content_type,
+                                inline_content,
+                                content_hash,
+                                payload_bytes,
+                                sync_strategy,
+                                int(is_partial),
+                                offset,
+                                metadata_json,
+                                source_modified_at,
+                                (
+                                    existing_retry_count
+                                    if revive_repair_delta
+                                    else 0
+                                ),
+                                base_hash,
+                                int(base_offset),
+                                source_path,
+                                target_status,
+                                payload_path,
+                                payload_bytes,
+                                (
+                                    existing_available_at
+                                    if revive_repair_delta
+                                    else 0
+                                ),
+                                target_status,
+                                target_status,
+                                target_status,
+                                target_status,
+                                target_status,
+                                now,
+                                auth_fingerprint,
+                                item_id,
+                            ),
+                        )
                 else:
                     cursor = self._conn.execute(
                         """INSERT INTO queue (
@@ -2484,8 +2546,12 @@ class SyncQueue:
                 status = "auth_blocked"
                 available_at = 0.0
             elif outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED:
-                status = "repair_required"
-                available_at = 0.0
+                if next_retry >= SOURCE_REPAIR_MAX_ATTEMPTS:
+                    status = "quarantined"
+                    available_at = 0.0
+                else:
+                    status = "repair_required"
+                    available_at = now + _retry_delay_seconds(next_retry)
             else:
                 status = "quarantined"
                 available_at = 0.0

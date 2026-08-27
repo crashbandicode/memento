@@ -20,6 +20,7 @@ from server.api import ingest as ingest_api  # noqa: E402
 from server.config import settings  # noqa: E402
 from server.services.ingest_spool import (  # noqa: E402
     StagedChunk,
+    TerminalSpoolJobError,
     stage_chunk as durable_stage_chunk,
 )
 
@@ -199,6 +200,55 @@ class ChunkIngestApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_terminal_delta_chunk_returns_committed_base_conflict(self) -> None:
+        meta = self._meta(0)
+        meta.update(
+            {
+                "mode": "delta",
+                "base_hash": "stale-hash",
+                "base_offset": 10,
+            }
+        )
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=uuid.uuid4()),
+            ),
+            patch.object(
+                ingest_api,
+                "stage_chunk",
+                side_effect=TerminalSpoolJobError(
+                    "a" * 64,
+                    error_type="DeltaBaseMismatch",
+                    blocked_reason="superseded_by_full_rebase",
+                ),
+            ),
+            patch.object(
+                ingest_api,
+                "committed_delta_base_for_source",
+                new_callable=AsyncMock,
+                return_value=("d2:" + ("c" * 61), 456),
+            ),
+        ):
+            response = self.client.post(
+                "/api/ingest/file/chunk",
+                data={"metadata": json.dumps(meta)},
+                files={"content": ("chunk-0", b"first", "text/plain")},
+                headers={"x-device-id": "device-1"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"],
+            {
+                "code": "delta_base_mismatch",
+                "expected_hash": "d2:" + ("c" * 61),
+                "expected_offset": 456,
+            },
+        )
 
     def test_completion_receipt_retry_does_not_enqueue_missing_job(self) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
