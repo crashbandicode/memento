@@ -18,6 +18,7 @@ from server.services.ingest_spool import (  # noqa: E402
     MAX_UPLOAD_BYTES,
     ChunkValidationError,
     StagedChunk,
+    TerminalSpoolJobError,
     assemble_job,
     blocked_job_ids,
     cleanup_completion_receipts,
@@ -262,6 +263,107 @@ class IngestSpoolTests(unittest.TestCase):
 
         self.assertEqual(manifest_path.read_bytes(), original_manifest)
         self.assertFalse((self.root / job_id / "chunk-000001.bin").exists())
+
+    def test_timestamp_change_does_not_conflict_with_an_existing_upload(self) -> None:
+        job_id, complete = self._stage(
+            self._meta(0, 2, file_size=11, timestamp=1.0),
+            b"first",
+        )
+        self.assertFalse(complete)
+
+        repeated_job_id, complete = self._stage(
+            self._meta(1, 2, file_size=11, timestamp=2.0),
+            b"second",
+        )
+
+        self.assertEqual(repeated_job_id, job_id)
+        self.assertTrue(complete)
+
+    def test_terminal_delta_job_raises_actionable_typed_disposition(self) -> None:
+        meta = self._meta(
+            0,
+            1,
+            upload_id="stale-delta",
+            hash="stale-delta-hash",
+            mode="delta",
+            base_hash="base-hash",
+            base_offset=10,
+            offset=20,
+            file_size=4,
+        )
+        job_id, complete = self._stage(meta, b"tail")
+        self.assertTrue(complete)
+        mark_job_failed(
+            job_id,
+            error_type="DeltaBaseMismatch",
+            attempts=1,
+            root=self.root,
+        )
+        mark_job_blocked(
+            job_id,
+            superseding_job_id="a" * 64,
+            document_id="document-id",
+            root=self.root,
+        )
+
+        with self.assertRaises(TerminalSpoolJobError) as raised:
+            self._stage({**meta, "timestamp": 2.0}, b"tail")
+
+        self.assertEqual(raised.exception.error_type, "DeltaBaseMismatch")
+        self.assertEqual(
+            raised.exception.blocked_reason,
+            "superseded_by_full_rebase",
+        )
+
+    def test_new_source_upload_archives_terminal_delta_evidence(self) -> None:
+        stale_meta = self._meta(
+            0,
+            1,
+            upload_id="stale-delta",
+            hash="stale-delta-hash",
+            mode="delta",
+            base_hash="base-hash",
+            base_offset=10,
+            offset=20,
+            file_size=4,
+        )
+        stale_job_id, complete = self._stage(stale_meta, b"tail")
+        self.assertTrue(complete)
+        mark_job_failed(
+            stale_job_id,
+            error_type="DeltaBaseMismatch",
+            attempts=1,
+            root=self.root,
+        )
+        mark_job_blocked(
+            stale_job_id,
+            superseding_job_id="b" * 64,
+            document_id="document-id",
+            root=self.root,
+        )
+
+        fresh_job_id, complete = self._stage(
+            self._meta(
+                0,
+                1,
+                upload_id="fresh-full",
+                hash="fresh-full-hash",
+                file_size=4,
+            ),
+            b"full",
+        )
+
+        self.assertTrue(complete)
+        self.assertTrue((self.root / fresh_job_id / "manifest.json").is_file())
+        self.assertFalse((self.root / stale_job_id).exists())
+        evidence = list((self.root / "terminal-evidence").glob("*.json"))
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(
+            json.loads(evidence[0].read_text(encoding="utf-8"))["failed.json"][
+                "error_type"
+            ],
+            "DeltaBaseMismatch",
+        )
 
     def test_invalid_chunk_bounds_are_rejected(self) -> None:
         invalid_cases = [
