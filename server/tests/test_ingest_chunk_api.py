@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.api import ingest as ingest_api  # noqa: E402
+from server.config import settings  # noqa: E402
 from server.services.ingest_spool import (  # noqa: E402
     StagedChunk,
     stage_chunk as durable_stage_chunk,
@@ -146,6 +147,49 @@ class ChunkIngestApiTests(unittest.TestCase):
             user_id="11111111-1111-1111-1111-111111111111",
             device_id="device-1",
         )
+
+    def test_capable_guarded_delta_is_fsynced_and_returns_accepted_receipt(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        staged = StagedChunk("a" * 64, complete=True, should_enqueue=True)
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(ingest_api, "stage_delta_payload", return_value=staged) as stage,
+            patch.object(settings, "realtime_ingest_spool_deltas", True),
+            patch.object(settings, "realtime_ingest_raw_writer_tools", "codex"),
+            patch.object(ingest_api, "ingest_file", new_callable=AsyncMock) as ingest,
+        ):
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+                headers={
+                    "x-device-id": "device-1",
+                    "x-device-name": "Yoga",
+                    "x-device-platform": "Windows",
+                    "x-collector-capabilities": "realtime_ingest_async_admission_v1",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertEqual(response.json()["receipt_id"], "a" * 64)
+        stage.assert_called_once()
+        ingest.assert_not_awaited()
+
+    def test_receipt_status_preserves_accepted_vs_committed_protocol(self) -> None:
+        result = SimpleNamespace(job_id="a" * 64, status="accepted", error_type=None)
+        with patch.object(ingest_api, "receipt_commit_status", return_value=result):
+            response = self.client.post(
+                "/api/ingest/file/receipt/status",
+                json={"receipt_id": "a" * 64},
+                headers={"x-device-id": "device-1"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "accepted")
 
     def test_invalid_metadata_returns_400_without_enqueuing(self) -> None:
         response = self.client.post(
@@ -378,6 +422,7 @@ class ChunkIngestApiTests(unittest.TestCase):
             "x-device-id": "device-1",
             "x-device-name": "Yoga",
             "x-device-platform": "Windows",
+            "x-collector-capabilities": "realtime_ingest_async_admission_v1",
         }
         with (
             patch.object(
@@ -416,7 +461,9 @@ class ChunkIngestApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["document_id"].startswith("queued:"))
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertTrue(response.json()["document_id"].startswith("accepted:"))
+        self.assertEqual(response.json()["receipt_id"], response.json()["document_id"][9:])
         self.assertIn("pending revision", response.json()["message"])
         find_pending.assert_called_once_with(
             user_id="11111111-1111-1111-1111-111111111111",
@@ -427,6 +474,40 @@ class ChunkIngestApiTests(unittest.TestCase):
             offset=10,
         )
         enqueue.assert_called_once()
+
+    def test_noncapable_delta_never_treats_pending_spool_as_committed(self) -> None:
+        machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        with (
+            patch.object(
+                ingest_api,
+                "ensure_device",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(id=machine_id),
+            ),
+            patch.object(
+                ingest_api,
+                "ingest_file",
+                new_callable=AsyncMock,
+                side_effect=ingest_api.DeltaBaseMismatch(
+                    expected_hash="server-hash",
+                    expected_offset=5,
+                ),
+            ),
+            patch.object(
+                ingest_api,
+                "pending_source_revision_job_id",
+                return_value="b" * 64,
+            ),
+            patch.object(ingest_api, "stage_chunk") as stage,
+        ):
+            response = self.client.post(
+                "/api/ingest/file",
+                json=self._delta_payload(),
+                headers={"x-device-id": "device-1"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        stage.assert_not_called()
 
     def test_multipart_guarded_delta_uses_same_pending_base_queue(self) -> None:
         machine_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
@@ -466,11 +547,15 @@ class ChunkIngestApiTests(unittest.TestCase):
                 "/api/ingest/file/upload",
                 data={"metadata": json.dumps(payload)},
                 files={"content": ("delta", content.encode(), "text/plain")},
-                headers={"x-device-id": "device-1"},
+                headers={
+                    "x-device-id": "device-1",
+                    "x-collector-capabilities": "realtime_ingest_async_admission_v1",
+                },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["document_id"].startswith("queued:"))
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertTrue(response.json()["document_id"].startswith("accepted:"))
         enqueue.assert_called_once()
 
 

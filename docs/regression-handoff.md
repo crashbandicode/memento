@@ -319,3 +319,15 @@ The integrated Chromium release-candidate count is recorded after the required f
 | `83951fb` | v0.1.49 | fix: preserve conversation navigation and agent context |
 | `7cb05b0` | v0.1.50 | fix: preserve live Claude question prompts |
 | `f8f4f16` | v0.1.50 | release: v0.1.50 |
+
+---
+
+## Active handoff — live conversation refresh and mobile SSE recovery
+
+- **Date / branch / base:** 2026-08-26; `main` at `eb14af7380`; no commit created.
+- **Objective:** Prevent live `conversation.messages` invalidations from presenting as reader pagination activity, and make a mobile background/restore reliably reconnect and reconcile current data.
+- **Scoped changes:** `web/src/components/viewers/ConversationViewer.tsx`, `web/src/lib/use-sse.ts`, and `web/e2e/live-conversation-resilience.spec.mjs`.
+- **Root causes confirmed:** A resumed attempt could be closed by an immediate `visibilitychange:hidden`, then its immediate visible counterpart was rejected solely by the 750 ms resume debounce. A persisted bfcache `pageshow` reconnected SSE but did not force the conversation’s cache/data invalidation when an SSE watermark already existed. The existing tail path already used `syncingTailRef`; `isUserLoading` now makes the reader-indicator boundary explicit and testable so a background tail refresh cannot borrow it.
+- **RED evidence:** The new Playwright file failed against temporarily restored pre-fix snippets: the reader had no explicit background-safe loading contract; a blocked first resume request followed by focus → hidden → visible created no replacement stream; and bfcache metadata remained at one request. The rejected-stream/re-session path was already healthy.
+- **Final GREEN evidence:** `npx playwright test e2e/live-conversation-resilience.spec.mjs` passed **4/4**. `npx --no-install tsc --noEmit` and ESLint over all touched files passed. `cargo clippy --all-targets` and `cargo build --no-default-features` passed from `tauri-collector/src-tauri`. Full Chromium: **88 passed, 2 skipped, 2 failed (5.5m)**; the failures are unrelated `brand-marks.spec.mjs` (missing Cursor brand SVG response) and `canvas-viewer.spec.mjs` (pre-existing mobile-history `removeChild` page error). The full runner’s generated tracked screenshots were restored to their pre-run contents.
+- **Next commands:** No further task work required. Re-run the focused live suite for these changes; investigate the two unrelated Chromium failures separately if desired.

@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     realtime_ingest_raw_writer_devices: str = ""
     realtime_ingest_raw_writer_tools: str = ""
 
+    # Phase 3 is a separate switch from the raw-writer canary.  When false,
+    # an opted-in source still uses the synchronous raw writer above.  This
+    # gives rollout an immediate, database-writing fallback without changing
+    # collector compatibility or the delivery fence.
+    realtime_ingest_spool_deltas: bool = False
+    realtime_ingest_drain_poll_seconds: float = 0.10
+
     # Redis
     redis_url: str = "redis://localhost:6380/0"
 

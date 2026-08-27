@@ -37,6 +37,34 @@ RETRY_JITTER_MAX = 1.25
 DEFAULT_TERMINAL_SPOOL_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TERMINAL_SPOOL_MAX_BYTES = 128 * 1024 * 1024
 LEGACY_FULL_RECONCILIATION_GATE = "legacy_full_reconciliation_active"
+MAX_ACCEPTED_DELTA_CHAIN = 32
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a POSIX directory entry; Windows uses write-through rename."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _durable_replace(temporary: Path, final: Path) -> None:
+    """Publish an immutable payload atomically and durably on both OS families."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+        move_file_ex.restype = wintypes.BOOL
+        if not move_file_ex(str(temporary), str(final), 0x1 | 0x8):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    os.replace(temporary, final)
+    _fsync_directory(final.parent)
 
 
 _LEGACY_FULL_CANDIDATE_PREDICATE = """
@@ -116,6 +144,7 @@ class QueueItem:
     payload_path: str | None = None
     payload_bytes: int = 0
     lease_token: str | None = None
+    receipt_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -203,7 +232,7 @@ class PayloadWriter:
             os.fsync(self._stream.fileno())
             self._stream.close()
             self._stream = None
-            os.replace(self._temporary, self._final)
+            _durable_replace(self._temporary, self._final)
             return PreparedPayload(
                 content="",
                 content_hash=self._hash.hexdigest(),
@@ -269,7 +298,7 @@ def _decode_metadata_state_value(value: object) -> tuple[str, str]:
 class SyncQueue:
     """Persistent SQLite metadata queue with immutable large-payload spooling."""
 
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
 
     def __init__(
         self,
@@ -290,13 +319,17 @@ class SyncQueue:
         self._terminal_spool_max_bytes = max(0, int(terminal_spool_max_bytes))
         self._spool_dir = db_path.parent / "spool"
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        spool_created = not self._spool_dir.exists()
         self._spool_dir.mkdir(parents=True, exist_ok=True)
+        if spool_created:
+            _fsync_directory(self._spool_dir.parent)
         self._lock = threading.RLock()
         self._change_condition = threading.Condition()
         self._change_token = 0
         self._fair_lane_cursor = 0
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
         self._remove_orphaned_spool_files()
@@ -362,6 +395,8 @@ class SyncQueue:
                 payload_bytes INTEGER NOT NULL DEFAULT 0,
                 lease_token TEXT,
                 lease_until REAL,
+                receipt_id TEXT,
+                admitted_at REAL,
                 available_at REAL NOT NULL DEFAULT 0,
                 last_attempt_at REAL,
                 last_error TEXT,
@@ -414,6 +449,8 @@ class SyncQueue:
             "payload_bytes": "INTEGER NOT NULL DEFAULT 0",
             "lease_token": "TEXT",
             "lease_until": "REAL",
+            "receipt_id": "TEXT",
+            "admitted_at": "REAL",
             "available_at": "REAL NOT NULL DEFAULT 0",
             "last_attempt_at": "REAL",
             "last_error": "TEXT",
@@ -908,7 +945,7 @@ class SyncQueue:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, final)
+            _durable_replace(temporary, final)
             return str(final), final.stat().st_size
         except Exception:
             try:
@@ -926,7 +963,7 @@ class SyncQueue:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, final)
+            _durable_replace(temporary, final)
             return str(final), final.stat().st_size
         except Exception:
             try:
@@ -1513,6 +1550,48 @@ class SyncQueue:
                 return None, 0
             return str(synced[0]), int(synced[1] or 0)
 
+    def get_capture_delta_base(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> tuple[str | None, int]:
+        """Return the watcher base, optionally extending a bounded ACCEPTED chain.
+
+        This method is intentionally separate from ``get_delta_base``.  The
+        latter is the durable committed cursor used by recovery code; an
+        ACCEPTED receipt is only a speculative capture cursor and must never
+        be written to ``file_state.synced_*``.
+        """
+        with self._lock:
+            complete = self._conn.execute(
+                """SELECT 1 FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND is_partial=0 AND sync_strategy IN ('full','delta')
+                   LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if complete is not None:
+                return None, 0
+            pending = self._conn.execute(
+                """SELECT base_hash, base_offset FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                     AND is_partial=1 AND sync_strategy='delta'
+                   ORDER BY id ASC LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if pending is not None:
+                return pending[0], int(pending[1] or 0)
+            accepted = self._conn.execute(
+                """SELECT content_hash, offset FROM queue
+                   WHERE tool_name=? AND relative_path=? AND status='accepted'
+                     AND sync_strategy='delta' AND is_partial=1
+                   ORDER BY id DESC LIMIT 1""",
+                (tool_name, relative_path),
+            ).fetchone()
+            if accepted is not None:
+                return str(accepted[0]), int(accepted[1] or 0)
+        return self.get_delta_base(tool_name, relative_path)
+
     def has_uncommitted_delta_revision(
         self,
         tool_name: str,
@@ -1536,7 +1615,20 @@ class SyncQueue:
                    LIMIT 1""",
                 (tool_name, relative_path),
             ).fetchone()
-            return row is not None
+            if row is not None:
+                return True
+            # A bounded accepted chain is the negotiated exception to the
+            # historical one-uncommitted-revision rule.  It is not committed,
+            # but its successor may be captured behind its separate cursor.
+            accepted_count = int(
+                self._conn.execute(
+                    """SELECT COUNT(*) FROM queue
+                       WHERE tool_name=? AND relative_path=? AND status='accepted'
+                         AND sync_strategy='delta' AND is_partial=1""",
+                    (tool_name, relative_path),
+                ).fetchone()[0]
+            )
+            return accepted_count >= MAX_ACCEPTED_DELTA_CHAIN
 
     def enqueue(
         self,
@@ -1773,10 +1865,10 @@ class SyncQueue:
                     superseded = self._conn.execute(
                         """SELECT id, payload_path FROM queue
                            WHERE tool_name=? AND relative_path=?
-                             AND status IN (
-                                 'pending','auth_blocked',
-                                 'repair_required','quarantined'
-                             )
+                              AND status IN (
+                                  'pending','auth_blocked',
+                                  'repair_required','quarantined','accepted'
+                              )
                              AND sync_strategy IN ('full','delta') AND id<>?""",
                         (tool_name, relative_path, item_id),
                     ).fetchall()
@@ -1785,12 +1877,13 @@ class SyncQueue:
                     )
                     self._conn.execute(
                         """UPDATE queue SET status='superseded', payload_path=NULL,
-                                  content='', lease_token=NULL, lease_until=NULL
+                                  content='', lease_token=NULL, lease_until=NULL,
+                                  receipt_id=NULL, admitted_at=NULL
                            WHERE tool_name=? AND relative_path=?
-                             AND status IN (
-                                 'pending','auth_blocked',
-                                 'repair_required','quarantined'
-                             )
+                              AND status IN (
+                                  'pending','auth_blocked',
+                                  'repair_required','quarantined','accepted'
+                              )
                              AND sync_strategy IN ('full','delta') AND id<>?""",
                         (tool_name, relative_path, item_id),
                     )
@@ -1894,7 +1987,7 @@ class SyncQueue:
                           q.payload_path,
                           CASE WHEN q.payload_bytes > 0
                                THEN q.payload_bytes ELSE q.file_size END,
-                          q.base_hash, q.base_offset, q.source_path
+                          q.base_hash, q.base_offset, q.source_path, q.receipt_id
                    FROM queue AS q
                    WHERE q.status='pending' AND COALESCE(q.available_at, 0) <= ?
                      AND NOT EXISTS (
@@ -2082,6 +2175,7 @@ class SyncQueue:
                     base_offset=int(row[17] or 0),
                     source_path=row[18],
                     lease_token=token,
+                    receipt_id=row[19],
                 )
             )
         return items
@@ -2098,6 +2192,77 @@ class SyncQueue:
             )
             self._conn.commit()
             return cursor.rowcount == 1
+
+    @_rollback_on_error
+    def mark_accepted(self, item: QueueItem, *, receipt_id: str) -> bool:
+        """Persist ACCEPTED without advancing the durable committed cursor."""
+        if not item.lease_token or not receipt_id:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE queue SET status='accepted', receipt_id=?, admitted_at=?,
+                          lease_token=NULL, lease_until=NULL, last_error=NULL,
+                          outcome_state='accepted', diagnostic_code='accepted_awaiting_commit',
+                          http_status=NULL, terminal_at=NULL
+                   WHERE id=? AND status='uploading' AND lease_token=?""",
+                (receipt_id, time.time(), item.id, item.lease_token),
+            )
+            self._conn.commit()
+            changed = cursor.rowcount == 1
+        if changed:
+            item.receipt_id = receipt_id
+            item.lease_token = None
+            self._signal_change()
+        return changed
+
+    def accepted_receipt_items(self) -> list[QueueItem]:
+        """Return retained local payloads whose server receipt needs polling."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, tool_name, category, content_type, relative_path,
+                          content_hash, file_size, sync_strategy, is_partial,
+                          offset, metadata, created_at, source_modified_at,
+                          retry_count, payload_path,
+                          CASE WHEN payload_bytes > 0 THEN payload_bytes ELSE file_size END,
+                          base_hash, base_offset, source_path, receipt_id
+                   FROM queue WHERE status='accepted' AND receipt_id IS NOT NULL
+                   ORDER BY id ASC"""
+            ).fetchall()
+        items: list[QueueItem] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row[10])
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            items.append(
+                QueueItem(
+                    id=int(row[0]), tool_name=str(row[1]), category=str(row[2]),
+                    content_type=str(row[3]), relative_path=str(row[4]), content=None,
+                    content_hash=str(row[5]), file_size=int(row[6]),
+                    sync_strategy=str(row[7]), is_partial=bool(row[8]), offset=int(row[9]),
+                    metadata=metadata, created_at=float(row[11]),
+                    source_modified_at=(float(row[12]) if row[12] is not None else None),
+                    retry_count=int(row[13]), payload_path=row[14],
+                    payload_bytes=int(row[15] or row[6]), base_hash=row[16],
+                    base_offset=int(row[17] or 0), source_path=row[18],
+                    receipt_id=str(row[19]),
+                )
+            )
+        return items
+
+    def is_accepted_receipt(self, item: QueueItem) -> bool:
+        """Return whether an in-memory receipt poll still owns a live row."""
+        if not item.receipt_id:
+            return False
+        with self._lock:
+            return (
+                self._conn.execute(
+                    """SELECT 1 FROM queue
+                       WHERE id=? AND status='accepted' AND receipt_id=?""",
+                    (item.id, item.receipt_id),
+                ).fetchone()
+                is not None
+            )
 
     def _inline_content(self, item: QueueItem) -> str:
         with self._lock:
@@ -2130,30 +2295,79 @@ class SyncQueue:
     @_rollback_on_error
     def mark_synced(self, item: QueueItem) -> bool:
         """Acknowledge only the exact live lease and advance synced state."""
-        if not item.lease_token:
+        if not item.lease_token and not item.receipt_id:
             return False
-        payload_path: str | None = None
+        payload_paths: list[str] = []
         now = time.time()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute(
-                """SELECT tool_name, relative_path, content_hash, offset,
-                          payload_path, metadata
-                   FROM queue WHERE id=? AND status='uploading' AND lease_token=?""",
-                (item.id, item.lease_token),
-            ).fetchone()
+            if item.lease_token:
+                row = self._conn.execute(
+                    """SELECT tool_name, relative_path, content_hash, offset,
+                              payload_path, metadata
+                       FROM queue WHERE id=? AND status='uploading' AND lease_token=?""",
+                    (item.id, item.lease_token),
+                ).fetchone()
+                completion_predicate = "status='uploading' AND lease_token=?"
+                completion_value = item.lease_token
+            else:
+                row = self._conn.execute(
+                    """SELECT tool_name, relative_path, content_hash, offset,
+                              payload_path, metadata
+                       FROM queue WHERE id=? AND status='accepted' AND receipt_id=?""",
+                    (item.id, item.receipt_id),
+                ).fetchone()
+                completion_predicate = "status='accepted' AND receipt_id=?"
+                completion_value = item.receipt_id
             if row is None:
                 self._conn.rollback()
                 return False
-            payload_path = row[4]
-            self._conn.execute(
-                """UPDATE queue SET status='synced', lease_token=NULL,
-                          lease_until=NULL, payload_path=NULL, content='',
-                          outcome_state='success', diagnostic_code=NULL,
-                          http_status=NULL, terminal_at=NULL, last_error=NULL,
-                          blocked_config_fingerprint=NULL
-                   WHERE id=? AND status='uploading' AND lease_token=?""",
-                (item.id, item.lease_token),
+            if item.lease_token:
+                if row[4]:
+                    payload_paths.append(str(row[4]))
+                self._conn.execute(
+                    f"""UPDATE queue SET status='synced', lease_token=NULL,
+                               lease_until=NULL, payload_path=NULL, content='',
+                               receipt_id=NULL, admitted_at=NULL,
+                               outcome_state='success', diagnostic_code=NULL,
+                               http_status=NULL, terminal_at=NULL, last_error=NULL,
+                               blocked_config_fingerprint=NULL
+                       WHERE id=? AND {completion_predicate}""",
+                    (item.id, completion_value),
+                )
+            else:
+                # A committed successor proves every accepted local ancestor
+                # in its exact-base chain is also committed. Retire that prefix
+                # together so out-of-order receipt futures cannot regress the
+                # capture cursor or retain a phantom ACCEPTED head.
+                predecessor_payloads = self._conn.execute(
+                    """SELECT payload_path FROM queue
+                       WHERE tool_name=? AND relative_path=? AND id<=?
+                         AND status='accepted' AND sync_strategy='delta'
+                         AND is_partial=1""",
+                    (row[0], row[1], item.id),
+                ).fetchall()
+                payload_paths.extend(
+                    str(candidate[0]) for candidate in predecessor_payloads if candidate[0]
+                )
+                self._conn.execute(
+                    """UPDATE queue SET status='synced', lease_token=NULL,
+                              lease_until=NULL, payload_path=NULL, content='',
+                              receipt_id=NULL, admitted_at=NULL,
+                              outcome_state='success', diagnostic_code=NULL,
+                              http_status=NULL, terminal_at=NULL, last_error=NULL,
+                              blocked_config_fingerprint=NULL
+                       WHERE tool_name=? AND relative_path=? AND id<=?
+                         AND status='accepted' AND sync_strategy='delta'
+                         AND is_partial=1""",
+                    (row[0], row[1], item.id),
+                )
+            monotonic_receipt_predicate = (
+                " WHERE COALESCE(file_state.synced_offset, 0) < excluded.synced_offset"
+                " OR (COALESCE(file_state.synced_offset, 0) = excluded.synced_offset"
+                " AND file_state.synced_hash = excluded.synced_hash)"
+                if not item.lease_token
+                else ""
             )
             self._conn.execute(
                 """INSERT INTO file_state (
@@ -2161,11 +2375,12 @@ class SyncQueue:
                        last_synced_at, observed_hash, observed_offset, observed_at,
                        synced_hash, synced_offset, synced_at
                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(tool_name, relative_path) DO UPDATE SET
-                       last_synced_at=excluded.last_synced_at,
-                       synced_hash=excluded.synced_hash,
-                       synced_offset=excluded.synced_offset,
-                       synced_at=excluded.synced_at""",
+                    ON CONFLICT(tool_name, relative_path) DO UPDATE SET
+                        last_synced_at=excluded.last_synced_at,
+                        synced_hash=excluded.synced_hash,
+                        synced_offset=excluded.synced_offset,
+                        synced_at=excluded.synced_at"""
+                + monotonic_receipt_predicate,
                 (
                     row[0],
                     row[1],
@@ -2202,7 +2417,8 @@ class SyncQueue:
                     (state_value, now, state_namespace, state_key),
                 )
             self._conn.commit()
-        self._discard_payload(payload_path)
+        for payload_path in set(payload_paths):
+            self._discard_payload(payload_path)
         self._signal_change()
         return True
 
@@ -2395,17 +2611,25 @@ class SyncQueue:
         expected_offset: int = 0,
     ) -> bool:
         """Discard a rejected tail and adopt the server's committed base."""
-        if not item.lease_token:
+        if not item.lease_token and not item.receipt_id:
             return False
         payload_paths: list[str] = []
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute(
-                """SELECT tool_name, relative_path, payload_path FROM queue
-                   WHERE id=? AND status='uploading' AND lease_token=?
-                     AND sync_strategy='delta' AND is_partial=1""",
-                (item.id, item.lease_token),
-            ).fetchone()
+            if item.lease_token:
+                row = self._conn.execute(
+                    """SELECT tool_name, relative_path, payload_path FROM queue
+                       WHERE id=? AND status='uploading' AND lease_token=?
+                         AND sync_strategy='delta' AND is_partial=1""",
+                    (item.id, item.lease_token),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    """SELECT tool_name, relative_path, payload_path FROM queue
+                       WHERE id=? AND status='accepted' AND receipt_id=?
+                         AND sync_strategy='delta' AND is_partial=1""",
+                    (item.id, item.receipt_id),
+                ).fetchone()
             if row is None:
                 self._conn.rollback()
                 return False
@@ -2414,7 +2638,8 @@ class SyncQueue:
                 payload_paths.append(str(row[2]))
             pending = self._conn.execute(
                 """SELECT payload_path FROM queue
-                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                   WHERE tool_name=? AND relative_path=?
+                     AND status IN ('pending','uploading','accepted')
                      AND sync_strategy='delta' AND is_partial=1""",
                 (row[0], row[1]),
             ).fetchall()
@@ -2425,21 +2650,13 @@ class SyncQueue:
             self._conn.execute(
                 """UPDATE queue SET status='superseded', payload_path=NULL,
                           content='', lease_token=NULL, lease_until=NULL,
+                          receipt_id=NULL, admitted_at=NULL,
                           last_error='delta base mismatch',
                           outcome_state='source_repair_required',
                           diagnostic_code='delta_base_mismatch',
                           terminal_at=?
-                   WHERE id=? AND status='uploading' AND lease_token=?""",
-                (time.time(), item.id, item.lease_token),
-            )
-            self._conn.execute(
-                """UPDATE queue SET status='superseded', payload_path=NULL,
-                          content='', lease_token=NULL, lease_until=NULL,
-                          last_error='delta base mismatch',
-                          outcome_state='source_repair_required',
-                          diagnostic_code='delta_base_mismatch',
-                          terminal_at=?
-                   WHERE tool_name=? AND relative_path=? AND status='pending'
+                   WHERE tool_name=? AND relative_path=?
+                     AND status IN ('pending','uploading','accepted')
                      AND sync_strategy='delta' AND is_partial=1""",
                 (time.time(), row[0], row[1]),
             )

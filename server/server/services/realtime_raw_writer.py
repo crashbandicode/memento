@@ -749,6 +749,11 @@ async def _stage_messages(
 ) -> tuple[list[SimpleNamespace], set[int]]:
     if not mutations:
         return [], set()
+    # The connection-local stage table is deliberately reused across pooled
+    # transactions.  Phase 3 invokes this ordered reducer more than once
+    # inside one coalesced transaction, so ``ON COMMIT DELETE ROWS`` alone is
+    # insufficient; otherwise the prior frame's inserts are replayed.
+    await connection.execute("TRUNCATE memento_raw_message_stage")
     await connection.copy_records_to_table(
         "memento_raw_message_stage",
         records=(
@@ -1364,4 +1369,338 @@ async def ingest_conversation_raw(
         raise RawWriterCommitUncertain(
             "raw COMMIT was attempted but its revision fence did not converge"
         ) from commit_error
+    return result, event
+
+
+async def ingest_conversation_raw_chain(
+    *,
+    frames: list[dict[str, Any]],
+    database_url: str | None = None,
+    simulate_ambiguous_commit: bool = False,
+) -> tuple[RawDocument, dict[str, Any] | None]:
+    """Commit an ordered guarded DELTA chain in one raw asyncpg transaction.
+
+    The reducer intentionally runs once per constituent envelope.  This keeps
+    frame metadata and the existing stateful tool semantics ordered exactly as
+    the synchronous writer, while the advisory lock, PostgreSQL transaction,
+    and post-commit SSE are amortized over the chain.
+    """
+    if not frames:
+        raise RawWriterUnsupported("raw chain requires at least one frame")
+    first = dict(frames[0])
+    machine = _uuid(first.get("machine_id"))
+    owner = _uuid(first.get("user_id"))
+    if machine is None or owner is None:
+        raise RawWriterUnsupported(
+            "raw conversation ingest requires an authenticated owner and machine"
+        )
+    tool_id = str(first.get("tool_id") or "")
+    category = str(first.get("category") or "")
+    content_type = str(first.get("content_type") or "")
+    relative_path = str(first.get("relative_path") or "")
+    if category != "conversation" or content_type != "jsonl":
+        raise RawWriterUnsupported("raw writer is limited to conversation JSONL")
+
+    from .ingest_service import (
+        CURSOR_PROJECTION_ORDER_KEY,
+        _claude_subagent_pair_transcript_path,
+        _resanitize,
+        _source_lock_id,
+    )
+    from .conversation_identity import conversation_session_id
+
+    prepared: list[dict[str, Any]] = []
+    stable_source_identity: str | None = None
+    for source_frame in frames:
+        frame = dict(source_frame)
+        if (
+            str(frame.get("tool_id") or "") != tool_id
+            or str(frame.get("category") or "") != category
+            or str(frame.get("content_type") or "") != content_type
+            or str(frame.get("relative_path") or "") != relative_path
+            or _uuid(frame.get("machine_id")) != machine
+            or _uuid(frame.get("user_id")) != owner
+            or frame.get("mode") != "delta"
+        ):
+            raise RawWriterUnsupported("raw chain has mixed source identities")
+        metadata = dict(frame.get("metadata") or {})
+        if metadata.get(CURSOR_PROJECTION_ORDER_KEY) is not None:
+            raise RawWriterUnsupported(
+                "Cursor projection reordering needs the legacy reducer"
+            )
+        if _claude_subagent_pair_transcript_path(relative_path, category) is not None:
+            raise RawWriterUnsupported(
+                "Claude transcript/sidecar pairing needs the legacy reducer"
+            )
+        content = str(frame.get("content") or "").replace("\x00", "")
+        if frame.get("content_already_sanitized"):
+            had_sensitive = bool(frame.get("content_had_sensitive"))
+        else:
+            content, detected_sensitive = _resanitize(content)
+            had_sensitive = bool(frame.get("content_had_sensitive")) or detected_sensitive
+        if tool_id == "codex" and content:
+            from .conversation_parser import extract_codex_session_metadata
+
+            metadata.update(extract_codex_session_metadata(content))
+        if tool_id in {"cursor", "claude_code"}:
+            from .conversation_hierarchy import path_linked_subagent_identity
+
+            for key, value in path_linked_subagent_identity(relative_path).items():
+                metadata.setdefault(key, value)
+        identity = conversation_session_id(tool_id, category, metadata)
+        if stable_source_identity is None:
+            stable_source_identity = identity
+        elif identity != stable_source_identity:
+            raise RawWriterUnsupported("raw chain changes stable source identity")
+        frame.update(content=content, metadata=metadata, had_sensitive=had_sensitive)
+        prepared.append(frame)
+
+    cursor_state_delta = (
+        tool_id == "cursor" and prepared[0]["metadata"].get("source") == "cursor_state_v1"
+    )
+    # Most collector DELTAs in one quiet window have identical source
+    # metadata.  They are plain append JSONL, so one reducer/application is
+    # semantically equivalent to applying each envelope in order while it
+    # removes repeated scalar loads, stage transfers, and projection writes.
+    # Metadata-bearing shapes deliberately retain the sequential path below:
+    # a later frame must never erase a prior frame's distinct metadata.
+    reducer_frames = prepared
+
+    def combined_frame(source_frames: list[dict[str, Any]]) -> dict[str, Any]:
+        combined_content = ""
+        for frame in source_frames:
+            content = frame["content"]
+            if (
+                combined_content
+                and content
+                and not combined_content.endswith("\n")
+                and not content.startswith("\n")
+            ):
+                combined_content += "\n"
+            combined_content += content
+        combined = dict(source_frames[-1])
+        combined.update(
+            content=combined_content,
+            file_size=sum(int(frame["file_size"]) for frame in source_frames),
+            base_hash=source_frames[0].get("base_hash"),
+            base_offset=source_frames[0].get("base_offset"),
+            had_sensitive=any(bool(frame["had_sensitive"]) for frame in source_frames),
+        )
+        return combined
+
+    can_combine = all(
+        frame["metadata"] == prepared[0]["metadata"] for frame in prepared[1:]
+    )
+    if can_combine:
+        reducer_frames = [combined_frame(prepared)]
+    try:
+        pool = await _pool(database_url)
+    except Exception as exc:
+        raise RawWriterFailure(f"raw pool unavailable before transaction: {exc}") from exc
+
+    commit_started = False
+    commit_error: Exception | None = None
+    result: RawDocument | None = None
+    events: list[dict[str, Any]] = []
+    last_state: WriterState | None = None
+    try:
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            try:
+                await transaction.start()
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1::bigint)",
+                    _source_lock_id(
+                        str(machine), str(owner), tool_id, relative_path,
+                        source_identity=stable_source_identity,
+                    ),
+                )
+                await _ensure_supported_identity_path(
+                    connection,
+                    machine_id=machine,
+                    user_id=owner,
+                    tool_id=tool_id,
+                    relative_path=relative_path,
+                    source_identity=stable_source_identity,
+                )
+                preloaded_state: WriterState | None = None
+                if can_combine and len(prepared) > 1:
+                    initial_state = await _load_state(
+                        connection,
+                        machine_id=machine,
+                        user_id=owner,
+                        tool_id=tool_id,
+                        relative_path=relative_path,
+                        cursor_state_delta=cursor_state_delta,
+                    )
+                    preloaded_state = initial_state
+                    current_hash = (
+                        (initial_state.delivery or {}).get("revision_hash")
+                        or (initial_state.document or {}).get("content_hash")
+                    )
+                    current_offset = (
+                        int(initial_state.sync.get("last_offset") or 0)
+                        if initial_state.sync
+                        and initial_state.sync.get("last_hash") == current_hash
+                        else 0
+                    )
+                    # A crash can commit the head before removing its marker;
+                    # successors admitted during that window must resume after
+                    # the already-committed prefix, not fail the combined base.
+                    for index, frame in enumerate(prepared[:-1]):
+                        if (
+                            str(frame["content_hash"]) == current_hash
+                            and int(frame["offset"]) == current_offset
+                        ):
+                            reducer_frames = [combined_frame(prepared[index + 1 :])]
+                            break
+                for frame in reducer_frames:
+                    # Re-read scalar state inside the still-open transaction.
+                    # PostgreSQL exposes our own writes, preserving exact
+                    # one-by-one reducer semantics without ORM hydration.
+                    if preloaded_state is not None:
+                        state = preloaded_state
+                        preloaded_state = None
+                    else:
+                        state = await _load_state(
+                            connection,
+                            machine_id=machine,
+                            user_id=owner,
+                            tool_id=tool_id,
+                            relative_path=relative_path,
+                            cursor_state_delta=cursor_state_delta,
+                        )
+                    last_state = state
+                    mutation = reduce_writer_state(
+                        state,
+                        tool_id=tool_id,
+                        category=category,
+                        content_type=content_type,
+                        relative_path=relative_path,
+                        content=frame["content"],
+                        content_hash=str(frame["content_hash"]),
+                        file_size=int(frame["file_size"]),
+                        mode="delta",
+                        offset=int(frame["offset"]),
+                        metadata=frame["metadata"],
+                        timestamp=frame.get("timestamp"),
+                        machine_id=machine,
+                        user_id=owner,
+                        base_hash=frame.get("base_hash"),
+                        base_offset=frame.get("base_offset"),
+                        authoritative_rebase=False,
+                        had_sensitive=bool(frame["had_sensitive"]),
+                    )
+                    result, event = await _apply(
+                        connection,
+                        state=state,
+                        mutation=mutation,
+                        tool_id=tool_id,
+                        category=category,
+                        content_type=content_type,
+                        relative_path=relative_path,
+                        content_hash=str(frame["content_hash"]),
+                        machine_id=machine,
+                        user_id=owner,
+                        content=frame["content"],
+                    )
+                    if event is not None:
+                        events.append(event)
+            except Exception:
+                try:
+                    await transaction.rollback()
+                except Exception:
+                    pass
+                raise
+            commit_started = True
+            try:
+                await transaction.commit()
+            except Exception as exc:
+                commit_error = exc
+    except (RawWriterUnsupported, RawWriterFailure):
+        raise
+    except Exception as exc:
+        from .ingest_service import DeltaBaseMismatch
+
+        if isinstance(exc, DeltaBaseMismatch):
+            raise
+        if commit_started:
+            commit_error = commit_error or exc
+        else:
+            raise RawWriterFailure(
+                f"raw chain transaction failed before commit: {exc}"
+            ) from exc
+
+    if result is None:
+        raise RawWriterFailure("raw chain completed without a result")
+    final = prepared[-1]
+    if commit_error is not None or simulate_ambiguous_commit:
+        try:
+            converged = await _commit_converged(
+                database_url=database_url,
+                document_id=result.id,
+                machine_id=machine,
+                tool_id=tool_id,
+                relative_path=relative_path,
+                content_hash=str(final["content_hash"]),
+                offset=int(final["offset"]),
+            )
+        except Exception as exc:
+            raise RawWriterCommitUncertain(
+                "raw chain COMMIT outcome could not be reread; retry delivery"
+            ) from exc
+        if not converged:
+            raise RawWriterCommitUncertain(
+                "raw chain COMMIT was attempted but revision fence did not converge"
+            ) from commit_error
+
+    if not events and result.disposition == "idempotent" and last_state is not None:
+        document = last_state.document or {}
+        project_id = document.get("project_id")
+        changes = {
+            "conversation.messages",
+            "conversation.metadata",
+            "conversation.pending_interactions",
+            "conversation.prompts",
+            "conversation.search",
+            "dashboard",
+            "project",
+        }
+        if project_id is None:
+            changes.discard("project")
+        return result, {
+            "event_type": "file_synced",
+            "user_id": str(owner),
+            "cache": {"daily": False, "project": False, "project_id": project_id},
+            "data": {
+                "document_id": str(result.id),
+                "tool_id": tool_id,
+                "category": category,
+                "relative_path": relative_path,
+                "title": document.get("title"),
+                "project_id": str(project_id) if project_id else None,
+                "changes": sorted(changes),
+            },
+        }
+    if not events:
+        return result, None
+    event = dict(events[-1])
+    changes: set[str] = set()
+    daily = False
+    project = False
+    for candidate in events:
+        data = candidate.get("data")
+        if isinstance(data, dict):
+            changes.update(str(value) for value in data.get("changes", []))
+        cache = candidate.get("cache")
+        if isinstance(cache, dict):
+            daily = daily or bool(cache.get("daily"))
+            project = project or bool(cache.get("project"))
+    data = dict(event.get("data") or {})
+    data["changes"] = sorted(changes)
+    event["data"] = data
+    cache = dict(event.get("cache") or {})
+    cache["daily"] = daily
+    cache["project"] = project
+    event["cache"] = cache
     return result, event

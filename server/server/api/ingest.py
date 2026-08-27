@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,8 @@ from ..services.ingest_spool import (
     chunk_commit_status,
     has_completion_receipt,
     pending_source_revision_job_id,
+    receipt_commit_status,
+    stage_delta_payload,
     stage_chunk,
 )
 from ..services.large_content_store import (
@@ -112,6 +115,7 @@ class IngestResponse(BaseModel):
     status: str = "ok"
     document_id: str
     message: str = ""
+    receipt_id: str | None = None
 
 
 class IngestChunkStatusRequest(BaseModel):
@@ -122,6 +126,16 @@ class IngestChunkStatusRequest(BaseModel):
 class IngestChunkStatusResponse(BaseModel):
     job_id: str
     status: Literal["completed", "pending", "receiving", "failed", "blocked", "missing"]
+    error_type: str | None = None
+
+
+class IngestReceiptStatusRequest(BaseModel):
+    receipt_id: str = Field(min_length=64, max_length=64)
+
+
+class IngestReceiptStatusResponse(BaseModel):
+    receipt_id: str
+    status: Literal["accepted", "committed", "failed", "blocked", "receiving", "missing"]
     error_type: str | None = None
 
 
@@ -348,6 +362,7 @@ async def _stage_delta_behind_pending_revision(
     device_id: str,
     device_name: str,
     device_platform: str,
+    supports_commit_receipts: bool,
 ) -> IngestResponse | None:
     """Durably queue a delta whose exact base is awaiting DB commit.
 
@@ -358,6 +373,10 @@ async def _stage_delta_behind_pending_revision(
     """
     if (content_bytes is None) == (content_path is None):
         raise ValueError("exactly one delta payload source is required")
+    # A 2xx queued response is unsafe for collectors that cannot distinguish
+    # ACCEPTED from COMMITTED. Let those callers take the normal 409/FULL path.
+    if not supports_commit_receipts:
+        return None
     payload_size = (
         len(content_bytes)
         if content_bytes is not None
@@ -431,13 +450,15 @@ async def _stage_delta_behind_pending_revision(
         raise RuntimeError("dependent delta was not durably staged")
     if staged.should_enqueue:
         await _enqueue_spool_job(staged.job_id)
-        status = "queued"
-        message = f"Delta queued behind pending revision {pending_job_id}"
+        status = "accepted"
+        message = f"Delta accepted behind pending revision {pending_job_id}"
     else:
-        status = "completed"
+        status = "committed"
         message = "Delta was already durably ingested"
     return IngestResponse(
         document_id=f"{status}:{staged.job_id}",
+        status=status,
+        receipt_id=staged.job_id,
         message=message,
     )
 
@@ -454,6 +475,7 @@ async def _ingest_or_stage_dependent_delta(
     device_name: str,
     device_platform: str,
     success_message: str,
+    supports_commit_receipts: bool = False,
 ) -> IngestResponse:
     try:
         doc = await ingest_file(**ingest_kwargs)
@@ -469,6 +491,7 @@ async def _ingest_or_stage_dependent_delta(
             device_id=device_id,
             device_name=device_name,
             device_platform=device_platform,
+            supports_commit_receipts=supports_commit_receipts,
         )
         if queued is not None:
             return queued
@@ -638,6 +661,94 @@ async def ingest_orchestration_event_batch(
     return OrchestrationEventBatchResponse(**result)
 
 
+_ASYNC_DELTA_CAPABILITY = "realtime_ingest_async_admission_v1"
+
+
+def _collector_supports_async_delta_admission(capabilities: str | None) -> bool:
+    return _ASYNC_DELTA_CAPABILITY in {
+        capability.strip()
+        for capability in str(capabilities or "").split(",")
+        if capability.strip()
+    }
+
+
+def _admission_identity(*, meta: dict, user_id: str, device_id: str) -> str:
+    """Stable source/revision proof excluding the mutable payload bytes."""
+    envelope = {
+        "user_id": user_id, "device_id": device_id, "tool": meta.get("tool"),
+        "category": meta.get("category"), "content_type": meta.get("content_type"),
+        "relative_path": meta.get("relative_path"), "mode": meta.get("mode"),
+        "hash": meta.get("hash"), "offset": meta.get("offset"),
+        "base_hash": meta.get("base_hash"), "base_offset": meta.get("base_offset"),
+        "timestamp": meta.get("timestamp"), "metadata": meta.get("metadata", {}),
+    }
+    encoded = json.dumps(
+        envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(b"memento:admission-envelope:v1\0" + encoded).hexdigest()
+
+
+async def _admit_realtime_delta(
+    *, meta: dict, payload: bytes, user_id: str, device_id: str,
+    device_name: str, device_platform: str,
+) -> IngestResponse:
+    """Fsync a capability-negotiated guarded DELTA and return ACCEPTED only."""
+    if not (
+        meta.get("category") == "conversation"
+        and meta.get("content_type") == "jsonl"
+        and meta.get("mode") == "delta"
+        and isinstance(meta.get("base_hash"), str)
+        and meta.get("base_hash")
+        and isinstance(meta.get("base_offset"), int)
+        and not isinstance(meta.get("base_offset"), bool)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="realtime admission requires a guarded conversation DELTA",
+        )
+    admission_identity = _admission_identity(
+        meta=meta, user_id=user_id, device_id=device_id,
+    )
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    delivery_identity = hashlib.sha256(
+        (
+            "memento:delivery-identity:v1\0"
+            + admission_identity + "\0" + payload_sha256
+        ).encode("ascii")
+    ).hexdigest()
+    try:
+        staged = await asyncio.to_thread(
+            stage_delta_payload,
+            meta={
+                **meta,
+                "upload_id": f"realtime/{delivery_identity}",
+                "admission_identity": admission_identity,
+                "delivery_identity": delivery_identity,
+                "payload_sha256": payload_sha256,
+                "realtime_admission": True,
+                "file_size": len(payload),
+            },
+            payload=payload,
+            user_id=user_id,
+            device_id=device_id,
+            device_name=device_name,
+            device_platform=device_platform,
+        )
+    except ChunkValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status = "committed" if not staged.should_enqueue else "accepted"
+    return IngestResponse(
+        status=status,
+        document_id=f"{status}:{staged.job_id}",
+        receipt_id=staged.job_id,
+        message=(
+            "Delta database transaction already committed"
+            if status == "committed"
+            else "Delta payload fsynced; awaiting database commit receipt"
+        ),
+    )
+
+
 @router.post("/file", response_model=IngestResponse)
 async def ingest_file_endpoint(
     req: IngestFileRequest,
@@ -647,6 +758,7 @@ async def ingest_file_endpoint(
     x_device_id: str = Header("unknown"),
     x_device_name: str = Header("unknown"),
     x_device_platform: str = Header("unknown"),
+    x_collector_capabilities: str | None = Header(default=None),
 ) -> IngestResponse:
     """Ingest a file from the collector (JSON payload, for files < 1MB)."""
     _reject_synthetic_metadata_file_upload(
@@ -663,13 +775,33 @@ async def ingest_file_endpoint(
         user_id=_collector_user.id,
     )
     measured_size = len(req.content.encode("utf-8"))
-    writer = None
-    if raw_realtime_writer_enabled(
+    raw_enabled = raw_realtime_writer_enabled(
         owner_id=str(_collector_user.id),
         device_id=x_device_id,
         tool_id=req.tool,
         category=req.category,
+    )
+    if (
+        settings.realtime_ingest_spool_deltas
+        and raw_enabled
+        and _collector_supports_async_delta_admission(x_collector_capabilities)
+        and req.category == "conversation"
+        and req.content_type == "jsonl"
+        and req.mode == "delta"
     ):
+        # Device ownership is committed before ACCEPTED can outlive this HTTP
+        # request.  The actual source fence remains in the drain's raw tx.
+        await db.commit()
+        return await _admit_realtime_delta(
+            meta=req.model_dump(exclude={"content"}),
+            payload=req.content.encode("utf-8"),
+            user_id=str(_collector_user.id),
+            device_id=x_device_id,
+            device_name=x_device_name,
+            device_platform=x_device_platform,
+        )
+    writer = None
+    if raw_enabled:
         # Device creation is deliberately outside the raw ingest transaction.
         # Commit it before acquiring the asyncpg connection so the raw FK and
         # authenticated owner scope are both visible on first contact.
@@ -705,6 +837,9 @@ async def ingest_file_endpoint(
         device_name=x_device_name,
         device_platform=x_device_platform,
         success_message="Ingested successfully",
+        supports_commit_receipts=_collector_supports_async_delta_admission(
+            x_collector_capabilities
+        ),
     )
 
 
@@ -718,6 +853,7 @@ async def ingest_file_upload(
     x_device_id: str = Header("unknown"),
     x_device_name: str = Header("unknown"),
     x_device_platform: str = Header("unknown"),
+    x_collector_capabilities: str | None = Header(default=None),
 ) -> IngestResponse:
     """Ingest a large file via multipart upload."""
     meta = json.loads(metadata)
@@ -758,6 +894,22 @@ async def ingest_file_upload(
             temporary_root = Path(temporary)
             raw_path = temporary_root / "payload.bin"
             measured_size = await _stream_upload_to_path(content, raw_path)
+            if (
+                settings.realtime_ingest_spool_deltas
+                and raw_writer
+                and _collector_supports_async_delta_admission(
+                    x_collector_capabilities
+                )
+                and meta.get("mode") == "delta"
+            ):
+                return await _admit_realtime_delta(
+                    meta={**meta, "file_size": measured_size},
+                    payload=raw_path.read_bytes(),
+                    user_id=str(_collector_user.id),
+                    device_id=x_device_id,
+                    device_name=x_device_name,
+                    device_platform=x_device_platform,
+                )
             if max(known_size, measured_size) <= DATABASE_CONTENT_MAX_BYTES:
                 file_content = raw_path.read_text(
                     encoding="utf-8",
@@ -792,6 +944,9 @@ async def ingest_file_upload(
                     device_name=x_device_name,
                     device_platform=x_device_platform,
                     success_message="Uploaded successfully",
+                    supports_commit_receipts=_collector_supports_async_delta_admission(
+                        x_collector_capabilities
+                    ),
                 )
             sanitized = await asyncio.to_thread(
                 sanitize_content_file,
@@ -854,6 +1009,9 @@ async def ingest_file_upload(
                 device_name=x_device_name,
                 device_platform=x_device_platform,
                 success_message="Uploaded successfully",
+                supports_commit_receipts=_collector_supports_async_delta_admission(
+                    x_collector_capabilities
+                ),
             )
 
     file_content = (await content.read()).decode("utf-8", errors="replace")
@@ -899,6 +1057,9 @@ async def ingest_file_upload(
         device_name=x_device_name,
         device_platform=x_device_platform,
         success_message="Uploaded successfully",
+        supports_commit_receipts=_collector_supports_async_delta_admission(
+            x_collector_capabilities
+        ),
     )
 
 
@@ -1039,6 +1200,30 @@ async def ingest_file_chunk_status(
     )
     return IngestChunkStatusResponse(
         job_id=result.job_id,
+        status=result.status,
+        error_type=result.error_type,
+    )
+
+
+@router.post("/file/receipt/status", response_model=IngestReceiptStatusResponse)
+async def ingest_file_receipt_status(
+    req: IngestReceiptStatusRequest,
+    _collector_user: User = Depends(verify_collector_token),
+    _throttle: None = Depends(throttle_ingest),
+    x_device_id: str = Header("unknown"),
+) -> IngestReceiptStatusResponse:
+    """Report ACCEPTED separately from the terminal database receipt."""
+    try:
+        result = await asyncio.to_thread(
+            receipt_commit_status,
+            receipt_id=req.receipt_id,
+            user_id=str(_collector_user.id),
+            device_id=x_device_id,
+        )
+    except ChunkValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return IngestReceiptStatusResponse(
+        receipt_id=result.job_id,
         status=result.status,
         error_type=result.error_type,
     )

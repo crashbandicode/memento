@@ -30,6 +30,8 @@ CHUNK_RETRY_BASE_SECONDS = 0.5
 CHUNK_RETRY_MAX_SECONDS = 4.0
 CHUNK_COMMIT_POLL_SECONDS = 2.0
 CHUNK_COMMIT_TIMEOUT_SECONDS = 30 * 60
+ADMISSION_COMMIT_POLL_SECONDS = 0.25
+ADMISSION_COMMIT_TIMEOUT_SECONDS = 30 * 60
 TRANSIENT_HTTP_STATUSES = frozenset(
     {408, 425, 429, 500, 502, 503, 504}
 ) | EDGE_AVAILABILITY_HTTP_STATUSES
@@ -148,6 +150,12 @@ class SyncClient:
             collector_version = "dev"
 
         self._pool = ThreadPoolExecutor(max_workers=config.max_concurrent_uploads)
+        # Receipt polling is intentionally separate from upload capacity.  An
+        # accepted head must not consume the slots needed to admit its bounded
+        # speculative successors during the server quiet window.
+        self._receipt_pool = ThreadPoolExecutor(
+            max_workers=config.max_concurrent_uploads
+        )
         from .tls import SSL_CONTEXT
 
         self._client = httpx.Client(
@@ -165,6 +173,7 @@ class SyncClient:
                 "X-Device-Name": config.device_name,
                 "X-Device-Platform": config.platform,
                 "X-Collector-Version": collector_version,
+                "X-Collector-Capabilities": "realtime_ingest_async_admission_v1",
             },
         )
 
@@ -188,6 +197,7 @@ class SyncClient:
             # prevents queue/client teardown from racing upload callbacks.
             self._thread.join(timeout=70)
         self._pool.shutdown(wait=True, cancel_futures=True)
+        self._receipt_pool.shutdown(wait=True, cancel_futures=True)
         self._client.close()
         logger.info("Sync client stopped")
 
@@ -217,6 +227,7 @@ class SyncClient:
 
     def _run(self) -> None:
         futures: dict[Future[UploadOutcome | bool], QueueItem] = {}
+        receipt_futures: dict[Future[UploadOutcome | bool], QueueItem] = {}
         poll_interval = max(0.05, self._config.sync_interval)
         queue_token = getattr(self._queue, "change_token", None)
         wait_for_change = getattr(self._queue, "wait_for_change", None)
@@ -227,22 +238,40 @@ class SyncClient:
         # Keep polling while uploads are in flight. The old batch barrier waited
         # for a large archive to finish before it even looked for a newly queued
         # live delta, leaving otherwise available upload capacity unused.
-        while self._running or futures:
-            self._reap_completed(futures)
+        receipt_scan_token: object = object()
+        while self._running or futures or receipt_futures:
+            self._reap_completed(futures, receipt_futures)
+            self._reap_receipt_completions(receipt_futures)
+
+            if self._running and not self._pause_requested.is_set():
+                current_receipt_token = queue_token() if callable(queue_token) else None
+                accepted_items = getattr(self._queue, "accepted_receipt_items", None)
+                if (
+                    callable(accepted_items)
+                    and current_receipt_token != receipt_scan_token
+                ):
+                    active_receipt_ids = {item.id for item in receipt_futures.values()}
+                    for item in accepted_items():
+                        if item.id in active_receipt_ids:
+                            continue
+                        receipt_futures[
+                            self._receipt_pool.submit(self._wait_for_admission_commit, item)
+                        ] = item
+                    receipt_scan_token = current_receipt_token
 
             if not self._running:
-                if futures:
+                if futures or receipt_futures:
                     wait(
-                        tuple(futures),
+                        tuple(futures) + tuple(receipt_futures),
                         timeout=poll_interval,
                         return_when=FIRST_COMPLETED,
                     )
                 continue
 
             if self._pause_requested.is_set():
-                if futures:
+                if futures or receipt_futures:
                     wait(
-                        tuple(futures),
+                        tuple(futures) + tuple(receipt_futures),
                         timeout=poll_interval,
                         return_when=FIRST_COMPLETED,
                     )
@@ -291,9 +320,13 @@ class SyncClient:
                 for item in items:
                     futures[self._pool.submit(self._upload, item)] = item
 
-            if futures:
+            if futures or receipt_futures:
                 self._idle.clear()
-                wait(tuple(futures), timeout=poll_interval, return_when=FIRST_COMPLETED)
+                wait(
+                    tuple(futures) + tuple(receipt_futures),
+                    timeout=poll_interval,
+                    return_when=FIRST_COMPLETED,
+                )
             else:
                 self._idle.set()
                 if callable(queue_token) and callable(wait_for_change):
@@ -319,6 +352,7 @@ class SyncClient:
     def _reap_completed(
         self,
         futures: dict[Future[UploadOutcome | bool], QueueItem],
+        receipt_futures: dict[Future[UploadOutcome | bool], QueueItem] | None = None,
     ) -> None:
         """Acknowledge completed uploads without blocking queue polling."""
         completed = [future for future in futures if future.done()]
@@ -336,7 +370,25 @@ class SyncClient:
                         else UploadOutcome.transient("upload returned false")
                     )
                 )
-                if outcome.state is UploadOutcomeState.SUCCESS:
+                if outcome.state is UploadOutcomeState.ACCEPTED:
+                    receipt_id = outcome.receipt_id
+                    marker = getattr(self._queue, "mark_accepted", None)
+                    if not receipt_id or not callable(marker) or not marker(
+                        item,
+                        receipt_id=receipt_id,
+                    ):
+                        self._queue.mark_failed(
+                            item,
+                            "accepted receipt could not be persisted locally",
+                        )
+                    elif receipt_futures is not None:
+                        receipt_futures[
+                            self._receipt_pool.submit(
+                                self._wait_for_admission_commit,
+                                item,
+                            )
+                        ] = item
+                elif outcome.state is UploadOutcomeState.SUCCESS:
                     if self._queue.mark_synced(item):
                         synced = True
                         upload_synced_callback = getattr(
@@ -397,6 +449,95 @@ class SyncClient:
                     item.relative_path,
                 )
                 self._queue.mark_failed(item, str(exc))
+        if synced:
+            self._queue.cleanup_synced()
+
+    def _reap_receipt_completions(
+        self,
+        receipt_futures: dict[Future[UploadOutcome | bool], QueueItem],
+    ) -> None:
+        """Advance the durable cursor only from COMMITTED receipt outcomes."""
+        completed = [future for future in receipt_futures if future.done()]
+        synced = False
+
+        def receipt_is_live(candidate: QueueItem) -> bool:
+            predicate = getattr(self._queue, "is_accepted_receipt", None)
+            return not callable(predicate) or bool(predicate(candidate))
+
+        for future in completed:
+            item = receipt_futures.pop(future)
+            try:
+                result = future.result()
+                outcome = result if isinstance(result, UploadOutcome) else UploadOutcome.transient(
+                    "receipt poll returned false"
+                )
+                if outcome.state is UploadOutcomeState.SUCCESS:
+                    if self._queue.mark_synced(item):
+                        synced = True
+                        callback = getattr(self, "_upload_synced_callback", None)
+                        if callable(callback):
+                            callback(item)
+                        if (
+                            item.sync_strategy == "delta"
+                            and item.source_path
+                            and self._delta_catchup_callback
+                        ):
+                            self._delta_catchup_callback(item.source_path)
+                elif (
+                    outcome.state is UploadOutcomeState.SOURCE_REPAIR_REQUIRED
+                    and item.sync_strategy == "delta"
+                ):
+                    # A terminal head receipt invalidates every speculative
+                    # accepted successor.  The queue drops that chain before
+                    # requesting the existing authoritative FULL recovery.
+                    if self._queue.mark_delta_conflict(
+                        item,
+                        expected_hash=outcome.expected_hash,
+                        expected_offset=outcome.expected_offset,
+                    ):
+                        self._schedule_delta_repair(item, outcome)
+                elif outcome.state is UploadOutcomeState.TRANSIENT_RETRY:
+                    # Keep ACCEPTED durable locally; a retry cannot advance or
+                    # discard the committed cursor.  Re-enter receipt polling
+                    # without re-uploading the retained source bytes.
+                    if (
+                        self._running
+                        and not self._pause_requested.is_set()
+                        and receipt_is_live(item)
+                    ):
+                        receipt_futures[
+                            self._receipt_pool.submit(
+                                self._wait_for_admission_commit,
+                                item,
+                            )
+                        ] = item
+                else:
+                    marker = getattr(self._queue, "mark_upload_outcome", None)
+                    if callable(marker):
+                        marker(
+                            item,
+                            outcome,
+                            auth_fingerprint=getattr(self, "_auth_fingerprint", None),
+                        )
+            except Exception as exc:
+                logger.exception(
+                    "Commit receipt worker failed for %s/%s",
+                    item.tool_name,
+                    item.relative_path,
+                )
+                # Do not discard an accepted payload on a local polling
+                # failure.  It is retried in-place and also resumed on restart.
+                if (
+                    self._running
+                    and not self._pause_requested.is_set()
+                    and receipt_is_live(item)
+                ):
+                    receipt_futures[
+                        self._receipt_pool.submit(
+                            self._wait_for_admission_commit,
+                            item,
+                        )
+                    ] = item
         if synced:
             self._queue.cleanup_synced()
 
@@ -592,6 +733,9 @@ class SyncClient:
     def _upload_json(self, payload: dict) -> UploadOutcome:
         resp = self._client.post("/api/ingest/file", json=payload)
         self._raise_delta_conflict(resp, payload)
+        admission = self._accepted_admission_outcome(resp, "/api/ingest/file")
+        if admission is not None:
+            return admission
         return _classify_http_response(
             resp,
             endpoint="/api/ingest/file",
@@ -608,9 +752,102 @@ class SyncClient:
             files={"content": ("content.txt", content_stream, "text/plain")},
         )
         self._raise_delta_conflict(resp, payload)
+        admission = self._accepted_admission_outcome(
+            resp,
+            "/api/ingest/file/upload",
+        )
+        if admission is not None:
+            return admission
         return _classify_http_response(
             resp,
             endpoint="/api/ingest/file/upload",
+        )
+
+    @staticmethod
+    def _accepted_admission_outcome(response, endpoint: str) -> UploadOutcome | None:
+        """Decode the new ACCEPTED receipt without changing old-server success."""
+        if not 200 <= int(response.status_code) < 300:
+            return None
+        try:
+            payload = response.json()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("status") != "accepted":
+            return None
+        receipt_id = payload.get("receipt_id")
+        if not isinstance(receipt_id, str) or len(receipt_id) != 64:
+            return UploadOutcome.quarantine(
+                f"{endpoint} returned ACCEPTED without a valid receipt id",
+                diagnostic_code="invalid_admission_receipt",
+            )
+        return UploadOutcome.accepted(receipt_id, "server durably accepted delta")
+
+    def _wait_for_admission_commit(self, item: QueueItem) -> UploadOutcome:
+        """Poll an ACCEPTED receipt without treating it as a committed base."""
+        if not item.receipt_id:
+            return UploadOutcome.quarantine(
+                "accepted queue item has no receipt id",
+                diagnostic_code="invalid_admission_receipt",
+            )
+        deadline = time.monotonic() + ADMISSION_COMMIT_TIMEOUT_SECONDS
+        while self._running and not self._pause_requested.is_set():
+            try:
+                response = self._client.post(
+                    "/api/ingest/file/receipt/status",
+                    json={"receipt_id": item.receipt_id},
+                )
+            except httpx.TransportError as exc:
+                logger.debug("Commit receipt unavailable for %s: %s", item.relative_path, exc)
+            else:
+                if response.status_code == 200:
+                    try:
+                        payload = response.json()
+                    except (AttributeError, TypeError, ValueError):
+                        return UploadOutcome.quarantine(
+                            "receipt status endpoint returned invalid JSON",
+                            diagnostic_code="invalid_commit_status",
+                        )
+                    status = payload.get("status") if isinstance(payload, dict) else None
+                    returned_receipt = payload.get("receipt_id") if isinstance(payload, dict) else None
+                    if returned_receipt not in (None, item.receipt_id):
+                        return UploadOutcome.quarantine(
+                            "receipt status identity changed",
+                            diagnostic_code="commit_identity_mismatch",
+                        )
+                    if status == "committed":
+                        return UploadOutcome.success("admitted delta committed")
+                    if status in {"failed", "blocked", "missing"}:
+                        error_type = str(payload.get("error_type") or "unknown")
+                        return UploadOutcome.source_repair(
+                            f"server receipt is {status} ({error_type})",
+                            diagnostic_code=(
+                                "delta_base_mismatch"
+                                if error_type == "DeltaBaseMismatch"
+                                else f"receipt_{status}"
+                            ),
+                            repair_action=SourceRepairAction.DELTA_BASE_CONFLICT,
+                        )
+                    if status not in {"accepted", "receiving"}:
+                        return UploadOutcome.quarantine(
+                            f"unknown receipt status: {status!r}",
+                            diagnostic_code="invalid_commit_status",
+                        )
+                else:
+                    outcome = _classify_http_response(
+                        response,
+                        endpoint="/api/ingest/file/receipt/status",
+                    )
+                    if outcome.state is not UploadOutcomeState.TRANSIENT_RETRY:
+                        return outcome
+            if time.monotonic() >= deadline:
+                return UploadOutcome.transient(
+                    "timed out awaiting admitted delta commit",
+                    diagnostic_code="commit_timeout",
+                )
+            self._sleep_interruptibly(ADMISSION_COMMIT_POLL_SECONDS)
+        return UploadOutcome.transient(
+            "admitted delta commit polling paused",
+            diagnostic_code="upload_paused",
         )
 
     def _upload_chunked(

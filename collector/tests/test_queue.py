@@ -363,6 +363,106 @@ class SyncQueueTests(unittest.TestCase):
             (expected_hash, 20),
         )
 
+    def test_accepted_receipt_keeps_durable_cursor_unchanged(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10,
+        )
+        admitted = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_accepted(admitted, receipt_id="a" * 64))
+
+        # ACCEPTED enables speculative capture, but is never written to the
+        # durable committed cursor used by restart/full-repair recovery.
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            ("hash-0", 10),
+        )
+        self.assertEqual(
+            self.queue.get_capture_delta_base("codex", "history.jsonl"),
+            ("hash-1", 20),
+        )
+        self.assertEqual(
+            self.queue.get_file_state("codex", "history.jsonl"),
+            ("hash-1", 20),
+        )
+        self.assertEqual(len(self.queue.accepted_receipt_items()), 1)
+
+    def test_accepted_head_failure_discards_speculative_successor_chain(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10,
+        )
+        head = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_accepted(head, receipt_id="a" * 64))
+        self._enqueue(
+            "history.jsonl", "tail-2", "hash-2", "delta", True, 30,
+            base_hash="hash-1", base_offset=20,
+        )
+
+        self.assertTrue(self.queue.mark_delta_conflict(head))
+        self.assertEqual(self.queue.pending_count(), 0)
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            ("hash-0", 10),
+        )
+        self.assertEqual(
+            [row[2] for row in self._status_rows()],
+            ["synced", "superseded", "superseded"],
+        )
+
+    def test_later_committed_receipt_retires_prefix_without_cursor_regression(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10,
+        )
+        head = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_accepted(head, receipt_id="a" * 64))
+        self._enqueue(
+            "history.jsonl", "tail-2", "hash-2", "delta", True, 30,
+            base_hash="hash-1", base_offset=20,
+        )
+        successor = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_accepted(successor, receipt_id="b" * 64))
+
+        # Receipt futures are independent. Observing the successor first proves
+        # its exact-base prefix committed and must make a later head completion
+        # a no-op rather than moving the durable cursor backward.
+        self.assertTrue(self.queue.mark_synced(successor))
+        self.assertFalse(self.queue.mark_synced(head))
+        self.assertEqual(
+            self.queue.get_delta_base("codex", "history.jsonl"),
+            ("hash-2", 30),
+        )
+        self.assertEqual(
+            [row[2] for row in self._status_rows()],
+            ["synced", "synced", "synced"],
+        )
+
+    def test_authoritative_full_fences_accepted_delta_chain(self) -> None:
+        self._enqueue("history.jsonl", "base", "hash-0", "full", False, 10)
+        self.assertTrue(self.queue.mark_synced(self.queue.claim_batch()[0]))
+        self._enqueue(
+            "history.jsonl", "tail-1", "hash-1", "delta", True, 20,
+            base_hash="hash-0", base_offset=10,
+        )
+        accepted = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_accepted(accepted, receipt_id="a" * 64))
+
+        self._enqueue("history.jsonl", "full-2", "hash-full", "delta", False, 30)
+
+        self.assertEqual(self.queue.accepted_receipt_items(), [])
+        self.assertFalse(self.queue.mark_synced(accepted))
+        self.assertEqual(
+            [row[2] for row in self._status_rows()],
+            ["synced", "superseded", "pending"],
+        )
+
     def test_mixed_strategies_cannot_claim_same_path_concurrently(self) -> None:
         self._enqueue("same.jsonl", "delta", "hash-delta", "delta", True, 10)
         self._enqueue("same.jsonl", "full", "hash-full", "full", False, 20)

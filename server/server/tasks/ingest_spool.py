@@ -47,6 +47,7 @@ from ..services.ingest_spool import (
     ready_manifest,
     ready_job_ids,
     ready_delta_chain_job_ids,
+    read_ready_job_bytes,
     record_job_attempt,
     select_ready_source_head,
     source_identity,
@@ -64,6 +65,70 @@ class RetryLimitExceeded(RuntimeError):
 
 
 _existing_full_supersedes = committed_full_supersedes
+
+
+async def _ingest_realtime_delta_chain(
+    *,
+    payload_jobs: tuple[tuple[str, dict], ...],
+    machine_id: str,
+    user_id: UUID,
+) -> dict:
+    """Use the Phase 2 raw writer once for every admitted DELTA chain."""
+    from ..services.realtime_raw_writer import ingest_conversation_raw_chain
+    from ..services.sse_service import publish_event
+
+    frames: list[dict] = []
+    for job_id, manifest in payload_jobs:
+        meta, payload = await asyncio.to_thread(
+            read_ready_job_bytes,
+            job_id,
+            manifest=manifest,
+        )
+        source_meta = meta["meta"]
+        frames.append(
+            {
+                "tool_id": source_meta["tool"],
+                "category": source_meta["category"],
+                "content_type": source_meta["content_type"],
+                "relative_path": source_meta["relative_path"],
+                "content": payload.decode("utf-8", errors="replace"),
+                "content_hash": source_meta["hash"],
+                "file_size": int(source_meta["file_size"]),
+                "mode": source_meta.get("mode", "delta"),
+                "offset": int(source_meta.get("offset", 0)),
+                "metadata": dict(source_meta.get("metadata", {})),
+                "timestamp": source_meta.get("timestamp"),
+                "machine_id": machine_id,
+                "user_id": str(user_id),
+                "base_hash": source_meta.get("base_hash"),
+                "base_offset": source_meta.get("base_offset"),
+            }
+        )
+    document, event = await ingest_conversation_raw_chain(
+        frames=frames,
+        database_url=settings.database_url,
+    )
+    if event is not None:
+        # The transaction has already committed.  A failed Redis publish is an
+        # acceleration failure only; recovered receipts remain authoritative.
+        try:
+            await publish_event(
+                event["event_type"],
+                event["data"],
+                user_id=event.get("user_id"),
+            )
+        except Exception:
+            logger.exception(
+                "Post-commit realtime event could not be published for %s",
+                document.id,
+            )
+    return {
+        "status": document._memento_ingest_disposition,
+        "job_id": payload_jobs[0][0],
+        "document_id": str(document.id),
+        "bytes": sum(int(manifest["meta"]["file_size"]) for _, manifest in payload_jobs),
+        "coalesced_frames": len(payload_jobs),
+    }
 
 
 def _preflight_full_supersedes(**revision) -> bool:
@@ -113,6 +178,19 @@ async def _ingest_ready_job(
         )
         machine_id = str(machine.id)
         await device_db.commit()
+
+    # Phase 3 DELTAs carry an authenticated admission marker.  They never go
+    # through the ORM finalizer: one raw asyncpg transaction owns every
+    # contiguous frame, then every constituent receipt is completed together.
+    if all(
+        candidate[1]["meta"].get("realtime_admission") is True
+        for candidate in payload_jobs
+    ):
+        return await _ingest_realtime_delta_chain(
+            payload_jobs=payload_jobs,
+            machine_id=machine_id,
+            user_id=user_id,
+        )
 
     if meta.get("mode", "full") == "full" and not meta.get(
         "authoritative_rebase", False
@@ -319,7 +397,16 @@ def process_spooled_ingest(self, job_id: str) -> dict:
     if not _JOB_ID_RE.fullmatch(job_id):
         return {"status": "invalid", "job_id": job_id}
 
-    initial_manifest = try_ready_manifest_metadata(job_id)
+    realtime_manifest = try_ready_manifest_metadata(job_id)
+    if (
+        realtime_manifest is not None
+        and realtime_manifest["meta"].get("realtime_admission") is True
+    ):
+        # Phase 3 owns these markers in its persistent single drain.  Never
+        # turn an admission wake/recovery scan into one Celery child per frame.
+        return {"status": "delegated_to_realtime_drain", "job_id": job_id}
+
+    initial_manifest = realtime_manifest
     initial_identity = (
         source_identity(initial_manifest) if initial_manifest is not None else None
     )
@@ -546,7 +633,12 @@ def recover_spooled_ingests() -> dict:
     job_ids = ready_job_ids_in_recovery_order()
     failed_count = len(failed_job_ids())
     blocked_count = len(blocked_job_ids())
+    realtime_count = 0
     for job_id in job_ids:
+        manifest = try_ready_manifest_metadata(job_id)
+        if manifest is not None and manifest["meta"].get("realtime_admission") is True:
+            realtime_count += 1
+            continue
         process_spooled_ingest.apply_async(
             args=[job_id],
             queue="ingest",
@@ -559,4 +651,5 @@ def recover_spooled_ingests() -> dict:
         "completion_receipts_removed": receipts_removed,
         "quarantined_count": failed_count,
         "blocked_count": blocked_count,
+        "realtime_drain_ready_count": realtime_count,
     }

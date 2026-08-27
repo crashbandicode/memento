@@ -137,29 +137,73 @@ async def _run_delta(
     session_id: str,
     use_core_delta_message_staging: bool,
     writer: str,
+    frames_per_drain: int = 1,
+    coalesced: bool = False,
 ) -> None:
-    await ingest_file(
-        session,
-        tool_id="codex",
-        category="conversation",
-        content_type="jsonl",
-        relative_path=relative_path,
-        content=fixture.delta,
-        content_hash=_hash(fixture.final),
-        file_size=len(fixture.delta.encode("utf-8")),
-        mode="delta",
-        offset=len(fixture.final.encode("utf-8")),
-        base_hash=_hash(fixture.full),
-        base_offset=len(fixture.full.encode("utf-8")),
-        metadata={"session_id": session_id},
-        timestamp=1_785_932_801.0,
-        machine_id=machine.id,
-        user_id=str(user.id),
-        schedule_post_ingest=False,
-        use_core_delta_message_staging=use_core_delta_message_staging,
-        writer=writer,
-    )
-    await session.commit()
+    lines = fixture.delta.splitlines()
+    if frames_per_drain < 1 or frames_per_drain > len(lines):
+        raise ValueError("frames_per_drain must be between 1 and delta line count")
+    frame_size = max(1, (len(lines) + frames_per_drain - 1) // frames_per_drain)
+    fragments = [
+        "\n".join(lines[index : index + frame_size])
+        for index in range(0, len(lines), frame_size)
+    ]
+    current = fixture.full
+    current_hash = _hash(current)
+    current_offset = len(current.encode("utf-8"))
+    frames: list[dict[str, object]] = []
+    for index, fragment in enumerate(fragments, start=1):
+        final = f"{current}\n{fragment}"
+        final_hash = _hash(final)
+        final_offset = len(final.encode("utf-8"))
+        frames.append(
+            {
+                "tool_id": "codex", "category": "conversation",
+                "content_type": "jsonl", "relative_path": relative_path,
+                "content": fragment, "content_hash": final_hash,
+                "file_size": len(fragment.encode("utf-8")), "mode": "delta",
+                "offset": final_offset, "base_hash": current_hash,
+                "base_offset": current_offset, "metadata": {"session_id": session_id},
+                "timestamp": 1_785_932_800.0 + index,
+                "machine_id": machine.id, "user_id": str(user.id),
+            }
+        )
+        current, current_hash, current_offset = final, final_hash, final_offset
+    if coalesced:
+        if writer != "raw":
+            raise ValueError("coalesced benchmark requires --writer raw")
+        from ..services.realtime_raw_writer import ingest_conversation_raw_chain
+
+        await ingest_conversation_raw_chain(
+            frames=frames,
+            database_url=session.get_bind().url.render_as_string(hide_password=False),
+        )
+        return
+    for frame in frames:
+        await ingest_file(
+            session,
+            tool_id="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=relative_path,
+            content=str(frame["content"]),
+            content_hash=str(frame["content_hash"]),
+            file_size=int(frame["file_size"]),
+            mode="delta",
+            offset=int(frame["offset"]),
+            base_hash=str(frame["base_hash"]),
+            base_offset=int(frame["base_offset"]),
+            metadata={"session_id": session_id},
+            timestamp=float(frame["timestamp"]),
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
+        )
+        # Separate synchronous calls are separate commits by definition.
+        await session.commit()
+    return
 
 
 async def _timed_sample(
@@ -169,6 +213,8 @@ async def _timed_sample(
     sample: int,
     use_core_delta_message_staging: bool,
     writer: str,
+    frames_per_drain: int,
+    coalesced: bool,
 ) -> dict[str, int]:
     async with session_factory() as session:
         user, machine, relative_path, session_id = await _seed_document(
@@ -188,6 +234,8 @@ async def _timed_sample(
             session_id=session_id,
             use_core_delta_message_staging=use_core_delta_message_staging,
             writer=writer,
+            frames_per_drain=frames_per_drain,
+            coalesced=coalesced,
         )
         return {
             "wall_ns": time.perf_counter_ns() - wall_started,
@@ -202,6 +250,8 @@ async def _allocation_sample(
     sample: int,
     use_core_delta_message_staging: bool,
     writer: str,
+    frames_per_drain: int,
+    coalesced: bool,
 ) -> dict[str, int]:
     async with session_factory() as session:
         user, machine, relative_path, session_id = await _seed_document(
@@ -221,6 +271,8 @@ async def _allocation_sample(
             session_id=session_id,
             use_core_delta_message_staging=use_core_delta_message_staging,
             writer=writer,
+            frames_per_drain=frames_per_drain,
+            coalesced=coalesced,
         )
         after = tracemalloc.take_snapshot()
         _current, peak = tracemalloc.get_traced_memory()
@@ -261,6 +313,8 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 sample=warmup,
                 use_core_delta_message_staging=use_core,
                 writer=args.writer,
+                frames_per_drain=args.frames_per_drain,
+                coalesced=args.coalesced,
             )
         timed = [
             await _timed_sample(
@@ -269,6 +323,8 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 sample=sample,
                 use_core_delta_message_staging=use_core,
                 writer=args.writer,
+                frames_per_drain=args.frames_per_drain,
+                coalesced=args.coalesced,
             )
             for sample in range(args.iterations)
         ]
@@ -279,6 +335,8 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 sample=sample,
                 use_core_delta_message_staging=use_core,
                 writer=args.writer,
+                frames_per_drain=args.frames_per_drain,
+                coalesced=args.coalesced,
             )
             for sample in range(args.allocation_samples)
         ]
@@ -293,9 +351,15 @@ async def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "iterations": args.iterations,
             "warmup": args.warmup,
             "allocation_samples": args.allocation_samples,
+            "frames_per_drain": args.frames_per_drain,
+            "coalesced": args.coalesced,
         },
         "median": {
             "cpu_ms_per_sync": _median_ms([item["cpu_ns"] for item in timed]),
+            "cpu_ms_per_frame": round(
+                _median_ms([item["cpu_ns"] for item in timed]) / args.frames_per_drain,
+                3,
+            ),
             "wall_ms_per_sync": _median_ms([item["wall_ns"] for item in timed]),
             "net_allocated_bytes": int(
                 statistics.median(
@@ -324,9 +388,19 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--allocation-samples", type=int, default=3)
+    parser.add_argument("--frames-per-drain", type=int, default=1)
+    parser.add_argument("--coalesced", action="store_true")
     args = parser.parse_args()
-    if args.messages < 1 or args.iterations < 1 or args.allocation_samples < 1:
-        parser.error("messages, iterations, and allocation samples must be positive")
+    if (
+        args.messages < 1
+        or args.iterations < 1
+        or args.allocation_samples < 1
+        or args.frames_per_drain < 1
+        or args.frames_per_drain > args.messages
+    ):
+        parser.error("messages, frames, iterations, and allocation samples must be positive")
+    if args.coalesced and args.writer != "raw":
+        parser.error("--coalesced requires --writer raw")
     print(json.dumps(asyncio.run(_benchmark(args)), indent=2, sort_keys=True))
 
 

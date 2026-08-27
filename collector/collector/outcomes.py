@@ -13,6 +13,7 @@ class UploadOutcomeState(str, Enum):
     """Disposition of one upload attempt."""
 
     SUCCESS = "success"
+    ACCEPTED = "accepted"
     TRANSIENT_RETRY = "transient_retry"
     AUTHENTICATION_BLOCKED = "authentication_blocked"
     SOURCE_REPAIR_REQUIRED = "source_repair_required"
@@ -37,6 +38,7 @@ class UploadOutcome:
     repair_action: SourceRepairAction | None = None
     expected_hash: str | None = None
     expected_offset: int = 0
+    receipt_id: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -50,6 +52,16 @@ class UploadOutcome:
     @classmethod
     def success(cls, diagnostic: str = "") -> "UploadOutcome":
         return cls(UploadOutcomeState.SUCCESS, diagnostic=diagnostic)
+
+    @classmethod
+    def accepted(cls, receipt_id: str, diagnostic: str = "") -> "UploadOutcome":
+        """The server fsynced work but has not committed the source fence."""
+        return cls(
+            UploadOutcomeState.ACCEPTED,
+            diagnostic=diagnostic,
+            diagnostic_code="accepted_awaiting_commit",
+            receipt_id=receipt_id,
+        )
 
     @classmethod
     def transient(

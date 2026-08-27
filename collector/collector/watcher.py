@@ -782,7 +782,12 @@ class FileWatcher:
                 16 * 1024 * 1024,
             )
             if not force_full:
-                base_hash, base_offset = self._queue.get_delta_base(
+                capture_base = getattr(
+                    self._queue,
+                    "get_capture_delta_base",
+                    self._queue.get_delta_base,
+                )
+                base_hash, base_offset = capture_base(
                     classification.tool_name,
                     classification.relative_path,
                 )

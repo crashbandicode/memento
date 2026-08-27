@@ -218,6 +218,23 @@ class _SignaledQueue(_ConcurrentQueue):
             self._condition.notify_all()
 
 
+class _AcceptedReceiptQueue(_SignaledQueue):
+    def __init__(self, item: QueueItem) -> None:
+        super().__init__()
+        self.item = item
+        self.accepted = True
+
+    def accepted_receipt_items(self) -> list[QueueItem]:
+        return [self.item] if self.accepted else []
+
+    def is_accepted_receipt(self, item: QueueItem) -> bool:
+        return self.accepted and item.id == self.item.id
+
+    def mark_synced(self, item: QueueItem) -> bool:
+        self.accepted = False
+        return super().mark_synced(item)
+
+
 class SyncClientStreamingTests(unittest.TestCase):
     @staticmethod
     def _item(
@@ -394,6 +411,56 @@ class SyncClientStreamingTests(unittest.TestCase):
             client._pool.shutdown(wait=True)
 
         self.assertFalse(worker.is_alive())
+
+    def test_resume_rescans_durable_accepted_receipts(self) -> None:
+        item = self._item(100)
+        item.sync_strategy = "delta"
+        item.is_partial = True
+        item.receipt_id = "a" * 64
+        queue = _AcceptedReceiptQueue(item)
+        client = object.__new__(SyncClient)
+        client._queue = queue
+        client._config = SimpleNamespace(
+            batch_size=20,
+            max_concurrent_uploads=1,
+            max_in_flight_bytes=64 * 1024 * 1024,
+            max_delta_upload_bytes=16 * 1024 * 1024,
+            queue_lease_seconds=300,
+            sync_interval=0.01,
+        )
+        client._running = True
+        client._pause_requested = threading.Event()
+        client._pause_requested.set()
+        client._idle = threading.Event()
+        client._pool = ThreadPoolExecutor(max_workers=1)
+        client._receipt_pool = ThreadPoolExecutor(max_workers=1)
+        client._delta_catchup_callback = None
+        client._upload_synced_callback = None
+        polled = threading.Event()
+        client._wait_for_admission_commit = (
+            lambda _item: polled.set() or UploadOutcome.success()
+        )
+
+        worker = threading.Thread(target=client._run)
+        worker.start()
+        try:
+            self.assertTrue(client._idle.wait(timeout=1))
+            self.assertFalse(polled.is_set())
+            client.resume()
+            self.assertTrue(polled.wait(timeout=1))
+            deadline = time.monotonic() + 1
+            while queue.accepted and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            client._running = False
+            queue.wake_waiters()
+            worker.join(timeout=2)
+            client._pool.shutdown(wait=True)
+            client._receipt_pool.shutdown(wait=True)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(queue.accepted)
+        self.assertEqual(queue.synced, [item.id])
 
     def test_successful_delta_base_schedules_the_next_bounded_window(self) -> None:
         item = self._item(100)

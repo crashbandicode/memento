@@ -36,11 +36,13 @@ from server.services.ingest_spool import (  # noqa: E402
     read_ready_job_bytes,
     ready_job_ids,
     record_job_attempt,
+    receipt_commit_status,
     remove_job,
     select_ready_source_head,
     source_identity,
     spool_job_lock,
     spool_source_lock,
+    stage_delta_payload,
     stage_chunk,
     superseding_ready_full_job_id,
 )
@@ -113,6 +115,79 @@ class IngestSpoolTests(unittest.TestCase):
             force_reprocess=force_reprocess,
             root=self.root,
         )
+
+    def test_realtime_delta_receipt_distinguishes_accepted_and_committed(self) -> None:
+        payload = b'{"type":"event_msg"}\n'
+        meta = self._meta(
+            0,
+            1,
+            mode="delta",
+            file_size=len(payload),
+            hash="b" * 64,
+            base_hash="a" * 64,
+            base_offset=10,
+            offset=20,
+            upload_id="realtime/test",
+            admission_identity="c" * 64,
+            delivery_identity="d" * 64,
+        )
+        staged = stage_delta_payload(
+            meta=meta,
+            payload=payload,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            device_name="Yoga",
+            device_platform="Windows",
+            root=self.root,
+        )
+        self.assertTrue(staged.complete)
+        accepted = receipt_commit_status(
+            receipt_id=staged.job_id,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            root=self.root,
+        )
+        self.assertEqual(accepted.status, "accepted")
+        self.assertTrue(
+            complete_and_remove_job(
+                staged.job_id,
+                document_id="document-1",
+                root=self.root,
+            )
+        )
+        committed = receipt_commit_status(
+            receipt_id=staged.job_id,
+            user_id="11111111-1111-1111-1111-111111111111",
+            device_id="device-1",
+            root=self.root,
+        )
+        self.assertEqual(committed.status, "committed")
+
+    def test_realtime_delta_rejects_same_revision_with_different_payload(self) -> None:
+        first = b'{"type":"event_msg","n":1}\n'
+        second = b'{"type":"event_msg","n":2}\n'
+        common = {
+            "mode": "delta", "hash": "b" * 64, "base_hash": "a" * 64,
+            "base_offset": 10, "offset": 20, "upload_id": "realtime/test",
+            "admission_identity": "c" * 64,
+        }
+        first_meta = self._meta(
+            0, 1, file_size=len(first), delivery_identity="d" * 64, **common
+        )
+        stage_delta_payload(
+            meta=first_meta, payload=first,
+            user_id="11111111-1111-1111-1111-111111111111", device_id="device-1",
+            device_name="Yoga", device_platform="Windows", root=self.root,
+        )
+        second_meta = self._meta(
+            0, 1, file_size=len(second), delivery_identity="e" * 64, **common
+        )
+        with self.assertRaisesRegex(ChunkValidationError, "conflicts with an admitted payload"):
+            stage_delta_payload(
+                meta=second_meta, payload=second,
+                user_id="11111111-1111-1111-1111-111111111111", device_id="device-1",
+                device_name="Yoga", device_platform="Windows", root=self.root,
+            )
 
     def test_out_of_order_chunks_complete_only_after_gap_is_filled(self) -> None:
         job_id, complete = self._stage(self._meta(2, 3, file_size=16), b"third")
@@ -747,6 +822,28 @@ class IngestSpoolTests(unittest.TestCase):
             (second,),
         )
 
+    def test_delta_chain_uses_hash_offset_links_when_timestamps_regress(self) -> None:
+        successor, _ = self._stage(
+            self._meta(
+                0, 1, upload_id="delta-two", hash="hash-two", mode="delta",
+                base_hash="hash-one", base_offset=1, offset=2, timestamp=1.0,
+            ),
+            b"b",
+        )
+        head, _ = self._stage(
+            self._meta(
+                0, 1, upload_id="delta-one", hash="hash-one", mode="delta",
+                base_hash="base", base_offset=0, offset=1, timestamp=2.0,
+            ),
+            b"a",
+        )
+
+        self.assertEqual(select_ready_source_head(successor, self.root), (head, ()))
+        self.assertEqual(
+            ready_delta_chain_job_ids(head, self.root),
+            (head, successor),
+        )
+
     def test_delta_chain_stops_at_a_discontinuity_or_failed_barrier(self) -> None:
         first, _ = self._stage(
             self._meta(
@@ -971,6 +1068,40 @@ class IngestSpoolTests(unittest.TestCase):
 
         self.assertEqual(select_ready_source_head(delta, self.root), (None, ()))
         self.assertNotIn(delta, ready_job_ids_in_recovery_order(self.root))
+
+    def test_new_delta_root_after_direct_full_bypasses_old_failed_chain(self) -> None:
+        failed_head, _ = self._stage(
+            self._meta(
+                0, 1, upload_id="failed-head", hash="old-one", mode="delta",
+                base_hash="old-base", base_offset=10, offset=20, timestamp=1.0,
+            ),
+            b"a",
+        )
+        blocked_successor, _ = self._stage(
+            self._meta(
+                0, 1, upload_id="blocked-tail", hash="old-two", mode="delta",
+                base_hash="old-one", base_offset=20, offset=30, timestamp=2.0,
+            ),
+            b"b",
+        )
+        recovered_delta, _ = self._stage(
+            self._meta(
+                0, 1, upload_id="recovered-tail", hash="new-one", mode="delta",
+                base_hash="old-two", base_offset=30, offset=50, timestamp=3.0,
+            ),
+            b"c",
+        )
+        mark_job_failed(failed_head, error_type="test", attempts=1, root=self.root)
+        mark_job_failed(blocked_successor, error_type="test", attempts=1, root=self.root)
+
+        self.assertEqual(
+            select_ready_source_head(blocked_successor, self.root),
+            (recovered_delta, ()),
+        )
+        self.assertEqual(
+            ready_delta_chain_job_ids(recovered_delta, self.root),
+            (recovered_delta,),
+        )
 
     def test_corrupt_delta_is_ordered_then_becomes_a_failed_barrier(self) -> None:
         base, _ = self._stage(

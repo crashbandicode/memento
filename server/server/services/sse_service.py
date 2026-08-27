@@ -29,6 +29,7 @@ _STREAM_PREFIX = "memento:realtime:v1"
 _STREAM_MAX_EVENTS = 1_000
 _STREAM_TTL_SECONDS = 24 * 60 * 60
 _STREAM_BLOCK_MS = 25_000
+_PUBLISH_SOCKET_TIMEOUT_SECONDS = 0.2
 _LOCAL_MAX_EVENTS = 200
 _EVENT_ID_RE = re.compile(r"^\d+-\d+$")
 
@@ -90,8 +91,8 @@ def _get_redis_publisher() -> redis.Redis:
         _redis_client = redis.Redis.from_url(
             settings.redis_url,
             decode_responses=True,
-            socket_connect_timeout=1,
-            socket_timeout=1,
+            socket_connect_timeout=_PUBLISH_SOCKET_TIMEOUT_SECONDS,
+            socket_timeout=_PUBLISH_SOCKET_TIMEOUT_SECONDS,
         )
         _redis_client_pid = process_id
     return _redis_client

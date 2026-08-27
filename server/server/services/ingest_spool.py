@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -49,6 +50,8 @@ COMPLETION_RECEIPT_SECONDS = 7 * 24 * 60 * 60
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 SourceIdentity = tuple[str, str, str, str]
+_portable_lock_guard = threading.Lock()
+_portable_locks: dict[str, threading.Lock] = {}
 
 
 class ChunkValidationError(ValueError):
@@ -83,6 +86,17 @@ class ChunkCommitStatus:
 
 
 def _job_id(meta: dict[str, Any], user_id: str, device_id: str) -> str:
+    # Realtime admission supplies an identity derived from the authenticated
+    # source/revision envelope and payload proof.  Keep the historical chunk
+    # identity unchanged for older collectors and already-spooled uploads.
+    delivery_identity = meta.get("delivery_identity")
+    if isinstance(delivery_identity, str) and delivery_identity:
+        identity = json.dumps(
+            [user_id, device_id, "realtime-receipt-v1", delivery_identity],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
     identity = json.dumps(
         [user_id, device_id, meta.get("upload_id"), meta.get("hash")],
         ensure_ascii=False,
@@ -100,23 +114,58 @@ def _job_dir(job_id: str, root: Path) -> Path:
 @contextmanager
 def _filesystem_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     """Cross-process advisory lock for API workers sharing one spool volume."""
-    import fcntl
-
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     stream = path.open("a+b")
     os.chmod(path, 0o600)
-    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
     acquired = False
     try:
         try:
+            # fcntl is ideal on the Linux spool volume used in production.
+            # Windows test/development hosts lack it, so use the CRT byte-lock
+            # there and retain a process-local guard for thread correctness.
+            import fcntl
+
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             fcntl.flock(stream.fileno(), flags)
             acquired = True
+            unlock = lambda: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except ModuleNotFoundError:
+            import msvcrt
+
+            key = str(path.resolve())
+            with _portable_lock_guard:
+                local_lock = _portable_locks.setdefault(key, threading.Lock())
+            acquired = local_lock.acquire(blocking=blocking)
+            if acquired:
+                # msvcrt locks a byte range; ensure the range exists first.
+                stream.seek(0)
+                if stream.tell() == 0 and stream.read(1) == b"":
+                    stream.seek(0)
+                    stream.write(b"\0")
+                    stream.flush()
+                stream.seek(0)
+                try:
+                    msvcrt.locking(
+                        stream.fileno(),
+                        msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK,
+                        1,
+                    )
+                except OSError:
+                    local_lock.release()
+                    acquired = False
+
+            def unlock() -> None:
+                try:
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                finally:
+                    local_lock.release()
         except BlockingIOError:
             pass
         yield acquired
     finally:
         if acquired:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            unlock()
         stream.close()
 
 
@@ -165,6 +214,20 @@ def spool_source_lock(
         yield acquired
 
 
+@contextmanager
+def spool_realtime_drain_lock(
+    *,
+    root: Path = DEFAULT_SPOOL_ROOT,
+    blocking: bool = False,
+) -> Iterator[bool]:
+    """Enforce one long-lived Phase 3 drain for the shared spool."""
+    with _filesystem_lock(
+        root / ".realtime-drain.lock",
+        blocking=blocking,
+    ) as acquired:
+        yield acquired
+
+
 def _spool_usage_bytes(root: Path) -> int:
     total = 0
     if not root.exists():
@@ -203,6 +266,68 @@ def _completion_path(job_id: str, root: Path) -> Path:
     if not _JOB_ID_RE.fullmatch(job_id):
         raise ChunkValidationError("invalid spool job id")
     return root / "completed" / f"{job_id}.json"
+
+
+def _completion_payload(job_id: str, root: Path) -> dict[str, Any] | None:
+    path = _completion_path(job_id, root)
+    if not path.is_file():
+        return None
+    try:
+        value = orjson.loads(path.read_text(encoding="utf-8"))
+    except (OSError, orjson.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def receipt_commit_status(
+    *,
+    receipt_id: str,
+    user_id: str,
+    device_id: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> ChunkCommitStatus:
+    """Return the durable admission/commit state for one authenticated receipt.
+
+    This is deliberately distinct from the legacy chunk status vocabulary:
+    ``accepted`` is only fsynced spool durability, while ``committed`` means
+    the PostgreSQL transaction completed.  The caller must continue retaining
+    the local payload in every non-terminal state.
+    """
+    if not _JOB_ID_RE.fullmatch(receipt_id):
+        raise ChunkValidationError("invalid spool receipt id")
+    completion = _completion_payload(receipt_id, root)
+    if completion is not None:
+        if (
+            completion.get("user_id") not in (None, user_id)
+            or completion.get("device_id") not in (None, device_id)
+        ):
+            return ChunkCommitStatus(job_id=receipt_id, status="missing")
+        return ChunkCommitStatus(job_id=receipt_id, status="committed")
+
+    job_dir = _job_dir(receipt_id, root)
+    if not job_dir.is_dir():
+        return ChunkCommitStatus(job_id=receipt_id, status="missing")
+    manifest = try_ready_manifest_metadata(receipt_id, root)
+    if manifest is not None and (
+        manifest.get("user_id") != user_id or manifest.get("device_id") != device_id
+    ):
+        return ChunkCommitStatus(job_id=receipt_id, status="missing")
+    failed_path = job_dir / "failed.json"
+    if failed_path.is_file():
+        error_type = None
+        try:
+            payload = orjson.loads(failed_path.read_text(encoding="utf-8"))
+            value = payload.get("error_type")
+            if isinstance(value, str) and value:
+                error_type = value[:128]
+        except (OSError, orjson.JSONDecodeError):
+            pass
+        return ChunkCommitStatus(receipt_id, "failed", error_type)
+    if (job_dir / "blocked.json").is_file():
+        return ChunkCommitStatus(receipt_id, "blocked")
+    if (job_dir / "ready").is_file():
+        return ChunkCommitStatus(receipt_id, "accepted")
+    return ChunkCommitStatus(receipt_id, "receiving")
 
 
 def has_completion_receipt(
@@ -259,19 +384,44 @@ def chunk_commit_status(
     return ChunkCommitStatus(job_id=job_id, status="missing")
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path, *, strict: bool = False) -> None:
     """Persist directory-entry changes on filesystems that support it."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
         fd = os.open(path, flags)
     except OSError:
+        if strict and os.name != "nt":
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if strict and os.name != "nt":
+            raise
     finally:
         os.close(fd)
+
+
+def _durable_replace(temporary: Path, path: Path) -> None:
+    """Atomically publish a file with rename durability on Windows and POSIX."""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+        move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+        move_file_ex.restype = wintypes.BOOL
+        movefile_replace_existing = 0x1
+        movefile_write_through = 0x8
+        if not move_file_ex(
+            str(temporary),
+            str(path),
+            movefile_replace_existing | movefile_write_through,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    os.replace(temporary, path)
+    _fsync_directory(path.parent, strict=True)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -282,8 +432,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        _durable_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -377,7 +526,73 @@ def _validated_chunk_coordinates(
         or not math.isfinite(timestamp)
     ):
         raise ChunkValidationError("timestamp must be finite and numeric")
+    for field in ("delivery_identity", "admission_identity"):
+        value = meta.get(field)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or not _JOB_ID_RE.fullmatch(value)
+        ):
+            raise ChunkValidationError(f"invalid {field}")
+    payload_sha256 = meta.get("payload_sha256")
+    if payload_sha256 is not None and (
+        not isinstance(payload_sha256, str)
+        or not _JOB_ID_RE.fullmatch(payload_sha256)
+    ):
+        raise ChunkValidationError("invalid payload_sha256")
     return chunk_index, total_chunks
+
+
+def _admission_claim_path(admission_identity: str, root: Path) -> Path:
+    claims = root / "admissions"
+    claims_created = not claims.exists()
+    claims.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if claims_created:
+        _fsync_directory(root, strict=True)
+    shard = claims / admission_identity[:2]
+    shard_created = not shard.exists()
+    shard.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if shard_created:
+        _fsync_directory(claims, strict=True)
+    return shard / f"{admission_identity}.json"
+
+
+def _admission_conflicts_with_existing_payload(
+    *,
+    meta: dict[str, Any],
+    root: Path,
+) -> bool:
+    """Reject same source/revision envelope with different admitted bytes."""
+    admission_identity = meta.get("admission_identity")
+    payload_sha256 = meta.get("payload_sha256")
+    if not isinstance(admission_identity, str) or not isinstance(payload_sha256, str):
+        return False
+    claim_path = _admission_claim_path(admission_identity, root)
+    lock_path = root / ".admission-locks" / f".{admission_identity}.lock"
+    with _filesystem_lock(lock_path):
+        if not claim_path.is_file():
+            _atomic_write(
+                claim_path,
+                json.dumps(
+                    {
+                        "admission_identity": admission_identity,
+                        "payload_sha256": payload_sha256,
+                        "created_at": time.time(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            return False
+        try:
+            value = orjson.loads(claim_path.read_text(encoding="utf-8"))
+        except (OSError, orjson.JSONDecodeError):
+            raise ChunkValidationError("existing admission claim is unreadable")
+        if not isinstance(value, dict):
+            raise ChunkValidationError("existing admission claim is invalid")
+        existing_sha = value.get("payload_sha256")
+        if not isinstance(existing_sha, str) or not _JOB_ID_RE.fullmatch(existing_sha):
+            raise ChunkValidationError("existing admission claim is invalid")
+        return existing_sha != payload_sha256
 
 
 def stage_chunk(
@@ -394,9 +609,16 @@ def stage_chunk(
     """Atomically persist one chunk and mark the job ready when complete."""
     chunk_index, total_chunks = _validated_chunk_coordinates(meta, len(chunk_data))
     job_id = _job_id(meta, user_id, device_id)
+    root_created = not root.exists()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root_created:
+        _fsync_directory(root.parent, strict=True)
     os.chmod(root, 0o700)
     with spool_job_lock(job_id, root=root, purpose="stage"):
+        if _admission_conflicts_with_existing_payload(meta=meta, root=root):
+            raise ChunkValidationError(
+                "source revision envelope conflicts with an admitted payload"
+            )
         completion_path = _completion_path(job_id, root)
         if completion_path.is_file():
             if not force_reprocess:
@@ -405,7 +627,10 @@ def stage_chunk(
             _fsync_directory(completion_path.parent)
 
         job_dir = _job_dir(job_id, root)
+        job_dir_created = not job_dir.exists()
         job_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if job_dir_created:
+            _fsync_directory(root, strict=True)
         os.chmod(job_dir, 0o700)
 
         manifest_path = job_dir / "manifest.json"
@@ -462,6 +687,9 @@ def stage_chunk(
                 "base_hash",
                 "base_offset",
                 "authoritative_rebase",
+                "delivery_identity",
+                "admission_identity",
+                "payload_sha256",
                 "total_chunks",
             ):
                 if existing_meta.get(field) != meta.get(field):
@@ -501,6 +729,54 @@ def stage_chunk(
             if not (job_dir / "ready").exists():
                 _atomic_write(job_dir / "ready", b"ready\n")
         return StagedChunk(job_id, complete=complete, should_enqueue=complete)
+
+
+def stage_delta_payload(
+    *,
+    meta: dict[str, Any],
+    payload: bytes,
+    user_id: str,
+    device_id: str,
+    device_name: str,
+    device_platform: str,
+    root: Path = DEFAULT_SPOOL_ROOT,
+) -> StagedChunk:
+    """Fsync one bounded guarded DELTA into the shared chunk spool.
+
+    The representation intentionally remains the existing manifest/chunk/ready
+    format, so crash recovery and source ordering have one authority.  Small
+    JSON endpoint payloads use this helper rather than bypassing the spool.
+    """
+    if not payload:
+        raise ChunkValidationError("realtime delta payload must not be empty")
+    if len(payload) > MAX_COALESCED_DELTA_BYTES:
+        raise ChunkValidationError("realtime delta exceeds bounded spool limit")
+    supplied_size = meta.get("file_size")
+    if supplied_size is not None and int(supplied_size) != len(payload):
+        raise ChunkValidationError("realtime delta file_size does not match payload")
+    staged_meta = dict(meta)
+    staged_meta["file_size"] = len(payload)
+    staged_meta["payload_sha256"] = hashlib.sha256(payload).hexdigest()
+    total_chunks = max(1, math.ceil(len(payload) / MAX_CHUNK_BYTES))
+    staged: StagedChunk | None = None
+    for chunk_index in range(total_chunks):
+        start = chunk_index * MAX_CHUNK_BYTES
+        staged = stage_chunk(
+            meta={
+                **staged_meta,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+            },
+            chunk_data=payload[start : start + MAX_CHUNK_BYTES],
+            user_id=user_id,
+            device_id=device_id,
+            device_name=device_name,
+            device_platform=device_platform,
+            root=root,
+        )
+    if staged is None or not staged.complete:
+        raise RuntimeError("realtime delta was not durably staged")
+    return staged
 
 
 def _ready_candidate_job_ids(
@@ -768,6 +1044,70 @@ def select_ready_source_head(
     if not jobs:
         return None, ()
 
+    # DELTA envelopes carry their own exact ordering proof.  Source mtimes can
+    # be equal, regress, or arrive concurrently, so timestamp sorting must not
+    # put a successor ahead of the revision named by its base hash/offset.
+    if all(
+        manifest["meta"].get("mode", "full") == "delta"
+        and isinstance(manifest["meta"].get("base_hash"), str)
+        and bool(manifest["meta"].get("base_hash"))
+        and isinstance(manifest["meta"].get("base_offset"), int)
+        and not isinstance(manifest["meta"].get("base_offset"), bool)
+        for _, manifest in all_jobs
+    ):
+        endpoints = {
+            (str(manifest["meta"].get("hash", "")), int(manifest["meta"].get("offset", 0)))
+            for _, manifest in all_jobs
+        }
+        roots = [
+            item
+            for item in all_jobs
+            if (
+                item[1]["meta"].get("base_hash"),
+                int(item[1]["meta"].get("base_offset", -1)),
+            )
+            not in endpoints
+        ]
+        actionable_roots = [
+            item
+            for item in roots
+            if not (root / item[0] / "failed.json").exists()
+        ]
+        failed_endpoints = {
+            (
+                str(manifest["meta"].get("hash", "")),
+                int(manifest["meta"].get("offset", 0)),
+            )
+            for candidate_id, manifest in all_jobs
+            if (root / candidate_id / "failed.json").exists()
+        }
+        failed_successors = [
+            item
+            for item in all_jobs
+            if not (root / item[0] / "failed.json").exists()
+            and (
+                item[1]["meta"].get("base_hash"),
+                int(item[1]["meta"].get("base_offset", -1)),
+            )
+            in failed_endpoints
+        ]
+        candidates = list(
+            {
+                item[0]: item
+                for item in (*actionable_roots, *failed_successors)
+            }.values()
+        )
+        if roots and not candidates:
+            return None, ()
+        candidates = candidates or all_jobs
+        head_id, _ = min(
+            candidates,
+            key=lambda item: _source_sequence_rank(item[0], item[1], root),
+        )
+        if (root / head_id / "failed.json").exists():
+            return None, ()
+        return head_id, ()
+
     all_full = all(
         manifest["meta"].get("mode", "full") == "full" for _, manifest in all_jobs
     )
@@ -921,26 +1261,30 @@ def ready_delta_chain_job_ids(
     if head_id != job_id or target["meta"].get("mode", "full") != "delta":
         return (job_id,)
 
-    ordered = sorted(
-        _ready_jobs_for_source(identity, root, include_failed=True),
-        key=lambda item: _source_sequence_rank(item[0], item[1], root),
-    )
-    start = next(
-        (
-            index
-            for index, (candidate_id, _) in enumerate(ordered)
-            if candidate_id == job_id
-        ),
-        None,
-    )
-    if start is None:
+    jobs = _ready_jobs_for_source(identity, root, include_failed=True)
+    by_id = {candidate_id: manifest for candidate_id, manifest in jobs}
+    if job_id not in by_id:
         return (job_id,)
+
+    by_base: dict[tuple[str | None, int], list[tuple[str, dict[str, Any]]]] = {}
+    for candidate_id, manifest in jobs:
+        meta = manifest["meta"]
+        if meta.get("mode", "full") != "delta":
+            continue
+        by_base.setdefault(
+            (meta.get("base_hash"), int(meta.get("base_offset", -1))),
+            [],
+        ).append((candidate_id, manifest))
+    for candidates in by_base.values():
+        candidates.sort(key=lambda item: _source_sequence_rank(item[0], item[1], root))
 
     chain: list[str] = []
     total_payload_bytes = 0
-    previous_hash: str | None = None
-    previous_offset: int | None = None
-    for candidate_id, manifest in ordered[start:]:
+    candidate_id = job_id
+    seen: set[str] = set()
+    while candidate_id not in seen:
+        seen.add(candidate_id)
+        manifest = by_id[candidate_id]
         if (root / candidate_id / "failed.json").exists():
             break
         meta = manifest["meta"]
@@ -949,20 +1293,25 @@ def ready_delta_chain_job_ids(
         payload_bytes = int(meta.get("file_size", 0))
         if payload_bytes < 0:
             break
-        if chain and (
-            meta.get("base_hash") != previous_hash
-            or int(meta.get("base_offset", -1)) != previous_offset
-        ):
-            break
         if chain and total_payload_bytes + payload_bytes > max_payload_bytes:
             break
 
         chain.append(candidate_id)
         total_payload_bytes += payload_bytes
-        previous_hash = str(meta.get("hash", ""))
-        previous_offset = int(meta.get("offset", 0))
         if len(chain) >= max_jobs:
             break
+
+        successors = [
+            item
+            for item in by_base.get(
+                (str(meta.get("hash", "")), int(meta.get("offset", 0))),
+                [],
+            )
+            if item[0] not in seen
+        ]
+        if not successors:
+            break
+        candidate_id = successors[0][0]
 
     return tuple(chain or (job_id,))
 
@@ -1130,6 +1479,9 @@ def read_ready_job_bytes(
     payload = b"".join(parts)
     if len(payload) != int(manifest["meta"]["file_size"]):
         raise ChunkValidationError("assembled payload size does not match file_size")
+    expected_sha = manifest["meta"].get("payload_sha256")
+    if isinstance(expected_sha, str) and hashlib.sha256(payload).hexdigest() != expected_sha:
+        raise ChunkValidationError("assembled payload does not match payload_sha256")
     return manifest, payload
 
 
@@ -1151,13 +1503,24 @@ def mark_job_complete(
 ) -> None:
     """Durably retain a short-lived receipt before deleting accepted chunks."""
     completed_dir = root / "completed"
+    completed_created = not completed_dir.exists()
     completed_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if completed_created:
+        _fsync_directory(root, strict=True)
     os.chmod(completed_dir, 0o700)
+    manifest = try_ready_manifest_metadata(job_id, root)
+    meta = manifest.get("meta", {}) if isinstance(manifest, dict) else {}
     payload = json.dumps(
         {
             "job_id": job_id,
             "document_id": document_id,
             "completed_at": time.time(),
+            # The receipt endpoint authorizes by the original collector scope
+            # even after the job directory has been removed.
+            "user_id": manifest.get("user_id") if isinstance(manifest, dict) else None,
+            "device_id": manifest.get("device_id") if isinstance(manifest, dict) else None,
+            "admission_identity": meta.get("admission_identity"),
+            "payload_sha256": meta.get("payload_sha256"),
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -1281,9 +1644,24 @@ def cleanup_completion_receipts(
         try:
             if now - receipt.stat().st_mtime <= max_age_seconds:
                 continue
+            completion = orjson.loads(receipt.read_bytes())
             receipt.unlink()
+            admission_identity = (
+                completion.get("admission_identity")
+                if isinstance(completion, dict)
+                else None
+            )
+            if isinstance(admission_identity, str) and _JOB_ID_RE.fullmatch(
+                admission_identity
+            ):
+                claim_path = _admission_claim_path(admission_identity, root)
+                with _filesystem_lock(
+                    root / ".admission-locks" / f".{admission_identity}.lock"
+                ):
+                    claim_path.unlink(missing_ok=True)
+                    _fsync_directory(claim_path.parent, strict=True)
             removed += 1
-        except OSError:
+        except (OSError, orjson.JSONDecodeError):
             continue
     if removed:
         _fsync_directory(completed_dir)

@@ -310,6 +310,7 @@ async def _snapshot(
     *,
     document_id: uuid.UUID,
     user_id: uuid.UUID,
+    relative_path: str | None = None,
 ) -> dict[str, object]:
     messages = (
         await session.execute(
@@ -345,7 +346,11 @@ async def _snapshot(
                     .limit(1)
                     .scalar_subquery()
                 ),
-                SyncState.relative_path.like("phase0/%"),
+                (
+                    SyncState.relative_path == relative_path
+                    if relative_path is not None
+                    else SyncState.relative_path.like("phase0/%")
+                ),
             )
         )
     ).scalar_one()
@@ -745,6 +750,144 @@ async def test_recorded_delta_sequences_match_phase0_golden(
         f"{path_name} drifted from the Phase 0 golden at {difference[0]}: "
         f"expected {difference[1]!r}, got {difference[2]!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_coalesced_raw_chain_matches_same_frames_one_by_one(
+    session_factory,
+) -> None:
+    """Phase 3's one-transaction chain preserves the Phase 0 row golden."""
+    from server.services.realtime_raw_writer import (
+        ingest_conversation_raw,
+        ingest_conversation_raw_chain,
+    )
+
+    sequence = next(item for item in RECORDED_DELTA_SEQUENCES if item.tool_id == "codex")
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(), email=f"phase3-chain-{uuid.uuid4()}@example.test",
+            role="viewer", status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(), name="phase3-chain",
+            collector_token_hash=str(uuid.uuid4()), user_id=user.id,
+        )
+        session.add_all((user, machine))
+        if await session.get(Tool, "codex") is None:
+            session.add(Tool(id="codex", display_name="codex"))
+        await session.commit()
+
+        fragments = tuple(_json_line(row) for row in sequence.delta_rows)
+
+        async def seed(path: str):
+            full_hash = _hash(sequence.full)
+            return await ingest_conversation_raw(
+                tool_id="codex", category="conversation", content_type="jsonl",
+                relative_path=path, content=sequence.full, content_hash=full_hash,
+                file_size=len(sequence.full.encode("utf-8")), mode="full",
+                offset=len(sequence.full.encode("utf-8")), metadata=dict(sequence.metadata),
+                timestamp=1_785_672_000.0, machine_id=machine.id, user_id=user.id,
+                base_hash=None, base_offset=None, database_url=TEST_DATABASE_URL,
+            )
+
+        individual_path = f"phase0/phase3-individual-{uuid.uuid4()}.jsonl"
+        chain_path = f"phase0/phase3-chain-{uuid.uuid4()}.jsonl"
+        individual_document, _ = await seed(individual_path)
+        chain_document, _ = await seed(chain_path)
+        current = sequence.full
+        current_hash = _hash(current)
+        current_offset = len(current.encode("utf-8"))
+        chain_frames: list[dict[str, object]] = []
+        for index, fragment in enumerate(fragments, start=1):
+            next_snapshot = f"{current}\n{fragment}"
+            next_hash = _hash(next_snapshot)
+            next_offset = len(next_snapshot.encode("utf-8"))
+            common = {
+                "tool_id": "codex", "category": "conversation",
+                "content_type": "jsonl", "content": fragment,
+                "content_hash": next_hash, "file_size": len(fragment.encode("utf-8")),
+                "mode": "delta", "offset": next_offset,
+                "metadata": dict(sequence.metadata),
+                "timestamp": 1_785_672_000.0 + index,
+                "machine_id": machine.id, "user_id": user.id,
+                "base_hash": current_hash, "base_offset": current_offset,
+            }
+            await ingest_conversation_raw(
+                relative_path=individual_path,
+                **common,
+                database_url=TEST_DATABASE_URL,
+            )
+            chain_frames.append({**common, "relative_path": chain_path})
+            current, current_hash, current_offset = next_snapshot, next_hash, next_offset
+
+        committed, event = await ingest_conversation_raw_chain(
+            frames=chain_frames,
+            database_url=TEST_DATABASE_URL,
+        )
+        assert committed.id == chain_document.id
+        assert event is not None
+        assert event["data"]["changes"]
+        individual = await _snapshot(
+            session,
+            document_id=individual_document.id,
+            user_id=user.id,
+            relative_path=individual_path,
+        )
+        coalesced = await _snapshot(
+            session,
+            document_id=chain_document.id,
+            user_id=user.id,
+            relative_path=chain_path,
+        )
+        # IDs and paths are intentionally excluded by _snapshot.  The final
+        # messages, delivery/sync fence, and all live projections must match.
+        for snapshot in (individual, coalesced):
+            snapshot["sync_state"]["relative_path"] = "<path>"
+            if snapshot["dashboard_projection"] is not None:
+                snapshot["dashboard_projection"]["relative_path"] = "<path>"
+                snapshot["dashboard_projection"]["title"] = "<path-title>"
+        assert coalesced == individual
+
+        # A restart after COMMIT but before receipt/SSE cleanup replays the
+        # exact chain. It must produce a safe post-commit invalidation even
+        # though the final revision is already idempotent.
+        retry, retry_event = await ingest_conversation_raw_chain(
+            frames=chain_frames,
+            database_url=TEST_DATABASE_URL,
+        )
+        assert retry.disposition == "idempotent"
+        assert retry_event is not None
+        assert "conversation.messages" in retry_event["data"]["changes"]
+
+        # A successor can arrive while the previous drain is committing. If
+        # the process dies before removing the head marker, restart sees the
+        # already-committed prefix plus new frames and must resume the suffix.
+        resumed_path = f"phase0/phase3-resumed-{uuid.uuid4()}.jsonl"
+        resumed_document, _ = await seed(resumed_path)
+        resumed_frames = [
+            {**frame, "relative_path": resumed_path} for frame in chain_frames
+        ]
+        await ingest_conversation_raw(
+            **resumed_frames[0],
+            database_url=TEST_DATABASE_URL,
+        )
+        resumed, resumed_event = await ingest_conversation_raw_chain(
+            frames=resumed_frames,
+            database_url=TEST_DATABASE_URL,
+        )
+        assert resumed.id == resumed_document.id
+        assert resumed_event is not None
+        resumed_snapshot = await _snapshot(
+            session,
+            document_id=resumed_document.id,
+            user_id=user.id,
+            relative_path=resumed_path,
+        )
+        resumed_snapshot["sync_state"]["relative_path"] = "<path>"
+        if resumed_snapshot["dashboard_projection"] is not None:
+            resumed_snapshot["dashboard_projection"]["relative_path"] = "<path>"
+            resumed_snapshot["dashboard_projection"]["title"] = "<path-title>"
+        assert resumed_snapshot == individual
 
 
 @pytest.mark.asyncio
