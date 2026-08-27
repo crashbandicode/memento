@@ -833,7 +833,6 @@ async def ingest_file_endpoint(
     )
     if (
         settings.realtime_ingest_spool_deltas
-        and raw_enabled
         and _collector_supports_async_delta_admission(x_collector_capabilities)
         and req.category == "conversation"
         and req.content_type == "jsonl"
@@ -948,7 +947,6 @@ async def ingest_file_upload(
             measured_size = await _stream_upload_to_path(content, raw_path)
             if (
                 settings.realtime_ingest_spool_deltas
-                and raw_writer
                 and _collector_supports_async_delta_admission(
                     x_collector_capabilities
                 )
