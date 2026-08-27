@@ -11,8 +11,10 @@ import pytest
 
 from server.services.ingest_service import _select_updated_document_title
 from server.services.realtime_raw_writer import (
+    MessageMutation,
     RawWriterUnsupported,
     WriterState,
+    _history_metadata_is_already_committed,
     reduce_writer_state,
 )
 
@@ -192,6 +194,7 @@ def _reduce_codex_history(
     *,
     history: list[dict[str, object]],
     state: WriterState | None = None,
+    first_user_message: str = "Use Core staging.",
 ) -> object:
     timestamp = datetime.fromtimestamp(1_785_672_000, tz=timezone.utc)
     row = json.dumps(
@@ -217,7 +220,7 @@ def _reduce_codex_history(
         metadata={
             "session_id": "codex-history-state",
             "user_history": history,
-            "first_user_message": "Use Core staging.",
+            "first_user_message": first_user_message,
         },
         timestamp=_OBSERVED_AT.timestamp(),
         machine_id=None,
@@ -296,6 +299,94 @@ def test_history_represented_by_ordinary_user_commits_raw() -> None:
     mutation = _reduce_codex_history(
         history=[{"text": "Use Core staging.", "ts": 1_785_672_000}],
         state=state,
+    )
+
+    assert mutation.disposition == "committed"
+
+
+def test_first_user_message_is_noop_when_ordinary_user_exists() -> None:
+    ordinary_user = SimpleNamespace(
+        id=3,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="user_message",
+        role="user",
+        content="A later ordinary user message.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+
+    mutation = _reduce_codex_history(
+        history=[],
+        state=_codex_history_state(None, ordinary_user_rows=(ordinary_user,)),
+    )
+
+    assert mutation.disposition == "committed"
+
+
+def test_first_user_message_without_user_row_requires_legacy_injection() -> None:
+    state = _codex_history_state(None)
+
+    assert _history_metadata_is_already_committed(
+        state,
+        tool_id="codex",
+        history=[],
+        first_user_message="Use Core staging.",
+        prospective_mutations=[],
+    ) is False
+    with pytest.raises(
+        RawWriterUnsupported,
+        match="authoritative rebuild/history needs legacy reducer",
+    ):
+        _reduce_codex_history(history=[], state=state)
+
+
+def test_non_user_codex_first_user_message_is_already_committed() -> None:
+    assert _history_metadata_is_already_committed(
+        _codex_history_state(None),
+        tool_id="codex",
+        history=[],
+        first_user_message="# Context from my IDE setup:\n<context>",
+        prospective_mutations=[],
+    ) is True
+
+
+def test_first_user_message_is_noop_when_current_frame_adds_user() -> None:
+    prospective_user = MessageMutation(
+        ordinal=0,
+        operation="insert",
+        line_number=1,
+        message_type="user_message",
+        role="user",
+        content="Current-frame user message.",
+        metadata={},
+        timestamp=_OBSERVED_AT,
+    )
+
+    assert _history_metadata_is_already_committed(
+        _codex_history_state(None),
+        tool_id="codex",
+        history=[],
+        first_user_message="Use Core staging.",
+        prospective_mutations=[prospective_user],
+    ) is True
+
+
+def test_existing_first_user_message_is_already_committed() -> None:
+    stored_first_user = SimpleNamespace(
+        id=4,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="first_user_message",
+        role="user",
+        content="An earlier fallback prompt.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+
+    mutation = _reduce_codex_history(
+        history=[],
+        state=_codex_history_state(stored_first_user),
     )
 
     assert mutation.disposition == "committed"

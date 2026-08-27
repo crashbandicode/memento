@@ -563,16 +563,29 @@ def _history_metadata_is_already_committed(
             for row in state.recovered_history
             if row.message_type == "history_user_message"
         )
-    if first_user_message:
-        # The fallback prompt has no stable source ID. Its dedicated stored row
-        # is the only unambiguous proof that a repeat carries the same state.
-        return any(
-            row.message_type == "first_user_message"
-            and row.role == "user"
-            and row.content == first_user_message
-            for row in state.recovered_history
+    first_user_msg = (first_user_message or "").strip()
+    if tool_id == "codex" and first_user_msg:
+        from .conversation_parser import normalize_codex_user_payload
+
+        first_role, first_user_msg = normalize_codex_user_payload(first_user_msg)
+        if first_role != "user":
+            # Legacy discards Codex-injected context before its fallback gate.
+            return True
+    if not first_user_msg.strip():
+        # Legacy does not inject an absent or whitespace-only fallback prompt.
+        return True
+
+    # Legacy's gate selects any persisted user row, including recovered rows;
+    # non-delete user mutations commit in this raw transaction before legacy
+    # fallback would run, so each proves its injection would be a no-op.
+    return (
+        bool(state.ordinary_user_rows)
+        or any(row.role == "user" for row in state.recovered_history)
+        or any(
+            mutation.role == "user" and mutation.operation != "delete"
+            for mutation in prospective_mutations
         )
-    return False
+    )
 
 
 def reduce_writer_state(
