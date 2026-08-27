@@ -889,9 +889,12 @@ async def _handoff_successor_reference(
             ConversationMessage.content.startswith(_HANDOFF_MARKER_PREFIX),
             content_vector.op("@@")(session_query),
         )
-        # Newest successor wins: a re-done handoff (an abandoned successor
-        # thread followed by the real one) must resolve to the live thread.
+        # Most-recently-ACTIVE successor wins: a re-done handoff leaves
+        # abandoned successor threads behind (sometimes created after the
+        # live one), and the thread that kept working is the real
+        # continuation. The pointer self-heals as activity accrues.
         .order_by(
+            Document.activity_at.desc().nulls_last(),
             Document.created_at.desc(),
             ConversationMessage.line_number.asc(),
             Document.id.desc(),
