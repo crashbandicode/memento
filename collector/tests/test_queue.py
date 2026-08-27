@@ -7,12 +7,16 @@ import time
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from collector.outcomes import UploadOutcome  # noqa: E402
-from collector.queue import SyncQueue  # noqa: E402
+from collector.queue import (  # noqa: E402
+    SOURCE_REPAIR_MAX_ATTEMPTS,
+    SyncQueue,
+)
 
 
 class SyncQueueTests(unittest.TestCase):
@@ -664,6 +668,119 @@ class SyncQueueTests(unittest.TestCase):
             quarantine_id,
         )
         self.assertEqual(self.queue.claim_batch()[0].content_hash, "hash-repaired")
+
+    def test_delta_repair_backoff_survives_coalescing_until_due(self) -> None:
+        with patch("collector.queue._retry_delay_seconds", return_value=60.0):
+            item_id = self._enqueue(
+                "sessions/thread.jsonl",
+                "first tail",
+                "tail-hash-1",
+                strategy="delta",
+                partial=True,
+                offset=20,
+                base_hash="base-hash",
+                base_offset=10,
+            )
+            item = self.queue.claim_batch()[0]
+            self.assertTrue(
+                self.queue.mark_upload_outcome(
+                    item,
+                    UploadOutcome.source_repair(
+                        "HTTP 400 stale chunk metadata",
+                        diagnostic_code="http_400",
+                        http_status=400,
+                    ),
+                )
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            before = connection.execute(
+                """SELECT status, retry_count, available_at, terminal_at
+                   FROM queue WHERE id=?""",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(before[0], "repair_required")
+        self.assertEqual(before[1], 1)
+        self.assertGreater(before[2], time.time())
+        self.assertIsNotNone(before[3])
+
+        repeated_id = self._enqueue(
+            "sessions/thread.jsonl",
+            "newer tail",
+            "tail-hash-2",
+            strategy="delta",
+            partial=True,
+            offset=20,
+            base_hash="base-hash",
+            base_offset=10,
+        )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            during_backoff = connection.execute(
+                """SELECT status, retry_count, available_at, terminal_at
+                   FROM queue WHERE id=?""",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(repeated_id, item_id)
+        self.assertEqual(during_backoff, before)
+        self.assertEqual(self.queue.claim_batch(), [])
+
+        with self.queue._lock:
+            self.queue._conn.execute(
+                "UPDATE queue SET available_at=0 WHERE id=?", (item_id,)
+            )
+            self.queue._conn.commit()
+        revived_id = self._enqueue(
+            "sessions/thread.jsonl",
+            "due tail",
+            "tail-hash-3",
+            strategy="delta",
+            partial=True,
+            offset=20,
+            base_hash="base-hash",
+            base_offset=10,
+        )
+        revived = self.queue.claim_batch()[0]
+        self.assertEqual(revived_id, item_id)
+        self.assertEqual(revived.retry_count, 1)
+
+    def test_source_repair_attempt_cap_quarantines_delta(self) -> None:
+        item_id = self._enqueue(
+            "sessions/thread.jsonl",
+            "tail",
+            "tail-hash",
+            strategy="delta",
+            partial=True,
+            offset=20,
+            base_hash="base-hash",
+            base_offset=10,
+        )
+        with self.queue._lock:
+            self.queue._conn.execute(
+                "UPDATE queue SET retry_count=? WHERE id=?",
+                (SOURCE_REPAIR_MAX_ATTEMPTS - 1, item_id),
+            )
+            self.queue._conn.commit()
+        item = self.queue.claim_batch()[0]
+
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                item,
+                UploadOutcome.source_repair(
+                    "HTTP 400 stale chunk metadata",
+                    diagnostic_code="http_400",
+                    http_status=400,
+                ),
+            )
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            status, retry_count, available_at = connection.execute(
+                "SELECT status, retry_count, available_at FROM queue WHERE id=?",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(status, "quarantined")
+        self.assertEqual(retry_count, SOURCE_REPAIR_MAX_ATTEMPTS)
+        self.assertEqual(available_at, 0.0)
 
     def test_terminal_spool_is_bounded_only_when_source_is_rebuildable(
         self,

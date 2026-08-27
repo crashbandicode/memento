@@ -15,7 +15,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from collector.queue import QueueItem  # noqa: E402
+from collector.queue import SOURCE_REPAIR_MAX_ATTEMPTS, QueueItem  # noqa: E402
 from collector.outcomes import (  # noqa: E402
     SourceRepairAction,
     UploadOutcome,
@@ -50,6 +50,7 @@ class _FakeQueue:
         self.renewals = 0
         self.delta_conflicts: list[QueueItem] = []
         self.delta_conflict_bases: list[tuple[str | None, int]] = []
+        self.outcomes: list[UploadOutcome] = []
 
     @contextmanager
     def open_payload(self, _item: QueueItem):
@@ -71,6 +72,15 @@ class _FakeQueue:
     ) -> bool:
         self.delta_conflicts.append(item)
         self.delta_conflict_bases.append((expected_hash, expected_offset))
+        return True
+
+    def mark_upload_outcome(
+        self,
+        _item: QueueItem,
+        outcome: UploadOutcome,
+        **_kwargs,
+    ) -> bool:
+        self.outcomes.append(outcome)
         return True
 
 
@@ -576,6 +586,35 @@ class SyncClientStreamingTests(unittest.TestCase):
         with self.assertRaises(DeltaBaseConflict):
             client._upload_chunked(payload, self._item(total_size))
 
+    def test_terminal_chunk_conflict_reads_server_committed_revision(self) -> None:
+        total_size = CHUNK_SIZE + 1
+        queue = _FakeQueue(total_size)
+        client = self._client(
+            queue,
+            _ScriptedHttpClient(
+                [
+                    _Response(
+                        409,
+                        {
+                            "detail": {
+                                "code": "delta_base_mismatch",
+                                "expected_hash": "d2:" + ("d" * 61),
+                                "expected_offset": 456,
+                            }
+                        },
+                    )
+                ]
+            ),
+        )
+        payload = self._payload()
+        payload["mode"] = "delta"
+
+        with self.assertRaises(DeltaBaseConflict) as raised:
+            client._upload_chunked(payload, self._item(total_size))
+
+        self.assertEqual(raised.exception.expected_hash, "d2:" + ("d" * 61))
+        self.assertEqual(raised.exception.expected_offset, 456)
+
     def test_guarded_delta_uses_synchronous_multipart_and_sends_base(self) -> None:
         size = CHUNK_SIZE + 123
         queue = _FakeQueue(size)
@@ -630,6 +669,40 @@ class SyncClientStreamingTests(unittest.TestCase):
         client._reap_completed({completed: item})
         self.assertEqual(captured[0]["base_hash"], "base-hash")
         self.assertEqual(queue.delta_conflicts, [item])
+        self.assertEqual(requested, ["/tmp/thread.jsonl"])
+
+    def test_generic_source_repair_cap_quarantines_and_requests_full_resync(
+        self,
+    ) -> None:
+        queue = _FakeQueue(100)
+        client = self._client(queue, _FakeHttpClient())
+        requested: list[str] = []
+        client._full_resync_callback = requested.append
+        item = self._item(100)
+        item.sync_strategy = "delta"
+        item.is_partial = True
+        item.source_path = "/tmp/thread.jsonl"
+        item.retry_count = SOURCE_REPAIR_MAX_ATTEMPTS - 1
+        completed: Future[UploadOutcome] = Future()
+        completed.set_result(
+            UploadOutcome.source_repair(
+                "HTTP 400 stale chunk metadata",
+                diagnostic_code="http_400",
+                http_status=400,
+            )
+        )
+
+        client._reap_completed({completed: item})
+
+        self.assertEqual(len(queue.outcomes), 1)
+        self.assertEqual(
+            queue.outcomes[0].state,
+            UploadOutcomeState.PERMANENT_QUARANTINE,
+        )
+        self.assertEqual(
+            queue.outcomes[0].diagnostic_code,
+            "source_repair_attempt_cap",
+        )
         self.assertEqual(requested, ["/tmp/thread.jsonl"])
 
     def test_delta_conflict_reads_server_committed_revision(self) -> None:
