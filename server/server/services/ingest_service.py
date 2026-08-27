@@ -4992,8 +4992,11 @@ async def _extract_messages(
                     select(ConversationMessage)
                     # Cursor updates reconcile a bounded identity set. Keep
                     # only comparison/canvas fields out of full-row hydration.
+                    # document_id stays loaded so any document-scoped ORM
+                    # DELETE's evaluate-sync cannot expire these rows.
                     .options(load_only(
                         ConversationMessage.id,
+                        ConversationMessage.document_id,
                         ConversationMessage.line_number,
                         ConversationMessage.message_type,
                         ConversationMessage.role,
@@ -5247,8 +5250,14 @@ async def _extract_messages(
                                 select(ConversationMessage)
                                 # Full/rebase suffix comparison updates rows in
                                 # place, so load only the fields it compares.
+                                # document_id must stay loaded: the later ORM
+                                # DELETE filters on it, and evaluate-sync fully
+                                # expires any loaded row whose referenced
+                                # column is deferred (MissingGreenlet at the
+                                # canvas reconcile that reads those rows).
                                 .options(load_only(
                                     ConversationMessage.id,
+                                    ConversationMessage.document_id,
                                     ConversationMessage.line_number,
                                     ConversationMessage.message_type,
                                     ConversationMessage.role,
