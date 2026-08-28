@@ -934,6 +934,7 @@ async def apply_conversation_activity_update(
     activity_status: str,
     activity_tool: str,
     command: object,
+    is_background: bool = False,
     timestamp: str = "",
 ) -> ThreadTitleUpdateResult:
     """Apply a transient shell-command lifecycle update."""
@@ -1075,6 +1076,9 @@ async def apply_conversation_activity_update(
         "started_at": _bounded_message_text(started_at, 128),
         "updated_at": _bounded_message_text(event_timestamp, 128),
         "anchor_line_number": anchor_line_number,
+        "is_background": bool(is_background) or bool(
+            previous.get("is_background") if isinstance(previous, dict) else False
+        ),
     }
     activities.pop(activity_id, None)
     activities[activity_id] = activity

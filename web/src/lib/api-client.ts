@@ -618,6 +618,7 @@ export interface LiveConversationActivity {
   status: "running" | "completed" | "failed" | "cancelled";
   tool_name: string;
   command: string;
+  is_background: boolean;
   started_at: string | null;
   updated_at: string | null;
 }
@@ -627,6 +628,7 @@ export interface PendingConversationInteractionsResponse {
   interactions: PendingConversationInteraction[];
   inline_interactions: PendingConversationInteraction[];
   live_activities: LiveConversationActivity[];
+  background_running_count: number;
   inferred_responses: InferredConversationInteractionResponse[];
 }
 

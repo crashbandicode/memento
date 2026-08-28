@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -26,6 +27,7 @@ from .conversation_markdown import (
 )
 from .conversation_parser import (
     build_cursor_question_response,
+    is_meta_tool_interaction,
     normalize_tool_calls,
 )
 from .conversation_usage import (
@@ -71,6 +73,31 @@ _TERMINAL_MESSAGE_TYPES = {
     "tool_result",
     "tool_output",
     "question_tool_output",
+}
+_BACKGROUND_OUTPUT_TOOL_NAMES = {"bashoutput", "taskoutput"}
+_BACKGROUND_STOP_TOOL_NAMES = {"killshell", "taskstop"}
+_BACKGROUND_TASK_ID_KEYS = (
+    "backgroundShellId",
+    "background_shell_id",
+    "backgroundTaskId",
+    "background_task_id",
+    "taskId",
+    "task_id",
+    "bashId",
+    "bash_id",
+    "shellId",
+    "shell_id",
+)
+_TERMINAL_BACKGROUND_EVENT_STATUSES = {
+    "cancelled",
+    "canceled",
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "finished",
+    "interrupted",
+    "success",
 }
 
 
@@ -130,8 +157,6 @@ def _shell_command(value: object) -> str:
     if not text:
         return ""
     try:
-        import json
-
         payload = json.loads(text)
     except (TypeError, ValueError):
         return text
@@ -150,15 +175,116 @@ def _shell_command(value: object) -> str:
     return text
 
 
+def _normalized_tool_name(value: object) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _tool_input_mapping(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _background_task_target(metadata: dict) -> str:
+    payload = _tool_input_mapping(metadata.get("tool_input"))
+    for key in _BACKGROUND_TASK_ID_KEYS:
+        target = _bounded(payload.get(key), 512)
+        if target:
+            return target
+    return ""
+
+
+def _background_result_is_terminal(content: object) -> bool:
+    """Only close a polled background task when its result proves completion."""
+    text = str(content or "").casefold()
+    return any(marker in text for marker in (
+        "[exited with code",
+        "exited with code",
+        "task completed",
+        "task failed",
+        "task cancelled",
+        "task canceled",
+        "task interrupted",
+        "background command completed",
+        "background command failed",
+    ))
+
+
+def _agent_event_tokens(event: dict) -> set[str]:
+    return {
+        value
+        for value in (
+            _bounded(event.get("agent_tool_use_id"), 512),
+            _bounded(event.get("task_id"), 512),
+            _bounded(event.get("agent_thread_id"), 512),
+        )
+        if value
+    }
+
+
+def _agent_event_is_terminal(event: dict) -> bool:
+    return any(
+        _bounded(event.get(key), 80).casefold()
+        in _TERMINAL_BACKGROUND_EVENT_STATUSES
+        for key in ("resolved_status", "status", "kind")
+    )
+
+
+def background_running_count(
+    activities: Iterable[dict],
+    agent_events: Iterable[dict],
+) -> int:
+    """Count active background shells and agent launches from read-model state."""
+    shell_count = sum(
+        1
+        for activity in activities
+        if activity.get("is_background") is True
+        and _bounded(activity.get("status"), 80).casefold() == "running"
+    )
+    active_agents: dict[str, set[str]] = {}
+    for item in agent_events:
+        event = item.get("event") if isinstance(item, dict) else None
+        if not isinstance(event, dict):
+            continue
+        tokens = _agent_event_tokens(event)
+        if not tokens:
+            continue
+        if _agent_event_is_terminal(event):
+            active_agents = {
+                key: active_tokens
+                for key, active_tokens in active_agents.items()
+                if active_tokens.isdisjoint(tokens)
+            }
+            continue
+        if event.get("is_background") is True and (
+            _bounded(event.get("status"), 80).casefold() in {
+                "", "background", "pending", "running", "started",
+            }
+            or _bounded(event.get("kind"), 80).casefold() == "started"
+        ):
+            active_agents[sorted(tokens)[0]] = tokens
+    return shell_count + len(active_agents)
+
+
 def _question_interactions(metadata: object) -> list[dict]:
     values = metadata if isinstance(metadata, dict) else {}
     interactions: list[dict] = []
     direct = values.get("interaction")
-    if isinstance(direct, dict):
+    if isinstance(direct, dict) and not is_meta_tool_interaction(direct):
         interactions.append(direct)
     for call in normalize_tool_calls(values.get("tool_calls")):
         interaction = call.get("interaction")
-        if isinstance(interaction, dict):
+        if isinstance(interaction, dict) and not is_meta_tool_interaction(interaction):
             interactions.append(interaction)
     return interactions
 
@@ -206,6 +332,7 @@ class _Accumulator:
             )
             if isinstance(item, dict)
             and isinstance(item.get("interaction"), dict)
+            and not is_meta_tool_interaction(item.get("interaction"))
             and (item.get("interaction") or {}).get("id")
         }
         self.inferred = {
@@ -303,7 +430,20 @@ class _Accumulator:
             return
         raw_type = _bounded(row.message_type, 80).casefold()
         status = _bounded(metadata.get("tool_status"), 80).casefold()
+        self._observe_background_control(activity_id, raw_type, metadata)
         if raw_type in _TERMINAL_MESSAGE_TYPES or status in _TERMINAL_TOOL_STATUSES:
+            activity = self.activities.get(activity_id)
+            if activity is not None and activity.get("is_background") is True:
+                background_task_id = _bounded(
+                    metadata.get("background_task_id"),
+                    512,
+                )
+                if background_task_id:
+                    activity["background_task_id"] = background_task_id
+                activity["updated_at"] = _timestamp(row.timestamp)
+                return
+            if self._complete_background_output(activity_id, row.content):
+                return
             self.activities.pop(activity_id, None)
             return
         tool_name = _bounded(metadata.get("tool_name"), 256)
@@ -322,12 +462,82 @@ class _Accumulator:
             "command": command,
             "started_at": observed_at,
             "updated_at": observed_at,
+            "is_background": metadata.get("is_background") is True,
         }
+
+    def _matching_background_activities(self, target_id: str) -> list[str]:
+        if not target_id:
+            return []
+        return [
+            activity_id
+            for activity_id, activity in self.activities.items()
+            if activity.get("is_background") is True
+            and target_id in {
+                _bounded(activity_id, 512),
+                _bounded(activity.get("background_task_id"), 512),
+            }
+        ]
+
+    def _observe_background_control(
+        self,
+        activity_id: str,
+        raw_type: str,
+        metadata: dict,
+    ) -> None:
+        tool_name = _normalized_tool_name(metadata.get("tool_name"))
+        if tool_name not in (
+            _BACKGROUND_OUTPUT_TOOL_NAMES | _BACKGROUND_STOP_TOOL_NAMES
+        ):
+            return
+        targets = self._matching_background_activities(
+            _background_task_target(metadata),
+        )
+        if tool_name in _BACKGROUND_STOP_TOOL_NAMES:
+            for target in targets:
+                self.activities.pop(target, None)
+            return
+        for target in targets:
+            self.activities[target]["output_tool_call_id"] = activity_id
+
+    def _complete_background_output(
+        self,
+        activity_id: str,
+        content: object,
+    ) -> bool:
+        if not _background_result_is_terminal(content):
+            return False
+        targets = [
+            target
+            for target, activity in self.activities.items()
+            if activity.get("is_background") is True
+            and _bounded(activity.get("output_tool_call_id"), 512) == activity_id
+        ]
+        for target in targets:
+            self.activities.pop(target, None)
+        return bool(targets)
+
+    def _complete_background_activities_from_event(self, event: dict) -> None:
+        if not _agent_event_is_terminal(event):
+            return
+        tokens = _agent_event_tokens(event)
+        if not tokens:
+            return
+        for activity_id in [
+            activity_id
+            for activity_id, activity in self.activities.items()
+            if activity.get("is_background") is True
+            and tokens.intersection({
+                _bounded(activity_id, 512),
+                _bounded(activity.get("background_task_id"), 512),
+            })
+        ]:
+            self.activities.pop(activity_id, None)
 
     def _observe_agent_event(self, row, metadata: dict) -> None:
         event = metadata.get("agent_event")
         if not isinstance(event, dict):
             return
+        self._complete_background_activities_from_event(event)
         item = {
             "event": event,
             "line_number": int(row.line_number or 0),
@@ -373,6 +583,10 @@ class _Accumulator:
             "inferred_responses": inferred,
             "live_activities": activities,
             "agent_events": self.agent_events[-MAX_AGENT_EVENTS:],
+            "background_running_count": background_running_count(
+                activities,
+                self.agent_events[-MAX_AGENT_EVENTS:],
+            ),
             "latest_human_at": self.latest_human_at,
         }
 
@@ -614,6 +828,10 @@ async def refresh_conversation_read_model(
             )
 
     previous_generation = int(projection.generation or 0) if projection else 0
+    accumulator_values = accumulator.values()
+    # This is intentionally derived at read time: freshness bounds running
+    # activities, so persisting a count would turn a stale value into state.
+    accumulator_values.pop("background_running_count", None)
     values = {
         **_identity_values(document),
         "message_count": message_count,
@@ -628,7 +846,7 @@ async def refresh_conversation_read_model(
             else previous_generation + 1
         ),
         "projection_version": READ_MODEL_VERSION,
-        **accumulator.values(),
+        **accumulator_values,
     }
     if projection is None:
         projection = ConversationReadModel(document_id=document.id, **values)

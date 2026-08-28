@@ -66,11 +66,15 @@ from ..services.conversation_parser import (
     coerce_claude_live_interaction,
     count_conversation_messages,
     interaction_question_fingerprint,
+    is_meta_tool_interaction,
     normalize_message_attachments,
     normalize_tool_calls,
     parse_conversation,
 )
-from ..services.conversation_read_model import conversation_prompt_rows_statement
+from ..services.conversation_read_model import (
+    background_running_count,
+    conversation_prompt_rows_statement,
+)
 from ..services.conversation_usage import token_usage_from_metadata
 from ..services.conversation_usage_cycle import (
     aggregate_usage_cycle,
@@ -937,11 +941,11 @@ def _message_question_interactions(metadata: object) -> list[dict]:
         return []
     interactions: list[dict] = []
     direct = metadata.get("interaction")
-    if isinstance(direct, dict):
+    if isinstance(direct, dict) and not is_meta_tool_interaction(direct):
         interactions.append(direct)
     for call in _stored_tool_calls(metadata):
         interaction = call.get("interaction")
-        if isinstance(interaction, dict):
+        if isinstance(interaction, dict) and not is_meta_tool_interaction(interaction):
             interactions.append(interaction)
     return interactions
 
@@ -1735,6 +1739,7 @@ async def _projected_pending_interactions(
     inline_by_id: dict[str, dict] = {}
     inferred: list[dict] = []
     activities_by_id: dict[tuple[str, str], dict] = {}
+    agent_events: list[dict] = []
     seen_interaction_ids: set[str] = set()
     activity_now = datetime.now(timezone.utc)
     for source_document, state in rows:
@@ -1755,6 +1760,8 @@ async def _projected_pending_interactions(
                 continue
             item = {**raw_item, "source_title": title}
             interaction = item.get("interaction")
+            if is_meta_tool_interaction(interaction):
+                continue
             interaction_id = (
                 str(interaction.get("id") or "").strip()
                 if isinstance(interaction, dict)
@@ -1767,6 +1774,9 @@ async def _projected_pending_interactions(
         for item in state.inferred_responses or []:
             if isinstance(item, dict):
                 inferred.append(dict(item))
+        for item in state.agent_events or []:
+            if isinstance(item, dict):
+                agent_events.append(dict(item))
         for raw_activity in state.live_activities or []:
             if (
                 not isinstance(raw_activity, dict)
@@ -1925,6 +1935,7 @@ async def _projected_pending_interactions(
                     "status": status,
                     "tool_name": str(raw_activity.get("tool_name") or "Shell"),
                     "command": command,
+                    "is_background": raw_activity.get("is_background") is True,
                     "started_at": raw_activity.get("started_at") or None,
                     "updated_at": raw_activity.get("updated_at") or None,
                 }
@@ -1968,6 +1979,10 @@ async def _projected_pending_interactions(
         "inline_interactions": inline[-64:],
         "live_activities": activities[-64:],
         "inferred_responses": inferred[-64:],
+        "background_running_count": background_running_count(
+            activities[-64:],
+            agent_events,
+        ),
     }
 
 
@@ -2256,6 +2271,7 @@ async def get_pending_conversation_interactions(
             "status": "running",
             "tool_name": tool_name,
             "command": command,
+            "is_background": message_metadata.get("is_background") is True,
             "started_at": timestamp,
             "updated_at": timestamp,
         }
@@ -2461,6 +2477,7 @@ async def get_pending_conversation_interactions(
                 "status": status,
                 "tool_name": str(raw_activity.get("tool_name") or "Shell"),
                 "command": command,
+                "is_background": raw_activity.get("is_background") is True,
                 "started_at": raw_activity.get("started_at") or None,
                 "updated_at": raw_activity.get("updated_at") or None,
             }
@@ -2507,6 +2524,10 @@ async def get_pending_conversation_interactions(
         + live_pending,
         "inline_interactions": inline_interactions,
         "live_activities": live_activities,
+        "background_running_count": background_running_count(
+            live_activities,
+            [],
+        ),
         "inferred_responses": [
             {
                 "document_id": str(message.document_id),

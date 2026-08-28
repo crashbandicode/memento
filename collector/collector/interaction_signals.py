@@ -385,6 +385,15 @@ def _shell_command(value: object) -> str:
     return ""
 
 
+def _runs_in_background(value: object) -> bool:
+    payload = _mapping(value)
+    return bool(
+        payload.get("run_in_background")
+        if "run_in_background" in payload
+        else payload.get("runInBackground")
+    )
+
+
 def _shell_activity_status(value: object) -> str | None:
     status = str(value or "").strip().casefold()
     if status in {"failed", "error"}:
@@ -417,6 +426,7 @@ def _activity_record(
     command: object,
     timestamp: object,
     status: str,
+    is_background: bool = False,
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     previous = previous or {}
@@ -434,6 +444,9 @@ def _activity_record(
             str(command or "").strip()
             or str(previous.get("command") or "")
         )[:16_000],
+        "is_background": bool(is_background) or bool(
+            previous.get("is_background")
+        ),
         "timestamp": str(timestamp or "")[:128],
     }
 
@@ -476,6 +489,7 @@ def _extract_shell_activity_updates(
                     command=_shell_command(raw_input),
                     timestamp=timestamp,
                     status="running",
+                    is_background=_runs_in_background(raw_input),
                 )
             elif (
                 payload_type in {
@@ -521,6 +535,7 @@ def _extract_shell_activity_updates(
                     command=_shell_command(raw_input),
                     timestamp=timestamp,
                     status="running",
+                    is_background=_runs_in_background(raw_input),
                 )
             elif (
                 part_type in {"tool_result", "toolResult"}
@@ -554,6 +569,7 @@ def _extract_shell_activity_updates(
                     command=_shell_command(record.get("tool_input")),
                     timestamp=timestamp,
                     status=status,
+                    is_background=record.get("is_background") is True,
                     previous=activities.get(activity_id),
                 )
 

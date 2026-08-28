@@ -173,6 +173,7 @@ class IngestMetadataRequest(BaseModel):
         "cancelled",
     ] | None = None
     activity_tool: str = Field(default="", max_length=256)
+    is_background: bool = False
     command: object = ""
     timestamp: str = Field(default="", max_length=128)
 
@@ -634,6 +635,7 @@ async def ingest_metadata_endpoint(
             activity_id=req.activity_id,
             activity_status=req.activity_status,
             activity_tool=req.activity_tool,
+            is_background=req.is_background,
             command=req.command,
             timestamp=req.timestamp,
         )

@@ -292,6 +292,7 @@ async def apply_deferred_conversation_metadata(
                 activity_status=str(payload.get("activity_status") or ""),
                 activity_tool=str(payload.get("activity_tool") or ""),
                 command=payload.get("command") or "",
+                is_background=payload.get("is_background") is True,
                 timestamp=str(payload.get("timestamp") or ""),
             )
         elif metadata_type == "codex_thread_title" and document.tool_id == "codex":

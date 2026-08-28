@@ -253,6 +253,8 @@ const enUS: Translations = {
     resolved: "Resolved",
     resolvedAnswerUnavailable: "Claude Code did not record which option was selected.",
     awaitingResponse: "Awaiting response",
+    backgroundTasksRunning: "{count} running in background",
+    backgroundTag: "Background",
     planMode: "Plan mode",
     cancelled: "Cancelled",
     chooseOne: "Choose one",

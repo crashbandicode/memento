@@ -406,6 +406,7 @@ def extract_claude_live_activity_updates(
                     or raw_activity.get("started_at")
                 ),
                 status=status,
+                is_background=raw_activity.get("is_background") is True,
             )
             key = f"claude_code:{relative_path}:{canonical_id}"
             records[key] = signal

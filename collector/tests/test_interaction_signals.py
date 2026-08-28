@@ -289,6 +289,38 @@ def test_shell_activity_tracks_codex_call_until_output(tmp_path: Path) -> None:
     assert next(iter(completed.values()))["activity_status"] == "completed"
 
 
+def test_claude_background_shell_activity_preserves_background_flag(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "claude-shell.jsonl"
+    _write(path, {
+        "type": "assistant",
+        "timestamp": "2026-08-28T17:00:00Z",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu-background",
+                "name": "Bash",
+                "input": {
+                    "command": "pytest -q",
+                    "run_in_background": True,
+                },
+            }],
+        },
+    })
+
+    records = extract_conversation_activity_updates(
+        path,
+        tool_name="claude_code",
+        relative_path="projects/demo/thread.jsonl",
+    )
+
+    signal = next(iter(records.values()))
+    assert signal["activity_status"] == "running"
+    assert signal["is_background"] is True
+
+
 def test_cursor_state_shell_activity_uses_native_status() -> None:
     content = json.dumps({
         "type": "cursor_state_tool",
