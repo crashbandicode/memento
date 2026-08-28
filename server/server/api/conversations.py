@@ -35,10 +35,13 @@ from ..services.canvas_artifacts import (
 from ..services.conversation_activity import conversation_activity_is_fresh
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
+    TANGENT_MARKER_PREFIX,
     ConversationRef,
     build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_briefing_kind,
+    conversation_briefing_session_id,
     conversation_display_title,
     conversation_message_user_origin,
     conversation_root_thread_id,
@@ -768,6 +771,13 @@ def _handoff_marker_session_id(content: object) -> str | None:
         return None
 
 
+def _tangent_marker_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message tangent marker."""
+    if conversation_briefing_kind(content) != "tangent":
+        return None
+    return conversation_briefing_session_id(content)
+
+
 def _claude_session_id_from_relative_path(relative_path: object) -> str | None:
     """Return the Claude Code session UUID encoded by a transcript filename."""
     if not isinstance(relative_path, str):
@@ -934,6 +944,152 @@ async def _handoff_thread_links(
     if successor is not None:
         links["handoff_successor"] = successor
     return links
+
+
+async def _tangent_parent_reference(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict | None:
+    """Resolve this tangent thread's parent from its opening user prompt."""
+    first_user_content = (
+        await db.execute(
+            select(ConversationMessage.content)
+            .where(
+                ConversationMessage.document_id == document.id,
+                ConversationMessage.role == "user",
+                ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+            )
+            .order_by(
+                ConversationMessage.line_number.asc(),
+                ConversationMessage.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    parent_session_id = _tangent_marker_session_id(first_user_content)
+    if parent_session_id is None:
+        return None
+
+    normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
+    parent_path = f"{parent_session_id}.jsonl"
+    statement = (
+        select(Document)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            or_(
+                normalized_path == parent_path,
+                normalized_path.like(f"%/{parent_path}"),
+            ),
+        )
+        .order_by(Document.id)
+        .limit(1)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+    parent = (await db.execute(statement)).scalars().first()
+    return _handoff_conversation_reference(parent) if parent is not None else None
+
+
+async def _tangent_branch_references(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> list[dict]:
+    """Find all tangent branches with one bounded indexed full-text probe."""
+    session_id = _claude_session_id_from_relative_path(document.relative_path)
+    if session_id is None:
+        return []
+
+    # This expression deliberately matches idx_conv_msg_content_fts exactly.
+    # The 64-candidate cap bounds the Python validation and duplicate removal.
+    content_vector = func.to_tsvector("simple", ConversationMessage.content)
+    session_query = func.plainto_tsquery("simple", session_id)
+    statement = (
+        select(Document, ConversationMessage.content)
+        .join(ConversationMessage, ConversationMessage.document_id == Document.id)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.id != document.id,
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            ConversationMessage.role == "user",
+            ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+            ConversationMessage.content.startswith(TANGENT_MARKER_PREFIX),
+            content_vector.op("@@")(session_query),
+        )
+        # Activity must come from document_delivery_state when present: raw
+        # path documents leave Document.activity_at frozen after DELTAs.
+        .order_by(
+            delivery_activity_expression().desc().nulls_last(),
+            Document.created_at.desc(),
+            Document.id.desc(),
+        )
+        .limit(64)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+
+    branches: list[dict] = []
+    seen_document_ids: set[uuid.UUID] = set()
+    for branch, content in (await db.execute(statement)).all():
+        if branch.id in seen_document_ids:
+            continue
+        if _tangent_marker_session_id(content) != session_id:
+            continue
+        seen_document_ids.add(branch.id)
+        branches.append(_handoff_conversation_reference(branch))
+    return branches
+
+
+async def _tangent_thread_links(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict:
+    """Return detail-only tangent links without changing stored conversation data."""
+    if document.tool_id != "claude_code":
+        return {}
+
+    parent = await _tangent_parent_reference(db, document, machine_ids)
+    branches = await _tangent_branch_references(db, document, machine_ids)
+    links: dict[str, dict | list[dict]] = {}
+    if parent is not None:
+        links["tangent_parent"] = parent
+    if branches:
+        links["tangent_branches"] = branches
+    return links
+
+
+async def _conversation_thread_links(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict:
+    """Assemble orthogonal handoff and tangent links for one detail response."""
+    handoff_links = await _handoff_thread_links(db, document, machine_ids)
+    tangent_links = await _tangent_thread_links(db, document, machine_ids)
+    return {**handoff_links, **tangent_links}
 
 
 def _message_question_interactions(metadata: object) -> list[dict]:
@@ -1417,7 +1573,7 @@ async def get_conversation(
     if token_usage:
         runtime["token_usage"] = token_usage
     usage_models = await conversation_usage_models(db, doc.id)
-    handoff_links = await _handoff_thread_links(db, doc, mids)
+    thread_links = await _conversation_thread_links(db, doc, mids)
 
     return {
         "id": str(doc.id),
@@ -1478,7 +1634,7 @@ async def get_conversation(
         "activity_at": activity_at.isoformat() if activity_at else None,
         "synced_at": doc.synced_at.isoformat(),
         "related_plans": related_plans,
-        **handoff_links,
+        **thread_links,
     }
 
 
