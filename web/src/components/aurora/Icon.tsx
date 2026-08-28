@@ -14,6 +14,7 @@ type IconName =
   | "layers" | "message" | "file_text" | "clock" | "book"
   | "settings" | "target" | "code" | "terminal" | "edit"
   | "activity" | "zap" | "grid" | "inbox" | "command"
+  | "git_branch"
   | "arrow_up" | "arrow_down" | "refresh" | "check" | "close"
   | "menu" | "trash" | "link" | "copy" | "external_link" | "eye";
 
@@ -63,6 +64,7 @@ const PATHS: Record<IconName, React.ReactElement> = {
   grid: <><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></>,
   inbox: <><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></>,
   command: <path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/>,
+  git_branch: <><circle cx="6" cy="5" r="2"/><circle cx="18" cy="5" r="2"/><circle cx="18" cy="19" r="2"/><path d="M6 7v5a7 7 0 0 0 7 7h3M6 12a7 7 0 0 0 7-7h3"/></>,
   arrow_up: <path d="M12 19V5M5 12l7-7 7 7"/>,
   arrow_down: <path d="M12 5v14M19 12l-7 7-7-7"/>,
   refresh: <><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></>,

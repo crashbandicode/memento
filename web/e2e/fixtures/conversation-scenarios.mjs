@@ -1627,6 +1627,65 @@ export const subagentMarkdownSummary = {
   latestAgentLine: 2,
 };
 
+const tangentParentLink = {
+  document_id: "44444444-4444-4444-8444-444444444444",
+  tool_id: "claude_code",
+  title: "Primary implementation thread",
+  canonical_url: "/conversations/claude/44444444-4444-4444-8444-444444444444",
+};
+
+const tangentSingleBranchLink = {
+  document_id: "55555555-5555-4555-8555-555555555555",
+  tool_id: "claude_code",
+  title: "Explore the alternate rendering",
+  canonical_url: "/conversations/claude/55555555-5555-4555-8555-555555555555",
+};
+
+const tangentMultipleBranchLinks = [
+  tangentSingleBranchLink,
+  {
+    document_id: "66666666-6666-4666-8666-666666666666",
+    tool_id: "claude_code",
+    title: "Validate the mobile layout",
+    canonical_url: "/conversations/claude/66666666-6666-4666-8666-666666666666",
+  },
+  {
+    document_id: "77777777-7777-4777-8777-777777777777",
+    tool_id: "claude_code",
+    title: "Document the branch behavior",
+    canonical_url: "/conversations/claude/77777777-7777-4777-8777-777777777777",
+  },
+];
+
+/** Tangent detail with exactly one child branch. */
+export const tangentSingleBranchThread = {
+  ...pinnedMessageThread,
+  docId: "88888888-8888-4888-8888-888888888888",
+  meta: /** @type {ConversationMeta} */ ({
+    ...pinnedMessageThread.meta,
+    id: "88888888-8888-4888-8888-888888888888",
+    tool_id: "claude_code",
+    title: "Tangent implementation thread",
+    relative_path: "projects/memento/88888888-8888-4888-8888-888888888888.jsonl",
+    tangent_parent: tangentParentLink,
+    tangent_branches: [tangentSingleBranchLink],
+  }),
+};
+
+/** Parent detail with several independent tangent branches. */
+export const tangentMultipleBranchesThread = {
+  ...tangentSingleBranchThread,
+  docId: "99999999-9999-4999-8999-999999999999",
+  meta: /** @type {ConversationMeta} */ ({
+    ...tangentSingleBranchThread.meta,
+    id: "99999999-9999-4999-8999-999999999999",
+    title: "Primary thread with tangents",
+    relative_path: "projects/memento/99999999-9999-4999-8999-999999999999.jsonl",
+    tangent_parent: undefined,
+    tangent_branches: tangentMultipleBranchLinks,
+  }),
+};
+
 /** All scenarios keyed by docId, for the mock router + node tests. */
 export const scenarios = {
   [permissionWrappedQuestion.docId]: permissionWrappedQuestion,
@@ -1648,4 +1707,6 @@ export const scenarios = {
   [urlNavigationLargeThread.docId]: urlNavigationLargeThread,
   [urlNavigationCanvasThread.docId]: urlNavigationCanvasThread,
   [subagentMarkdownSummary.docId]: subagentMarkdownSummary,
+  [tangentSingleBranchThread.docId]: tangentSingleBranchThread,
+  [tangentMultipleBranchesThread.docId]: tangentMultipleBranchesThread,
 };
