@@ -145,7 +145,7 @@ LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY = "_latest_meaningful_human_timestamp"
 PENDING_QUESTION_RECONCILIATION_VERSION_KEY = (
     "_pending_question_reconciliation_version"
 )
-PENDING_QUESTION_RECONCILIATION_VERSION = 3
+PENDING_QUESTION_RECONCILIATION_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -1299,6 +1299,13 @@ def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
     if mode != "delta":
         return set()
     metadata = document_metadata(doc)
+    # A version bump means the durable reconciliation rules changed. Rebuild
+    # from the current ingest tail instead of carrying forward stale IDs.
+    if (
+        metadata.get(PENDING_QUESTION_RECONCILIATION_VERSION_KEY)
+        != PENDING_QUESTION_RECONCILIATION_VERSION
+    ):
+        return set()
     stored = metadata.get(CURRENT_PENDING_QUESTIONS_KEY)
     if not isinstance(stored, list):
         return set()
@@ -1358,6 +1365,8 @@ def _update_pending_question_ids(
     normalized,
     latest_human_timestamp: object = "",
 ) -> str:
+    from .conversation_parser import is_meta_tool_interaction
+
     interactions = (
         [normalized.interaction] if isinstance(normalized.interaction, dict) else []
     )
@@ -1368,6 +1377,8 @@ def _update_pending_question_ids(
         and isinstance((interaction := call.get("interaction")), dict)
     )
     for interaction in interactions:
+        if is_meta_tool_interaction(interaction):
+            continue
         interaction_id = _bounded_message_text(str(interaction.get("id") or ""), 512)
         if interaction_id:
             if interaction_at_or_before_human(
@@ -1427,6 +1438,8 @@ def _store_latest_human_timestamp(doc: Document, timestamp: object) -> None:
 
 
 def _normalized_interaction_ids(normalized) -> set[str]:
+    from .conversation_parser import is_meta_tool_interaction
+
     ids: set[str] = set()
     interactions = (
         [normalized.interaction] if isinstance(normalized.interaction, dict) else []
@@ -1438,6 +1451,8 @@ def _normalized_interaction_ids(normalized) -> set[str]:
         and isinstance((interaction := call.get("interaction")), dict)
     )
     for interaction in interactions:
+        if is_meta_tool_interaction(interaction):
+            continue
         interaction_id = _bounded_message_text(
             str(interaction.get("id") or ""),
             512,
@@ -1462,12 +1477,17 @@ def _reconcile_live_interaction_signals(
     clear_all: bool,
 ) -> None:
     """Retire previews once their canonical transcript rows have arrived."""
+    from .conversation_parser import is_meta_tool_interaction
+
     metadata = document_metadata(doc)
     raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
     if not isinstance(raw_signals, dict):
         return
     signals = {
-        str(key): value for key, value in raw_signals.items() if isinstance(value, dict)
+        str(key): value
+        for key, value in raw_signals.items()
+        if isinstance(value, dict)
+        and not is_meta_tool_interaction(value.get("interaction"))
     }
     if clear_all:
         signals.clear()
@@ -1539,6 +1559,7 @@ def _pending_question_interactions(
     from .conversation_parser import (
         CURSOR_QUESTION_RESPONSE_WINDOW,
         build_cursor_interaction_response,
+        is_meta_tool_interaction,
     )
 
     if not recent_rows:
@@ -1559,6 +1580,11 @@ def _pending_question_interactions(
                 if isinstance(call, dict)
                 and isinstance((interaction := call.get("interaction")), dict)
             )
+        interactions = [
+            interaction
+            for interaction in interactions
+            if not is_meta_tool_interaction(interaction)
+        ]
         for interaction in interactions:
             interaction_id = str(interaction.get("id") or "")
             if not interaction_id:
@@ -1608,7 +1634,10 @@ def _advance_stored_pending_questions(
 ) -> tuple[set[str], str]:
     """Apply one canonical DB row to persisted pending-question state."""
     from .conversation_markdown import is_meaningful_human_turn
-    from .conversation_parser import build_cursor_interaction_response
+    from .conversation_parser import (
+        build_cursor_interaction_response,
+        is_meta_tool_interaction,
+    )
 
     metadata = stored.metadata_ if isinstance(stored.metadata_, dict) else {}
     direct = metadata.get("interaction")
@@ -1621,6 +1650,11 @@ def _advance_stored_pending_questions(
             if isinstance(call, dict)
             and isinstance((interaction := call.get("interaction")), dict)
         )
+    interactions = [
+        interaction
+        for interaction in interactions
+        if not is_meta_tool_interaction(interaction)
+    ]
 
     seen: set[str] = set()
     for interaction in interactions:
@@ -1675,6 +1709,8 @@ def _advance_stored_pending_questions(
 
 async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
     """One-time repair for badges persisted before human-turn reconciliation."""
+    from .conversation_parser import is_meta_tool_interaction
+
     statement = select(Document).where(
         Document.category == "conversation",
         delivery_metadata_expression(joined=True).op("?")(
@@ -1732,6 +1768,7 @@ async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
                 str(interaction_id): signal
                 for interaction_id, signal in raw_signals.items()
                 if isinstance(signal, dict)
+                and not is_meta_tool_interaction(signal.get("interaction"))
             }
             if isinstance(raw_signals, dict)
             else {}
