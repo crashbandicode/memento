@@ -202,7 +202,7 @@ export default function ConversationPage() {
               {backgroundRunningCount > 0 && (
                 <span data-background-running-count={backgroundRunningCount}>
                   <Chip tone="accent" icon="layers">
-                    {backgroundRunningCount} background task{backgroundRunningCount === 1 ? "" : "s"} running
+                    {fmt(t.conversation.backgroundTasksRunning, { count: backgroundRunningCount })}
                   </Chip>
                 </span>
               )}
