@@ -785,14 +785,25 @@ def reduce_writer_state(
         document_metadata = _merge_delta_metadata(effective_metadata, stored_metadata) if mode == "delta" else dict(stored_metadata)
         new_document = False
         previous_title = doc_row["title"]
-        title = _select_updated_document_title(
-            previous_title,
-            incoming_title or relative_path.split("/")[-1],
-            category=category,
-            tool_id=tool_id,
-            metadata=document_metadata,
-            incoming_title_is_explicit=incoming_title_is_explicit,
-        )
+        if (
+            tool_id == "claude_code"
+            and previous_title
+            and not incoming_title_is_explicit
+            and not incoming_title
+        ):
+            # Legacy derives its friendly Claude title after applying the
+            # filename fallback for an untitled DELTA. Raw has no derivation
+            # pass, so preserve that net title here.
+            title = previous_title
+        else:
+            title = _select_updated_document_title(
+                previous_title,
+                incoming_title or relative_path.split("/")[-1],
+                category=category,
+                tool_id=tool_id,
+                metadata=document_metadata,
+                incoming_title_is_explicit=incoming_title_is_explicit,
+            )
         project_id = doc_row["project_id"]
         visibility = doc_row["visibility"] or "private"
         document_source_at = max(filter(None, ((delivery or {}).get("source_modified_at"), source_modified_at)))

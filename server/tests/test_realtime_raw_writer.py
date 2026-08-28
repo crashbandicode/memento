@@ -481,3 +481,82 @@ def test_existing_title_uses_legacy_selector_and_enqueues_search() -> None:
     assert mutation.document_values["title"] == expected
     assert mutation.title_changed is True
     assert mutation.search_candidate is True
+
+
+def _reduce_existing_claude_delta(
+    *,
+    previous_title: str,
+    metadata: dict[str, str],
+):
+    state = _state(_existing_row(role="assistant"))
+    state.document["title"] = previous_title
+    state.document["document_metadata"] = {"session_id": "claude-title-fixture"}
+    state.delivery["metadata"] = {"session_id": "claude-title-fixture"}
+    row = json.dumps(
+        {
+            "type": "assistant",
+            "uuid": "claude-title-follow-up",
+            "timestamp": "2026-08-27T12:00:01Z",
+            "message": {"role": "assistant", "content": "Raw DELTA committed."},
+        }
+    )
+    return reduce_writer_state(
+        state,
+        tool_id="claude_code",
+        category="conversation",
+        content_type="jsonl",
+        relative_path="projects/fixture-parent/main.jsonl",
+        content=row,
+        content_hash="e" * 64,
+        file_size=len(row.encode("utf-8")),
+        mode="delta",
+        offset=_BASE_OFFSET + len(row.encode("utf-8")),
+        metadata=metadata,
+        timestamp=_OBSERVED_AT.timestamp(),
+        machine_id=None,
+        user_id=None,
+        base_hash=_BASE_HASH,
+        base_offset=_BASE_OFFSET,
+        authoritative_rebase=False,
+        had_sensitive=False,
+    )
+
+
+def test_existing_friendly_claude_title_survives_untitled_raw_delta() -> None:
+    mutation = _reduce_existing_claude_delta(
+        previous_title="Inspect the raw writer pairing gate.",
+        metadata={"session_id": "claude-title-fixture"},
+    )
+
+    assert mutation.document_values["title"] == "Inspect the raw writer pairing gate."
+    assert mutation.title_changed is False
+
+
+def test_existing_claude_delta_applies_unmarked_meaningful_title() -> None:
+    # Legacy selects the real title at ingest_service.py:3526 and :3657, then
+    # preserves it because the friendly pass only derives opaque/empty titles
+    # (ingest_service.py:2293-2294). Match that net outcome in raw.
+    mutation = _reduce_existing_claude_delta(
+        previous_title="Earlier friendly Claude title",
+        metadata={
+            "session_id": "claude-title-fixture",
+            "title": "Meaningful unmarked source title",
+        },
+    )
+
+    assert mutation.document_values["title"] == "Meaningful unmarked source title"
+    assert mutation.title_changed is True
+
+
+def test_existing_claude_delta_applies_explicit_ai_title() -> None:
+    mutation = _reduce_existing_claude_delta(
+        previous_title="Earlier friendly Claude title",
+        metadata={
+            "session_id": "claude-title-fixture",
+            "source_title_kind": "claude_ai_title",
+            "title": "Explicit Claude AI title",
+        },
+    )
+
+    assert mutation.document_values["title"] == "Explicit Claude AI title"
+    assert mutation.title_changed is True
