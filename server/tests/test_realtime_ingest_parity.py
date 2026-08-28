@@ -40,12 +40,15 @@ from server.db.models import (
     User,
 )
 from server.services.document_delivery import document_metadata, store_document_metadata
+from server.services.dashboard_projection import refresh_dashboard_document_projection
 from server.services.ingest_service import (
     CURRENT_PENDING_QUESTIONS_KEY,
+    LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_COUNT_KEY,
     PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
     DeltaBaseMismatch,
     ingest_file,
+    reconcile_pending_question_metadata,
 )
 
 
@@ -1047,6 +1050,228 @@ async def test_historic_meta_interaction_does_not_rehydrate_pending_count(
         assert metadata.get(PENDING_QUESTION_COUNT_KEY, 0) == 0
         dashboard = await session.get(DashboardDocumentProjection, document_id)
         assert dashboard is None or dashboard.pending_question_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_question_reconciliation_refreshes_dashboard_projection(
+    session_factory,
+) -> None:
+    """The startup v4 repair updates the durable dashboard badge too."""
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"meta-reconcile-{uuid.uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(),
+            name="meta-reconcile",
+            collector_token_hash=str(uuid.uuid4()),
+            user_id=user.id,
+        )
+        if await session.get(Tool, "claude_code") is None:
+            session.add(Tool(id="claude_code", display_name="claude_code"))
+        session.add_all((user, machine))
+        await session.commit()
+
+        full = _json_line({
+            "type": "user",
+            "uuid": "meta-reconcile-full",
+            "timestamp": "2026-08-28T12:00:00Z",
+            "message": {"role": "user", "content": "Initial context."},
+        })
+        document = await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path="phase0/meta-reconcile.jsonl",
+            content=full,
+            content_hash=_hash(full),
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata={"session_id": "meta-reconcile"},
+            timestamp=1_788_000_100.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=False,
+            writer="legacy",
+        )
+        document_id = document.id
+        persisted_document = await session.get(Document, document_id)
+        assert persisted_document is not None
+        session.add(ConversationMessage(
+            document_id=document_id,
+            line_number=2,
+            role="tool",
+            message_type="tool_use",
+            content="[SendFeedback]",
+            metadata_={
+                "source_id": "historic-reconcile-feedback",
+                "interaction": {
+                    "id": "feedback-reconcile-1",
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "SendFeedback",
+                    "questions": [],
+                },
+            },
+            timestamp=datetime(2026, 8, 28, 12, 0, 1, tzinfo=timezone.utc),
+        ))
+        store_document_metadata(
+            persisted_document,
+            {
+                **document_metadata(persisted_document),
+                CURRENT_PENDING_QUESTIONS_KEY: ["feedback-reconcile-1"],
+                PENDING_QUESTION_COUNT_KEY: 1,
+                PENDING_QUESTION_RECONCILIATION_VERSION_KEY: 3,
+            },
+        )
+        await refresh_dashboard_document_projection(session, persisted_document)
+        await session.commit()
+
+        updated = await reconcile_pending_question_metadata(session)
+        await session.refresh(persisted_document)
+        dashboard = await session.get(DashboardDocumentProjection, document_id)
+
+        assert updated == 1
+        assert CURRENT_PENDING_QUESTIONS_KEY not in document_metadata(persisted_document)
+        assert document_metadata(persisted_document).get(
+            PENDING_QUESTION_COUNT_KEY,
+            0,
+        ) == 0
+        assert dashboard is not None
+        assert dashboard.pending_question_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("use_core_delta_message_staging", "writer"),
+    (
+        (False, "legacy"),
+        (True, "core"),
+        (True, "raw"),
+    ),
+)
+async def test_version_transition_retains_live_only_pending_interaction(
+    session_factory,
+    use_core_delta_message_staging: bool,
+    writer: str,
+) -> None:
+    """A v3 delta retains a legitimate live-only interaction through v4."""
+    async with session_factory() as session:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"live-transition-{writer}-{uuid.uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(),
+            name=f"live-transition-{writer}",
+            collector_token_hash=str(uuid.uuid4()),
+            user_id=user.id,
+        )
+        if await session.get(Tool, "claude_code") is None:
+            session.add(Tool(id="claude_code", display_name="claude_code"))
+        session.add_all((user, machine))
+        await session.commit()
+
+        full = _json_line({
+            "type": "user",
+            "uuid": f"live-transition-full-{writer}",
+            "timestamp": "2026-08-28T12:00:00Z",
+            "message": {"role": "user", "content": "Initial context."},
+        })
+        full_hash = _hash(full)
+        document = await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=f"phase0/live-transition-{writer}.jsonl",
+            content=full,
+            content_hash=full_hash,
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata={"session_id": f"live-transition-{writer}"},
+            timestamp=1_788_000_200.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
+        )
+        document_id = document.id
+        persisted_document = await session.get(Document, document_id)
+        assert persisted_document is not None
+        live_interaction = {
+            "id": "ask-live-1",
+            "kind": "question",
+            "source": "claude_code",
+            "tool_name": "AskUserQuestion",
+            "questions": [],
+        }
+        store_document_metadata(
+            persisted_document,
+            {
+                **document_metadata(persisted_document),
+                CURRENT_PENDING_QUESTIONS_KEY: ["ask-live-1"],
+                PENDING_QUESTION_COUNT_KEY: 1,
+                PENDING_QUESTION_RECONCILIATION_VERSION_KEY: 3,
+                LIVE_INTERACTION_SIGNALS_KEY: {
+                    "ask-live-1": {
+                        "timestamp": "2026-08-28T12:00:01Z",
+                        "interaction": live_interaction,
+                    },
+                },
+            },
+        )
+        await session.commit()
+
+        delta = _json_line({
+            "type": "assistant",
+            "uuid": f"live-transition-delta-{writer}",
+            "timestamp": "2026-08-28T12:00:02Z",
+            "message": {"role": "assistant", "content": "Tail update."},
+        })
+        final = f"{full}\n{delta}"
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=f"phase0/live-transition-{writer}.jsonl",
+            content=delta,
+            content_hash=_hash(final),
+            file_size=len(delta.encode("utf-8")),
+            mode="delta",
+            offset=len(final.encode("utf-8")),
+            base_hash=full_hash,
+            base_offset=len(full.encode("utf-8")),
+            metadata={"session_id": f"live-transition-{writer}"},
+            timestamp=1_788_000_201.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=use_core_delta_message_staging,
+            writer=writer,
+        )
+        await session.commit()
+        await session.refresh(persisted_document)
+
+        metadata = document_metadata(persisted_document)
+        assert metadata[CURRENT_PENDING_QUESTIONS_KEY] == ["ask-live-1"]
+        assert metadata[PENDING_QUESTION_COUNT_KEY] == 1
+        assert metadata[PENDING_QUESTION_RECONCILIATION_VERSION_KEY] == 4
+        assert LIVE_INTERACTION_SIGNALS_KEY in metadata
+        dashboard = await session.get(DashboardDocumentProjection, document_id)
+        assert dashboard is not None
+        assert dashboard.pending_question_count == 1
 
 
 @pytest.mark.asyncio

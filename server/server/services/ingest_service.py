@@ -1300,12 +1300,16 @@ def _pending_question_ids_for_ingest(doc: Document, mode: str) -> set[str]:
         return set()
     metadata = document_metadata(doc)
     # A version bump means the durable reconciliation rules changed. Rebuild
-    # from the current ingest tail instead of carrying forward stale IDs.
+    # from the current ingest tail instead of carrying forward stale IDs, but
+    # retain current live previews because they are necessarily outside it.
     if (
         metadata.get(PENDING_QUESTION_RECONCILIATION_VERSION_KEY)
         != PENDING_QUESTION_RECONCILIATION_VERSION
     ):
-        return set()
+        return _active_live_interaction_ids(
+            doc,
+            metadata.get(LATEST_MEANINGFUL_HUMAN_TIMESTAMP_KEY, ""),
+        )
     stored = metadata.get(CURRENT_PENDING_QUESTIONS_KEY)
     if not isinstance(stored, list):
         return set()
@@ -1348,6 +1352,36 @@ def interaction_at_or_before_human(
         and human_at is not None
         and interaction_at <= human_at
     )
+
+
+def _active_live_interaction_ids(
+    doc: Document,
+    latest_human_timestamp: object,
+) -> set[str]:
+    """Return retained, non-meta live interactions that still need attention."""
+    from .conversation_parser import is_meta_tool_interaction
+
+    metadata = document_metadata(doc)
+    raw_signals = metadata.get(LIVE_INTERACTION_SIGNALS_KEY)
+    if not isinstance(raw_signals, dict):
+        return set()
+    return {
+        interaction_id
+        for raw_interaction_id, signal in raw_signals.items()
+        if isinstance(signal, dict)
+        and isinstance(signal.get("interaction"), dict)
+        and not is_meta_tool_interaction(signal["interaction"])
+        and not interaction_at_or_before_human(
+            signal.get("timestamp"),
+            latest_human_timestamp,
+        )
+        and (
+            interaction_id := _bounded_message_text(
+                str(raw_interaction_id),
+                512,
+            )
+        )
+    }
 
 
 def _newest_interaction_timestamp(current: object, candidate: object) -> str:
@@ -1415,8 +1449,20 @@ def _update_pending_question_ids(
     return _bounded_message_text(str(latest_human_timestamp or ""), 128)
 
 
-def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
+def _store_pending_question_ids(
+    doc: Document,
+    pending_ids: set[str],
+) -> None:
     metadata = document_metadata(doc)
+    should_stamp_reconciliation_version = (
+        CURRENT_PENDING_QUESTIONS_KEY in metadata
+        or PENDING_QUESTION_COUNT_KEY in metadata
+        or bool(pending_ids)
+        or (
+            metadata.get(PENDING_QUESTION_RECONCILIATION_VERSION_KEY)
+            == PENDING_QUESTION_RECONCILIATION_VERSION
+        )
+    )
     bounded = sorted(pending_ids)[:64]
     if bounded:
         metadata[CURRENT_PENDING_QUESTIONS_KEY] = bounded
@@ -1424,6 +1470,10 @@ def _store_pending_question_ids(doc: Document, pending_ids: set[str]) -> None:
     else:
         metadata.pop(CURRENT_PENDING_QUESTIONS_KEY, None)
         metadata.pop(PENDING_QUESTION_COUNT_KEY, None)
+    if should_stamp_reconciliation_version:
+        metadata[PENDING_QUESTION_RECONCILIATION_VERSION_KEY] = (
+            PENDING_QUESTION_RECONCILIATION_VERSION
+        )
     store_document_metadata(doc, metadata)
 
 
@@ -1710,6 +1760,7 @@ def _advance_stored_pending_questions(
 async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
     """One-time repair for badges persisted before human-turn reconciliation."""
     from .conversation_parser import is_meta_tool_interaction
+    from .dashboard_projection import refresh_dashboard_document_projection
 
     statement = select(Document).where(
         Document.category == "conversation",
@@ -1802,6 +1853,8 @@ async def reconcile_pending_question_metadata(db: AsyncSession) -> int:
         )
         if metadata != original_metadata:
             store_document_metadata(document, metadata)
+            await db.flush()
+            await refresh_dashboard_document_projection(db, document)
             updated += 1
 
     await db.commit()
