@@ -14,7 +14,7 @@ import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora
 import LowActivitySection from "@/components/conversations/LowActivitySection";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import SpendDashboard from "@/components/dashboard/SpendDashboard";
-import { partitionDashboardRecent } from "@/lib/dashboard-recent";
+import { clawDelegateGroupCount, partitionDashboardRecent } from "@/lib/dashboard-recent";
 
 interface DashboardData {
   tools: {
@@ -41,6 +41,7 @@ interface DashboardData {
     is_low_activity: boolean;
     orchestration?: string | null;
   }[];
+  claw_delegate_count?: number;
   daily: { date: string; count: number }[];
   tool_daily: Record<string, { date: string; count: number }[]>;
   devices: {
@@ -203,6 +204,10 @@ export default function Dashboard() {
     lowActivity: lowActivityConversations,
     clawDelegates: clawDelegateConversations,
   } = partitionDashboardRecent(recent_conversations);
+  const clawDelegateCount = clawDelegateGroupCount(
+    clawDelegateConversations,
+    data.claw_delegate_count,
+  );
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -437,8 +442,11 @@ export default function Dashboard() {
                       isSubagentOrphan={conv.is_subagent_orphan}
                     />
                   ))}
-                  {clawDelegateConversations.length > 0 && (
-                    <ClawDelegateGroup conversations={clawDelegateConversations} />
+                  {clawDelegateCount > 0 && (
+                    <ClawDelegateGroup
+                      conversations={clawDelegateConversations}
+                      count={clawDelegateCount}
+                    />
                   )}
                   <LowActivitySection
                     compact
@@ -579,13 +587,14 @@ memento-collector setup`}
 
 function ClawDelegateGroup({
   conversations,
+  count,
 }: {
   conversations: DashboardData["recent_conversations"];
+  count: number;
 }) {
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
   const { t } = useI18n();
-  const count = conversations.length;
   const label = fmt(
     count === 1 ? t.dashboard.clawDelegatedAgent : t.dashboard.clawDelegatedAgents,
     { count },

@@ -19,7 +19,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
@@ -276,8 +276,7 @@ async def _selection_plan(
                 .order_by(ConversationMessage.line_number, ConversationMessage.id)
             )
         ).all()
-        if conversation_message_user_origin("user", metadata, thread_origin)
-        != "parent_agent"
+        if conversation_export_prompt_is_included(metadata, thread_origin)
     ]
     if not rows:
         return _SelectionPlan((), {})
@@ -657,6 +656,34 @@ def _representatives(
     return representatives, logical_activity
 
 
+def conversation_export_prompt_is_included(
+    metadata: Mapping[str, Any] | None,
+    thread_origin: str | None,
+) -> bool:
+    """Match prompt numbering/eligibility to other conversation consumers."""
+    return conversation_message_user_origin(
+        "user",
+        metadata,
+        thread_origin,
+    ) != "parent_agent"
+
+
+def _export_human_prompt_sql(parent_agent_document_ids: set[uuid.UUID]):
+    origin = func.coalesce(
+        ConversationMessage.metadata_["message_origin"].astext,
+        "",
+    )
+    thread_is_parent_agent = (
+        ConversationMessage.document_id.in_(parent_agent_document_ids)
+        if parent_agent_document_ids
+        else false()
+    )
+    return or_(
+        origin == "human",
+        and_(origin != "parent_agent", ~thread_is_parent_agent),
+    )
+
+
 def _prompt_number_predicate(
     prompt_number,
     selection: PromptSelection | None,
@@ -675,6 +702,7 @@ async def _prompt_matching_ids(
     start_at: datetime | None,
     end_at: datetime | None,
     allowed_document_ids: set[uuid.UUID],
+    parent_agent_document_ids: set[uuid.UUID] | None = None,
 ) -> set[uuid.UUID] | None:
     if selection is None and start_at is None and end_at is None:
         return None
@@ -697,6 +725,7 @@ async def _prompt_matching_ids(
             func.length(func.trim(ConversationMessage.content)) > 0,
             ~ConversationMessage.content.startswith("[Subagent Context]"),
             response_missing,
+            _export_human_prompt_sql(parent_agent_document_ids or set()),
         )
         .subquery()
     )
@@ -792,21 +821,23 @@ async def _select_global_documents(
         request.include_subagents,
     )
     matched_ids: set[uuid.UUID] = set(documents_by_id)
+    parent_agent_ids = {
+        document.id
+        for document in documents
+        if conversation_user_role_origin(
+            document.tool_id,
+            document.relative_path,
+            document.metadata,
+        )
+        == "parent_agent"
+    }
     prompt_ids = await _prompt_matching_ids(
         db,
         options.prompt_selection,
         options.start_at,
         options.end_at,
-        {
-            document.id
-            for document in documents
-            if conversation_user_role_origin(
-                document.tool_id,
-                document.relative_path,
-                document.metadata,
-            )
-            != "parent_agent"
-        },
+        set(documents_by_id),
+        parent_agent_document_ids=parent_agent_ids,
     )
     if prompt_ids is not None:
         matched_ids.intersection_update(prompt_ids)

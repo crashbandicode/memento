@@ -24,9 +24,12 @@ from ..db.models import (
 )
 from ..db.session import queue_realtime_event
 from .conversation_hierarchy import (
-    conversation_briefing_kind,
-    conversation_briefing_session_id,
-    conversation_is_chain_primary,
+    BRIEFING_RAW_PREFIX_CHARS,
+    resolve_conversation_briefing,
+)
+from .large_content_store import (
+    DocumentContentUnavailableError,
+    document_content_prefix,
 )
 from .document_delivery import (
     delivery_activity_expression,
@@ -282,16 +285,51 @@ async def _first_user_message_content(
     return content if isinstance(content, str) else ""
 
 
+async def _bounded_raw_prefix(
+    db: AsyncSession,
+    document: Document,
+) -> str | None:
+    try:
+        return await document_content_prefix(
+            db,
+            document,
+            max_chars=BRIEFING_RAW_PREFIX_CHARS,
+        )
+    except DocumentContentUnavailableError:
+        return None
+
+
+async def _resolve_document_briefing(
+    db: AsyncSession,
+    document: Document,
+) -> tuple[str | None, str | None]:
+    persisted = await _first_user_message_content(db, document.id)
+    metadata = document_metadata(document)
+    kind, session_id = resolve_conversation_briefing(
+        persisted_user_content=persisted or None,
+        metadata=metadata,
+        raw_prefix=None,
+    )
+    if (
+        kind
+        or (persisted or "").strip()
+        or str(metadata.get("first_user_message") or "").strip()
+    ):
+        return kind, session_id
+    raw_prefix = await _bounded_raw_prefix(db, document)
+    return resolve_conversation_briefing(
+        persisted_user_content=None,
+        metadata=metadata,
+        raw_prefix=raw_prefix,
+    )
+
+
 async def _child_is_chain_primary(
     db: AsyncSession,
     child: Document,
 ) -> bool:
-    metadata = document_metadata(child)
-    first_user = await _first_user_message_content(db, child.id)
-    return conversation_is_chain_primary(
-        metadata,
-        first_user_content=first_user or None,
-    )
+    kind, _session_id = await _resolve_document_briefing(db, child)
+    return kind in {"handoff", "tangent"}
 
 
 async def _find_document_by_session_id(
@@ -680,12 +718,10 @@ async def reconcile_orchestration_for_document(
     for run in candidate_runs:
         changed += await _reconcile_run_documents(db, run)
 
-    first_user = await _first_user_message_content(db, document.id)
-    kind = conversation_briefing_kind(first_user)
+    kind, parent_session_id = await _resolve_document_briefing(db, document)
     if kind in {"handoff", "tangent"}:
         return changed
     if kind == "delegate":
-        parent_session_id = conversation_briefing_session_id(first_user)
         parent_id = None
         if parent_session_id:
             parent_id = await _find_document_by_session_id(

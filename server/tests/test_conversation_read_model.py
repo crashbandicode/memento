@@ -118,6 +118,18 @@ def test_accumulator_materializes_prompts_and_interaction_resolution() -> None:
     assert values["latest_human_at"].startswith("2026-08-07T16:00:01")
 
 
+def test_prompt_projection_excludes_parent_agent_origin() -> None:
+    prompt = _prompt_projection_value(
+        _row(
+            1,
+            role="user",
+            content="MEMENTO-HANDOFF-FROM: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            metadata={"message_origin": "parent_agent"},
+        )
+    )
+    assert prompt is None
+
+
 def test_accumulator_materializes_shell_and_agent_state() -> None:
     now = datetime.now(UTC)
     accumulator = _Accumulator()

@@ -24,3 +24,13 @@ export function partitionDashboardRecent<T extends {
   ));
   return { attention, active, lowActivity, clawDelegates };
 }
+
+export function clawDelegateGroupCount(
+  sample: { id: string }[],
+  totalCount?: number | null,
+) {
+  if (typeof totalCount === "number" && totalCount >= sample.length) {
+    return totalCount;
+  }
+  return sample.length;
+}

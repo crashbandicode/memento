@@ -283,6 +283,20 @@ class LargeContentStoreTests(unittest.TestCase):
         self.assertEqual(first_prompt, "first")
         self.assertLessEqual(_json_size(metadata), MAX_DOCUMENT_METADATA_BYTES)
 
+    def test_handoff_first_user_message_persists_durable_briefing_marker(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        metadata, _history, first_prompt = _prepare_document_metadata(
+            {
+                "session_id": "successor",
+                "first_user_message": f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue.",
+            }
+        )
+
+        self.assertNotIn("first_user_message", metadata)
+        self.assertEqual(metadata["briefing_kind"], "handoff")
+        self.assertEqual(metadata["briefing_session_id"], parent_id)
+        self.assertTrue(first_prompt.startswith("MEMENTO-HANDOFF-FROM:"))
+
     def test_small_delta_preserves_externalized_full_snapshot(self) -> None:
         externalized = SimpleNamespace(content=None, content_s3_key="raw/job.txt")
         inline = SimpleNamespace(content="full", content_s3_key=None)

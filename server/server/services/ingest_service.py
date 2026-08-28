@@ -194,6 +194,8 @@ _ESSENTIAL_METADATA_KEYS = {
     LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
     "cwd",
+    "briefing_kind",
+    "briefing_session_id",
     "first_user_message",
     "forked_from_id",
     "is_subagent",
@@ -1896,6 +1898,9 @@ def _prepare_document_metadata(
         first_user_message,
         MAX_STORED_MESSAGE_CHARS,
     )
+    from .conversation_hierarchy import persist_conversation_briefing_metadata
+
+    persist_conversation_briefing_metadata(candidate, first_user_message)
 
     history: list[dict] = []
     history_bytes = 0

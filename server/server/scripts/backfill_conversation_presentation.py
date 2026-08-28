@@ -18,7 +18,12 @@ from datetime import datetime
 from sqlalchemy import delete, exists, func, or_, select, text, update
 from sqlalchemy.orm import load_only
 
-from server.db.models import ConversationMessage, Document, DocumentEmbedding
+from server.db.models import (
+    ConversationMessage,
+    ConversationReadModel,
+    Document,
+    DocumentEmbedding,
+)
 from server.db.session import async_session_factory, engine
 from server.services.conversation_parser import (
     _extract_local_command,
@@ -100,6 +105,7 @@ class BackfillStats:
     updated_message_origin: int = 0
     preserved_message_origin: int = 0
     unmatched_claude_origin_records: int = 0
+    refreshed_prompt_projections: int = 0
 
     def add(self, other: "BackfillStats") -> None:
         for field in fields(self):
@@ -671,6 +677,7 @@ async def _repair_claude_message_origin_batch(
     )
     matched_source_ids: dict = defaultdict(set)
     matched_identities: dict = defaultdict(set)
+    changed_by_document: dict = defaultdict(list)
     for message in message_rows.scalars():
         by_source, by_identity, _record_count = origins_by_document.get(
             message.document_id,
@@ -703,6 +710,7 @@ async def _repair_claude_message_origin_batch(
             metadata.pop("message_origin", None)
         message.metadata_ = metadata
         stats.updated_message_origin += 1
+        changed_by_document[message.document_id].append(message)
 
     stats.unmatched_claude_origin_records = sum(
         (len(by_source) - len(matched_source_ids.get(document_id, set())))
@@ -712,6 +720,20 @@ async def _repair_claude_message_origin_batch(
         in origins_by_document.items()
     )
     await db.flush()
+    if changed_by_document:
+        from server.services.conversation_read_model import _refresh_prompt_projections
+
+        for document_id, messages in changed_by_document.items():
+            await _refresh_prompt_projections(
+                db,
+                document_id,
+                messages,
+                replace=False,
+            )
+            projection = await db.get(ConversationReadModel, document_id)
+            if projection is not None:
+                projection.generation = int(projection.generation or 1) + 1
+            stats.refreshed_prompt_projections += 1
     return stats
 
 

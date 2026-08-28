@@ -964,7 +964,7 @@ def reduce_writer_state(
             # reconciliation, so it must decline this semantic shape before
             # any mutation rather than commit an unlinked child view.
             raise RawWriterUnsupported(
-                "claw delegate markers need legacy orchestration reconciliation"
+                "claw delegate marker needs legacy reducer"
             )
     _reconcile_live_interaction_signals(view, canonical_interaction_ids, clear_all=False)
     _reconcile_live_shell_activities(view, terminal_tool_ids)

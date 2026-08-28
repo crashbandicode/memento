@@ -10,6 +10,7 @@ parent's history.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -41,6 +42,16 @@ _BRIEFING_SESSION_ID = (
 HANDOFF_MARKER_PREFIX = "MEMENTO-HANDOFF-FROM:"
 TANGENT_MARKER_PREFIX = "MEMENTO-TANGENT-FROM:"
 DELEGATE_MARKER_PREFIX = "MEMENTO-DELEGATE-FROM:"
+BRIEFING_KIND_METADATA_KEY = "briefing_kind"
+BRIEFING_SESSION_ID_METADATA_KEY = "briefing_session_id"
+BRIEFING_RAW_PREFIX_CHARS = 4096
+_BRIEFING_CONTENT_CHARS = 2048
+_BRIEFING_KINDS = frozenset({"handoff", "tangent", "delegate"})
+_BRIEFING_KIND_PREFIXES = {
+    "handoff": HANDOFF_MARKER_PREFIX,
+    "tangent": TANGENT_MARKER_PREFIX,
+    "delegate": DELEGATE_MARKER_PREFIX,
+}
 _HANDOFF_MARKER_RE = re.compile(
     rf"\A{re.escape(HANDOFF_MARKER_PREFIX)}\s*(?P<session_id>"
     rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
@@ -69,46 +80,147 @@ def _metadata_flag_is_true(value: object) -> bool:
     return False
 
 
-def conversation_briefing_kind(content: object) -> str | None:
-    """Classify a first-user-message protocol marker, if one is present."""
+def _parse_conversation_briefing(content: object) -> tuple[str, str] | None:
+    """Return ``(kind, session_id)`` only when the marker carries a UUID."""
     if not isinstance(content, str):
         return None
     text = content.lstrip()
-    if text.startswith(HANDOFF_MARKER_PREFIX):
-        return "handoff"
-    if text.startswith(TANGENT_MARKER_PREFIX):
-        return "tangent"
-    if text.startswith(DELEGATE_MARKER_PREFIX):
-        return "delegate"
-    return None
-
-
-def conversation_briefing_session_id(content: object) -> str | None:
-    """Return the UUID carried by a first-user-message protocol marker."""
-    if not isinstance(content, str):
-        return None
-    text = content.lstrip()
-    for _kind, pattern in _BRIEFING_MARKER_PATTERNS:
+    for kind, pattern in _BRIEFING_MARKER_PATTERNS:
         match = pattern.match(text)
         if match is None:
             continue
         try:
-            return str(uuid.UUID(match.group("session_id")))
+            return kind, str(uuid.UUID(match.group("session_id")))
         except (ValueError, AttributeError):
             return None
     return None
+
+
+def conversation_briefing_kind(content: object) -> str | None:
+    """Classify a first-user-message protocol marker, if one is present.
+
+    A prefix without a parseable UUID is not a marker.
+    """
+    parsed = _parse_conversation_briefing(content)
+    return None if parsed is None else parsed[0]
+
+
+def conversation_briefing_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message protocol marker."""
+    parsed = _parse_conversation_briefing(content)
+    return None if parsed is None else parsed[1]
+
+
+def persist_conversation_briefing_metadata(
+    metadata: dict[str, Any],
+    first_user_content: str | None,
+) -> dict[str, Any]:
+    """Store a tiny durable briefing marker, or keep an existing one on deltas."""
+    candidate = metadata
+    parsed = _parse_conversation_briefing(first_user_content)
+    if parsed is not None:
+        kind, session_id = parsed
+        candidate[BRIEFING_KIND_METADATA_KEY] = kind
+        candidate[BRIEFING_SESSION_ID_METADATA_KEY] = session_id
+        return candidate
+    if isinstance(first_user_content, str) and first_user_content.strip():
+        candidate.pop(BRIEFING_KIND_METADATA_KEY, None)
+        candidate.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+    return candidate
+
+
+def _user_text_from_raw_record(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content", content)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(parts)
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def conversation_briefing_from_raw_prefix(raw_prefix: object) -> str:
+    """Bounded first line (or first JSON user record) used when no user row exists."""
+    if not isinstance(raw_prefix, str) or not raw_prefix.strip():
+        return ""
+    first_line, _, _ = raw_prefix.lstrip("\ufeff").partition("\n")
+    first_line = first_line.strip()
+    if not first_line:
+        return ""
+    if _parse_conversation_briefing(first_line) is not None:
+        return first_line[:_BRIEFING_CONTENT_CHARS]
+    if first_line.startswith("{"):
+        try:
+            payload = json.loads(first_line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return first_line[:_BRIEFING_CONTENT_CHARS]
+        extracted = _user_text_from_raw_record(payload)
+        if _parse_conversation_briefing(extracted) is not None:
+            return extracted[:_BRIEFING_CONTENT_CHARS]
+    return first_line[:_BRIEFING_CONTENT_CHARS]
+
+
+def resolve_conversation_briefing(
+    *,
+    persisted_user_content: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    raw_prefix: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve a validated briefing marker without inventing one from a prefix."""
+    if isinstance(persisted_user_content, str) and persisted_user_content.strip():
+        parsed = _parse_conversation_briefing(persisted_user_content)
+        return (None, None) if parsed is None else parsed
+
+    values = metadata or {}
+    stored_first = str(values.get("first_user_message") or "")
+    if stored_first.strip():
+        parsed = _parse_conversation_briefing(stored_first)
+        return (None, None) if parsed is None else parsed
+
+    durable_kind = str(values.get(BRIEFING_KIND_METADATA_KEY) or "").strip()
+    durable_session = str(values.get(BRIEFING_SESSION_ID_METADATA_KEY) or "").strip()
+    if durable_kind in _BRIEFING_KINDS:
+        try:
+            session_id = str(uuid.UUID(durable_session))
+        except (ValueError, AttributeError):
+            session_id = ""
+        if session_id:
+            reconstructed = f"{_BRIEFING_KIND_PREFIXES[durable_kind]} {session_id}"
+            parsed = _parse_conversation_briefing(reconstructed)
+            if parsed is not None:
+                return parsed
+
+    raw_content = conversation_briefing_from_raw_prefix(raw_prefix)
+    if raw_content:
+        parsed = _parse_conversation_briefing(raw_content)
+        return (None, None) if parsed is None else parsed
+    return None, None
 
 
 def conversation_is_chain_primary(
     metadata: Mapping[str, Any] | None,
     *,
     first_user_content: str | None = None,
+    raw_prefix: str | None = None,
 ) -> bool:
     """Return whether this thread is a handoff successor or tangent primary."""
-    content = first_user_content
-    if content is None:
-        content = str((metadata or {}).get("first_user_message") or "")
-    return conversation_briefing_kind(content) in {"handoff", "tangent"}
+    kind, _session_id = resolve_conversation_briefing(
+        persisted_user_content=first_user_content,
+        metadata=metadata,
+        raw_prefix=raw_prefix,
+    )
+    return kind in {"handoff", "tangent"}
 
 
 def conversation_message_user_origin(

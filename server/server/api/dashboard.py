@@ -69,6 +69,8 @@ from ..services.user_filter import user_machine_ids, apply_user_filter
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
+RECENT_PRIMARY_LIMIT = 20
+RECENT_CLAW_SAMPLE_LIMIT = 20
 
 
 @router.get("/spend")
@@ -249,6 +251,37 @@ def _row_metadata(row) -> dict:
         if row.tool_id == "codex":
             metadata["thread_source"] = "subagent"
     return metadata
+
+
+def _is_claw_orchestration_row(row) -> bool:
+    return str(_row_metadata(row).get("orchestration") or "").strip() == "claw"
+
+
+def _select_recent_conversation_rows(
+    visible_convo_rows,
+    attention_ids: set,
+    activity_key,
+    *,
+    primary_limit: int = RECENT_PRIMARY_LIMIT,
+    claw_sample_limit: int = RECENT_CLAW_SAMPLE_LIMIT,
+):
+    """Partition unlinked Claw rows before applying the Recent primary budget."""
+    attention_rows = [
+        row for row in visible_convo_rows if row.id in attention_ids
+    ]
+    recent_rows = [
+        row for row in visible_convo_rows if row.id not in attention_ids
+    ]
+    claw_rows = [row for row in recent_rows if _is_claw_orchestration_row(row)]
+    primary_rows = [
+        row for row in recent_rows if not _is_claw_orchestration_row(row)
+    ]
+    convos_rows = (
+        sorted(attention_rows, key=activity_key, reverse=True)
+        + sorted(primary_rows, key=activity_key, reverse=True)[:primary_limit]
+        + sorted(claw_rows, key=activity_key, reverse=True)[:claw_sample_limit]
+    )
+    return convos_rows, len(claw_rows)
 
 
 @router.get("")
@@ -515,12 +548,10 @@ async def get_dashboard(
         if pending_question_counts.get(row.id, 0) > 0
     ]
     attention_ids = {row.id for row in attention_rows}
-    recent_rows = [
-        row for row in visible_convo_rows if row.id not in attention_ids
-    ]
-    convos_rows = (
-        sorted(attention_rows, key=activity_key, reverse=True)
-        + sorted(recent_rows, key=activity_key, reverse=True)[:20]
+    convos_rows, claw_delegate_count = _select_recent_conversation_rows(
+        visible_convo_rows,
+        attention_ids,
+        activity_key,
     )
 
     # Only temporary legacy rows fall back to message aggregation. Once the
@@ -698,6 +729,7 @@ async def get_dashboard(
     return {
         "tools": tools,
         "recent_conversations": recent_conversations,
+        "claw_delegate_count": claw_delegate_count,
         "daily": daily,
         "tool_daily": tool_daily,
         "devices": devices,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     ConversationRef,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_briefing_from_raw_prefix,
     conversation_briefing_kind,
     conversation_briefing_session_id,
     conversation_display_title,
@@ -24,6 +26,8 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     merge_authoritative_subagent_summaries,
     merge_subagent_event_summaries,
     path_linked_subagent_identity,
+    persist_conversation_briefing_metadata,
+    resolve_conversation_briefing,
 )
 
 
@@ -643,6 +647,85 @@ class ConversationHierarchyTests(unittest.TestCase):
                 {"orchestration": "claw", "is_subagent": True},
             ),
             "parent_agent",
+        )
+
+    def test_briefing_kind_requires_a_parseable_uuid(self) -> None:
+        invalid_delegate = "MEMENTO-DELEGATE-FROM: not-a-uuid\nwork"
+        invalid_handoff = "MEMENTO-HANDOFF-FROM: not-a-uuid\nContinue."
+        self.assertIsNone(conversation_briefing_kind(invalid_delegate))
+        self.assertIsNone(conversation_briefing_session_id(invalid_delegate))
+        self.assertIsNone(conversation_briefing_kind(invalid_handoff))
+        self.assertFalse(
+            conversation_is_chain_primary({"first_user_message": invalid_handoff})
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(persisted_user_content=invalid_delegate),
+            (None, None),
+        )
+
+    def test_chain_primary_without_normalized_rows_uses_raw_or_durable_marker(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        self.assertTrue(
+            conversation_is_chain_primary(
+                {},
+                first_user_content="",
+                raw_prefix=handoff,
+            )
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(
+                persisted_user_content="",
+                metadata={},
+                raw_prefix=handoff,
+            ),
+            ("handoff", parent_id),
+        )
+        jsonl = json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": handoff},
+            }
+        ) + "\n"
+        self.assertEqual(
+            conversation_briefing_kind(conversation_briefing_from_raw_prefix(jsonl)),
+            "handoff",
+        )
+        durable = persist_conversation_briefing_metadata({}, handoff)
+        self.assertEqual(durable["briefing_kind"], "handoff")
+        self.assertEqual(durable["briefing_session_id"], parent_id)
+        self.assertTrue(
+            conversation_is_chain_primary(
+                durable,
+                first_user_content=None,
+                raw_prefix=None,
+            )
+        )
+
+    def test_global_export_keeps_claw_thread_with_explicit_human_prompt(self) -> None:
+        from server.api.conversation_exports import conversation_export_prompt_is_included
+
+        thread_origin = conversation_user_role_origin(
+            "cursor",
+            "agent-transcripts/delegate.jsonl",
+            {"orchestration": "claw", "is_subagent": True},
+        )
+        self.assertEqual(thread_origin, "parent_agent")
+        rows = [
+            {"message_origin": "parent_agent"},
+            {"message_origin": "human"},
+        ]
+        included = [
+            metadata
+            for metadata in rows
+            if conversation_export_prompt_is_included(metadata, thread_origin)
+        ]
+        self.assertEqual(included, [{"message_origin": "human"}])
+        self.assertFalse(
+            conversation_export_prompt_is_included(
+                {"message_origin": "parent_agent"},
+                thread_origin,
+            )
         )
 
     def test_per_message_origin_prefers_stored_value(self) -> None:
