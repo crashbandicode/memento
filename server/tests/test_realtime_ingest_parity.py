@@ -304,6 +304,89 @@ RECORDED_DELTA_SEQUENCES = (
             },
         ),
     ),
+    RecordedDeltaSequence(
+        name="claude_background_shell_and_meta_tool",
+        tool_id="claude_code",
+        metadata={"session_id": "phase0-background-shell"},
+        full_rows=(
+            {
+                "type": "user",
+                "uuid": "background-user",
+                "timestamp": "2026-08-28T12:00:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "Run the verification in the background.",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "background-shell-launch",
+                "timestamp": "2026-08-28T12:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-background-shell",
+                        "name": "Bash",
+                        "input": {
+                            "command": "pytest -q",
+                            "run_in_background": True,
+                        },
+                    }],
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "user",
+                "uuid": "background-shell-result",
+                "timestamp": "2026-08-28T12:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-background-shell",
+                        "content": (
+                            "Command running in background with ID: task-shell-1. "
+                            "You will be notified when it completes."
+                        ),
+                    }],
+                },
+            },
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "sessionId": "phase0-background-shell",
+                "timestamp": "2026-08-28T12:00:03.000Z",
+                "content": (
+                    "<task-notification>\n"
+                    "<task-id>task-shell-1</task-id>\n"
+                    "<tool-use-id>toolu-background-shell</tool-use-id>\n"
+                    "<status>completed</status>\n"
+                    "<summary>Background command completed</summary>\n"
+                    "<result>All checks passed.</result>\n"
+                    "</task-notification>"
+                ),
+            },
+            {
+                "type": "assistant",
+                "uuid": "background-feedback",
+                "timestamp": "2026-08-28T12:00:04.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-feedback",
+                        "name": "SendFeedback",
+                        "input": {
+                            "type": "bug",
+                            "title": "Background shell parity fixture",
+                        },
+                    }],
+                },
+            },
+        ),
+    ),
 )
 
 

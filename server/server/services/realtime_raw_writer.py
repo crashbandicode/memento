@@ -1185,13 +1185,17 @@ async def _refresh_projections(
         if (row.role or row.message_type) == "assistant":
             latest_assistant = max(int(latest_assistant or 0), row.line_number)
     previous_generation = int(existing.generation or 0) if existing is not None else 0
+    accumulator_values = accumulator.values()
+    # The count is derived from currently live state for API consumers.  It is
+    # deliberately not a persisted read-model column.
+    accumulator_values.pop("background_running_count", None)
     read_values = {
         **_identity_values(document), "message_count": message_count,
         "user_message_count": user_count, "assistant_message_count": assistant_count,
         "human_character_count": character_count, "projected_through_line": projected,
         "latest_assistant_line": latest_assistant,
         "generation": previous_generation if incremental and not dirty else previous_generation + 1,
-        "projection_version": READ_MODEL_VERSION, **accumulator.values(),
+        "projection_version": READ_MODEL_VERSION, **accumulator_values,
     }
     read_columns = list(read_values)
     read_placeholders = [

@@ -154,3 +154,146 @@ def test_accumulator_materializes_shell_and_agent_state() -> None:
         )
     )
     assert accumulator.values()["live_activities"] == []
+
+
+def test_background_shell_waits_for_task_notification_completion() -> None:
+    now = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    accumulator = _Accumulator()
+    accumulator.observe(
+        _row(
+            10,
+            role="tool",
+            content="[Bash]",
+            metadata={
+                "tool_call_id": "toolu-background",
+                "tool_name": "Bash",
+                "tool_input": '{"command":"pytest -q","run_in_background":true}',
+                "is_background": True,
+            },
+            timestamp=now,
+        )
+    )
+    accumulator.observe(
+        _row(
+            11,
+            role="tool",
+            content="Command running in background with ID: task-123.",
+            metadata={
+                "tool_call_id": "toolu-background",
+                "background_task_id": "task-123",
+                "tool_status": "completed",
+            },
+            timestamp=now + timedelta(seconds=1),
+        )
+    )
+    values = accumulator.values()
+    assert values["live_activities"][0]["is_background"] is True
+    assert values["live_activities"][0]["background_task_id"] == "task-123"
+    assert values["background_running_count"] == 1
+
+    accumulator.observe(
+        _row(
+            12,
+            role="tool",
+            content="Background command completed.",
+            metadata={
+                "agent_event": {
+                    "kind": "completed",
+                    "status": "completed",
+                    "activity_type": "subagent",
+                    "task_id": "task-123",
+                    "agent_tool_use_id": "toolu-background",
+                },
+            },
+            timestamp=now + timedelta(seconds=2),
+        )
+    )
+    assert accumulator.values()["live_activities"] == []
+
+
+def test_background_shell_is_stopped_by_kill_shell() -> None:
+    now = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    accumulator = _Accumulator()
+    accumulator.observe(
+        _row(
+            20,
+            role="tool",
+            content="[Bash]",
+            metadata={
+                "tool_call_id": "toolu-background",
+                "tool_name": "Bash",
+                "tool_input": '{"command":"pytest -q","run_in_background":true}',
+                "is_background": True,
+            },
+            timestamp=now,
+        )
+    )
+    accumulator.observe(
+        _row(
+            21,
+            role="tool",
+            content="Command running in background with ID: task-123.",
+            metadata={
+                "tool_call_id": "toolu-background",
+                "background_task_id": "task-123",
+                "tool_status": "completed",
+            },
+            timestamp=now + timedelta(seconds=1),
+        )
+    )
+    accumulator.observe(
+        _row(
+            22,
+            role="tool",
+            content="[KillShell]",
+            metadata={
+                "tool_call_id": "toolu-stop",
+                "tool_name": "KillShell",
+                "tool_input": '{"backgroundShellId":"task-123"}',
+            },
+            timestamp=now + timedelta(seconds=2),
+        )
+    )
+    assert accumulator.values()["live_activities"] == []
+
+
+def test_background_agent_event_contributes_to_running_count() -> None:
+    now = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    accumulator = _Accumulator()
+    accumulator.observe(
+        _row(
+            30,
+            role="tool",
+            content="[Agent]",
+            metadata={
+                "agent_event": {
+                    "kind": "started",
+                    "status": "running",
+                    "activity_type": "subagent",
+                    "agent_thread_id": "agent-background",
+                    "is_background": True,
+                },
+            },
+            timestamp=now,
+        )
+    )
+    assert accumulator.values()["background_running_count"] == 1
+
+    accumulator.observe(
+        _row(
+            31,
+            role="tool",
+            content="Background agent completed.",
+            metadata={
+                "agent_event": {
+                    "kind": "completed",
+                    "status": "completed",
+                    "activity_type": "subagent",
+                    "agent_thread_id": "agent-background",
+                    "is_background": True,
+                },
+            },
+            timestamp=now + timedelta(seconds=1),
+        )
+    )
+    assert accumulator.values()["background_running_count"] == 0

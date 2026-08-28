@@ -23,6 +23,7 @@ from server.services.conversation_parser import (  # noqa: E402
     normalize_cursor_user_payload,
     normalize_interaction,
     parse_conversation,
+    parse_conversation_object,
     parse_conversation_line,
     pop_matching_claude_queue_user,
     strip_terminal_sequences,
@@ -3786,6 +3787,116 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(msg.content, "Only thinking available")
         self.assertEqual(msg.thinking, "Only thinking available")
         self.assertEqual(msg.raw_type, "thinking_fallback")
+
+    def test_claude_background_shell_metadata_primary_block_path(self) -> None:
+        launch = {
+            "type": "assistant",
+            "timestamp": "2026-08-28T12:00:00Z",
+            "uuid": "background-launch",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu-background",
+                    "name": "Bash",
+                    "input": {
+                        "command": "pytest -q",
+                        "run_in_background": True,
+                    },
+                }],
+            },
+        }
+        result = {
+            "type": "user",
+            "timestamp": "2026-08-28T12:00:01Z",
+            "uuid": "background-result",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu-background",
+                    "content": "Command running in background with ID: task-123.",
+                }],
+            },
+        }
+
+        launch_message = parse_conversation_object(launch, "claude_code")
+        result_message = parse_conversation_object(result, "claude_code")
+
+        assert launch_message is not None
+        assert result_message is not None
+        self.assertTrue(launch_message.is_background)
+        self.assertEqual(result_message.background_task_id, "task-123")
+
+    def test_claude_background_shell_metadata_multi_block_path(self) -> None:
+        raw = "\n".join((json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-28T12:00:00Z",
+            "uuid": "background-multi",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu-background",
+                    "name": "PowerShell",
+                    "input": {
+                        "command": "pytest -q",
+                        "run_in_background": True,
+                    },
+                }, {
+                    "type": "tool_use",
+                    "id": "toolu-foreground",
+                    "name": "Read",
+                    "input": {"file_path": "README.md"},
+                }],
+            },
+        }), json.dumps({
+            "type": "user",
+            "timestamp": "2026-08-28T12:00:01Z",
+            "uuid": "background-multi-result",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu-background",
+                    "content": "Command running in background with ID: task-multi-1.",
+                }],
+            },
+        })))
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(len(messages), 3)
+        self.assertTrue(messages[0].is_background)
+        self.assertFalse(messages[1].is_background)
+        self.assertEqual(messages[2].background_task_id, "task-multi-1")
+
+    def test_send_feedback_is_never_an_interaction(self) -> None:
+        raw = json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-28T12:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu-feedback",
+                    "name": "SendFeedback",
+                    "input": {
+                        "questions": [{"question": "Should not render"}],
+                    },
+                }],
+            },
+        })
+
+        messages = parse_conversation(raw, "claude_code")
+
+        self.assertEqual(normalize_interaction(
+            "SendFeedback",
+            {"questions": [{"question": "Should not render"}]},
+            source="claude_code",
+        ), None)
+        self.assertEqual(len(messages), 1)
+        self.assertIsNone(messages[0].interaction)
 
 
 if __name__ == "__main__":
