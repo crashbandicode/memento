@@ -255,7 +255,7 @@ class DocumentContentGcCandidate(Base):
 
 
 class IngestProjectionCandidate(Base):
-    """Durable outbox for deferred Canvas and conversation-search projections.
+    """Durable outbox for deferred ingest projections.
 
     Identity is ``(document_id, revision_hash, kind)``.  The ingest commit
     inserts only real candidates; the projector fences on the current
@@ -270,6 +270,15 @@ class IngestProjectionCandidate(Base):
     )
     revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Claude's normalized message rows intentionally omit raw parent UUIDs and
+    # some lifecycle evidence. Keep the bounded, allow-listed DELTA facts with
+    # the fenced candidate so the projector never needs a full transcript read.
+    payload: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -285,7 +294,7 @@ class IngestProjectionCandidate(Base):
             name="uq_ingest_projection_candidate_fence",
         ),
         CheckConstraint(
-            "kind IN ('canvas', 'search')",
+            "kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle')",
             name="ck_ingest_projection_candidate_kind",
         ),
         Index(

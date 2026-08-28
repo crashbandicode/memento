@@ -28,6 +28,7 @@ def upgrade() -> None:
             document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             revision_hash VARCHAR(64) NOT NULL,
             kind VARCHAR(32) NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             claimed_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ,
@@ -35,8 +36,27 @@ def upgrade() -> None:
             CONSTRAINT uq_ingest_projection_candidate_fence
                 UNIQUE (document_id, revision_hash, kind),
             CONSTRAINT ck_ingest_projection_candidate_kind
-                CHECK (kind IN ('canvas', 'search'))
+                CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))
         )
+        """
+    )
+    op.execute(
+        """
+        ALTER TABLE ingest_projection_candidates
+        ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb
+        """
+    )
+    op.execute(
+        """
+        ALTER TABLE ingest_projection_candidates
+        DROP CONSTRAINT IF EXISTS ck_ingest_projection_candidate_kind
+        """
+    )
+    op.execute(
+        """
+        ALTER TABLE ingest_projection_candidates
+        ADD CONSTRAINT ck_ingest_projection_candidate_kind
+        CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))
         """
     )
     op.execute(

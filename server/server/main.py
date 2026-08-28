@@ -185,6 +185,7 @@ def _run_migrations(conn) -> None:
         "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
         "revision_hash VARCHAR(64) NOT NULL, "
         "kind VARCHAR(32) NOT NULL, "
+        "payload JSONB NOT NULL DEFAULT '{}'::jsonb, "
         "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
         "claimed_at TIMESTAMPTZ, "
         "completed_at TIMESTAMPTZ, "
@@ -192,8 +193,24 @@ def _run_migrations(conn) -> None:
         "CONSTRAINT uq_ingest_projection_candidate_fence "
         "UNIQUE (document_id, revision_hash, kind), "
         "CONSTRAINT ck_ingest_projection_candidate_kind "
-        "CHECK (kind IN ('canvas', 'search'))"
+        "CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))"
         ")"
+    ))
+    # ``CREATE TABLE IF NOT EXISTS`` does not widen existing installations.
+    # Keep the row payload additive, then replace the named CHECK so already
+    # deployed Phase 4 outboxes admit the two Claude deferred kinds.
+    conn.execute(text(
+        "ALTER TABLE ingest_projection_candidates "
+        "ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb"
+    ))
+    conn.execute(text(
+        "ALTER TABLE ingest_projection_candidates "
+        "DROP CONSTRAINT IF EXISTS ck_ingest_projection_candidate_kind"
+    ))
+    conn.execute(text(
+        "ALTER TABLE ingest_projection_candidates "
+        "ADD CONSTRAINT ck_ingest_projection_candidate_kind "
+        "CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))"
     ))
     conn.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_ingest_projection_candidates_pending "
