@@ -10,6 +10,8 @@ parent's history.
 
 from __future__ import annotations
 
+import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Hashable, Iterable, Mapping
@@ -32,6 +34,30 @@ FOLDABLE_CONVERSATION_TOOLS = frozenset({
     "cursor",
 })
 _PATH_LINKED_SUBAGENT_TOOLS = frozenset({"claude_code", "cursor"})
+_BRIEFING_SESSION_ID = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+HANDOFF_MARKER_PREFIX = "MEMENTO-HANDOFF-FROM:"
+TANGENT_MARKER_PREFIX = "MEMENTO-TANGENT-FROM:"
+DELEGATE_MARKER_PREFIX = "MEMENTO-DELEGATE-FROM:"
+_HANDOFF_MARKER_RE = re.compile(
+    rf"\A{re.escape(HANDOFF_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_TANGENT_MARKER_RE = re.compile(
+    rf"\A{re.escape(TANGENT_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_DELEGATE_MARKER_RE = re.compile(
+    rf"\A{re.escape(DELEGATE_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_BRIEFING_MARKER_PATTERNS = (
+    ("handoff", _HANDOFF_MARKER_RE),
+    ("tangent", _TANGENT_MARKER_RE),
+    ("delegate", _DELEGATE_MARKER_RE),
+)
 
 
 def _metadata_flag_is_true(value: object) -> bool:
@@ -41,6 +67,62 @@ def _metadata_flag_is_true(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() == "true"
     return False
+
+
+def conversation_briefing_kind(content: object) -> str | None:
+    """Classify a first-user-message protocol marker, if one is present."""
+    if not isinstance(content, str):
+        return None
+    text = content.lstrip()
+    if text.startswith(HANDOFF_MARKER_PREFIX):
+        return "handoff"
+    if text.startswith(TANGENT_MARKER_PREFIX):
+        return "tangent"
+    if text.startswith(DELEGATE_MARKER_PREFIX):
+        return "delegate"
+    return None
+
+
+def conversation_briefing_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message protocol marker."""
+    if not isinstance(content, str):
+        return None
+    text = content.lstrip()
+    for _kind, pattern in _BRIEFING_MARKER_PATTERNS:
+        match = pattern.match(text)
+        if match is None:
+            continue
+        try:
+            return str(uuid.UUID(match.group("session_id")))
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
+def conversation_is_chain_primary(
+    metadata: Mapping[str, Any] | None,
+    *,
+    first_user_content: str | None = None,
+) -> bool:
+    """Return whether this thread is a handoff successor or tangent primary."""
+    content = first_user_content
+    if content is None:
+        content = str((metadata or {}).get("first_user_message") or "")
+    return conversation_briefing_kind(content) in {"handoff", "tangent"}
+
+
+def conversation_message_user_origin(
+    role: str | None,
+    metadata: Mapping[str, Any] | None,
+    thread_user_role_origin: str | None,
+) -> str | None:
+    """Prefer a persisted per-message origin over thread-level classification."""
+    if (role or "") != "user":
+        return None
+    stored = str((metadata or {}).get("message_origin") or "").strip()
+    if stored in {"human", "parent_agent"}:
+        return stored
+    return thread_user_role_origin
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +209,11 @@ def is_conversation_subagent(
     if values.get("orchestration_parent_document_id"):
         return True
     if (
+        str(values.get("orchestration") or "").strip() == "claw"
+        and _metadata_flag_is_true(values.get("is_subagent"))
+    ):
+        return True
+    if (
         tool_id == "codex"
         and str(values.get("thread_source") or "").strip().lower()
         == "subagent"
@@ -178,17 +265,22 @@ def conversation_user_role_origin(
     metadata: Mapping[str, Any] | None,
 ) -> str | None:
     """Identify child-thread user turns that were dispatched by a parent agent."""
-    if (metadata or {}).get("orchestration_parent_document_id"):
+    values = metadata or {}
+    if conversation_is_chain_primary(values):
+        return None
+    if str(values.get("orchestration") or "").strip() == "claw":
+        return "parent_agent"
+    if values.get("orchestration_parent_document_id"):
         return "parent_agent"
     if (
         tool_id in {"claude_code", "cursor"}
         and (
             is_conversation_subagent(tool_id, relative_path, metadata)
             or (
-                _metadata_flag_is_true((metadata or {}).get("is_subagent"))
+                _metadata_flag_is_true(values.get("is_subagent"))
                 and bool(
-                    (metadata or {}).get("parent_thread_id")
-                    or (metadata or {}).get("root_session_id")
+                    values.get("parent_thread_id")
+                    or values.get("root_session_id")
                 )
             )
         )
@@ -405,6 +497,18 @@ def fold_conversation_subagents(
             existing_children.append(child.document_id)
         subagent_document_ids[canonical_parent_id] = tuple(existing_children)
         subagent_counts[canonical_parent_id] = len(existing_children)
+
+    for child in refs:
+        values = child.metadata or {}
+        if str(values.get("orchestration") or "").strip() != "claw":
+            continue
+        if conversation_is_chain_primary(values):
+            continue
+        if str(values.get("orchestration_parent_document_id") or "").strip():
+            continue
+        if not _metadata_flag_is_true(values.get("is_subagent")):
+            continue
+        orphan_ids.add(child.document_id)
 
     return ConversationHierarchy(
         visible_document_ids=frozenset(visible_ids),
