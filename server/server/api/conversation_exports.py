@@ -43,6 +43,7 @@ from ..services.conversation_hierarchy import (
     ConversationRef,
     build_logical_activity_map,
     conversation_display_title,
+    conversation_message_user_origin,
     conversation_root_thread_id,
     conversation_user_role_origin,
     current_thread_id,
@@ -250,29 +251,36 @@ async def _selection_plan(
     )
     if not filtered or normalized_count == 0:
         return _SelectionPlan(None, {})
-    if conversation_user_role_origin(
+    thread_origin = conversation_user_role_origin(
         document.tool_id,
         document.relative_path,
         document.metadata,
-    ) == "parent_agent":
-        return _SelectionPlan((), {})
+    )
 
-    rows = (
-        await db.execute(
-            select(
-                ConversationMessage.line_number,
-                ConversationMessage.timestamp,
+    rows = [
+        (line_number, timestamp)
+        for line_number, timestamp, metadata in (
+            await db.execute(
+                select(
+                    ConversationMessage.line_number,
+                    ConversationMessage.timestamp,
+                    ConversationMessage.metadata_,
+                )
+                .where(
+                    ConversationMessage.document_id == document.id,
+                    ConversationMessage.role == "user",
+                    func.length(func.trim(ConversationMessage.content)) > 0,
+                    ~ConversationMessage.content.startswith("[Subagent Context]"),
+                    ConversationMessage.metadata_["interaction_response"].astext.is_(None),
+                )
+                .order_by(ConversationMessage.line_number, ConversationMessage.id)
             )
-            .where(
-                ConversationMessage.document_id == document.id,
-                ConversationMessage.role == "user",
-                func.length(func.trim(ConversationMessage.content)) > 0,
-                ~ConversationMessage.content.startswith("[Subagent Context]"),
-                ConversationMessage.metadata_["interaction_response"].astext.is_(None),
-            )
-            .order_by(ConversationMessage.line_number, ConversationMessage.id)
-        )
-    ).all()
+        ).all()
+        if conversation_message_user_origin("user", metadata, thread_origin)
+        != "parent_agent"
+    ]
+    if not rows:
+        return _SelectionPlan((), {})
     prompt_numbers = {
         line_number: index
         for index, (line_number, _timestamp) in enumerate(rows, start=1)
@@ -330,11 +338,13 @@ async def _message_stream(
         )
         async for message in stream:
             metadata = dict(message.metadata_ or {})
-            if (
-                user_role_origin
-                and (message.role or message.message_type) == "user"
-            ):
-                metadata["message_origin"] = user_role_origin
+            origin = conversation_message_user_origin(
+                message.role or message.message_type,
+                metadata,
+                user_role_origin,
+            )
+            if origin:
+                metadata["message_origin"] = origin
             yield ExportMessage(
                 line_number=message.line_number,
                 role=message.role or message.message_type or "system",
@@ -356,8 +366,15 @@ async def _message_stream(
     )
     for index, message in enumerate(parse_conversation(raw_content, document.tool_id), start=1):
         metadata: dict[str, Any] = {}
-        if user_role_origin and message.role == "user":
-            metadata["message_origin"] = user_role_origin
+        if message.message_origin:
+            metadata["message_origin"] = message.message_origin
+        origin = conversation_message_user_origin(
+            message.role,
+            metadata,
+            user_role_origin,
+        )
+        if origin:
+            metadata["message_origin"] = origin
         if message.thinking:
             metadata["thinking"] = message.thinking
         if message.tool_name:

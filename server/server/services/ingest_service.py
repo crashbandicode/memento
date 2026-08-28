@@ -947,6 +947,9 @@ def _conversation_message_metadata(normalized) -> dict:
         meta["task_state"] = normalized.task_state
     if normalized.agent_event:
         meta["agent_event"] = normalized.agent_event
+    origin = str(getattr(normalized, "message_origin", "") or "").strip()
+    if origin in {"human", "parent_agent"}:
+        meta["message_origin"] = origin
     return meta
 
 
@@ -3169,9 +3172,43 @@ async def ingest_file(
             )
             writer = "legacy"
         else:
+            # The raw writer commits through its own asyncpg transaction.
+            # Invalidate only tables it can have changed: expiring unrelated
+            # caller-owned Machine/User instances makes ordinary scalar access
+            # attempt async IO outside greenlet context.
+            raw_mutated_tables = {
+                "tools",
+                "documents",
+                "document_delivery_state",
+                "sync_state",
+                "conversation_messages",
+                "conversation_usage_events",
+                "conversation_read_models",
+                "conversation_prompt_projections",
+                "conversation_task_states",
+                "dashboard_document_projections",
+                "projects",
+            }
+            for mapped_instance in tuple(db.identity_map.values()):
+                if getattr(mapped_instance, "__tablename__", None) in raw_mutated_tables:
+                    db.expire(mapped_instance)
             if raw_event is not None:
                 from ..db.session import queue_realtime_event
 
+                if raw_event.get("claw_delegate_metadata"):
+                    queue_realtime_event(
+                        db,
+                        "file_synced",
+                        {
+                            "document_id": str(raw_document.id),
+                            "changes": [
+                                "conversation.metadata",
+                                "dashboard",
+                                "project",
+                            ],
+                        },
+                        user_id=raw_event["user_id"],
+                    )
                 cache_scope = raw_event.get("cache") or {}
                 _stage_ingest_read_cache_invalidations(
                     db,

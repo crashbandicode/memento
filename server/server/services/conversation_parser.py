@@ -90,6 +90,11 @@ class NormalizedMessage:
     # Safe semantic lifecycle metadata from Codex sub_agent_activity events.
     # The associated encrypted inter-agent payload is intentionally ignored.
     agent_event: dict[str, object] | None = None
+    # Per-record operator-vs-parent attribution for Claude user turns.
+    # ``sdk-cli`` records are parent-agent dispatches; ``cli`` records are
+    # typed by the operator. Absent or unknown entrypoints stay unset so
+    # thread-level classification remains the fallback.
+    message_origin: str = ""
 
 
 @dataclass
@@ -330,6 +335,23 @@ def is_claude_session_context_record(obj: dict) -> bool:
         obj.get(name) is True
         for name in ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly")
     )
+
+
+def claude_entrypoint_message_origin(obj: object) -> str:
+    """Map a Claude record ``entrypoint`` onto per-message origin.
+
+    Claw/SDK-injected user records carry ``entrypoint: "sdk-cli"``. Operator-
+    typed records carry ``entrypoint: "cli"``. Unknown or absent values stay
+    unset so callers can fall back to thread-level classification.
+    """
+    if not isinstance(obj, dict):
+        return ""
+    entrypoint = _coerce_text(obj.get("entrypoint")).strip()
+    if entrypoint == "sdk-cli":
+        return "parent_agent"
+    if entrypoint == "cli":
+        return "human"
+    return ""
 
 
 def is_claude_queue_user_pair(
@@ -1869,6 +1891,9 @@ def parse_conversation_object(
             return NormalizedMessage(
                 role=role, content=content, thinking=thinking,
                 timestamp=timestamp, raw_type=msg_type, source_id=source_id,
+                message_origin=(
+                    claude_entrypoint_message_origin(obj) if role == "user" else ""
+                ),
             )
 
         if msg_type == "ai-title":
