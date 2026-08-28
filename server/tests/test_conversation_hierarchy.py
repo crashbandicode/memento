@@ -12,7 +12,11 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     ConversationRef,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_briefing_kind,
+    conversation_briefing_session_id,
     conversation_display_title,
+    conversation_is_chain_primary,
+    conversation_message_user_origin,
     conversation_user_role_origin,
     effective_conversation_timestamp,
     fold_codex_subagents,
@@ -595,6 +599,89 @@ class ConversationHierarchyTests(unittest.TestCase):
                     ),
                     "Inspect the parser",
                 )
+
+    def test_chain_primary_threads_are_not_parent_agent_origins(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        metadata = {
+            "orchestration": "claw",
+            "orchestration_parent_document_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "is_subagent": True,
+            "first_user_message": f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue.",
+        }
+        self.assertEqual(conversation_briefing_kind(metadata["first_user_message"]), "handoff")
+        self.assertTrue(conversation_is_chain_primary(metadata))
+        self.assertIsNone(
+            conversation_user_role_origin(
+                "claude_code",
+                "projects/demo/successor.jsonl",
+                metadata,
+            )
+        )
+        tangent = {
+            **metadata,
+            "first_user_message": (
+                "MEMENTO-TANGENT-FROM: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+            ),
+        }
+        self.assertEqual(conversation_briefing_kind(tangent["first_user_message"]), "tangent")
+        self.assertIsNone(
+            conversation_user_role_origin("cursor", "agent-transcripts/t.jsonl", tangent)
+        )
+
+    def test_delegate_marker_is_classified_separately_from_chain_primaries(self) -> None:
+        parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        content = f"MEMENTO-DELEGATE-FROM: {parent_id}\nImplement the design."
+        self.assertEqual(conversation_briefing_kind(content), "delegate")
+        self.assertEqual(conversation_briefing_session_id(content), parent_id)
+        self.assertFalse(
+            conversation_is_chain_primary({"first_user_message": content})
+        )
+        self.assertEqual(
+            conversation_user_role_origin(
+                "cursor",
+                "agent-transcripts/delegate.jsonl",
+                {"orchestration": "claw", "is_subagent": True},
+            ),
+            "parent_agent",
+        )
+
+    def test_per_message_origin_prefers_stored_value(self) -> None:
+        self.assertEqual(
+            conversation_message_user_origin(
+                "user",
+                {"message_origin": "human"},
+                "parent_agent",
+            ),
+            "human",
+        )
+        self.assertEqual(
+            conversation_message_user_origin(
+                "user",
+                {"message_origin": "parent_agent"},
+                None,
+            ),
+            "parent_agent",
+        )
+        self.assertEqual(
+            conversation_message_user_origin("user", {}, "parent_agent"),
+            "parent_agent",
+        )
+        self.assertIsNone(conversation_message_user_origin("assistant", {}, "parent_agent"))
+
+    def test_parentless_claw_delegate_is_visible_orphan(self) -> None:
+        child = ConversationRef(
+            document_id="child",
+            tool_id="cursor",
+            relative_path="agent-transcripts/delegate.jsonl",
+            metadata={
+                "orchestration": "claw",
+                "is_subagent": True,
+                "session_id": "delegate",
+            },
+        )
+        hierarchy = fold_conversation_subagents([child])
+        self.assertIn("child", hierarchy.visible_document_ids)
+        self.assertIn("child", hierarchy.orphan_document_ids)
 
     def test_lifecycle_event_surfaces_child_before_document_ingest(self) -> None:
         summaries = merge_subagent_event_summaries([], [{

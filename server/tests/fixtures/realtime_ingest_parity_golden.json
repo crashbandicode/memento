@@ -101,5 +101,202 @@
     "task_projection": null,
     "dashboard_projection": {"tool_id": "claude_code", "category": "conversation", "visibility": "private", "title": "claude_background_shell_and_meta_tool.jsonl", "relative_path": "phase0/claude_background_shell_and_meta_tool.jsonl", "file_size_bytes": 1346, "source_modified_at": "2026-08-02T12:00:01Z", "activity_at": "2026-08-28T12:00:00Z", "session_id": "phase0-background-shell", "root_thread_id": "phase0-background-shell", "parent_thread_id": null, "is_subagent": false, "is_archived": false, "hierarchy_metadata": {"thread_id": "phase0-background-shell", "session_id": "phase0-background-shell", "agent_depth": 0, "is_subagent": false, "root_session_id": "phase0-background-shell"}, "message_count": 5, "user_message_count": 1, "assistant_message_count": 0, "human_character_count": 39, "pending_question_count": 0, "agent_mode": "", "projection_version": 2},
     "staged_sse_events": [{"event_type": "file_synced", "owner_scoped": true, "data": {"document_id": "<document>", "tool_id": "claude_code", "category": "conversation", "relative_path": "phase0/claude_background_shell_and_meta_tool.jsonl", "title": "claude_background_shell_and_meta_tool.jsonl", "project_id": null, "changes": ["conversation.messages", "conversation.metadata", "conversation.pending_interactions"]}}]
+  },
+  "claude_entrypoint_origin": {
+    "messages": [
+      {
+        "line_number": 1,
+        "message_type": "user",
+        "role": "user",
+        "content": "MEMENTO-DELEGATE-FROM: 035914ae-8e99-4bbf-a9af-3602cf5019bc\nImplement the approved design.",
+        "metadata_": {
+          "source_id": "entrypoint-sdk-cli",
+          "message_origin": "parent_agent"
+        },
+        "timestamp": "2026-08-28T15:00:00Z"
+      },
+      {
+        "line_number": 2,
+        "message_type": "user",
+        "role": "user",
+        "content": "Please keep the operator messages labeled You.",
+        "metadata_": {
+          "source_id": "entrypoint-cli",
+          "message_origin": "human"
+        },
+        "timestamp": "2026-08-28T15:00:01Z"
+      },
+      {
+        "line_number": 3,
+        "message_type": "assistant",
+        "role": "assistant",
+        "content": "I will preserve per-message origin.",
+        "metadata_": {
+          "source_id": "entrypoint-assistant"
+        },
+        "timestamp": "2026-08-28T15:00:02Z"
+      }
+    ],
+    "usage_events": [
+      {
+        "tool_id": "claude_code",
+        "source_id": "claude_code:entrypoint-assistant",
+        "source": "claude",
+        "occurred_at": "2026-08-28T15:00:02Z",
+        "model": null,
+        "reasoning_effort": null,
+        "service_tier": null,
+        "attribution_status": "missing_model",
+        "input_tokens": 6,
+        "uncached_input_tokens": 6,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 4,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 10
+      }
+    ],
+    "delivery_state": {
+      "revision_hash": "9a174b0d13b4666d145bf477ca8327ab89b1459b784e632f2757c4d6af76ab26",
+      "file_size_bytes": 632,
+      "delivery_metadata": {
+        "agent_path": "claw/delegate",
+        "session_id": "phase0-entrypoint-origin",
+        "agent_depth": 1,
+        "is_subagent": true,
+        "orchestration": "claw",
+        "_stored_source_hash": "5540f15b658eda92b3dfed69eb98706134c56fdff439ba80c688e28aac2dc584",
+        "_stored_source_size": 235,
+        "_assistant_started_at": "2026-08-28T15:00:00+00:00",
+        "subagent_lifecycle_source": "claw_delegate_marker",
+        "_assistant_last_activity_at": "2026-08-28T15:00:02+00:00",
+        "_stored_source_revision_hash": "5540f15b658eda92b3dfed69eb98706134c56fdff439ba80c688e28aac2dc584",
+        "_latest_meaningful_human_timestamp": "2026-08-28T15:00:01+00:00",
+        "_assistant_token_usage": {
+          "input_tokens": 6,
+          "uncached_input_tokens": 6,
+          "output_tokens": 4,
+          "total_tokens": 10,
+          "source": "claude",
+          "input_uncached": 6
+        }
+      },
+      "source_modified_at": "2026-08-02T12:00:01Z",
+      "activity_at": "2026-08-28T15:00:02Z"
+    },
+    "sync_state": {
+      "tool_id": "claude_code",
+      "relative_path": "phase0/claude_entrypoint_origin.jsonl",
+      "last_hash": "9a174b0d13b4666d145bf477ca8327ab89b1459b784e632f2757c4d6af76ab26",
+      "last_offset": 632
+    },
+    "read_model": {
+      "tool_id": "claude_code",
+      "thread_id": "phase0-entrypoint-origin",
+      "root_thread_id": null,
+      "parent_thread_id": null,
+      "agent_id": null,
+      "agent_tool_use_id": null,
+      "agent_depth": 1,
+      "is_subagent": true,
+      "message_count": 3,
+      "user_message_count": 2,
+      "assistant_message_count": 1,
+      "human_character_count": 171,
+      "projected_through_line": 3,
+      "latest_assistant_line": 3,
+      "generation": 1,
+      "projection_version": 1,
+      "pending_interactions": [],
+      "inferred_responses": [],
+      "live_activities": [],
+      "agent_events": [],
+      "runtime": {
+        "started_at": "2026-08-28T15:00:00+00:00",
+        "token_usage": {
+          "source": "claude",
+          "input_tokens": 6,
+          "total_tokens": 10,
+          "output_tokens": 4,
+          "input_uncached": 6,
+          "uncached_input_tokens": 6
+        },
+        "last_activity_at": "2026-08-28T15:00:02+00:00"
+      },
+      "lifecycle": null,
+      "latest_human_at": "2026-08-28T15:00:01+00:00"
+    },
+    "prompt_projections": [
+      {
+        "line_number": 2,
+        "content": "Please keep the operator messages labeled You.",
+        "timestamp": "2026-08-28T15:00:01Z"
+      }
+    ],
+    "task_projection": null,
+    "dashboard_projection": {
+      "tool_id": "claude_code",
+      "category": "conversation",
+      "visibility": "private",
+      "title": "claude_entrypoint_origin.jsonl",
+      "relative_path": "phase0/claude_entrypoint_origin.jsonl",
+      "file_size_bytes": 632,
+      "source_modified_at": "2026-08-02T12:00:01Z",
+      "activity_at": "2026-08-28T15:00:02Z",
+      "session_id": "phase0-entrypoint-origin",
+      "root_thread_id": null,
+      "parent_thread_id": null,
+      "is_subagent": true,
+      "is_archived": false,
+      "hierarchy_metadata": {
+        "thread_id": "phase0-entrypoint-origin",
+        "agent_path": "claw/delegate",
+        "session_id": "phase0-entrypoint-origin",
+        "agent_depth": 1,
+        "is_subagent": true,
+        "orchestration": "claw"
+      },
+      "message_count": 3,
+      "user_message_count": 2,
+      "assistant_message_count": 1,
+      "human_character_count": 171,
+      "pending_question_count": 0,
+      "agent_mode": "",
+      "projection_version": 2
+    },
+    "staged_sse_events": [
+      {
+        "event_type": "file_synced",
+        "owner_scoped": true,
+        "data": {
+          "document_id": "<document>",
+          "changes": [
+            "conversation.metadata",
+            "dashboard",
+            "project"
+          ]
+        }
+      },
+      {
+        "event_type": "file_synced",
+        "owner_scoped": true,
+        "data": {
+          "document_id": "<document>",
+          "tool_id": "claude_code",
+          "category": "conversation",
+          "relative_path": "phase0/claude_entrypoint_origin.jsonl",
+          "title": "claude_entrypoint_origin.jsonl",
+          "project_id": null,
+          "changes": [
+            "conversation.messages",
+            "conversation.metadata",
+            "conversation.pending_interactions",
+            "conversation.prompts",
+            "conversation.search",
+            "dashboard"
+          ]
+        }
+      }
+    ]
   }
 }

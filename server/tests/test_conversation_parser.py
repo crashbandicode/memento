@@ -14,6 +14,7 @@ from server.services.conversation_markdown import (  # noqa: E402
 from server.services.conversation_parser import (  # noqa: E402
     AssistantIdentityState,
     build_question_response,
+    claude_entrypoint_message_origin,
     coerce_claude_live_interaction,
     count_conversation_messages,
     extract_codex_session_metadata,
@@ -883,6 +884,44 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(messages[0].reasoning_effort, "")
         assert isolated is not None
         self.assertEqual(isolated.model, "claude-opus-4-8")
+
+    def test_claude_entrypoint_maps_to_message_origin(self) -> None:
+        sdk = {
+            "type": "user",
+            "uuid": "sdk-user-1",
+            "entrypoint": "sdk-cli",
+            "timestamp": "2026-08-28T12:00:00.000Z",
+            "message": {"role": "user", "content": "MEMENTO-DELEGATE-FROM: parent"},
+        }
+        typed = {
+            "type": "user",
+            "uuid": "cli-user-1",
+            "entrypoint": "cli",
+            "timestamp": "2026-08-28T12:01:00.000Z",
+            "message": {"role": "user", "content": "please continue"},
+        }
+        unknown = {
+            "type": "user",
+            "uuid": "plain-user-1",
+            "timestamp": "2026-08-28T12:02:00.000Z",
+            "message": {"role": "user", "content": "no entrypoint"},
+        }
+
+        self.assertEqual(claude_entrypoint_message_origin(sdk), "parent_agent")
+        self.assertEqual(claude_entrypoint_message_origin(typed), "human")
+        self.assertEqual(claude_entrypoint_message_origin(unknown), "")
+        self.assertEqual(claude_entrypoint_message_origin({"entrypoint": "other"}), "")
+
+        sdk_message = parse_conversation_object(sdk, "claude_code")
+        typed_message = parse_conversation_object(typed, "claude_code")
+        unknown_message = parse_conversation_object(unknown, "claude_code")
+        assert sdk_message is not None
+        assert typed_message is not None
+        assert unknown_message is not None
+        self.assertEqual(sdk_message.role, "user")
+        self.assertEqual(sdk_message.message_origin, "parent_agent")
+        self.assertEqual(typed_message.message_origin, "human")
+        self.assertEqual(unknown_message.message_origin, "")
 
     def test_claude_thinking_mode_follows_observed_turn_blocks(self) -> None:
         raw = "\n".join([

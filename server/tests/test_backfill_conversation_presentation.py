@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "server"))
 from server.scripts.backfill_conversation_presentation import (  # noqa: E402
     BackfillStats,
     _claude_context_identities,
+    _claude_user_origin_records,
     _codex_title_from_messages,
     _conversation_embedding_rows_query,
     _cursor_repair_document_ids_query,
@@ -70,6 +71,46 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         self.assertEqual(records, 1)
         self.assertEqual(len(identities), 1)
         iter_lines.assert_called_once_with("raw/x")
+
+    def test_claude_user_origin_records_map_entrypoint(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "sdk-1",
+                        "entrypoint": "sdk-cli",
+                        "timestamp": "2026-08-28T12:00:00Z",
+                        "message": {"role": "user", "content": "Parent dispatch"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "cli-1",
+                        "entrypoint": "cli",
+                        "timestamp": "2026-08-28T12:01:00Z",
+                        "message": {"role": "user", "content": "Typed follow-up"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "plain-1",
+                        "timestamp": "2026-08-28T12:02:00Z",
+                        "message": {"role": "user", "content": "No entrypoint"},
+                    }
+                ),
+            ]
+        )
+
+        by_source, by_identity, records = _claude_user_origin_records(raw)
+
+        self.assertEqual(records, 3)
+        self.assertEqual(by_source["sdk-1"], "parent_agent")
+        self.assertEqual(by_source["cli-1"], "human")
+        self.assertEqual(by_source["plain-1"], "")
+        self.assertEqual(by_identity[("Parent dispatch", "2026-08-28T12:00:00")], "parent_agent")
 
     def test_agents_message_is_reclassified_idempotently(self) -> None:
         message = SimpleNamespace(
