@@ -117,11 +117,13 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
     drain 144 times at ~32% CPU)."""
     from types import SimpleNamespace
 
+    from server.config import settings
     from server.db import session as session_module
     from server.services import ingest_service as ingest_module
     from server.services import realtime_raw_writer as raw_module
     from server.tasks import ingest_spool as task_module
 
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", False)
     job_ids = ("a" * 64, "b" * 64)
     manifests = {job_id: {"meta": {"file_size": 10}} for job_id in job_ids}
 
@@ -130,10 +132,12 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
         return (
             {
                 "meta": {
-                    "tool": "codex",
+                    "tool": "claude_code",
                     "category": "conversation",
                     "content_type": "jsonl",
-                    "relative_path": "sessions/x.jsonl",
+                    "relative_path": (
+                        "sessions/parent/subagents/agent-drain-fixture.jsonl"
+                    ),
                     "hash": f"hash-{job_id[:6]}",
                     "file_size": 10,
                     "mode": "delta",
@@ -197,6 +201,67 @@ async def test_unsupported_raw_chain_falls_back_to_legacy_writer_per_frame(
     assert outcomes.legacy_fallback_chains == {
         "Claude transcript/sidecar pairing needs the legacy reducer": 1
     }
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_chain_records_raw_commit_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+    from server.tasks import ingest_spool as task_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    job_ids = ("c" * 64, "d" * 64)
+    manifests = {job_id: {"meta": {"file_size": 10}} for job_id in job_ids}
+    raw_calls: list[list[dict]] = []
+
+    def read_bytes(job_id, *, manifest):
+        del manifest
+        return (
+            {
+                "meta": {
+                    "tool": "claude_code",
+                    "category": "conversation",
+                    "content_type": "jsonl",
+                    "relative_path": (
+                        "sessions/parent/subagents/agent-drain-fixture.jsonl"
+                    ),
+                    "hash": f"hash-{job_id[:6]}",
+                    "file_size": 10,
+                    "mode": "delta",
+                    "offset": 10,
+                    "metadata": {"session_id": "drain-fixture"},
+                }
+            },
+            b'{"type":"user"}',
+        )
+
+    monkeypatch.setattr(task_module, "read_ready_job_bytes", read_bytes)
+
+    async def committed_chain(*, frames, **_kwargs):
+        raw_calls.append(frames)
+        return raw_module.RawDocument(__import__("uuid").uuid4()), None
+
+    monkeypatch.setattr(raw_module, "ingest_conversation_raw_chain", committed_chain)
+    outcomes = task_module._RealtimeWriterOutcomeCounters()
+    monkeypatch.setattr(task_module, "_realtime_writer_outcomes", outcomes)
+
+    result = await task_module._ingest_realtime_delta_chain(
+        payload_jobs=tuple((job_id, manifests[job_id]) for job_id in job_ids),
+        machine_id="machine-1",
+        user_id=__import__("uuid").uuid4(),
+    )
+
+    assert result["status"] == "committed"
+    assert result["coalesced_frames"] == 2
+    assert [frame["relative_path"] for frame in raw_calls[0]] == [
+        "sessions/parent/subagents/agent-drain-fixture.jsonl",
+        "sessions/parent/subagents/agent-drain-fixture.jsonl",
+    ]
+    assert outcomes.raw_committed_chains == 1
+    assert outcomes.raw_committed_frames == 2
+    assert outcomes.legacy_fallback_chains == {}
 
 
 def test_raw_writer_outcome_counters_log_bounded_per_reason_metrics(

@@ -1556,7 +1556,9 @@ async def ingest_conversation_raw(
         raise RawWriterUnsupported(
             "Cursor projection reordering needs the legacy reducer"
         )
-    if _claude_subagent_pair_transcript_path(relative_path, category) is not None:
+    if _claude_subagent_pair_transcript_path(relative_path, category) is not None and (
+        not settings.realtime_ingest_raw_subagent_transcripts or mode != "delta"
+    ):
         raise RawWriterUnsupported(
             "Claude transcript/sidecar pairing needs the legacy reducer"
         )
@@ -1747,7 +1749,10 @@ async def ingest_conversation_raw_chain(
             raise RawWriterUnsupported(
                 "Cursor projection reordering needs the legacy reducer"
             )
-        if _claude_subagent_pair_transcript_path(relative_path, category) is not None:
+        if (
+            not settings.realtime_ingest_raw_subagent_transcripts
+            and _claude_subagent_pair_transcript_path(relative_path, category) is not None
+        ):
             raise RawWriterUnsupported(
                 "Claude transcript/sidecar pairing needs the legacy reducer"
             )

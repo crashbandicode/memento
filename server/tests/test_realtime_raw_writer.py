@@ -24,6 +24,9 @@ _BASE_HASH = "a" * 64
 _BASE_OFFSET = 512
 _SOURCE_ID = "cursor-source-row"
 _OBSERVED_AT = datetime(2026, 8, 27, tzinfo=timezone.utc)
+_SUBAGENT_TRANSCRIPT_PATH = (
+    "projects/fixture-parent/subagents/agent-fixture-subagent.jsonl"
+)
 
 
 def _existing_row(*, role: str, content: str = "old content") -> SimpleNamespace:
@@ -101,6 +104,238 @@ def _reduce(existing: SimpleNamespace, content: str):
         authoritative_rebase=False,
         had_sensitive=False,
     )
+
+
+def _claude_subagent_delta_frame() -> dict[str, object]:
+    content = json.dumps(
+        {
+            "type": "user",
+            "uuid": "fixture-subagent-user",
+            "timestamp": "2026-08-27T12:00:00Z",
+            "message": {
+                "role": "user",
+                "content": "Inspect the raw subagent transcript.",
+            },
+        }
+    )
+    return {
+        "tool_id": "claude_code",
+        "category": "conversation",
+        "content_type": "jsonl",
+        "relative_path": _SUBAGENT_TRANSCRIPT_PATH,
+        "content": content,
+        "content_hash": "b" * 64,
+        "file_size": len(content.encode("utf-8")),
+        "mode": "delta",
+        "offset": _BASE_OFFSET + len(content.encode("utf-8")),
+        "metadata": {"session_id": "fixture-subagent"},
+        "timestamp": _OBSERVED_AT.timestamp(),
+        "machine_id": "22222222-2222-2222-2222-222222222222",
+        "user_id": "33333333-3333-3333-3333-333333333333",
+        "base_hash": _BASE_HASH,
+        "base_offset": _BASE_OFFSET,
+    }
+
+
+def _claude_state() -> WriterState:
+    state = _state(_existing_row(role="assistant"))
+    metadata = {"session_id": "fixture-subagent"}
+    state.document["document_metadata"] = metadata
+    state.delivery["metadata"] = dict(metadata)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_raw_chain_remains_legacy_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", False)
+    frame = _claude_subagent_delta_frame()
+
+    with pytest.raises(
+        RawWriterUnsupported,
+        match="Claude transcript/sidecar pairing needs the legacy reducer",
+    ):
+        await raw_module.ingest_conversation_raw_chain(frames=[frame])
+
+    with pytest.raises(
+        RawWriterUnsupported,
+        match="Claude transcript/sidecar pairing needs the legacy reducer",
+    ):
+        await raw_module.ingest_conversation_raw(
+            tool_id=str(frame["tool_id"]),
+            category=str(frame["category"]),
+            content_type=str(frame["content_type"]),
+            relative_path=str(frame["relative_path"]),
+            content=str(frame["content"]),
+            content_hash=str(frame["content_hash"]),
+            file_size=int(frame["file_size"]),
+            mode=str(frame["mode"]),
+            offset=int(frame["offset"]),
+            metadata=dict(frame["metadata"]),
+            timestamp=float(frame["timestamp"]),
+            machine_id=str(frame["machine_id"]),
+            user_id=str(frame["user_id"]),
+            base_hash=str(frame["base_hash"]),
+            base_offset=int(frame["base_offset"]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_raw_chain_commits_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    frame = _claude_subagent_delta_frame()
+    applied = []
+
+    class FakeTransaction:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def start(self) -> None:
+            self.calls.append("start")
+
+        async def commit(self) -> None:
+            self.calls.append("commit")
+
+        async def rollback(self) -> None:
+            self.calls.append("rollback")
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.transaction_ = FakeTransaction()
+
+        def transaction(self) -> FakeTransaction:
+            return self.transaction_
+
+        async def execute(self, *_args) -> None:
+            return None
+
+    class FakeAcquire:
+        def __init__(self, connection: FakeConnection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self) -> FakeConnection:
+            return self.connection
+
+        async def __aexit__(self, *_args) -> bool:
+            return False
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.connection = FakeConnection()
+
+        def acquire(self) -> FakeAcquire:
+            return FakeAcquire(self.connection)
+
+    pool = FakePool()
+
+    async def fake_pool(_database_url):
+        return pool
+
+    async def fake_load_state(*_args, **_kwargs) -> WriterState:
+        return _claude_state()
+
+    async def fake_apply(_connection, **kwargs):
+        applied.append(kwargs["mutation"])
+        return raw_module.RawDocument(_DOCUMENT_ID), None
+
+    monkeypatch.setattr(raw_module, "_pool", fake_pool)
+    monkeypatch.setattr(raw_module, "_load_state", fake_load_state)
+    monkeypatch.setattr(raw_module, "_apply", fake_apply)
+
+    document, event = await raw_module.ingest_conversation_raw_chain(frames=[frame])
+
+    expected = reduce_writer_state(
+        _claude_state(),
+        tool_id="claude_code",
+        category="conversation",
+        content_type="jsonl",
+        relative_path="projects/fixture-parent/main.jsonl",
+        content=str(frame["content"]),
+        content_hash=str(frame["content_hash"]),
+        file_size=int(frame["file_size"]),
+        mode="delta",
+        offset=int(frame["offset"]),
+        metadata=dict(frame["metadata"]),
+        timestamp=float(frame["timestamp"]),
+        machine_id=uuid.UUID(str(frame["machine_id"])),
+        user_id=uuid.UUID(str(frame["user_id"])),
+        base_hash=str(frame["base_hash"]),
+        base_offset=int(frame["base_offset"]),
+        authoritative_rebase=False,
+        had_sensitive=False,
+    )
+
+    assert document.disposition == "committed"
+    assert event is None
+    assert pool.connection.transaction_.calls == ["start", "commit"]
+    assert len(applied) == 1
+    assert applied[0].messages == expected.messages
+
+
+@pytest.mark.asyncio
+async def test_subagent_transcript_full_remains_legacy_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    frame = _claude_subagent_delta_frame()
+
+    with pytest.raises(
+        RawWriterUnsupported,
+        match="Claude transcript/sidecar pairing needs the legacy reducer",
+    ):
+        await raw_module.ingest_conversation_raw(
+            tool_id=str(frame["tool_id"]),
+            category=str(frame["category"]),
+            content_type=str(frame["content_type"]),
+            relative_path=str(frame["relative_path"]),
+            content=str(frame["content"]),
+            content_hash=str(frame["content_hash"]),
+            file_size=int(frame["file_size"]),
+            mode="full",
+            offset=int(frame["offset"]),
+            metadata=dict(frame["metadata"]),
+            timestamp=float(frame["timestamp"]),
+            machine_id=str(frame["machine_id"]),
+            user_id=str(frame["user_id"]),
+            base_hash=None,
+            base_offset=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", (False, True))
+async def test_subagent_sidecar_is_rejected_by_category_before_pairing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: bool,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", flag)
+    frame = _claude_subagent_delta_frame()
+    frame.update(
+        category="state",
+        content_type="json",
+        relative_path=_SUBAGENT_TRANSCRIPT_PATH.replace(".jsonl", ".meta.json"),
+    )
+
+    with pytest.raises(
+        RawWriterUnsupported,
+        match="raw writer is limited to conversation JSONL",
+    ):
+        await raw_module.ingest_conversation_raw_chain(frames=[frame])
 
 
 def test_cursor_user_replaced_by_directives_enqueues_canvas_and_search() -> None:

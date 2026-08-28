@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     realtime_ingest_raw_writer_owners: str = ""
     realtime_ingest_raw_writer_devices: str = ""
     realtime_ingest_raw_writer_tools: str = ""
+    # Canary Claude subagent transcript DELTAs through the raw writer.
+    # Pairing sidecars and FULLs remain on the legacy path regardless.
+    realtime_ingest_raw_subagent_transcripts: bool = False
 
     # Phase 5 defaults capability-negotiated conversation DELTAs to durable
     # spool admission. Setting this false is the kill-switch that reverts them
