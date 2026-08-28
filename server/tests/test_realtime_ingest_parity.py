@@ -23,8 +23,10 @@ import pytest_asyncio
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from server.config import settings
 from server.db.models import (
     Base,
+    ClaudeConversationLineageRecord,
     ConversationMessage,
     ConversationPromptProjection,
     ConversationReadModel,
@@ -72,6 +74,11 @@ async def session_factory():
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await connection.run_sync(Base.metadata.create_all)
+        # Match production's idempotent startup DDL for a shared test database
+        # whose existing outbox can be from an earlier Phase 4 revision.
+        from server.main import _run_migrations
+
+        await connection.run_sync(_run_migrations)
     yield async_sessionmaker(
         engine,
         expire_on_commit=False,
@@ -87,6 +94,7 @@ class RecordedDeltaSequence:
     full_rows: tuple[dict[str, object], ...]
     delta_rows: tuple[dict[str, object], ...]
     relative_path: str | None = None
+    deferred_projection_fixture: bool = False
 
     @property
     def full(self) -> str:
@@ -439,6 +447,55 @@ RECORDED_DELTA_SEQUENCES = (
             },
         ),
     ),
+    RecordedDeltaSequence(
+        name="claude_deferred_lineage_lifecycle",
+        tool_id="claude_code",
+        metadata={
+            "session_id": "agent-deferred-projection",
+            "parent_thread_id": "deferred-projection-root",
+            "root_session_id": "deferred-projection-root",
+            "is_subagent": True,
+        },
+        full_rows=(
+            {
+                "type": "user",
+                "uuid": "deferred-lineage-root",
+                "timestamp": "2026-08-28T16:00:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "Carry lineage through the raw DELTA.",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "deferred-lineage-middle",
+                "parentUuid": "deferred-lineage-root",
+                "timestamp": "2026-08-28T16:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": "The initial lineage is durable.",
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "assistant",
+                "uuid": "deferred-lineage-terminal",
+                "parentUuid": "deferred-lineage-middle",
+                "timestamp": "2026-08-28T16:00:02.000Z",
+                "message": {
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "content": "The deferred terminal state is complete.",
+                },
+            },
+        ),
+        relative_path=(
+            "projects/deferred-projection-root/subagents/"
+            "agent-deferred-projection.jsonl"
+        ),
+        deferred_projection_fixture=True,
+    ),
 )
 
 
@@ -516,6 +573,7 @@ async def _snapshot(
     document_id: uuid.UUID,
     user_id: uuid.UUID,
     relative_path: str | None = None,
+    include_lineage: bool = False,
 ) -> dict[str, object]:
     messages = (
         await session.execute(
@@ -574,7 +632,7 @@ async def _snapshot(
                 "data": _json_value(event_data),
             }
         )
-    return {
+    snapshot = {
         "messages": [
             _model_snapshot(
                 message,
@@ -729,6 +787,67 @@ async def _snapshot(
         ),
         "staged_sse_events": events,
     }
+    if include_lineage:
+        lineage = (
+            await session.execute(
+                select(ClaudeConversationLineageRecord)
+                .where(ClaudeConversationLineageRecord.document_id == document_id)
+                .order_by(ClaudeConversationLineageRecord.source_order)
+            )
+        ).scalars().all()
+        snapshot["lineage_records"] = [
+            _model_snapshot(
+                row,
+                (
+                    "record_uuid",
+                    "parent_uuid",
+                    "source_order",
+                    "is_sidechain",
+                    "is_subagent",
+                    "agent_id",
+                    "is_eligible",
+                    "active",
+                ),
+            )
+            for row in lineage
+        ]
+    return snapshot
+
+
+def _deferred_projection_golden_snapshot(
+    snapshot: dict[str, object],
+) -> dict[str, object]:
+    """Keep the enhanced fixture focused on fields owned by the new kinds."""
+    delivery = snapshot["delivery_state"]
+    assert isinstance(delivery, dict)
+    metadata = delivery["delivery_metadata"]
+    assert isinstance(metadata, dict)
+    lineage = snapshot["lineage_records"]
+    assert isinstance(lineage, list)
+    return {
+        "lifecycle": {
+            key: metadata.get(key)
+            for key in (
+                "subagent_lifecycle_status",
+                "subagent_lifecycle_source",
+                "subagent_lifecycle_at",
+                "subagent_lifecycle_evidence",
+            )
+        },
+        "lineage_records": [
+            {
+                key: row[key]
+                for key in (
+                    "record_uuid",
+                    "parent_uuid",
+                    "is_subagent",
+                    "active",
+                )
+            }
+            for row in lineage
+            if isinstance(row, dict)
+        ],
+    }
 
 
 async def _run_sequence(
@@ -737,6 +856,8 @@ async def _run_sequence(
     *,
     use_core_delta_message_staging: bool,
     writer: str | None = None,
+    full_writer: str | None = None,
+    apply_deferred_projections: bool = False,
 ) -> dict[str, object]:
     async with session_factory() as session:
         user = User(
@@ -792,7 +913,11 @@ async def _run_sequence(
                 schedule_post_ingest=False,
                 authoritative_rebase=authoritative_rebase,
                 use_core_delta_message_staging=use_core_delta_message_staging,
-                writer=writer,
+                writer=(
+                    full_writer
+                    if mode == "full" and full_writer is not None
+                    else writer
+                ),
             )
 
         full = sequence.full
@@ -832,11 +957,18 @@ async def _run_sequence(
             base_offset=len(full.encode("utf-8")),
         )
         await session.flush()
+        if apply_deferred_projections:
+            from server.services.realtime_ingest_projector import (
+                process_pending_candidates,
+            )
+
+            await process_pending_candidates(session, document_ids=(document_id,))
         snapshot = await _snapshot(
             session,
             document_id=document_id,
             user_id=user_uuid,
             relative_path=relative_path,
+            include_lineage=sequence.deferred_projection_fixture,
         )
         await session.commit()
         session.info.pop(_PENDING_REALTIME_EVENTS, None)
@@ -864,6 +996,7 @@ async def _run_sequence(
                 document_id=document_id,
                 user_id=user_uuid,
                 relative_path=relative_path,
+                include_lineage=sequence.deferred_projection_fixture,
             )
             assert rebased_snapshot["messages"] == snapshot["messages"]
             assert rebased_snapshot["usage_events"] == snapshot["usage_events"]
@@ -947,6 +1080,11 @@ async def test_recorded_delta_sequences_match_phase0_golden(
     from server.config import settings
 
     monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    phase0_sequences = tuple(
+        sequence
+        for sequence in RECORDED_DELTA_SEQUENCES
+        if not sequence.deferred_projection_fixture
+    )
     actual = {
         sequence.name: await _run_sequence(
             session_factory,
@@ -954,13 +1092,45 @@ async def test_recorded_delta_sequences_match_phase0_golden(
             use_core_delta_message_staging=use_core_delta_message_staging,
             writer=writer,
         )
-        for sequence in RECORDED_DELTA_SEQUENCES
+        for sequence in phase0_sequences
     }
     expected = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+    expected = {name: expected[name] for name in actual}
     difference = _first_difference(actual, expected)
     assert difference is None, (
         f"{path_name} drifted from the Phase 0 golden at {difference[0]}: "
         f"expected {difference[1]!r}, got {difference[2]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deferred_claude_lineage_lifecycle_matches_golden(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw DELTAs reproduce legacy lineage and terminal lifecycle via outbox."""
+    sequence = next(
+        item
+        for item in RECORDED_DELTA_SEQUENCES
+        if item.deferred_projection_fixture
+    )
+    monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    actual = _deferred_projection_golden_snapshot(
+        await _run_sequence(
+            session_factory,
+            sequence,
+            use_core_delta_message_staging=True,
+            writer="raw",
+            full_writer="legacy",
+            apply_deferred_projections=True,
+        )
+    )
+    expected = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))[sequence.name]
+    difference = _first_difference(actual, expected)
+    assert difference is None, (
+        "raw deferred lineage/lifecycle drifted from the legacy golden at "
+        f"{difference[0]}: expected {difference[1]!r}, got {difference[2]!r}"
     )
 
 

@@ -17,6 +17,7 @@ from server.config import settings
 from server.db.models import (
     Base,
     CanvasArtifactReference,
+    ClaudeConversationLineageRecord,
     ConversationMessage,
     ConversationSearchTerm,
     Document,
@@ -29,7 +30,9 @@ from server.db.models import (
 from server.services.ingest_service import ingest_file
 from server.services.realtime_ingest_projector import (
     KIND_CANVAS,
+    KIND_CLAUDE_LINEAGE,
     KIND_SEARCH,
+    KIND_SUBAGENT_LIFECYCLE,
     RealtimeIngestProjector,
     deferred_projections_enabled,
     process_pending_candidates,
@@ -90,6 +93,11 @@ async def session_factory():
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await connection.run_sync(Base.metadata.create_all)
+        # The shared task DB can predate an expand migration. Exercise the
+        # production startup path rather than assuming create_all alters it.
+        from server.main import _run_migrations
+
+        await connection.run_sync(_run_migrations)
     yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
 
@@ -145,6 +153,32 @@ def _large_cursor_transcript(
             }
         )
     return "\n".join(_json_line(row) for row in rows)
+
+
+def _claude_record(
+    record_uuid: str,
+    record_type: str,
+    *,
+    parent_uuid: str | None = None,
+    stop_reason: str | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "uuid": record_uuid,
+        "type": record_type,
+        "timestamp": f"2026-08-28T12:00:{len(record_uuid):02d}Z",
+        "message": {
+            "role": record_type,
+            "content": f"Projection record {record_uuid}",
+        },
+    }
+    if parent_uuid:
+        record["parentUuid"] = parent_uuid
+    if stop_reason:
+        record["message"] = {
+            **record["message"],
+            "stop_reason": stop_reason,
+        }
+    return record
 
 
 async def _seed_owner(session, *, suffix: str):
@@ -364,6 +398,203 @@ async def test_deferred_canvas_search_matches_synchronous_after_projector(
     assert projected["content_tsv"]
     assert projected["lexicon_term"] == nonce
     assert synchronous["lexicon_term"] == nonce
+
+
+@pytest.mark.asyncio
+async def test_deferred_claude_kinds_replay_delta_facts_with_revision_fencing(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new kinds retain only DELTA facts and apply them once at the fence."""
+    monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    full_records = (
+        _claude_record("lineage-root", "user"),
+        _claude_record("lineage-middle", "assistant", parent_uuid="lineage-root"),
+    )
+    first_delta = _claude_record(
+        "lineage-terminal",
+        "assistant",
+        parent_uuid="lineage-middle",
+        stop_reason="end_turn",
+    )
+    second_delta = _claude_record(
+        "lineage-latest",
+        "assistant",
+        parent_uuid="lineage-terminal",
+    )
+    full = "\n".join(_json_line(record) for record in full_records)
+    first_body = _json_line(first_delta)
+    first_revision = f"{full}\n{first_body}"
+    second_body = _json_line(second_delta)
+    second_revision = f"{first_revision}\n{second_body}"
+    path = f"phase4/subagents/agent-{uuid.uuid4().hex}.jsonl"
+    metadata = {
+        "session_id": path.rsplit("/", 1)[-1].removesuffix(".jsonl"),
+        "parent_thread_id": str(uuid.uuid4()),
+        "is_subagent": True,
+    }
+
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session, suffix="claude-deferred")
+        document = await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=full,
+            content_hash=_hash(full),
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_000.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            writer="legacy",
+        )
+        await session.commit()
+        document_id = document.id
+
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=first_body,
+            content_hash=_hash(first_revision),
+            file_size=len(first_body.encode("utf-8")),
+            mode="delta",
+            offset=len(first_revision.encode("utf-8")),
+            base_hash=_hash(full),
+            base_offset=len(full.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_001.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=True,
+            writer="raw",
+        )
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=second_body,
+            content_hash=_hash(second_revision),
+            file_size=len(second_body.encode("utf-8")),
+            mode="delta",
+            offset=len(second_revision.encode("utf-8")),
+            base_hash=_hash(first_revision),
+            base_offset=len(first_revision.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_002.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=True,
+            writer="raw",
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        pending = await _pending_candidates(session, document_id)
+        by_kind = {
+            kind: [row for row in pending if row.kind == kind]
+            for kind in (KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE)
+        }
+        assert set(by_kind) == {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+        for candidates in by_kind.values():
+            assert len(candidates) == 2
+            assert all(
+                "content" not in candidate.payload["records"][0]
+                for candidate in candidates
+            )
+            assert (
+                candidates[0].payload["records"][0]["uuid"]
+                == "lineage-terminal"
+            )
+            assert (
+                candidates[1].payload["records"][0]["uuid"]
+                == "lineage-latest"
+            )
+
+    projector = RealtimeIngestProjector(session_factory=session_factory)
+    results = await projector.run_until_quiescent(document_ids=(document_id,))
+    result_by_kind = {
+        result["kind"]: result
+        for result in results
+        if result["kind"] in {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+    }
+    assert (
+        result_by_kind[KIND_CLAUDE_LINEAGE]["revision_hash"]
+        == _hash(second_revision)
+    )
+    assert result_by_kind[KIND_CLAUDE_LINEAGE]["superseded"] == 1
+    assert result_by_kind[KIND_SUBAGENT_LIFECYCLE]["superseded"] == 1
+
+    async with session_factory() as session:
+        document = await session.get(Document, document_id)
+        assert document is not None
+        assert document.metadata_["subagent_lifecycle_status"] == "completed"
+        assert (
+            document.metadata_["subagent_lifecycle_evidence"]
+            == "assistant.stop_reason=end_turn"
+        )
+        lineage = (
+            (
+                await session.execute(
+                    select(ClaudeConversationLineageRecord).where(
+                        ClaudeConversationLineageRecord.document_id == document_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {
+            (row.record_uuid, row.active, row.is_subagent)
+            for row in lineage
+        } == {
+            ("lineage-root", True, True),
+            ("lineage-middle", True, True),
+            ("lineage-terminal", True, True),
+            ("lineage-latest", True, True),
+        }
+        candidates = (
+            (
+                await session.execute(
+                    select(IngestProjectionCandidate).where(
+                        IngestProjectionCandidate.document_id == document_id,
+                        IngestProjectionCandidate.kind.in_(
+                            (KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE)
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for kind in (KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE):
+            old = next(
+                row
+                for row in candidates
+                if row.kind == kind and row.revision_hash == _hash(first_revision)
+            )
+            latest = next(
+                row
+                for row in candidates
+                if row.kind == kind and row.revision_hash == _hash(second_revision)
+            )
+            assert old.completed_at is not None
+            assert old.superseded_at is not None
+            assert latest.completed_at is not None
+            assert latest.superseded_at is None
 
 
 @pytest.mark.asyncio
