@@ -52,6 +52,7 @@ export default function ConversationPage() {
   const [meta, setMeta] = useState<ConversationMetaWithPlans | null>(null);
   const [metaRef, setMetaRef] = useState<string | null>(null);
   const [showExport, setShowExport] = useState(false);
+  const [backgroundRunningCount, setBackgroundRunningCount] = useState(0);
   const metaRequestRef = useRef(0);
   const metaRefreshTimerRef = useRef<number | null>(null);
   const { t, locale } = useI18n();
@@ -197,6 +198,13 @@ export default function ConversationPage() {
               )}
               {Boolean(currentMeta.pending_question_count) && (
                 <Chip tone="warn" icon="message">{t.conversation.awaitingResponse}</Chip>
+              )}
+              {backgroundRunningCount > 0 && (
+                <span data-background-running-count={backgroundRunningCount}>
+                  <Chip tone="accent" icon="layers">
+                    {backgroundRunningCount} background task{backgroundRunningCount === 1 ? "" : "s"} running
+                  </Chip>
+                </span>
               )}
               {currentMeta.agent_mode?.toLocaleLowerCase() === "plan" && (
                 <Chip tone="accent">{t.conversation.planMode}</Chip>
@@ -345,6 +353,7 @@ export default function ConversationPage() {
         activeTaskState={currentMeta?.active_task_state}
         artifacts={plans}
         handoffSuccessor={currentMeta?.handoff_successor}
+        onBackgroundRunningCountChange={setBackgroundRunningCount}
       />
       {showExport && (
         <MarkdownExportDialog documentId={currentMeta?.id || docId} onClose={() => setShowExport(false)} />

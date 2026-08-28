@@ -30,6 +30,7 @@ import {
   QuestionInteractionResponse,
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
+import { isMetaConversationTool } from "@/lib/conversation-tools";
 import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
 import SessionContextBody from "./SessionContextBody";
@@ -467,6 +468,7 @@ export default function ConversationViewer({
   activeTaskState,
   artifacts,
   handoffSuccessor,
+  onBackgroundRunningCountChange,
 }: {
   documentId: string;
   prompts: ConversationPrompt[];
@@ -479,6 +481,7 @@ export default function ConversationViewer({
   activeTaskState?: ConversationTaskState | null;
   artifacts?: Artifact[];
   handoffSuccessor?: ConversationHandoffLink | null;
+  onBackgroundRunningCountChange?: (count: number) => void;
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   // This state is intentionally restricted to reader-driven work (the first
@@ -497,6 +500,7 @@ export default function ConversationViewer({
   const [pendingInteractions, setPendingInteractions] = useState<PendingConversationInteraction[]>([]);
   const [inlineInteractions, setInlineInteractions] = useState<PendingConversationInteraction[]>([]);
   const [liveActivities, setLiveActivities] = useState<LiveConversationActivity[]>([]);
+  const [backgroundRunningCount, setBackgroundRunningCount] = useState(0);
   const [inferredInteractionResponses, setInferredInteractionResponses] = useState<InferredConversationInteractionResponse[]>([]);
   const [urlState, setUrlState] = useState<ConversationUrlState>(
     EMPTY_CONVERSATION_URL_STATE,
@@ -932,8 +936,10 @@ export default function ConversationViewer({
     setPendingInteractions([]);
     setInlineInteractions([]);
     setLiveActivities([]);
+    setBackgroundRunningCount(0);
     setInferredInteractionResponses([]);
-  }, [documentId]);
+    onBackgroundRunningCountChange?.(0);
+  }, [documentId, onBackgroundRunningCountChange]);
 
   useEffect(() => {
     let current = true;
@@ -943,6 +949,7 @@ export default function ConversationViewer({
           setPendingInteractions(response.interactions);
           setInlineInteractions(response.inline_interactions || []);
           setLiveActivities(response.live_activities || []);
+          setBackgroundRunningCount(response.background_running_count || 0);
           setInferredInteractionResponses(response.inferred_responses);
         }
       })
@@ -955,6 +962,10 @@ export default function ConversationViewer({
       current = false;
     };
   }, [documentId, pendingInteractionsSyncVersion]);
+
+  useEffect(() => {
+    onBackgroundRunningCountChange?.(backgroundRunningCount);
+  }, [backgroundRunningCount, onBackgroundRunningCountChange]);
 
   useEffect(() => {
     promptLinesRef.current = prompts.map((prompt) => prompt.line_number);
@@ -5291,6 +5302,23 @@ function LiveShellActivityCard({
             <strong style={{ color: "var(--aurora-fg1)", fontSize: 11.5 }}>
               {activity.tool_name || "Shell"}
             </strong>
+            {activity.is_background && (
+              <span
+                data-background-activity
+                style={{
+                  borderRadius: 999,
+                  padding: "1px 6px",
+                  background: "color-mix(in srgb, #6366F1 13%, transparent)",
+                  color: "#4F46E5",
+                  fontSize: 9,
+                  fontWeight: 750,
+                  letterSpacing: "0.03em",
+                  textTransform: "uppercase",
+                }}
+              >
+                Background
+              </span>
+            )}
           </div>
           <div
             aria-live={activity.status === "running" ? "polite" : "off"}
@@ -5928,7 +5956,7 @@ export const ChatBubble = memo(function ChatBubble({
         style={{ display: "grid", gap: 6, marginTop: hasNarrative ? 6 : 0 }}
       >
         {visibleToolCalls.map((call, index) => (
-          call.interaction ? (
+          call.interaction && !isMetaConversationTool(call.name) ? (
             showAssistant || !questionResponses.has(call.interaction.id) ? (
               <QuestionInteractionCard
                 key={`${call.name}-${index}`}
@@ -6071,7 +6099,7 @@ export const ChatBubble = memo(function ChatBubble({
   // output stay collapsed until requested, keeping long agent sessions easy
   // to scan while retaining every detail.
   if (role === "tool") {
-    if (msg.interaction) {
+    if (msg.interaction && !isMetaConversationTool(toolName)) {
       const pairedResponse = questionResponses.get(msg.interaction.id);
       if (showAssistant || !pairedResponse) {
         return withCopyControls(
