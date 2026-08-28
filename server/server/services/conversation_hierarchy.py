@@ -260,7 +260,12 @@ def _repair_truncated_json_object(line: str) -> dict | None:
         else:
             if escaped:
                 base = base[:-1]
-            base += '"'
+            # Poison the cut value with a sentinel (JSON-escaped NULs) so a
+            # truncated string can never be completed into an authoritative
+            # value: '"user-notif…' cut after "user" must not become "user".
+            # Content strings stay truthful at their START, which is the only
+            # part the \A-anchored marker parser reads.
+            base += '\\u0000\\u0000"'
     elif last_sig == "k" and string_start >= 0:
         # A completed key string with no value yet.
         base = line[:string_start].rstrip().rstrip(",").rstrip()

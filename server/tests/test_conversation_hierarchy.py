@@ -897,6 +897,66 @@ class ConversationHierarchyTests(unittest.TestCase):
             conversation_is_chain_primary({}, raw_prefix=truncated)
         )
 
+    def test_truncated_discriminator_value_is_never_completed(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        line = json.dumps(
+            {
+                "type": "user-notification",
+                "message": {"role": "user", "content": handoff},
+            }
+        )
+        # Cut inside the discriminator value so the raw prefix ends `"user`.
+        cut = line.find("user-notification") + len("user")
+        truncated = line[:cut]
+        self.assertTrue(truncated.endswith('"user'))
+        self.assertEqual(conversation_briefing_from_raw_prefix(truncated), "")
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            (None, None),
+        )
+
+    def test_truncated_content_after_marker_still_resolves(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        content = (
+            f"MEMENTO-HANDOFF-FROM: {parent_id}\nfollow "
+            + "x" * 100
+            + "\\tail\\"
+            + "y" * 20000
+        )
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            }
+        )
+        marker_end = line.find(parent_id) + len(parent_id)
+        # Cut deep inside the content, directly after an escape backslash so
+        # the repair must also survive a dangling escape.
+        dangling = line.find("\\\\", marker_end)
+        self.assertGreater(dangling, marker_end)
+        truncated = line[: dangling + 1]
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            ("handoff", parent_id),
+        )
+
+    def test_truncated_marker_uuid_stays_unresolved(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": handoff},
+            }
+        )
+        truncated = line[: line.find(parent_id) + 8]
+        self.assertEqual(conversation_briefing_from_raw_prefix(truncated), "")
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            (None, None),
+        )
+
     def test_raw_prefix_first_user_without_marker_is_authoritative(self) -> None:
         parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
