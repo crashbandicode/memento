@@ -52,13 +52,10 @@ export function useThreadFavicon(toolId: string | null | undefined): void {
   useEffect(() => {
     if (!toolId || typeof document === "undefined") return undefined;
     const head = document.head;
-    // Detach whatever icon links are currently live (the root layout's default
-    // svg + png) and restore them verbatim on cleanup, so navigating away never
-    // leaves a stale thread favicon behind.
-    const previous = Array.from(
-      head.querySelectorAll<HTMLLinkElement>('link[rel~="icon"]'),
-    );
-    previous.forEach((link) => link.remove());
+    // Root-layout favicon links are owned by Next's head resource tree. Removing
+    // them here leaves React holding detached nodes, which makes a later route
+    // transition fail while React tries to remove those resources. Add a thread
+    // icon after the defaults instead; browsers use the latest matching icon.
     const link = document.createElement("link");
     link.rel = "icon";
     link.type = "image/svg+xml";
@@ -67,7 +64,6 @@ export function useThreadFavicon(toolId: string | null | undefined): void {
     head.appendChild(link);
     return () => {
       link.remove();
-      previous.forEach((old) => head.appendChild(old));
     };
   }, [toolId]);
 }
