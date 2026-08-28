@@ -482,7 +482,7 @@ export interface ConversationMessage {
   line_number: number;
   message_type?: string | null;
   role: string | null;
-  origin?: "parent_agent" | null;
+  origin?: "parent_agent" | "human" | null;
   content: string;
   thinking?: string | null;
   model?: string | null;
@@ -725,7 +725,7 @@ export interface ConversationSearchHit {
   id: number;
   line_number: number;
   role: "user" | "assistant" | string;
-  origin?: "parent_agent" | null;
+  origin?: "parent_agent" | "human" | null;
   snippet: string;
   timestamp: string | null;
   score: number;

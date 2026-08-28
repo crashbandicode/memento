@@ -115,6 +115,8 @@ const enUS: Translations = {
     weeklyActivity: "Last 7 Days",
     needsAttention: "Needs Attention",
     recentConversations: "Recent Conversations",
+    clawDelegatedAgent: "Claw · {count} delegated agent",
+    clawDelegatedAgents: "Claw · {count} delegated agents",
   },
 
   tools: {

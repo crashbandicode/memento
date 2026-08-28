@@ -590,6 +590,10 @@ async def get_dashboard(
             "message_count": total,
             "pending_question_count": pending_question_counts.get(row.id, 0),
             "agent_mode": row.agent_mode or "",
+            "orchestration": (
+                str(_row_metadata(row).get("orchestration") or "").strip()
+                or None
+            ),
             "subagent_count": conversation_hierarchy.subagent_counts.get(
                 row.id,
                 0,
