@@ -41,7 +41,7 @@ conversation data.
   `MEMENTO-TANGENT-FROM:` with the public `conversation_hierarchy` briefing
   helpers. A valid UUID resolves only to a visible `claude_code` conversation
   whose normalized `relative_path` ends in `<uuid>.jsonl` within the current
-  machine scope.
+  machine scope, and never resolves the viewed document itself.
 - Parent to tangents derives the viewed thread UUID from its `.jsonl` path and
   performs one candidate query using
   `to_tsvector('simple', conversation_messages.content) @@
@@ -49,9 +49,11 @@ conversation data.
   The query uses the existing user-role partial-index predicate, the opening
   `line_number <= 3` bound, exact tangent prefix, Claude Code/document scope,
   and machine scope.
-- The reverse probe is capped at 64 candidates. Python strictly revalidates
-  each marker, de-duplicates by document ID, and returns every valid tangent
-  in `delivery_activity_expression().desc().nulls_last()`,
+- The reverse probe is capped at 64 candidates. For every unique candidate,
+  one bounded follow-up query fetches that document's earliest normalized user
+  row (ordered by `line_number`, then row ID); only that row may validate the
+  tangent marker. Python then de-duplicates by document ID and returns every
+  valid tangent in `delivery_activity_expression().desc().nulls_last()`,
   `Document.created_at.desc()`, `Document.id.desc()` order. The cap bounds
   both marker validation and de-duplication work; it intentionally does not
   promise to discover a branch beyond the first 64 index candidates.
@@ -69,10 +71,10 @@ environment.
 ```powershell
 $env:MEMENTO_TASK_TEST_DATABASE_URL = 'postgresql+asyncpg://postgres:test@localhost:55437/postgres'
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_tangent_thread_links_api.py --basetemp ..\.pytest-basetemp\tangent-api -q
-# 5 passed in 111.19s
+# 7 passed in 150.70s (0:02:30) after the earliest-row/self-parent fix round
 
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_handoff_thread_links_api.py --basetemp ..\.pytest-basetemp\tangent-handoff-api -q
-# 4 passed in 87.03s
+# 4 passed in 86.82s (0:01:26) after the earliest-row/self-parent fix round
 
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_conversation_hierarchy.py --basetemp ..\.pytest-basetemp\tangent-hierarchy -q
 # 50 passed, 6 subtests passed in 1.78s
@@ -144,12 +146,13 @@ resource-path line.
 This missing sidecar binary is an environmental prerequisite, not a tangent
 rendering failure; no binary was fabricated or copied into the worktree.
 
-Focused API coverage proves parent resolution, all-branch delivery-state
-ordering, absent/malformed-marker omission, and simultaneous handoff/tangent
-families. The orchestration-event regression adds the tangent twin of the
-handoff no-delegate-stamp case. Browser coverage exercises parent, one-child,
-and multi-child rendering across desktop and mobile, including measured header
-geometry and the intentional absence of a continuation banner.
+Focused API coverage proves parent resolution, self-parent exclusion,
+earliest-user-row agreement between forward and reverse resolution, all-branch
+delivery-state ordering, absent/malformed-marker omission, and simultaneous
+handoff/tangent families. The orchestration-event regression adds the tangent
+twin of the handoff no-delegate-stamp case. Browser coverage exercises parent,
+one-child, and multi-child rendering across desktop and mobile, including
+measured header geometry and the intentional absence of a continuation banner.
 
 ## Explicit non-changes
 

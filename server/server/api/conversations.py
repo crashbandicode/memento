@@ -986,6 +986,7 @@ async def _tangent_parent_reference(
             )
         )
         .where(
+            Document.id != document.id,
             Document.tool_id == "claude_code",
             Document.category == "conversation",
             or_(
@@ -1050,16 +1051,56 @@ async def _tangent_branch_references(
     if machine_ids is not None:
         statement = statement.where(Document.machine_id.in_(machine_ids))
 
-    branches: list[dict] = []
+    # The FTS probe is intentionally index-compatible and capped at 64 rows.
+    # Validate only the first user row for every unique candidate in one
+    # bounded follow-up query, matching the forward-resolution contract.
+    candidate_documents: list[Document] = []
     seen_document_ids: set[uuid.UUID] = set()
-    for branch, content in (await db.execute(statement)).all():
-        if branch.id in seen_document_ids:
-            continue
-        if _tangent_marker_session_id(content) != session_id:
-            continue
-        seen_document_ids.add(branch.id)
-        branches.append(_handoff_conversation_reference(branch))
-    return branches
+    for branch, _content in (await db.execute(statement)).all():
+        if branch.id not in seen_document_ids:
+            seen_document_ids.add(branch.id)
+            candidate_documents.append(branch)
+    if not candidate_documents:
+        return []
+
+    earliest_user_rows = (
+        select(
+            ConversationMessage.document_id.label("document_id"),
+            ConversationMessage.content.label("content"),
+            func.row_number()
+            .over(
+                partition_by=ConversationMessage.document_id,
+                order_by=(
+                    ConversationMessage.line_number.asc(),
+                    ConversationMessage.id.asc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(
+            ConversationMessage.document_id.in_(
+                [branch.id for branch in candidate_documents]
+            ),
+            ConversationMessage.role == "user",
+        )
+        .subquery()
+    )
+    first_user_content_by_document = dict(
+        (
+            await db.execute(
+                select(
+                    earliest_user_rows.c.document_id,
+                    earliest_user_rows.c.content,
+                ).where(earliest_user_rows.c.row_number == 1)
+            )
+        ).all()
+    )
+    return [
+        _handoff_conversation_reference(branch)
+        for branch in candidate_documents
+        if _tangent_marker_session_id(first_user_content_by_document.get(branch.id))
+        == session_id
+    ]
 
 
 async def _tangent_thread_links(

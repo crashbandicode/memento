@@ -225,6 +225,86 @@ async def test_detail_api_lists_all_tangent_branches_by_delivery_activity(
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_reverse_probe_rejects_later_wrong_parent_marker(session_factory) -> None:
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session)
+        first_parent_session_id = uuid4()
+        first_parent = await _seed_thread(
+            session,
+            session_id=first_parent_session_id,
+            title="First parent",
+            first_user_content="Start here.",
+            machine_id=machine.id,
+        )
+        wrong_parent_session_id = uuid4()
+        wrong_parent = await _seed_thread(
+            session,
+            session_id=wrong_parent_session_id,
+            title="Wrong later parent",
+            first_user_content="Start somewhere else.",
+            machine_id=machine.id,
+        )
+        tangent_session_id = uuid4()
+        tangent = await _seed_thread(
+            session,
+            session_id=tangent_session_id,
+            title="Tangent with a later wrong marker",
+            first_user_content=(
+                f"MEMENTO-TANGENT-FROM: {first_parent_session_id}\n"
+                "The opening user row controls the branch parent."
+            ),
+            machine_id=machine.id,
+        )
+        session.add(
+            ConversationMessage(
+                document_id=tangent.id,
+                line_number=3,
+                role="user",
+                content=f"MEMENTO-TANGENT-FROM: {wrong_parent_session_id}",
+                metadata_={},
+            )
+        )
+        await session.commit()
+
+        first_parent_payload = await get_conversation(
+            first_parent.id,
+            db=session,
+            _user=user,
+        )
+        wrong_parent_payload = await get_conversation(
+            wrong_parent.id,
+            db=session,
+            _user=user,
+        )
+
+    assert first_parent_payload["tangent_branches"] == [
+        _reference(tangent, tangent_session_id)
+    ]
+    assert "tangent_branches" not in wrong_parent_payload
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_forward_probe_rejects_self_parent(session_factory) -> None:
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session)
+        session_id = uuid4()
+        document = await _seed_thread(
+            session,
+            session_id=session_id,
+            title="Self-referential tangent",
+            first_user_content=f"MEMENTO-TANGENT-FROM: {session_id}",
+            machine_id=machine.id,
+        )
+        await session.commit()
+
+        payload = await get_conversation(document.id, db=session, _user=user)
+
+    assert "tangent_parent" not in payload
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_detail_api_omits_tangent_fields_when_marker_is_absent(session_factory) -> None:
     async with session_factory() as session:
         user, machine = await _seed_owner(session)
