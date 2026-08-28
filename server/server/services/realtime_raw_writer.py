@@ -632,9 +632,6 @@ def reduce_writer_state(
     from .embedding_service import desired_embedding_tier
     from .ingest_revision import bounded_source_timestamp, committed_full_supersedes
     from .ingest_service import (
-        CURRENT_PENDING_QUESTIONS_KEY,
-        LIVE_INTERACTION_SIGNALS_KEY,
-        LIVE_SHELL_ACTIVITIES_KEY,
         STORED_SOURCE_HASH_KEY,
         STORED_SOURCE_REVISION_KEY,
         STORED_SOURCE_SIZE_KEY,
@@ -642,7 +639,6 @@ def reduce_writer_state(
         _assistant_identity_for_ingest,
         _bounded_message_text,
         _committed_delta_base,
-        _conversation_message_metadata,
         _drain_assistant_usage_rows,
         _latest_human_timestamp_for_ingest,
         _logical_document_file_size,
@@ -870,7 +866,6 @@ def reduce_writer_state(
         incremental=mode == "delta",
     ):
         usage_rows.extend(_drain_assistant_usage_rows(view, tool_id, assistant_identity))
-        pending_before = bool(pending_ids)
         latest_human = _update_pending_question_ids(pending_ids, normalized, latest_human)
         canonical_interaction_ids.update(_normalized_interaction_ids(normalized))
         terminal_tool_ids.update(_normalized_terminal_tool_call_ids(normalized))
@@ -1155,7 +1150,7 @@ async def _refresh_projections(
     document: SimpleNamespace, rows: list[SimpleNamespace], dirty: set[int], user_id: uuid.UUID | None,
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
     from .conversation_read_model import READ_MODEL_VERSION, _Accumulator, _identity_values, _prompt_projection_value
-    from .conversation_tasks import _document_identity, _state_from_metadata, canonical_task_state, task_state_counts, task_state_hash
+    from .conversation_tasks import _document_identity, _state_from_metadata, task_state_counts, task_state_hash
     from .dashboard_projection import dashboard_projection_values
 
     existing = _view(**state.read_model) if state.read_model else None
