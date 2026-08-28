@@ -82,7 +82,12 @@ def bounded_claude_projection_records(content: str) -> tuple[dict[str, Any], ...
         "subtype",
         "event_type",
     )
-    bool_fields = ("isSidechain", "is_sidechain", "isApiErrorMessage", "is_api_error_message")
+    bool_fields = (
+        "isSidechain",
+        "is_sidechain",
+        "isApiErrorMessage",
+        "is_api_error_message",
+    )
     records: list[dict[str, Any]] = []
     for raw_line in content.splitlines():
         try:

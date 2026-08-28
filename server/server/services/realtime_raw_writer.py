@@ -1489,7 +1489,9 @@ async def _apply(
             # All Claude conversation documents participate: lineage for a
             # main session can otherwise stay stale indefinitely, while the
             # lifecycle reconciler itself cheaply no-ops for non-subagents.
-            claude_lineage=tool_id == "claude_code" and category == "conversation",
+            claude_lineage=(
+                tool_id == "claude_code" and category == "conversation"
+            ),
             subagent_lifecycle=(
                 tool_id == "claude_code" and category == "conversation"
             ),

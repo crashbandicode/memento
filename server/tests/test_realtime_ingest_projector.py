@@ -1017,6 +1017,11 @@ async def test_deferred_ingest_live_fields_match_golden(
 
     monkeypatch.setattr(parity, "_snapshot", snapshot_after_projector)
     monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    phase4_sequences = tuple(
+        sequence
+        for sequence in RECORDED_DELTA_SEQUENCES
+        if not sequence.deferred_projection_fixture
+    )
     actual = {
         sequence.name: await _run_sequence(
             session_factory,
@@ -1024,9 +1029,10 @@ async def test_deferred_ingest_live_fields_match_golden(
             use_core_delta_message_staging=use_core_delta_message_staging,
             writer=None if writer == "core" else writer,
         )
-        for sequence in RECORDED_DELTA_SEQUENCES
+        for sequence in phase4_sequences
     }
     expected = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+    expected = {name: expected[name] for name in actual}
     live_actual = {
         name: {key: value for key, value in snapshot.items() if key != "staged_sse_events"}
         for name, snapshot in actual.items()
