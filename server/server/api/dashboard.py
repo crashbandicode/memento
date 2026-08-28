@@ -14,6 +14,7 @@ from sqlalchemy import (
     cast,
     func,
     literal,
+    not_,
     or_,
     select,
     union_all,
@@ -257,6 +258,48 @@ def _is_claw_orchestration_row(row) -> bool:
     return str(_row_metadata(row).get("orchestration") or "").strip() == "claw"
 
 
+def _is_unlinked_claw_row(row) -> bool:
+    """True for orchestration=claw with no parent document id (Python twin of SQL)."""
+    metadata = _row_metadata(row)
+    if str(metadata.get("orchestration") or "").strip().casefold() != "claw":
+        return False
+    return not str(metadata.get("orchestration_parent_document_id") or "").strip()
+
+
+def _unlinked_claw_hierarchy_sql(hierarchy_metadata):
+    """Unlinked-claw predicate over dashboard hierarchy_metadata JSONB."""
+    orchestration = func.lower(
+        func.coalesce(hierarchy_metadata["orchestration"].astext, "")
+    )
+    parent = func.coalesce(
+        hierarchy_metadata["orchestration_parent_document_id"].astext,
+        "",
+    )
+    return and_(orchestration == "claw", parent == "")
+
+
+def partition_dashboard_candidates_before_limit(
+    rows,
+    *,
+    activity_key,
+    candidate_limit: int = DASHBOARD_CONVERSATION_CANDIDATE_LIMIT,
+    claw_sample_limit: int = RECENT_CLAW_SAMPLE_LIMIT,
+):
+    """Split unlinked claws from primaries before the 600-row candidate cap.
+
+    Mirrors the SQL used by ``get_dashboard``: unlinked claws are counted and
+    sampled independently so delegate volume cannot drown primary rows.
+    """
+    ordered = sorted(rows, key=activity_key, reverse=True)
+    unlinked = [row for row in ordered if _is_unlinked_claw_row(row)]
+    primaries = [row for row in ordered if not _is_unlinked_claw_row(row)]
+    return {
+        "primary_candidates": primaries[:candidate_limit],
+        "claw_count": len(unlinked),
+        "claw_sample": unlinked[:claw_sample_limit],
+    }
+
+
 def _select_recent_conversation_rows(
     visible_convo_rows,
     attention_ids: set,
@@ -401,15 +444,47 @@ async def get_dashboard(
         source.c.source_modified_at,
         source.c.synced_at,
     )
+    unlinked_claw = _unlinked_claw_hierarchy_sql(source.c.hierarchy_metadata)
     recent_convos_q = (
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
-        .where(_unarchived_conversation_filter(source))
+        .where(
+            _unarchived_conversation_filter(source),
+            not_(unlinked_claw),
+        )
         .order_by(activity_expr.desc(), source.c.id.desc())
         .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
     candidate_rows = list(
         (await db.execute(scoped(recent_convos_q))).all()
+    )
+    claw_delegate_count = int(
+        (
+            await db.execute(
+                scoped(
+                    select(func.count())
+                    .select_from(source)
+                    .where(
+                        _unarchived_conversation_filter(source),
+                        unlinked_claw,
+                    )
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    claw_sample_q = (
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
+        .where(
+            _unarchived_conversation_filter(source),
+            unlinked_claw,
+        )
+        .order_by(activity_expr.desc(), source.c.id.desc())
+        .limit(RECENT_CLAW_SAMPLE_LIMIT)
+    )
+    claw_sample_rows = list(
+        (await db.execute(scoped(claw_sample_q))).all()
     )
 
     attention_convos_q = (
@@ -422,6 +497,8 @@ async def get_dashboard(
     )
     rows_by_id = {row.id: row for row in candidate_rows}
     for row in (await db.execute(scoped(attention_convos_q))).all():
+        rows_by_id[row.id] = row
+    for row in claw_sample_rows:
         rows_by_id[row.id] = row
     candidate_rows = list(rows_by_id.values())
 
@@ -548,7 +625,7 @@ async def get_dashboard(
         if pending_question_counts.get(row.id, 0) > 0
     ]
     attention_ids = {row.id for row in attention_rows}
-    convos_rows, claw_delegate_count = _select_recent_conversation_rows(
+    convos_rows, _sampled_claw_count = _select_recent_conversation_rows(
         visible_convo_rows,
         attention_ids,
         activity_key,

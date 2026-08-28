@@ -3772,6 +3772,15 @@ async def ingest_file(
         existing_metadata = document_metadata(doc)
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
+        if mode != "delta":
+            from .conversation_hierarchy import (
+                clear_stale_briefing_keys_for_full_replacement,
+            )
+
+            clear_stale_briefing_keys_for_full_replacement(
+                existing_metadata,
+                first_user_message,
+            )
         metadata_update = (
             _merge_delta_metadata(existing_metadata, stored_metadata)
             if mode == "delta"

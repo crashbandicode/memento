@@ -13,6 +13,7 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     ConversationRef,
     build_logical_activity_map,
     build_subagent_summaries,
+    clear_stale_briefing_keys_for_full_replacement,
     conversation_briefing_from_raw_prefix,
     conversation_briefing_kind,
     conversation_briefing_session_id,
@@ -701,6 +702,159 @@ class ConversationHierarchyTests(unittest.TestCase):
                 raw_prefix=None,
             )
         )
+
+    def test_raw_prefix_skips_leading_non_user_records(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        prefix = "\n".join(
+            [
+                json.dumps({"type": "summary", "summary": "prior turn"}),
+                json.dumps(
+                    {
+                        "type": "system",
+                        "content": "ignore this",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": handoff},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=prefix),
+            ("handoff", parent_id),
+        )
+        self.assertTrue(
+            conversation_is_chain_primary({}, raw_prefix=prefix)
+        )
+
+    def test_raw_prefix_rejects_assistant_marker_false_positive(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        prefix = json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": handoff},
+            }
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=prefix),
+            (None, None),
+        )
+        self.assertFalse(
+            conversation_is_chain_primary({}, raw_prefix=prefix)
+        )
+        self.assertEqual(conversation_briefing_from_raw_prefix(prefix), "")
+
+    def test_raw_prefix_extracts_marker_from_truncated_first_user_record(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": handoff},
+            }
+        )
+        truncated = line[:800]
+        self.assertLess(len(truncated), len(line))
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            ("handoff", parent_id),
+        )
+        self.assertTrue(
+            conversation_is_chain_primary({}, raw_prefix=truncated)
+        )
+        summary_then_truncated = (
+            json.dumps({"type": "summary", "summary": "prior turn"})
+            + "\n"
+            + truncated
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=summary_then_truncated),
+            ("handoff", parent_id),
+        )
+
+    def test_raw_prefix_unresolvable_truncated_record_is_not_a_marker(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("y" * 5000)
+        assistant_line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": handoff},
+            }
+        )
+        truncated_assistant = assistant_line[:900]
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated_assistant),
+            (None, None),
+        )
+        truncated_summary = '{"type": "summary", "summary": "' + ("z" * 500)
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated_summary),
+            (None, None),
+        )
+        truncated_user_uuid = (
+            '{"type":"user","message":{"role":"user","content":'
+            '"MEMENTO-HANDOFF-FROM: aaaa'
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated_user_uuid),
+            (None, None),
+        )
+
+    def test_raw_prefix_first_user_without_marker_is_authoritative(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."
+        prefix = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "ordinary first turn"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": handoff},
+                    }
+                ),
+            ]
+        )
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=prefix),
+            (None, None),
+        )
+
+    def test_full_replacement_clears_stale_durable_briefing_keys(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        existing = {
+            "briefing_kind": "handoff",
+            "briefing_session_id": parent_id,
+            "session_id": "successor",
+        }
+        clear_stale_briefing_keys_for_full_replacement(
+            existing,
+            "ordinary replacement",
+        )
+        self.assertNotIn("briefing_kind", existing)
+        self.assertNotIn("briefing_session_id", existing)
+
+        preserved = {
+            "briefing_kind": "handoff",
+            "briefing_session_id": parent_id,
+        }
+        clear_stale_briefing_keys_for_full_replacement(preserved, "")
+        self.assertEqual(preserved["briefing_kind"], "handoff")
+        replacement_marker = (
+            "MEMENTO-TANGENT-FROM: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\nAsk."
+        )
+        clear_stale_briefing_keys_for_full_replacement(preserved, replacement_marker)
+        self.assertEqual(preserved["briefing_kind"], "handoff")
 
     def test_global_export_keeps_claw_thread_with_explicit_human_prompt(self) -> None:
         from server.api.conversation_exports import conversation_export_prompt_is_included

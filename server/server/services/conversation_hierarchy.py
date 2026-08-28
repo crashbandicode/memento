@@ -44,7 +44,7 @@ TANGENT_MARKER_PREFIX = "MEMENTO-TANGENT-FROM:"
 DELEGATE_MARKER_PREFIX = "MEMENTO-DELEGATE-FROM:"
 BRIEFING_KIND_METADATA_KEY = "briefing_kind"
 BRIEFING_SESSION_ID_METADATA_KEY = "briefing_session_id"
-BRIEFING_RAW_PREFIX_CHARS = 4096
+BRIEFING_RAW_PREFIX_CHARS = 32 * 1024
 _BRIEFING_CONTENT_CHARS = 2048
 _BRIEFING_KINDS = frozenset({"handoff", "tangent", "delegate"})
 _BRIEFING_KIND_PREFIXES = {
@@ -52,6 +52,20 @@ _BRIEFING_KIND_PREFIXES = {
     "tangent": TANGENT_MARKER_PREFIX,
     "delegate": DELEGATE_MARKER_PREFIX,
 }
+_NON_USER_RECORD_TYPES = frozenset({
+    "assistant",
+    "system",
+    "summary",
+    "progress",
+    "file-history-snapshot",
+    "queue-operation",
+})
+_JSON_RECORD_TYPE = re.compile(r'"type"\s*:\s*"(?P<value>[^"]+)"')
+_JSON_RECORD_ROLE = re.compile(r'"role"\s*:\s*"(?P<value>[^"]+)"')
+_JSON_EMBEDDED_BRIEFING = re.compile(
+    r"MEMENTO-(?P<kind>HANDOFF|TANGENT|DELEGATE)-FROM:\s*"
+    rf"(?P<session_id>{_BRIEFING_SESSION_ID})"
+)
 _HANDOFF_MARKER_RE = re.compile(
     rf"\A{re.escape(HANDOFF_MARKER_PREFIX)}\s*(?P<session_id>"
     rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
@@ -129,6 +143,24 @@ def persist_conversation_briefing_metadata(
     return candidate
 
 
+def clear_stale_briefing_keys_for_full_replacement(
+    existing_metadata: dict[str, Any],
+    first_user_content: str | None,
+) -> dict[str, Any]:
+    """Drop durable briefing keys when a FULL replacement's first user is a non-marker.
+
+    Empty first-user text is not authoritative (deltas and incomplete FULL
+    payloads must not wipe a previously stored marker).
+    """
+    if not isinstance(first_user_content, str) or not first_user_content.strip():
+        return existing_metadata
+    if _parse_conversation_briefing(first_user_content) is not None:
+        return existing_metadata
+    existing_metadata.pop(BRIEFING_KIND_METADATA_KEY, None)
+    existing_metadata.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+    return existing_metadata
+
+
 def _user_text_from_raw_record(payload: object) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -150,25 +182,107 @@ def _user_text_from_raw_record(payload: object) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _payload_is_user_record(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    envelope_type = str(payload.get("type") or "").strip().casefold()
+    envelope_role = str(payload.get("role") or "").strip().casefold()
+    if envelope_type in _NON_USER_RECORD_TYPES or envelope_role in _NON_USER_RECORD_TYPES:
+        return False
+    if envelope_type == "user" or envelope_role == "user":
+        return True
+    message = payload.get("message")
+    if isinstance(message, dict):
+        nested_role = str(message.get("role") or "").strip().casefold()
+        if nested_role == "user" and envelope_type in {"", "user"}:
+            return True
+    return False
+
+
+def _json_envelope_head(line: str) -> str:
+    """Fields before message/content, so nested payload strings cannot spoof type."""
+    cuts = [
+        index
+        for token in ('"message"', '"content"')
+        if (index := line.find(token)) > 0
+    ]
+    if cuts:
+        return line[: min(cuts)]
+    return line[:2048]
+
+
+def _truncated_json_record_is_user(line: str) -> bool:
+    head = _json_envelope_head(line)
+    record_type = ""
+    record_role = ""
+    type_match = _JSON_RECORD_TYPE.search(head)
+    role_match = _JSON_RECORD_ROLE.search(head)
+    if type_match is not None:
+        record_type = type_match.group("value").strip().casefold()
+    if role_match is not None:
+        record_role = role_match.group("value").strip().casefold()
+    if record_type in _NON_USER_RECORD_TYPES or record_role in _NON_USER_RECORD_TYPES:
+        return False
+    return record_type == "user" or record_role == "user"
+
+
+def _marker_text_from_truncated_user_record(line: str) -> str:
+    match = _JSON_EMBEDDED_BRIEFING.search(line)
+    if match is None:
+        return ""
+    kind = match.group("kind").casefold()
+    prefix = _BRIEFING_KIND_PREFIXES.get(kind)
+    if prefix is None:
+        return ""
+    try:
+        session_id = str(uuid.UUID(match.group("session_id")))
+    except (ValueError, AttributeError):
+        return ""
+    return f"{prefix} {session_id}"
+
+
 def conversation_briefing_from_raw_prefix(raw_prefix: object) -> str:
-    """Bounded first line (or first JSON user record) used when no user row exists."""
+    """First user record in a bounded JSONL/plaintext prefix, if one is present.
+
+    Non-user records (summary/system/assistant/...) are skipped. The first user
+    record is authoritative even when it has no marker. A truncated final JSON
+    line may still yield a marker because the protocol text sits at the start
+    of user content; an unresolvable truncated prefix yields no text.
+    """
     if not isinstance(raw_prefix, str) or not raw_prefix.strip():
         return ""
-    first_line, _, _ = raw_prefix.lstrip("\ufeff").partition("\n")
-    first_line = first_line.strip()
-    if not first_line:
-        return ""
-    if _parse_conversation_briefing(first_line) is not None:
-        return first_line[:_BRIEFING_CONTENT_CHARS]
-    if first_line.startswith("{"):
+    text = raw_prefix.lstrip("\ufeff")
+    truncated_tail = bool(text) and not text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    last_index = len(lines) - 1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("{"):
+            if _parse_conversation_briefing(stripped) is not None:
+                return stripped[:_BRIEFING_CONTENT_CHARS]
+            continue
+        payload = None
         try:
-            payload = json.loads(first_line)
+            payload = json.loads(stripped)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return first_line[:_BRIEFING_CONTENT_CHARS]
-        extracted = _user_text_from_raw_record(payload)
-        if _parse_conversation_briefing(extracted) is not None:
+            payload = None
+        if isinstance(payload, dict):
+            if not _payload_is_user_record(payload):
+                continue
+            extracted = _user_text_from_raw_record(payload)
             return extracted[:_BRIEFING_CONTENT_CHARS]
-    return first_line[:_BRIEFING_CONTENT_CHARS]
+        if payload is not None:
+            continue
+        is_last = index == last_index
+        if is_last and truncated_tail:
+            if not _truncated_json_record_is_user(stripped):
+                return ""
+            return _marker_text_from_truncated_user_record(stripped)[
+                :_BRIEFING_CONTENT_CHARS
+            ]
+    return ""
 
 
 def resolve_conversation_briefing(
