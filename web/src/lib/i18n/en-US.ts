@@ -200,6 +200,9 @@ const enUS: Translations = {
     offlineVscdbFallback: "Recovered from local Antigravity session state",
     offlinePbFallback: "Recovered from local protobuf cache",
     collapse: "Collapse",
+    branchedFrom: "Branched from",
+    tangent: "Tangent",
+    tangents: "Tangents ({count})",
     canvas: {
       chip: "Canvas",
       eyebrow: "Cursor Canvas",

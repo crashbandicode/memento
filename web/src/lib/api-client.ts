@@ -353,6 +353,8 @@ export interface ConversationMeta {
   token_usage?: ConversationTokenUsage | null;
   handoff_predecessor?: ConversationHandoffLink | null;
   handoff_successor?: ConversationHandoffLink | null;
+  tangent_parent?: ConversationHandoffLink | null;
+  tangent_branches?: ConversationHandoffLink[];
   message_count: number;
   subagent_count?: number;
   is_subagent_orphan?: boolean;

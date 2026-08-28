@@ -35,10 +35,13 @@ from ..services.canvas_artifacts import (
 from ..services.conversation_activity import conversation_activity_is_fresh
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
+    TANGENT_MARKER_PREFIX,
     ConversationRef,
     build_conversation_companion_filter,
     build_logical_activity_map,
     build_subagent_summaries,
+    conversation_briefing_kind,
+    conversation_briefing_session_id,
     conversation_display_title,
     conversation_message_user_origin,
     conversation_root_thread_id,
@@ -768,6 +771,13 @@ def _handoff_marker_session_id(content: object) -> str | None:
         return None
 
 
+def _tangent_marker_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message tangent marker."""
+    if conversation_briefing_kind(content) != "tangent":
+        return None
+    return conversation_briefing_session_id(content)
+
+
 def _claude_session_id_from_relative_path(relative_path: object) -> str | None:
     """Return the Claude Code session UUID encoded by a transcript filename."""
     if not isinstance(relative_path, str):
@@ -934,6 +944,216 @@ async def _handoff_thread_links(
     if successor is not None:
         links["handoff_successor"] = successor
     return links
+
+
+async def _tangent_parent_reference(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict | None:
+    """Resolve this tangent thread's parent from its opening user prompt."""
+    first_user_content = (
+        await db.execute(
+            select(ConversationMessage.content)
+            .where(
+                ConversationMessage.document_id == document.id,
+                ConversationMessage.role == "user",
+                ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+            )
+            .order_by(
+                ConversationMessage.line_number.asc(),
+                ConversationMessage.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    parent_session_id = _tangent_marker_session_id(first_user_content)
+    if parent_session_id is None:
+        return None
+    # A session may never be its own tangent parent. Documents are unique per
+    # (machine_id, tool_id, relative_path), so the same transcript synced from
+    # another visible machine passes a document-ID check; reject at the
+    # session-UUID level and keep the ID predicate below as a second defense.
+    own_session_id = _claude_session_id_from_relative_path(document.relative_path)
+    if own_session_id is not None and parent_session_id.lower() == own_session_id.lower():
+        return None
+
+    normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
+    parent_path = f"{parent_session_id}.jsonl"
+    statement = (
+        select(Document)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.id != document.id,
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            or_(
+                normalized_path == parent_path,
+                normalized_path.like(f"%/{parent_path}"),
+            ),
+        )
+        .order_by(Document.id)
+        .limit(1)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+    parent = (await db.execute(statement)).scalars().first()
+    return _handoff_conversation_reference(parent) if parent is not None else None
+
+
+async def _tangent_branch_references(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> list[dict]:
+    """Find all tangent branches with one bounded indexed full-text probe."""
+    session_id = _claude_session_id_from_relative_path(document.relative_path)
+    if session_id is None:
+        return []
+
+    # This expression deliberately matches idx_conv_msg_content_fts exactly.
+    # The 64-candidate cap bounds the Python validation and duplicate removal.
+    content_vector = func.to_tsvector("simple", ConversationMessage.content)
+    session_query = func.plainto_tsquery("simple", session_id)
+    statement = (
+        select(Document, ConversationMessage.content)
+        .join(ConversationMessage, ConversationMessage.document_id == Document.id)
+        .options(
+            load_only(
+                Document.id,
+                Document.machine_id,
+                Document.tool_id,
+                Document.title,
+                Document.relative_path,
+                Document.metadata_,
+            )
+        )
+        .where(
+            Document.id != document.id,
+            Document.tool_id == "claude_code",
+            Document.category == "conversation",
+            ConversationMessage.role == "user",
+            ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+            ConversationMessage.content.startswith(TANGENT_MARKER_PREFIX),
+            content_vector.op("@@")(session_query),
+        )
+        # Activity must come from document_delivery_state when present: raw
+        # path documents leave Document.activity_at frozen after DELTAs.
+        .order_by(
+            delivery_activity_expression().desc().nulls_last(),
+            Document.created_at.desc(),
+            Document.id.desc(),
+        )
+        .limit(64)
+    )
+    if machine_ids is not None:
+        statement = statement.where(Document.machine_id.in_(machine_ids))
+
+    # The FTS probe is intentionally index-compatible and capped at 64 rows.
+    # Validate only the first user row for every unique candidate in one
+    # bounded follow-up query, matching the forward-resolution contract.
+    candidate_documents: list[Document] = []
+    seen_document_ids: set[uuid.UUID] = set()
+    for branch, _content in (await db.execute(statement)).all():
+        if branch.id not in seen_document_ids:
+            seen_document_ids.add(branch.id)
+            candidate_documents.append(branch)
+    if not candidate_documents:
+        return []
+
+    earliest_user_rows = (
+        select(
+            ConversationMessage.document_id.label("document_id"),
+            ConversationMessage.content.label("content"),
+            func.row_number()
+            .over(
+                partition_by=ConversationMessage.document_id,
+                order_by=(
+                    ConversationMessage.line_number.asc(),
+                    ConversationMessage.id.asc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(
+            ConversationMessage.document_id.in_(
+                [branch.id for branch in candidate_documents]
+            ),
+            ConversationMessage.role == "user",
+            # Every candidate's earliest user row provably sits inside the
+            # opening window (the probe matched a user row there), so this
+            # predicate caps the window scan at three rows per candidate
+            # instead of each transcript's full user history.
+            ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
+        )
+        .subquery()
+    )
+    first_user_content_by_document = dict(
+        (
+            await db.execute(
+                select(
+                    earliest_user_rows.c.document_id,
+                    earliest_user_rows.c.content,
+                ).where(earliest_user_rows.c.row_number == 1)
+            )
+        ).all()
+    )
+    def _is_valid_branch(branch: Document) -> bool:
+        if (
+            _tangent_marker_session_id(first_user_content_by_document.get(branch.id))
+            != session_id
+        ):
+            return False
+        # A session may never be its own tangent branch: the same self-markered
+        # transcript synced from another visible machine carries a distinct
+        # document ID but the same session UUID (mirrors the parent-side rule).
+        branch_session_id = _claude_session_id_from_relative_path(branch.relative_path)
+        return branch_session_id is None or branch_session_id.lower() != session_id.lower()
+
+    return [
+        _handoff_conversation_reference(branch)
+        for branch in candidate_documents
+        if _is_valid_branch(branch)
+    ]
+
+
+async def _tangent_thread_links(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict:
+    """Return detail-only tangent links without changing stored conversation data."""
+    if document.tool_id != "claude_code":
+        return {}
+
+    parent = await _tangent_parent_reference(db, document, machine_ids)
+    branches = await _tangent_branch_references(db, document, machine_ids)
+    links: dict[str, dict | list[dict]] = {}
+    if parent is not None:
+        links["tangent_parent"] = parent
+    if branches:
+        links["tangent_branches"] = branches
+    return links
+
+
+async def _conversation_thread_links(
+    db: AsyncSession,
+    document: Document,
+    machine_ids: set[uuid.UUID] | None,
+) -> dict:
+    """Assemble orthogonal handoff and tangent links for one detail response."""
+    handoff_links = await _handoff_thread_links(db, document, machine_ids)
+    tangent_links = await _tangent_thread_links(db, document, machine_ids)
+    return {**handoff_links, **tangent_links}
 
 
 def _message_question_interactions(metadata: object) -> list[dict]:
@@ -1417,7 +1637,7 @@ async def get_conversation(
     if token_usage:
         runtime["token_usage"] = token_usage
     usage_models = await conversation_usage_models(db, doc.id)
-    handoff_links = await _handoff_thread_links(db, doc, mids)
+    thread_links = await _conversation_thread_links(db, doc, mids)
 
     return {
         "id": str(doc.id),
@@ -1478,7 +1698,7 @@ async def get_conversation(
         "activity_at": activity_at.isoformat() if activity_at else None,
         "synced_at": doc.synced_at.isoformat(),
         "related_plans": related_plans,
-        **handoff_links,
+        **thread_links,
     }
 
 

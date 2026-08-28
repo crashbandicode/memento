@@ -424,6 +424,107 @@ async def test_handoff_successor_is_not_stamped_as_claw_delegate(
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_tangent_branch_is_not_stamped_as_claw_delegate(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-tangent",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        parent_session_id = str(uuid4())
+        child_session_id = str(uuid4())
+        run_id = f"session-{uuid4()}"
+        parent = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{parent_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Parent",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": parent_session_id},
+        )
+        child = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Tangent",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={
+                "session_id": child_session_id,
+                "first_user_message": f"MEMENTO-TANGENT-FROM: {parent_session_id}\n",
+            },
+        )
+        db.add_all([parent, child])
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=parent.id,
+                line_number=1,
+                role="assistant",
+                content=f"orchestrationRunId: {run_id}",
+            )
+        )
+        db.add(
+            ConversationMessage(
+                document_id=child.id,
+                line_number=1,
+                role="user",
+                content=f"MEMENTO-TANGENT-FROM: {parent_session_id}\nExplore separately.",
+            )
+        )
+        await db.flush()
+        occurred_at = datetime.now(timezone.utc)
+        await ingest_orchestration_events(
+            db,
+            machine_id=machine.id,
+            user_id=user.id,
+            events=[{
+                "schema_version": 1,
+                "event_id": str(uuid4()),
+                "occurred_at": occurred_at,
+                "installation_id": str(uuid4()),
+                "orchestrator": "claw-orchestrator",
+                "orchestrator_version": "5.0.0-memento.1",
+                "event": "agent.identity_bound",
+                "run_id": run_id,
+                "run_kind": "session",
+                "agent_key": "tangent",
+                "agent_name": "Explore",
+                "engine": "claude",
+                "native_session_id": child_session_id,
+                "agent_status": "running",
+            }],
+        )
+        await db.flush()
+        await db.refresh(child)
+        run = (await db.execute(select(OrchestrationRun))).scalar_one()
+
+        assert run.parent_document_id == parent.id
+        assert (child.metadata_ or {}).get("orchestration") != "claw"
+        assert (child.metadata_ or {}).get("is_subagent") is not True
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_delegate_marker_classifies_and_links_parent(
     session_factory,
 ) -> None:

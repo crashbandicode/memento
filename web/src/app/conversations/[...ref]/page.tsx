@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import {
   api,
+  ConversationHandoffLink,
   ConversationMeta,
   ExportDiagnostics,
   invalidateConversationMetadata,
@@ -176,6 +177,28 @@ export default function ConversationPage() {
                     </span>
                   </Link>
                 )}
+                {currentMeta.tangent_parent && (
+                  <Link
+                    data-tangent-parent
+                    href={currentMeta.tangent_parent.canonical_url || `/conversations/${currentMeta.tangent_parent.document_id}`}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      maxWidth: "100%",
+                      marginTop: 6,
+                      color: "#0F9F8A",
+                      fontSize: 12,
+                      textDecoration: "none",
+                    }}
+                  >
+                    <Icon name="git_branch" size={13} />
+                    <span style={{ flex: "0 0 auto" }}>{t.conversation.branchedFrom}</span>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {currentMeta.tangent_parent.title}
+                    </span>
+                  </Link>
+                )}
               </div>
               <Btn size="sm" variant="glass" icon="arrow_down" onClick={() => setShowExport(true)}>
                 Export
@@ -196,6 +219,7 @@ export default function ConversationPage() {
                   </Chip>
                 </Link>
               )}
+              <TangentBranches branches={currentMeta.tangent_branches || []} />
               {Boolean(currentMeta.pending_question_count) && (
                 <Chip tone="warn" icon="message">{t.conversation.awaitingResponse}</Chip>
               )}
@@ -357,6 +381,97 @@ export default function ConversationPage() {
       />
       {showExport && (
         <MarkdownExportDialog documentId={currentMeta?.id || docId} onClose={() => setShowExport(false)} />
+      )}
+    </div>
+  );
+}
+
+function TangentBranches({ branches }: { branches: ConversationHandoffLink[] }) {
+  const [open, setOpen] = useState(false);
+  const { t } = useI18n();
+
+  if (branches.length === 0) return null;
+  if (branches.length === 1) {
+    const branch = branches[0];
+    return (
+      <Link
+        data-tangent-branch
+        href={branch.canonical_url || `/conversations/${branch.document_id}`}
+        style={{ display: "inline-flex", minWidth: 0, maxWidth: "min(100%, 360px)", textDecoration: "none" }}
+      >
+        <Chip tone="success" icon="git_branch" style={{ minWidth: 0, maxWidth: "100%" }}>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {t.conversation.tangent} → {branch.title}
+          </span>
+        </Chip>
+      </Link>
+    );
+  }
+
+  return (
+    <div data-tangent-branches style={{ flex: "1 1 220px", minWidth: 0, maxWidth: "100%" }}>
+      <button
+        type="button"
+        data-tangent-branches-toggle
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 5,
+          maxWidth: "100%",
+          padding: "3px 10px",
+          border: "1px solid color-mix(in srgb, #10B981 26%, var(--aurora-border))",
+          borderRadius: 9999,
+          background: "rgba(16,185,129,0.12)",
+          color: "#0F9F8A",
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 500,
+        }}
+      >
+        <Icon name="git_branch" size={11} />
+        <span>{fmt(t.conversation.tangents, { count: branches.length })}</span>
+        <Icon name={open ? "chevron_up" : "chevron_down"} size={11} />
+      </button>
+      {open && (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: 5,
+            width: "100%",
+            marginTop: 6,
+            padding: 8,
+            border: "1px solid color-mix(in srgb, #10B981 20%, var(--aurora-border))",
+            borderRadius: 10,
+            background: "var(--aurora-surface-solid)",
+          }}
+        >
+          {branches.map((branch) => (
+            <Link
+              key={branch.document_id}
+              data-tangent-branch
+              href={branch.canonical_url || `/conversations/${branch.document_id}`}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                minWidth: 0,
+                maxWidth: "100%",
+                color: "#0F9F8A",
+                fontSize: 12,
+                textDecoration: "none",
+              }}
+            >
+              <Icon name="git_branch" size={12} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {branch.title}
+              </span>
+            </Link>
+          ))}
+        </div>
       )}
     </div>
   );

@@ -205,6 +205,9 @@ const zhCN = {
     offlineVscdbFallback: "已从本地 Antigravity 会话状态补回内容",
     offlinePbFallback: "已从本地 protobuf 缓存补回内容",
     collapse: "收起",
+    branchedFrom: "分支自",
+    tangent: "分支",
+    tangents: "分支（{count}）",
     canvas: {
       chip: "画布",
       eyebrow: "Cursor 画布",
