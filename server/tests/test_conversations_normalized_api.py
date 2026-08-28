@@ -892,6 +892,66 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["interactions"][0]["line_number"], 0)
 
+    async def test_pending_interactions_exclude_persisted_meta_tool_interactions(
+        self,
+    ) -> None:
+        message = self.message(1, role="tool")
+        message.metadata_["interaction"] = {
+            "id": "feedback-persisted",
+            "kind": "question",
+            "source": "claude_code",
+            "tool_name": "SendFeedback",
+            "questions": [],
+        }
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(rows=[(self.doc_id, self.doc.title, self.doc.metadata_)]),
+            _Result(rows=[message]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["interactions"], [])
+        self.assertEqual(payload["inline_interactions"], [])
+
+    async def test_projected_pending_interactions_exclude_stale_meta_tools(
+        self,
+    ) -> None:
+        projection = self.read_model(
+            pending_interactions=[{
+                "document_id": str(self.doc_id),
+                "message_id": 88,
+                "line_number": 88,
+                "interaction": {
+                    "id": "feedback-projected",
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "SendFeedback",
+                    "questions": [],
+                },
+                "timestamp": self.now.isoformat(),
+            }]
+        )
+        db = _Db([
+            _Result(rows=[(self.doc, projection)]),
+            _Result(rows=[(self.doc, projection)]),
+        ])
+
+        payload = await get_pending_conversation_interactions(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["interactions"], [])
+        self.assertEqual(payload["inline_interactions"], [])
+
     async def test_live_claude_preview_repairs_stored_option_mojibake(self) -> None:
         self.doc.tool_id = "claude_code"
         self.doc.metadata_["_live_interaction_signals"] = {

@@ -66,6 +66,7 @@ from ..services.conversation_parser import (
     coerce_claude_live_interaction,
     count_conversation_messages,
     interaction_question_fingerprint,
+    is_meta_tool_interaction,
     normalize_message_attachments,
     normalize_tool_calls,
     parse_conversation,
@@ -940,11 +941,11 @@ def _message_question_interactions(metadata: object) -> list[dict]:
         return []
     interactions: list[dict] = []
     direct = metadata.get("interaction")
-    if isinstance(direct, dict):
+    if isinstance(direct, dict) and not is_meta_tool_interaction(direct):
         interactions.append(direct)
     for call in _stored_tool_calls(metadata):
         interaction = call.get("interaction")
-        if isinstance(interaction, dict):
+        if isinstance(interaction, dict) and not is_meta_tool_interaction(interaction):
             interactions.append(interaction)
     return interactions
 
@@ -1759,6 +1760,8 @@ async def _projected_pending_interactions(
                 continue
             item = {**raw_item, "source_title": title}
             interaction = item.get("interaction")
+            if is_meta_tool_interaction(interaction):
+                continue
             interaction_id = (
                 str(interaction.get("id") or "").strip()
                 if isinstance(interaction, dict)

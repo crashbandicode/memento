@@ -30,7 +30,10 @@ import {
   QuestionInteractionResponse,
 } from "@/lib/api-client";
 import { useI18n, fmt } from "@/lib/i18n";
-import { isMetaConversationTool } from "@/lib/conversation-tools";
+import {
+  filterMetaConversationInteractions,
+  isMetaConversationTool,
+} from "@/lib/conversation-tools";
 import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
 import SessionContextBody from "./SessionContextBody";
@@ -946,8 +949,12 @@ export default function ConversationViewer({
     api.getPendingInteractions(documentId)
       .then((response) => {
         if (current) {
-          setPendingInteractions(response.interactions);
-          setInlineInteractions(response.inline_interactions || []);
+          setPendingInteractions(
+            filterMetaConversationInteractions(response.interactions),
+          );
+          setInlineInteractions(
+            filterMetaConversationInteractions(response.inline_interactions || []),
+          );
           setLiveActivities(response.live_activities || []);
           setBackgroundRunningCount(response.background_running_count || 0);
           setInferredInteractionResponses(response.inferred_responses);
@@ -5316,7 +5323,7 @@ function LiveShellActivityCard({
                   textTransform: "uppercase",
                 }}
               >
-                Background
+                {t.conversation.backgroundTag}
               </span>
             )}
           </div>

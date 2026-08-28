@@ -3898,6 +3898,15 @@ class ConversationParserTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIsNone(messages[0].interaction)
 
+    def test_claude_live_meta_tool_interaction_is_rejected(self) -> None:
+        self.assertIsNone(coerce_claude_live_interaction({
+            "id": "feedback-live",
+            "kind": "question",
+            "source": "claude_code",
+            "tool_name": "SendFeedback",
+            "questions": [],
+        }))
+
 
 if __name__ == "__main__":
     unittest.main()

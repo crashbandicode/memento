@@ -259,6 +259,7 @@ const zhCN = {
     resolvedAnswerUnavailable: "Claude Code 未记录所选择的选项。",
     awaitingResponse: "等待回答",
     backgroundTasksRunning: "{count} 个后台任务运行中",
+    backgroundTag: "后台",
     planMode: "计划模式",
     cancelled: "已取消",
     chooseOne: "选择一项",

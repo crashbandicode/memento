@@ -2636,6 +2636,13 @@ def _is_meta_tool_name(value: object) -> bool:
     return _normalized_tool_name(value) in _META_TOOL_NAMES
 
 
+def is_meta_tool_interaction(payload: object) -> bool:
+    """Return whether a normalized interaction belongs to an inert meta-tool."""
+    return isinstance(payload, dict) and _is_meta_tool_name(
+        payload.get("tool_name")
+    )
+
+
 def _tool_runs_in_background(value: object) -> bool:
     payload = _json_mapping(value)
     return bool(
@@ -4119,6 +4126,8 @@ def coerce_claude_live_interaction(
     """Return a display-safe live interaction, recovering AskUserQuestion wrappers."""
     if not isinstance(interaction, dict):
         return None
+    if is_meta_tool_interaction(interaction):
+        return None
     candidate = interaction
     if is_claude_ask_user_permission_wrapper(interaction):
         recovered = _recover_ask_user_question_from_permission_interaction(
@@ -4127,6 +4136,8 @@ def coerce_claude_live_interaction(
         if recovered is None:
             return None
         candidate = recovered
+    if is_meta_tool_interaction(candidate):
+        return None
     return _repair_claude_question_interaction_text(candidate)
 
 

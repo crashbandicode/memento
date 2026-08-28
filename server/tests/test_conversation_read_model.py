@@ -156,6 +156,28 @@ def test_accumulator_materializes_shell_and_agent_state() -> None:
     assert accumulator.values()["live_activities"] == []
 
 
+def test_persisted_meta_tool_interaction_is_not_pending() -> None:
+    accumulator = _Accumulator()
+    accumulator.observe(
+        _row(
+            12,
+            role="tool",
+            content="[SendFeedback]",
+            metadata={
+                "interaction": {
+                    "id": "feedback-persisted",
+                    "kind": "question",
+                    "source": "claude_code",
+                    "tool_name": "SendFeedback",
+                    "questions": [],
+                },
+            },
+            timestamp=datetime(2026, 8, 28, 12, tzinfo=UTC),
+        )
+    )
+    assert accumulator.values()["pending_interactions"] == []
+
+
 def test_background_shell_waits_for_task_notification_completion() -> None:
     now = datetime(2026, 8, 28, 12, tzinfo=UTC)
     accumulator = _Accumulator()

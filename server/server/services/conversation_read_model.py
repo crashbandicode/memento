@@ -27,6 +27,7 @@ from .conversation_markdown import (
 )
 from .conversation_parser import (
     build_cursor_question_response,
+    is_meta_tool_interaction,
     normalize_tool_calls,
 )
 from .conversation_usage import (
@@ -279,11 +280,11 @@ def _question_interactions(metadata: object) -> list[dict]:
     values = metadata if isinstance(metadata, dict) else {}
     interactions: list[dict] = []
     direct = values.get("interaction")
-    if isinstance(direct, dict):
+    if isinstance(direct, dict) and not is_meta_tool_interaction(direct):
         interactions.append(direct)
     for call in normalize_tool_calls(values.get("tool_calls")):
         interaction = call.get("interaction")
-        if isinstance(interaction, dict):
+        if isinstance(interaction, dict) and not is_meta_tool_interaction(interaction):
             interactions.append(interaction)
     return interactions
 
@@ -331,6 +332,7 @@ class _Accumulator:
             )
             if isinstance(item, dict)
             and isinstance(item.get("interaction"), dict)
+            and not is_meta_tool_interaction(item.get("interaction"))
             and (item.get("interaction") or {}).get("id")
         }
         self.inferred = {
