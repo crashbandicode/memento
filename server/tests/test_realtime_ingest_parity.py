@@ -76,6 +76,7 @@ class RecordedDeltaSequence:
     metadata: dict[str, object]
     full_rows: tuple[dict[str, object], ...]
     delta_rows: tuple[dict[str, object], ...]
+    relative_path: str | None = None
 
     @property
     def full(self) -> str:
@@ -124,6 +125,74 @@ RECORDED_DELTA_SEQUENCES = (
                     "usage": {"input_tokens": 8, "output_tokens": 3},
                 },
             },
+        ),
+    ),
+    RecordedDeltaSequence(
+        name="claude_subagent_transcript",
+        tool_id="claude_code",
+        metadata={"session_id": "agent-a8219f353e7676f9c"},
+        full_rows=(
+            {
+                "type": "user",
+                "uuid": "claude-subagent-user-full",
+                "timestamp": "2026-08-04T09:00:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "Inspect the raw writer pairing gate.",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "claude-subagent-assistant-tool",
+                "timestamp": "2026-08-04T09:00:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I will inspect the gate."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_subagent_read",
+                            "name": "Read",
+                            "input": {
+                                "file_path": (
+                                    "server/server/services/realtime_raw_writer.py"
+                                )
+                            },
+                        },
+                    ],
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "user",
+                "uuid": "claude-subagent-tool-result",
+                "timestamp": "2026-08-04T09:00:02.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_subagent_read",
+                            "content": "The pairing gate is flag controlled.",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "claude-subagent-assistant-final",
+                "timestamp": "2026-08-04T09:00:03.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": "The raw transcript DELTA is ready to commit.",
+                    "usage": {"input_tokens": 13, "output_tokens": 5},
+                },
+            },
+        ),
+        relative_path=(
+            "projects/fe4bdc0b-1bbf-4c05-a174-1bd9ea5f4ac5/subagents/"
+            "agent-a8219f353e7676f9c.jsonl"
         ),
     ),
     RecordedDeltaSequence(
@@ -555,7 +624,7 @@ async def _run_sequence(
         machine_id = machine.id
         user_uuid = user.id
         user_id = str(user_uuid)
-        relative_path = f"phase0/{sequence.name}.jsonl"
+        relative_path = sequence.relative_path or f"phase0/{sequence.name}.jsonl"
 
         async def ingest_recorded(
             *,
@@ -601,6 +670,7 @@ async def _run_sequence(
             offset=len(full.encode("utf-8")),
         )
         await session.commit()
+        document_id = document.id
         session.info.pop(_PENDING_REALTIME_EVENTS, None)
 
         full_retry = await ingest_recorded(
@@ -629,8 +699,9 @@ async def _run_sequence(
         await session.flush()
         snapshot = await _snapshot(
             session,
-            document_id=document.id,
+            document_id=document_id,
             user_id=user_uuid,
+            relative_path=relative_path,
         )
         await session.commit()
         session.info.pop(_PENDING_REALTIME_EVENTS, None)
@@ -655,8 +726,9 @@ async def _run_sequence(
             await session.flush()
             rebased_snapshot = await _snapshot(
                 session,
-                document_id=document.id,
+                document_id=document_id,
                 user_id=user_uuid,
+                relative_path=relative_path,
             )
             assert rebased_snapshot["messages"] == snapshot["messages"]
             assert rebased_snapshot["usage_events"] == snapshot["usage_events"]
@@ -734,8 +806,12 @@ async def test_recorded_delta_sequences_match_phase0_golden(
     use_core_delta_message_staging: bool,
     writer: str,
     path_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Both writer paths must reproduce the current path's semantic output."""
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
     actual = {
         sequence.name: await _run_sequence(
             session_factory,
