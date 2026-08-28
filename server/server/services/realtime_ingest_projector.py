@@ -14,7 +14,7 @@ import logging
 import signal
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,6 +28,8 @@ logger = logging.getLogger("realtime_ingest_projector")
 
 KIND_CANVAS = "canvas"
 KIND_SEARCH = "search"
+KIND_CLAUDE_LINEAGE = "claude_lineage"
+KIND_SUBAGENT_LIFECYCLE = "subagent_lifecycle"
 NOTIFY_CHANNEL = "memento_ingest_projections"
 MAX_GROUPS_PER_CYCLE = 64
 PROJECTOR_LOCK_KEY = b"memento:ingest-projector:v1"
@@ -57,6 +59,54 @@ def message_is_canvas_projection_candidate(
     )
 
 
+def bounded_claude_projection_records(content: str) -> tuple[dict[str, Any], ...]:
+    """Retain only raw Claude fields required by deferred lineage/lifecycle.
+
+    Conversation DELTAs intentionally keep their last FULL source pointer, so
+    the projector cannot safely recover their raw UUID parents later.  This
+    allow-list is both bounded and sufficient for ``refresh_claude_lineage``
+    and ``child_lifecycle_evidence_from_objects``; notably it never copies
+    message text, tool input, or other transcript body data into the outbox.
+    """
+    import orjson
+
+    scalar_fields = (
+        "uuid",
+        "record_uuid",
+        "parentUuid",
+        "parent_uuid",
+        "agentId",
+        "agent_id",
+        "type",
+        "timestamp",
+        "subtype",
+        "event_type",
+    )
+    bool_fields = ("isSidechain", "is_sidechain", "isApiErrorMessage", "is_api_error_message")
+    records: list[dict[str, Any]] = []
+    for raw_line in content.splitlines():
+        try:
+            raw = orjson.loads(raw_line)
+        except (TypeError, orjson.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        record = {
+            field: value[:512]
+            for field in scalar_fields
+            if isinstance((value := raw.get(field)), str) and value
+        }
+        for field in bool_fields:
+            if isinstance(raw.get(field), bool):
+                record[field] = raw[field]
+        message = raw.get("message")
+        if isinstance(message, dict) and isinstance(message.get("stop_reason"), str):
+            record["message"] = {"stop_reason": message["stop_reason"][:128]}
+        if record:
+            records.append(record)
+    return tuple(records)
+
+
 def _dsn(database_url: str | None = None) -> str:
     url = database_url or settings.database_url
     return url.replace("postgresql+asyncpg://", "postgresql://", 1)
@@ -69,6 +119,9 @@ async def enqueue_projection_candidates(
     revision_hash: str,
     canvas: bool,
     search: bool,
+    claude_lineage: bool = False,
+    subagent_lifecycle: bool = False,
+    claude_records: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str, ...]:
     """Persist real projector work inside the caller's ingest transaction."""
     from ..db.models import IngestProjectionCandidate
@@ -78,16 +131,24 @@ async def enqueue_projection_candidates(
         for kind, requested in (
             (KIND_CANVAS, canvas),
             (KIND_SEARCH, search),
+            (KIND_CLAUDE_LINEAGE, claude_lineage),
+            (KIND_SUBAGENT_LIFECYCLE, subagent_lifecycle),
         )
         if requested
     )
     if not kinds or not revision_hash:
         return ()
+    payload = {"records": [dict(record) for record in claude_records]}
     for kind in kinds:
         statement = pg_insert(IngestProjectionCandidate).values(
             document_id=document_id,
             revision_hash=revision_hash,
             kind=kind,
+            payload=(
+                payload
+                if kind in {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+                else {}
+            ),
         )
         await db.execute(
             statement.on_conflict_do_nothing(
@@ -108,6 +169,9 @@ async def enqueue_projection_candidates_raw(
     revision_hash: str,
     canvas: bool,
     search: bool,
+    claude_lineage: bool = False,
+    subagent_lifecycle: bool = False,
+    claude_records: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[str, ...]:
     """Same outbox insert for the raw asyncpg writer transaction."""
     kinds = tuple(
@@ -115,22 +179,30 @@ async def enqueue_projection_candidates_raw(
         for kind, requested in (
             (KIND_CANVAS, canvas),
             (KIND_SEARCH, search),
+            (KIND_CLAUDE_LINEAGE, claude_lineage),
+            (KIND_SUBAGENT_LIFECYCLE, subagent_lifecycle),
         )
         if requested
     )
     if not kinds or not revision_hash:
         return ()
+    payload = {"records": [dict(record) for record in claude_records]}
     for kind in kinds:
         await connection.execute(
             """
             INSERT INTO ingest_projection_candidates
-              (document_id, revision_hash, kind)
-            VALUES ($1, $2, $3)
+              (document_id, revision_hash, kind, payload)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (document_id, revision_hash, kind) DO NOTHING
             """,
             document_id,
             revision_hash,
             kind,
+            (
+                payload
+                if kind in {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+                else {}
+            ),
         )
     await connection.execute(
         "SELECT pg_notify('memento_ingest_projections', $1)",
@@ -314,6 +386,68 @@ async def _apply_search(db: AsyncSession, document_id: uuid.UUID) -> bool:
     return after != before
 
 
+async def _apply_claude_lineage(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    source_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Apply queued Claude DELTA identity facts without reading full content."""
+    from ..db.models import Document
+    from .claude_lineage import refresh_claude_lineage
+    from .conversation_hierarchy import is_conversation_subagent
+    from .document_delivery import document_metadata
+
+    document = await db.get(Document, document_id)
+    if document is None:
+        return False
+    metadata = document_metadata(document)
+    return await refresh_claude_lineage(
+        db,
+        document,
+        source_records,
+        mode="delta",
+        document_is_subagent=is_conversation_subagent(
+            document.tool_id,
+            document.relative_path,
+            metadata,
+        ),
+    )
+
+
+async def _apply_subagent_lifecycle(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    source_records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Apply queued bounded source facts through the existing sticky guard."""
+    from ..db.models import Document
+    from .ingest_service import _reconcile_subagent_document_lifecycle
+
+    document = await db.get(Document, document_id)
+    if document is None:
+        return False
+    return _reconcile_subagent_document_lifecycle(
+        document,
+        None,
+        source_timestamp=document.source_modified_at,
+        source_objects=source_records,
+    )
+
+
+def _candidate_source_records(
+    rows: Sequence[Any],
+) -> tuple[dict[str, Any], ...]:
+    """Flatten queued compact facts in source-commit order."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        values = payload.get("records")
+        if not isinstance(values, list):
+            continue
+        records.extend(dict(value) for value in values if isinstance(value, dict))
+    return tuple(records)
+
+
 async def _publish_projection_event(
     db: AsyncSession,
     *,
@@ -341,7 +475,7 @@ async def process_pending_candidates(
     document_ids: list[uuid.UUID] | tuple[uuid.UUID, ...] | None = None,
     skip_pairs: set[tuple[uuid.UUID, str]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply pending Canvas/search work, collapsing each document to current revision.
+    """Apply pending deferred work, collapsing each document to current revision.
 
     Completes inside the caller's transaction.  A crash before commit leaves
     the outbox rows pending and the projection writes uncommitted, so replay
@@ -392,7 +526,10 @@ async def process_pending_candidates(
                                 *pending_filter,
                             )
                             .with_for_update(skip_locked=True)
-                            .order_by(IngestProjectionCandidate.created_at)
+                            .order_by(
+                                IngestProjectionCandidate.created_at,
+                                IngestProjectionCandidate.id,
+                            )
                         )
                     )
                     .scalars()
@@ -409,12 +546,32 @@ async def process_pending_candidates(
                     changed = await _apply_canvas(db, document_id)
                 elif kind == KIND_SEARCH:
                     changed = await _apply_search(db, document_id)
+                elif kind in {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}:
+                    # Source locks make candidate rows one contiguous DELTA
+                    # sequence. Only replay it when its newest fence matches
+                    # the current revision; otherwise the normal fence marks
+                    # every stale fact superseded without mutating projections.
+                    if any(row.revision_hash == current_revision for row in rows):
+                        source_records = _candidate_source_records(rows)
+                        if kind == KIND_CLAUDE_LINEAGE:
+                            changed = await _apply_claude_lineage(
+                                db, document_id, source_records
+                            )
+                        else:
+                            changed = await _apply_subagent_lifecycle(
+                                db, document_id, source_records
+                            )
+                    else:
+                        status = "superseded"
                 else:
                     status = "superseded"
                 if changed:
-                    namespace = (
-                        "conversation.canvas" if kind == KIND_CANVAS else "conversation.search"
-                    )
+                    namespace = {
+                        KIND_CANVAS: "conversation.canvas",
+                        KIND_SEARCH: "conversation.search",
+                        KIND_CLAUDE_LINEAGE: "conversation.lineage",
+                        KIND_SUBAGENT_LIFECYCLE: "conversation.metadata",
+                    }[kind]
                     await _publish_projection_event(
                         db, document_id=document_id, changes=[namespace]
                     )

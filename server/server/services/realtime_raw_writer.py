@@ -1469,7 +1469,16 @@ async def _apply(
     if mutation.document_values["project_id"] is None:
         changes = [change for change in changes if change != "project"]
     if settings.realtime_ingest_deferred_projections:
-        from .realtime_ingest_projector import enqueue_projection_candidates_raw
+        from .realtime_ingest_projector import (
+            bounded_claude_projection_records,
+            enqueue_projection_candidates_raw,
+        )
+
+        claude_projection_records = (
+            bounded_claude_projection_records(content)
+            if tool_id == "claude_code" and category == "conversation"
+            else ()
+        )
 
         await enqueue_projection_candidates_raw(
             connection,
@@ -1477,6 +1486,14 @@ async def _apply(
             revision_hash=content_hash,
             canvas=mutation.canvas_candidate,
             search=mutation.search_candidate,
+            # All Claude conversation documents participate: lineage for a
+            # main session can otherwise stay stale indefinitely, while the
+            # lifecycle reconciler itself cheaply no-ops for non-subagents.
+            claude_lineage=tool_id == "claude_code" and category == "conversation",
+            subagent_lifecycle=(
+                tool_id == "claude_code" and category == "conversation"
+            ),
+            claude_records=claude_projection_records,
         )
     return RawDocument(
         mutation.document_id,
