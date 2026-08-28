@@ -970,6 +970,13 @@ async def _tangent_parent_reference(
     parent_session_id = _tangent_marker_session_id(first_user_content)
     if parent_session_id is None:
         return None
+    # A session may never be its own tangent parent. Documents are unique per
+    # (machine_id, tool_id, relative_path), so the same transcript synced from
+    # another visible machine passes a document-ID check; reject at the
+    # session-UUID level and keep the ID predicate below as a second defense.
+    own_session_id = _claude_session_id_from_relative_path(document.relative_path)
+    if own_session_id is not None and parent_session_id.lower() == own_session_id.lower():
+        return None
 
     normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
     parent_path = f"{parent_session_id}.jsonl"
@@ -1082,6 +1089,11 @@ async def _tangent_branch_references(
                 [branch.id for branch in candidate_documents]
             ),
             ConversationMessage.role == "user",
+            # Every candidate's earliest user row provably sits inside the
+            # opening window (the probe matched a user row there), so this
+            # predicate caps the window scan at three rows per candidate
+            # instead of each transcript's full user history.
+            ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
         )
         .subquery()
     )
@@ -1095,11 +1107,22 @@ async def _tangent_branch_references(
             )
         ).all()
     )
+    def _is_valid_branch(branch: Document) -> bool:
+        if (
+            _tangent_marker_session_id(first_user_content_by_document.get(branch.id))
+            != session_id
+        ):
+            return False
+        # A session may never be its own tangent branch: the same self-markered
+        # transcript synced from another visible machine carries a distinct
+        # document ID but the same session UUID (mirrors the parent-side rule).
+        branch_session_id = _claude_session_id_from_relative_path(branch.relative_path)
+        return branch_session_id is None or branch_session_id.lower() != session_id.lower()
+
     return [
         _handoff_conversation_reference(branch)
         for branch in candidate_documents
-        if _tangent_marker_session_id(first_user_content_by_document.get(branch.id))
-        == session_id
+        if _is_valid_branch(branch)
     ]
 
 

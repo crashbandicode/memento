@@ -41,7 +41,11 @@ conversation data.
   `MEMENTO-TANGENT-FROM:` with the public `conversation_hierarchy` briefing
   helpers. A valid UUID resolves only to a visible `claude_code` conversation
   whose normalized `relative_path` ends in `<uuid>.jsonl` within the current
-  machine scope, and never resolves the viewed document itself.
+  machine scope. Self-links are rejected at the session-UUID level: a marker
+  naming the viewed thread's own session resolves no parent, including through
+  a same-session copy synced from another visible machine (documents are
+  unique only per machine/tool/path); the document-ID exclusion remains as a
+  second defense.
 - Parent to tangents derives the viewed thread UUID from its `.jsonl` path and
   performs one candidate query using
   `to_tsvector('simple', conversation_messages.content) @@
@@ -50,10 +54,15 @@ conversation data.
   `line_number <= 3` bound, exact tangent prefix, Claude Code/document scope,
   and machine scope.
 - The reverse probe is capped at 64 candidates. For every unique candidate,
-  one bounded follow-up query fetches that document's earliest normalized user
-  row (ordered by `line_number`, then row ID); only that row may validate the
-  tangent marker. Python then de-duplicates by document ID and returns every
-  valid tangent in `delivery_activity_expression().desc().nulls_last()`,
+  one row-bounded follow-up query fetches that document's earliest normalized
+  user row, restricted to the same opening window (`line_number <= 3`, valid
+  because every candidate proved a user marker row inside that window) and
+  ordered by `line_number`, then row ID; only that row may validate the
+  tangent marker. Candidates whose own session UUID equals the viewed session
+  are rejected (a session is never its own branch, even via a same-session
+  copy from another visible machine). Python then de-duplicates by document ID
+  and returns every valid tangent in
+  `delivery_activity_expression().desc().nulls_last()`,
   `Document.created_at.desc()`, `Document.id.desc()` order. The cap bounds
   both marker validation and de-duplication work; it intentionally does not
   promise to discover a branch beyond the first 64 index candidates.
@@ -71,10 +80,11 @@ environment.
 ```powershell
 $env:MEMENTO_TASK_TEST_DATABASE_URL = 'postgresql+asyncpg://postgres:test@localhost:55437/postgres'
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_tangent_thread_links_api.py --basetemp ..\.pytest-basetemp\tangent-api -q
-# 7 passed in 150.70s (0:02:30) after the earliest-row/self-parent fix round
+# 8 passed in 172.28s (0:02:52) after the session-level self-exclusion and
+# window-bounded follow-up fix round (Sol round 2)
 
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_handoff_thread_links_api.py --basetemp ..\.pytest-basetemp\tangent-handoff-api -q
-# 4 passed in 86.82s (0:01:26) after the earliest-row/self-parent fix round
+# 4 passed in 86.63s (0:01:26) after the Sol round-2 fix round
 
 & '..\.venv\Scripts\python.exe' -m pytest tests/test_conversation_hierarchy.py --basetemp ..\.pytest-basetemp\tangent-hierarchy -q
 # 50 passed, 6 subtests passed in 1.78s

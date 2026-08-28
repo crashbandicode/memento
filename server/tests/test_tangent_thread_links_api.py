@@ -305,6 +305,50 @@ async def test_forward_probe_rejects_self_parent(session_factory) -> None:
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_self_session_is_rejected_across_visible_machine_copies(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session)
+        second_machine = Machine(
+            id=uuid4(),
+            name="tangent-links-owner-second",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        session.add(second_machine)
+        await session.flush()
+        session_id = uuid4()
+        self_marker = f"MEMENTO-TANGENT-FROM: {session_id}"
+        original = await _seed_thread(
+            session,
+            session_id=session_id,
+            title="Self-referential tangent",
+            first_user_content=self_marker,
+            machine_id=machine.id,
+        )
+        synced_copy = await _seed_thread(
+            session,
+            session_id=session_id,
+            title="Self-referential tangent (synced copy)",
+            first_user_content=self_marker,
+            machine_id=second_machine.id,
+        )
+        await session.commit()
+
+        original_payload = await get_conversation(original.id, db=session, _user=user)
+        copy_payload = await get_conversation(synced_copy.id, db=session, _user=user)
+
+    # The same session synced from another visible machine has a distinct
+    # document ID but must never resolve as its own parent or branch.
+    assert "tangent_parent" not in original_payload
+    assert "tangent_branches" not in original_payload
+    assert "tangent_parent" not in copy_payload
+    assert "tangent_branches" not in copy_payload
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_detail_api_omits_tangent_fields_when_marker_is_absent(session_factory) -> None:
     async with session_factory() as session:
         user, machine = await _seed_owner(session)
