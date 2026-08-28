@@ -891,6 +891,13 @@ def _conversation_message_metadata(normalized) -> dict:
             str(normalized.tool_status),
             80,
         )
+    if normalized.is_background:
+        meta["is_background"] = True
+    if normalized.background_task_id:
+        meta["background_task_id"] = _bounded_message_text(
+            str(normalized.background_task_id),
+            512,
+        )
     if normalized.session_context:
         meta["session_context"] = _bounded_message_text(
             strip_terminal_sequences(normalized.session_context).replace("\x00", ""),

@@ -58,6 +58,10 @@ class NormalizedMessage:
     # the interaction so the viewer can present the pair as one decision card.
     tool_call_id: str = ""
     tool_status: str = ""
+    # Claude shell tools report the immediate launch separately from the
+    # background task's eventual completion notification.
+    is_background: bool = False
+    background_task_id: str = ""
     timestamp: str = ""
     raw_type: str = ""  # Original message type
     # Stable identity from the source transcript when one exists.  This is
@@ -1793,12 +1797,21 @@ def parse_conversation_object(
                     raw_type="agent_event" if agent_event is not None else "tool_result",
                     source_id=source_id,
                     tool_call_id=tool_call_id,
+                    background_task_id=_background_task_id_from_result(
+                        result_content,
+                    ),
                     agent_event=agent_event,
                 )
 
             tool_use = _extract_tool_use(raw_content)
             if role == "assistant" and tool_use is not None:
-                tool_name, tool_input, tool_call_id, interaction = tool_use
+                (
+                    tool_name,
+                    tool_input,
+                    tool_call_id,
+                    interaction,
+                    is_background,
+                ) = tool_use
                 agent_event = normalize_claude_agent_launch_event(
                     tool_name,
                     tool_input,
@@ -1824,6 +1837,7 @@ def parse_conversation_object(
                     source_id=source_id,
                     interaction=interaction,
                     tool_call_id=tool_call_id,
+                    is_background=is_background,
                     agent_event=agent_event,
                 )
 
@@ -2587,6 +2601,56 @@ def _extract_tool_result_content(content) -> str | None:
     return details[0] if details is not None else None
 
 
+_SHELL_TOOL_NAMES = {
+    "bash",
+    "execcommand",
+    "powershell",
+    "runterminalcommand",
+    "runterminalcommandv2",
+    "shell",
+    "shellcommand",
+    "terminal",
+}
+# Meta-tools record local product feedback or diagnostics. They are never an
+# invitation for the operator to answer the agent, even if a future client
+# happens to reuse an interaction-shaped envelope for their payload.
+_META_TOOL_NAMES = {"sendfeedback"}
+_BACKGROUND_TASK_ID_RE = re.compile(
+    r"(?:command\s+running\s+in\s+background\s+with\s+id"
+    r"|background(?:\s+(?:task|shell))?\s+id"
+    r"|task\s+id|shell\s+id)\s*[:=]\s*"
+    r"(?P<id>[a-z0-9][a-z0-9_-]{0,511})",
+    re.IGNORECASE,
+)
+
+
+def _normalized_tool_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", _coerce_text(value).casefold())
+
+
+def _is_shell_tool_name(value: object) -> bool:
+    return _normalized_tool_name(value) in _SHELL_TOOL_NAMES
+
+
+def _is_meta_tool_name(value: object) -> bool:
+    return _normalized_tool_name(value) in _META_TOOL_NAMES
+
+
+def _tool_runs_in_background(value: object) -> bool:
+    payload = _json_mapping(value)
+    return bool(
+        payload.get("run_in_background")
+        if "run_in_background" in payload
+        else payload.get("runInBackground")
+    )
+
+
+def _background_task_id_from_result(value: object) -> str:
+    """Extract Claude's task ID from its immediate background-launch result."""
+    match = _BACKGROUND_TASK_ID_RE.search(_coerce_text(value))
+    return match.group("id") if match is not None else ""
+
+
 def _extract_local_command(content) -> tuple[str, str, str] | None:
     """Return Claude Code slash-command context as (name, input, output)."""
     if not isinstance(content, str):
@@ -2616,7 +2680,7 @@ def _extract_local_command(content) -> tuple[str, str, str] | None:
 
 def _extract_tool_use(
     content,
-) -> tuple[str, str, str, dict[str, object] | None] | None:
+) -> tuple[str, str, str, dict[str, object] | None, bool] | None:
     """Return a standalone Claude tool invocation and optional interaction."""
     if not isinstance(content, list):
         return None
@@ -2655,6 +2719,7 @@ def _extract_tool_use(
             strip_terminal_sequences(tool_input).strip(),
             tool_call_id,
             interaction,
+            _is_shell_tool_name(name) and _tool_runs_in_background(value),
         )
     return None
 
@@ -3413,6 +3478,8 @@ def normalize_question_interaction(
     interaction_id: object = "",
 ) -> dict[str, object] | None:
     """Normalize interactive-question payloads emitted by supported tools."""
+    if _is_meta_tool_name(tool_name):
+        return None
     normalized_tool_name = re.sub(
         r"[^a-z0-9]",
         "",
@@ -3631,6 +3698,8 @@ def normalize_claude_live_prompt_interaction(
     interaction_id: object = "",
 ) -> dict[str, object] | None:
     """Normalize hook-only Claude prompts that are absent from JSONL."""
+    if _is_meta_tool_name(tool_name):
+        return None
     normalized_tool_name = re.sub(
         r"[^a-z0-9]",
         "",
@@ -3808,6 +3877,8 @@ def normalize_cursor_plan_mode_interaction(
     interaction_id: object = "",
 ) -> dict[str, object] | None:
     """Normalize Cursor's approval-gated request to enter Plan mode."""
+    if _is_meta_tool_name(tool_name):
+        return None
     normalized_tool_name = re.sub(
         r"[^a-z0-9]",
         "",
@@ -3867,6 +3938,8 @@ def normalize_interaction(
     interaction_id: object = "",
 ) -> dict[str, object] | None:
     """Normalize a supported human-response interaction."""
+    if _is_meta_tool_name(tool_name):
+        return None
     question = normalize_question_interaction(
         tool_name,
         raw_input,
@@ -4563,7 +4636,13 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
             tool_use = _extract_tool_use([item])
             if tool_use is None:
                 continue
-            tool_name, tool_input, tool_call_id, interaction = tool_use
+            (
+                tool_name,
+                tool_input,
+                tool_call_id,
+                interaction,
+                is_background,
+            ) = tool_use
             agent_event = normalize_claude_agent_launch_event(
                 tool_name,
                 tool_input,
@@ -4589,6 +4668,7 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
                 source_id=_claude_part_source_id(source_id, "tool_use", index),
                 interaction=interaction,
                 tool_call_id=tool_call_id,
+                is_background=is_background,
                 agent_event=agent_event,
             ))
             continue
@@ -4629,6 +4709,7 @@ def _parse_claude_record_messages(obj: object) -> list[NormalizedMessage]:
             raw_type="agent_event" if agent_event is not None else "tool_result",
             source_id=_claude_part_source_id(source_id, "tool_result", index),
             tool_call_id=tool_call_id,
+            background_task_id=_background_task_id_from_result(result_content),
             agent_event=agent_event,
         ))
 
