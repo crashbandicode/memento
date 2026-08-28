@@ -254,19 +254,22 @@ def _row_metadata(row) -> dict:
     return metadata
 
 
-def _is_claw_orchestration_row(row) -> bool:
-    return str(_row_metadata(row).get("orchestration") or "").strip() == "claw"
-
-
 def _is_unlinked_claw_row(row) -> bool:
-    """True for orchestration=claw with no parent document id (Python twin of SQL)."""
+    """True for orchestration=claw with no parent document id (Python twin of SQL).
+
+    Path-linked children (``/subagents/`` transcripts) are excluded: the
+    hierarchy fold links them under their parent regardless of orchestration
+    metadata, so counting them in the unlinked aggregate double-counts.
+    """
     metadata = _row_metadata(row)
     if str(metadata.get("orchestration") or "").strip().casefold() != "claw":
+        return False
+    if "/subagents/" in str(getattr(row, "relative_path", "") or "").replace("\\", "/"):
         return False
     return not str(metadata.get("orchestration_parent_document_id") or "").strip()
 
 
-def _unlinked_claw_hierarchy_sql(hierarchy_metadata):
+def _unlinked_claw_hierarchy_sql(hierarchy_metadata, relative_path):
     """Unlinked-claw predicate over dashboard hierarchy_metadata JSONB."""
     orchestration = func.lower(
         func.coalesce(hierarchy_metadata["orchestration"].astext, "")
@@ -275,7 +278,38 @@ def _unlinked_claw_hierarchy_sql(hierarchy_metadata):
         hierarchy_metadata["orchestration_parent_document_id"].astext,
         "",
     )
-    return and_(orchestration == "claw", parent == "")
+    return and_(
+        orchestration == "claw",
+        parent == "",
+        not_(func.coalesce(relative_path, "").like("%/subagents/%")),
+    )
+
+
+def corrected_claw_delegate_count(
+    raw_count: int,
+    loaded_rows,
+    visible_document_ids,
+    attention_ids: set,
+) -> int:
+    """Reconcile the independent SQL aggregate with rendered group membership.
+
+    The COUNT(*) cannot see hierarchy folding (a delegate represented under
+    its parent) or attention elevation (a delegate rendered as an Attention
+    card); both remove rows from the rendered Claw group, so every loaded
+    unlinked-claw row in either state is subtracted. Rows beyond the candidate
+    cap are by construction unloaded and therefore neither folded nor
+    elevated.
+    """
+    removed = sum(
+        1
+        for row in loaded_rows
+        if _is_unlinked_claw_row(row)
+        and (
+            row.id not in visible_document_ids
+            or row.id in attention_ids
+        )
+    )
+    return max(0, int(raw_count) - removed)
 
 
 def partition_dashboard_candidates_before_limit(
@@ -315,9 +349,12 @@ def _select_recent_conversation_rows(
     recent_rows = [
         row for row in visible_convo_rows if row.id not in attention_ids
     ]
-    claw_rows = [row for row in recent_rows if _is_claw_orchestration_row(row)]
+    # Group membership must match the aggregate-count predicate exactly:
+    # linked/path-linked claw rows that remain visible render as ordinary
+    # rows, never as uncounted members of the aggregate group.
+    claw_rows = [row for row in recent_rows if _is_unlinked_claw_row(row)]
     primary_rows = [
-        row for row in recent_rows if not _is_claw_orchestration_row(row)
+        row for row in recent_rows if not _is_unlinked_claw_row(row)
     ]
     convos_rows = (
         sorted(attention_rows, key=activity_key, reverse=True)
@@ -444,7 +481,10 @@ async def get_dashboard(
         source.c.source_modified_at,
         source.c.synced_at,
     )
-    unlinked_claw = _unlinked_claw_hierarchy_sql(source.c.hierarchy_metadata)
+    unlinked_claw = _unlinked_claw_hierarchy_sql(
+        source.c.hierarchy_metadata,
+        source.c.relative_path,
+    )
     recent_convos_q = (
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
@@ -625,6 +665,12 @@ async def get_dashboard(
         if pending_question_counts.get(row.id, 0) > 0
     ]
     attention_ids = {row.id for row in attention_rows}
+    claw_delegate_count = corrected_claw_delegate_count(
+        claw_delegate_count,
+        all_convo_rows,
+        conversation_hierarchy.visible_document_ids,
+        attention_ids,
+    )
     convos_rows, _sampled_claw_count = _select_recent_conversation_rows(
         visible_convo_rows,
         attention_ids,
@@ -702,6 +748,10 @@ async def get_dashboard(
                 str(_row_metadata(row).get("orchestration") or "").strip()
                 or None
             ),
+            # Group membership flag: matches the aggregate-count predicate
+            # exactly (unlinked, not path-linked). Linked claw rows render as
+            # ordinary rows and must not be re-grouped client-side.
+            "claw_delegate": _is_unlinked_claw_row(row),
             "subagent_count": conversation_hierarchy.subagent_counts.get(
                 row.id,
                 0,

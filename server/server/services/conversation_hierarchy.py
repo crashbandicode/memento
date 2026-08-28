@@ -60,12 +60,6 @@ _NON_USER_RECORD_TYPES = frozenset({
     "file-history-snapshot",
     "queue-operation",
 })
-_JSON_RECORD_TYPE = re.compile(r'"type"\s*:\s*"(?P<value>[^"]+)"')
-_JSON_RECORD_ROLE = re.compile(r'"role"\s*:\s*"(?P<value>[^"]+)"')
-_JSON_EMBEDDED_BRIEFING = re.compile(
-    r"MEMENTO-(?P<kind>HANDOFF|TANGENT|DELEGATE)-FROM:\s*"
-    rf"(?P<session_id>{_BRIEFING_SESSION_ID})"
-)
 _HANDOFF_MARKER_RE = re.compile(
     rf"\A{re.escape(HANDOFF_MARKER_PREFIX)}\s*(?P<session_id>"
     rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
@@ -199,46 +193,93 @@ def _payload_is_user_record(payload: object) -> bool:
     return False
 
 
-def _json_envelope_head(line: str) -> str:
-    """Fields before message/content, so nested payload strings cannot spoof type."""
-    cuts = [
-        index
-        for token in ('"message"', '"content"')
-        if (index := line.find(token)) > 0
-    ]
-    if cuts:
-        return line[: min(cuts)]
-    return line[:2048]
+def _scan_json_line_state(
+    line: str,
+) -> tuple[list[str], bool, bool, bool, int, str]:
+    """One lexical pass over a JSONL line.
+
+    Returns (open_closers_stack, in_string, escaped, string_is_key,
+    current_string_start_index, last_significant_token). The last token is
+    "k"/"v" for a completed key/value string, the structural character
+    otherwise, or "!" for a malformed line (closer without opener).
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    string_is_key = False
+    string_start = -1
+    last_sig = ""
+    for index, char in enumerate(line):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                last_sig = "k" if string_is_key else "v"
+            continue
+        if char in " \t\r\n":
+            continue
+        if char == '"':
+            in_string = True
+            # A string opening right after '{' or ',' at object level is a
+            # key. Inside arrays a ',' precedes values, which at worst makes
+            # the repair drop a trailing array string — never fabricate one.
+            string_is_key = last_sig in ("{", ",")
+            string_start = index
+            continue
+        last_sig = char
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                return [], False, False, False, -1, "!"
+            stack.pop()
+    return stack, in_string, escaped, string_is_key, string_start, last_sig
 
 
-def _truncated_json_record_is_user(line: str) -> bool:
-    head = _json_envelope_head(line)
-    record_type = ""
-    record_role = ""
-    type_match = _JSON_RECORD_TYPE.search(head)
-    role_match = _JSON_RECORD_ROLE.search(head)
-    if type_match is not None:
-        record_type = type_match.group("value").strip().casefold()
-    if role_match is not None:
-        record_role = role_match.group("value").strip().casefold()
-    if record_type in _NON_USER_RECORD_TYPES or record_role in _NON_USER_RECORD_TYPES:
-        return False
-    return record_type == "user" or record_role == "user"
+def _repair_truncated_json_object(line: str) -> dict | None:
+    """Best-effort completion of the truncated final JSONL record.
 
-
-def _marker_text_from_truncated_user_record(line: str) -> str:
-    match = _JSON_EMBEDDED_BRIEFING.search(line)
-    if match is None:
-        return ""
-    kind = match.group("kind").casefold()
-    prefix = _BRIEFING_KIND_PREFIXES.get(kind)
-    if prefix is None:
-        return ""
+    The repaired object is subjected to the SAME top-level envelope checks as
+    a complete record, so the repair can only under-approximate: a failed
+    repair leaves the record unresolved, never misclassified.
+    """
+    if not line.startswith("{"):
+        return None
+    stack, in_string, escaped, string_is_key, string_start, last_sig = (
+        _scan_json_line_state(line)
+    )
+    if last_sig == "!":
+        return None
+    base = line
+    if in_string:
+        if string_is_key and string_start >= 0:
+            base = line[:string_start].rstrip().rstrip(",").rstrip()
+        else:
+            if escaped:
+                base = base[:-1]
+            base += '"'
+    elif last_sig == "k" and string_start >= 0:
+        # A completed key string with no value yet.
+        base = line[:string_start].rstrip().rstrip(",").rstrip()
+    else:
+        base = base.rstrip()
+        if base.endswith(":"):
+            base += " null"
+        elif base.endswith(","):
+            base = base[:-1]
+    stack, in_string, _escaped, _is_key, _start, last_sig = (
+        _scan_json_line_state(base)
+    )
+    if in_string or last_sig in {"!", "k"}:
+        return None
     try:
-        session_id = str(uuid.UUID(match.group("session_id")))
-    except (ValueError, AttributeError):
-        return ""
-    return f"{prefix} {session_id}"
+        payload = json.loads(base + "".join(reversed(stack)))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def conversation_briefing_from_raw_prefix(raw_prefix: object) -> str:
@@ -277,11 +318,18 @@ def conversation_briefing_from_raw_prefix(raw_prefix: object) -> str:
             continue
         is_last = index == last_index
         if is_last and truncated_tail:
-            if not _truncated_json_record_is_user(stripped):
+            payload = _repair_truncated_json_object(stripped)
+            if payload is None or not _payload_is_user_record(payload):
                 return ""
-            return _marker_text_from_truncated_user_record(stripped)[
-                :_BRIEFING_CONTENT_CHARS
-            ]
+            extracted = _user_text_from_raw_record(payload)
+            # A truncated record is only trusted when a validated marker sits
+            # at the very start of the decoded user content (the parser is
+            # \A-anchored). Anything else — mid-content mentions, cut-off
+            # markers, ordinary prompts — stays unresolved rather than
+            # becoming authoritative.
+            if _parse_conversation_briefing(extracted) is None:
+                return ""
+            return extracted[:_BRIEFING_CONTENT_CHARS]
     return ""
 
 

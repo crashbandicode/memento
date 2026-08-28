@@ -806,6 +806,97 @@ class ConversationHierarchyTests(unittest.TestCase):
             (None, None),
         )
 
+    def test_truncated_user_with_message_before_type_resolves(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        line = json.dumps(
+            {
+                "message": {"role": "user", "content": handoff},
+                "type": "user",
+            }
+        )
+        truncated = line[:800]
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            ("handoff", parent_id),
+        )
+
+    def test_truncated_user_with_early_content_like_field_resolves(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        line = json.dumps(
+            {
+                "content_digest": "unrelated early field",
+                "type": "user",
+                "message": {"role": "user", "content": handoff},
+            }
+        )
+        truncated = line[:900]
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            ("handoff", parent_id),
+        )
+
+    def test_truncated_assistant_with_nested_user_type_is_rejected(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        line = json.dumps(
+            {
+                "metadata": {"type": "user"},
+                "type": "assistant",
+                "message": {"role": "assistant", "content": handoff},
+            }
+        )
+        truncated = line[:900]
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            (None, None),
+        )
+        self.assertEqual(conversation_briefing_from_raw_prefix(truncated), "")
+
+    def test_truncated_user_with_nested_assistant_metadata_resolves(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        line = json.dumps(
+            {
+                "metadata": {"type": "assistant"},
+                "type": "user",
+                "message": {"role": "user", "content": handoff},
+            }
+        )
+        truncated = line[:900]
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            ("handoff", parent_id),
+        )
+
+    def test_truncated_user_with_mid_content_marker_stays_unresolved(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        content = (
+            "Ordinary opening sentence about the routing protocol. "
+            f"MEMENTO-HANDOFF-FROM: {parent_id}\n" + ("x" * 20000)
+        )
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            }
+        )
+        truncated = line[:900]
+        self.assertFalse(truncated.endswith("}"))
+        self.assertEqual(
+            resolve_conversation_briefing(raw_prefix=truncated),
+            (None, None),
+        )
+        self.assertEqual(conversation_briefing_from_raw_prefix(truncated), "")
+        self.assertFalse(
+            conversation_is_chain_primary({}, raw_prefix=truncated)
+        )
+
     def test_raw_prefix_first_user_without_marker_is_authoritative(self) -> None:
         parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         handoff = f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue."

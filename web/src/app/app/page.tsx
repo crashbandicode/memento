@@ -40,6 +40,7 @@ interface DashboardData {
     is_subagent_orphan?: boolean;
     is_low_activity: boolean;
     orchestration?: string | null;
+    claw_delegate?: boolean;
   }[];
   claw_delegate_count?: number;
   daily: { date: string; count: number }[];

@@ -10,8 +10,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.api.dashboard import (  # noqa: E402
+    _is_unlinked_claw_row,
     _row_metadata,
     _select_recent_conversation_rows,
+    corrected_claw_delegate_count,
     partition_dashboard_candidates_before_limit,
 )
 from server.services.dashboard_projection import _hierarchy_metadata  # noqa: E402
@@ -159,3 +161,56 @@ class DashboardRecentOrchestrationTests(unittest.TestCase):
         self.assertEqual(partitioned["claw_count"], 0)
         self.assertEqual(partitioned["claw_sample"], [])
         self.assertEqual(primary_ids, ["linked-child", "primary"])
+
+    def _unlinked_claw_row(self, row_id: str, *, relative_path: str = "", pending: int = 0):
+        return SimpleNamespace(
+            id=row_id,
+            hierarchy_metadata={
+                "orchestration": "claw",
+                "is_subagent": True,
+            },
+            session_id=row_id,
+            root_thread_id=None,
+            parent_thread_id=None,
+            is_subagent=True,
+            tool_id="cursor",
+            relative_path=relative_path,
+            pending_question_count=pending,
+            activity_at=datetime(2026, 8, 28, 13, 0, tzinfo=timezone.utc),
+        )
+
+    def test_path_linked_claw_rows_are_not_unlinked(self) -> None:
+        path_linked = self._unlinked_claw_row(
+            "path-child",
+            relative_path="projects/root/subagents/agent-1.jsonl",
+        )
+        plain = self._unlinked_claw_row("plain-delegate")
+        self.assertFalse(_is_unlinked_claw_row(path_linked))
+        self.assertTrue(_is_unlinked_claw_row(plain))
+
+    def test_aggregate_count_subtracts_folded_and_attention_rows(self) -> None:
+        folded = self._unlinked_claw_row("folded-delegate")
+        elevated = self._unlinked_claw_row("attention-delegate", pending=1)
+        grouped = self._unlinked_claw_row("grouped-delegate")
+        # Raw SQL count saw all three plus two rows beyond the candidate cap.
+        corrected = corrected_claw_delegate_count(
+            5,
+            [folded, elevated, grouped],
+            visible_document_ids={"attention-delegate", "grouped-delegate"},
+            attention_ids={"attention-delegate"},
+        )
+        # folded (not visible) and elevated (attention) leave the group;
+        # grouped and the two unloaded beyond-cap rows remain.
+        self.assertEqual(corrected, 3)
+
+    def test_aggregate_count_never_negative(self) -> None:
+        folded = self._unlinked_claw_row("folded-delegate")
+        self.assertEqual(
+            corrected_claw_delegate_count(
+                0,
+                [folded],
+                visible_document_ids=set(),
+                attention_ids=set(),
+            ),
+            0,
+        )
