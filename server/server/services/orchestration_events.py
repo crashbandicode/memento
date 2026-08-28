@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,12 +17,25 @@ from ..db.models import (
     ConversationReadModel,
     DashboardDocumentProjection,
     Document,
+    Machine,
     OrchestrationAgent,
     OrchestrationEventReceipt,
     OrchestrationRun,
 )
 from ..db.session import queue_realtime_event
-from .document_delivery import document_metadata, store_document_metadata
+from .conversation_hierarchy import (
+    BRIEFING_RAW_PREFIX_CHARS,
+    resolve_conversation_briefing,
+)
+from .large_content_store import (
+    DocumentContentUnavailableError,
+    document_content_prefix,
+)
+from .document_delivery import (
+    delivery_activity_expression,
+    document_metadata,
+    store_document_metadata,
+)
 
 
 _RUN_KEY_PATTERN = re.compile(
@@ -251,45 +264,175 @@ async def _find_parent_document(
     return None
 
 
-async def _apply_agent_projection(
+async def _first_user_message_content(
     db: AsyncSession,
-    run: OrchestrationRun,
-    agent: OrchestrationAgent,
+    document_id: uuid.UUID,
+) -> str:
+    content = (
+        await db.execute(
+            select(ConversationMessage.content)
+            .where(
+                ConversationMessage.document_id == document_id,
+                ConversationMessage.role == "user",
+            )
+            .order_by(
+                ConversationMessage.line_number.asc(),
+                ConversationMessage.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return content if isinstance(content, str) else ""
+
+
+async def _bounded_raw_prefix(
+    db: AsyncSession,
+    document: Document,
+) -> str | None:
+    try:
+        return await document_content_prefix(
+            db,
+            document,
+            max_chars=BRIEFING_RAW_PREFIX_CHARS,
+        )
+    except DocumentContentUnavailableError:
+        return None
+
+
+async def _resolve_document_briefing(
+    db: AsyncSession,
+    document: Document,
+) -> tuple[str | None, str | None]:
+    persisted = await _first_user_message_content(db, document.id)
+    metadata = document_metadata(document)
+    kind, session_id = resolve_conversation_briefing(
+        persisted_user_content=persisted or None,
+        metadata=metadata,
+        raw_prefix=None,
+    )
+    if (
+        kind
+        or (persisted or "").strip()
+        or str(metadata.get("first_user_message") or "").strip()
+    ):
+        return kind, session_id
+    raw_prefix = await _bounded_raw_prefix(db, document)
+    return resolve_conversation_briefing(
+        persisted_user_content=None,
+        metadata=metadata,
+        raw_prefix=raw_prefix,
+    )
+
+
+async def _child_is_chain_primary(
+    db: AsyncSession,
+    child: Document,
 ) -> bool:
-    """Mirror a proven normalized relation into existing read projections."""
-    if run.parent_document_id is None or agent.document_id is None:
+    kind, _session_id = await _resolve_document_briefing(db, child)
+    return kind in {"handoff", "tangent"}
+
+
+async def _find_document_by_session_id(
+    db: AsyncSession,
+    *,
+    machine_id: uuid.UUID,
+    session_id: str,
+) -> uuid.UUID | None:
+    """Resolve a protocol-marker session id to the most recently active document."""
+    normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
+    path_suffix = f"{session_id.lower()}.jsonl"
+    return (
+        await db.execute(
+            select(Document.id)
+            .outerjoin(
+                ConversationReadModel,
+                ConversationReadModel.document_id == Document.id,
+            )
+            .where(
+                Document.machine_id == machine_id,
+                Document.category == "conversation",
+                or_(
+                    Document.metadata_["session_id"].astext == session_id,
+                    Document.metadata_["thread_id"].astext == session_id,
+                    ConversationReadModel.thread_id == session_id,
+                    normalized_path == path_suffix,
+                    normalized_path.like(f"%/{path_suffix}"),
+                ),
+            )
+            .order_by(
+                delivery_activity_expression().desc().nulls_last(),
+                Document.id.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _stamp_claw_child(
+    db: AsyncSession,
+    child: Document,
+    *,
+    run: OrchestrationRun | None,
+    agent: OrchestrationAgent | None,
+    parent_document_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+) -> bool:
+    """Stamp claw-delegate classification, optionally without a parent yet."""
+    if await _child_is_chain_primary(db, child):
         return False
-    if run.parent_document_id == agent.document_id:
-        return False
-    child = await db.get(Document, agent.document_id)
-    if child is None:
-        return False
+    if parent_document_id == child.id:
+        parent_document_id = None
 
     metadata = document_metadata(child)
+    existing_parent = str(
+        metadata.get("orchestration_parent_document_id") or ""
+    ).strip()
+    if parent_document_id is None and existing_parent:
+        try:
+            parent_document_id = uuid.UUID(existing_parent)
+        except (ValueError, AttributeError):
+            parent_document_id = None
+
     projected = {
         **metadata,
         "orchestration": "claw",
-        "orchestration_run_id": run.external_run_id,
-        "orchestration_run_kind": run.run_kind,
-        "orchestration_parent_document_id": str(run.parent_document_id),
-        "orchestration_relation_resolved": True,
-        "orchestration_agent_key": agent.agent_key,
-        "orchestration_agent_name": agent.agent_name,
-        "orchestration_agent_codename": agent.codename,
         "is_subagent": True,
-        "agent_id": agent.native_session_id,
-        "agent_tool_use_id": f"{run.external_run_id}:{agent.agent_key}",
-        "agent_nickname": agent.codename,
-        "agent_launch_description": agent.agent_name,
-        "agent_path": f"claw/{run.run_kind}/{agent.agent_key}",
-        "agent_depth": 1,
-        "subagent_model": agent.model,
-        "subagent_reasoning_effort": agent.effort,
-        "subagent_lifecycle_status": _normalized_agent_status(agent.status),
-        "subagent_lifecycle_source": "claw_orchestrator",
-        "subagent_lifecycle_at": agent.last_event_at.isoformat(),
-        "subagent_lifecycle_evidence": f"claw.agent.status={agent.status}",
+        "agent_depth": max(1, int(metadata.get("agent_depth") or 0) or 1),
     }
+    if run is not None:
+        projected["orchestration_run_id"] = run.external_run_id
+        projected["orchestration_run_kind"] = run.run_kind
+        projected["agent_path"] = (
+            f"claw/{run.run_kind}/{agent.agent_key}"
+            if agent is not None
+            else f"claw/{run.run_kind}"
+        )
+        projected["subagent_lifecycle_source"] = "claw_orchestrator"
+    else:
+        projected.setdefault("agent_path", "claw/delegate")
+        projected.setdefault("subagent_lifecycle_source", "claw_delegate_marker")
+    if agent is not None:
+        projected.update({
+            "orchestration_agent_key": agent.agent_key,
+            "orchestration_agent_name": agent.agent_name,
+            "orchestration_agent_codename": agent.codename,
+            "agent_id": agent.native_session_id,
+            "agent_tool_use_id": (
+                f"{run.external_run_id}:{agent.agent_key}"
+                if run is not None
+                else agent.agent_key
+            ),
+            "agent_nickname": agent.codename,
+            "agent_launch_description": agent.agent_name,
+            "subagent_model": agent.model,
+            "subagent_reasoning_effort": agent.effort,
+            "subagent_lifecycle_status": _normalized_agent_status(agent.status),
+            "subagent_lifecycle_at": agent.last_event_at.isoformat(),
+            "subagent_lifecycle_evidence": f"claw.agent.status={agent.status}",
+        })
+    if parent_document_id is not None:
+        projected["orchestration_parent_document_id"] = str(parent_document_id)
+        projected["orchestration_relation_resolved"] = True
     projected = {key: value for key, value in projected.items() if value is not None}
     changed = store_document_metadata(child, projected)
 
@@ -311,8 +454,11 @@ async def _apply_agent_projection(
             dashboard.hierarchy_metadata = merged_hierarchy
             dashboard.is_subagent = True
             changed = True
-    if changed:
-        for document_id in {run.parent_document_id, child.id}:
+    if changed and user_id is not None:
+        document_ids = {child.id}
+        if parent_document_id is not None:
+            document_ids.add(parent_document_id)
+        for document_id in document_ids:
             queue_realtime_event(
                 db,
                 "file_synced",
@@ -320,9 +466,32 @@ async def _apply_agent_projection(
                     "document_id": str(document_id),
                     "changes": ["conversation.metadata", "dashboard", "project"],
                 },
-                user_id=str(run.user_id),
+                user_id=str(user_id),
             )
     return changed
+
+
+async def _apply_agent_projection(
+    db: AsyncSession,
+    run: OrchestrationRun,
+    agent: OrchestrationAgent,
+) -> bool:
+    """Mirror a proven normalized relation into existing read projections."""
+    if agent.document_id is None:
+        return False
+    if run.parent_document_id == agent.document_id:
+        return False
+    child = await db.get(Document, agent.document_id)
+    if child is None:
+        return False
+    return await _stamp_claw_child(
+        db,
+        child,
+        run=run,
+        agent=agent,
+        parent_document_id=run.parent_document_id,
+        user_id=run.user_id,
+    )
 
 
 async def _reconcile_run_documents(db: AsyncSession, run: OrchestrationRun) -> int:
@@ -548,4 +717,30 @@ async def reconcile_orchestration_for_document(
     changed = 0
     for run in candidate_runs:
         changed += await _reconcile_run_documents(db, run)
+
+    kind, parent_session_id = await _resolve_document_briefing(db, document)
+    if kind in {"handoff", "tangent"}:
+        return changed
+    if kind == "delegate":
+        parent_id = None
+        if parent_session_id:
+            parent_id = await _find_document_by_session_id(
+                db,
+                machine_id=document.machine_id,
+                session_id=parent_session_id,
+            )
+        user_id = None
+        machine = await db.get(Machine, document.machine_id)
+        if machine is not None:
+            user_id = machine.user_id
+        changed += int(
+            await _stamp_claw_child(
+                db,
+                document,
+                run=None,
+                agent=None,
+                parent_document_id=parent_id,
+                user_id=user_id,
+            )
+        )
     return changed

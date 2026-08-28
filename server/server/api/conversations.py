@@ -40,6 +40,7 @@ from ..services.conversation_hierarchy import (
     build_logical_activity_map,
     build_subagent_summaries,
     conversation_display_title,
+    conversation_message_user_origin,
     conversation_root_thread_id,
     conversation_user_role_origin,
     current_thread_id,
@@ -1601,10 +1602,10 @@ async def get_conversation_messages(
                     "id": m.id,
                     "line_number": m.line_number,
                     "role": m.role or m.message_type,
-                    "origin": (
-                        user_role_origin
-                        if (m.role or m.message_type) == "user"
-                        else None
+                    "origin": conversation_message_user_origin(
+                        m.role or m.message_type,
+                        m.metadata_,
+                        user_role_origin,
                     ),
                     "content": m.content,
                     "thinking": (
@@ -1663,7 +1664,11 @@ async def get_conversation_messages(
                     "id": offset + i,
                     "line_number": offset + i + 1,
                     "role": m.role,
-                    "origin": user_role_origin if m.role == "user" else None,
+                    "origin": conversation_message_user_origin(
+                        m.role,
+                        {"message_origin": m.message_origin} if m.message_origin else {},
+                        user_role_origin,
+                    ),
                     "content": m.content,
                     "thinking": m.thinking or None,
                     "model": m.model,
@@ -2143,7 +2148,11 @@ async def get_pending_conversation_interactions(
     for message in rows:
         document_open_ids = open_ids.setdefault(message.document_id, set())
         message_metadata = dict(message.metadata_ or {})
-        if source_origins.get(message.document_id):
+        stored_origin = str(message_metadata.get("message_origin") or "").strip()
+        if (
+            not stored_origin
+            and source_origins.get(message.document_id)
+        ):
             message_metadata["message_origin"] = source_origins[message.document_id]
         message_interactions = _message_question_interactions(message.metadata_)
         for interaction in message_interactions:
@@ -2641,6 +2650,7 @@ async def search_conversation_messages(
                 ConversationMessage.id,
                 ConversationMessage.line_number,
                 ConversationMessage.role,
+                ConversationMessage.metadata_,
                 func.left(
                     ConversationMessage.content,
                     MAX_SEARCH_CONTENT_CHARS,
@@ -2690,10 +2700,10 @@ async def search_conversation_messages(
                 "id": row["id"],
                 "line_number": row["line_number"],
                 "role": row["role"],
-                "origin": (
-                    user_role_origin
-                    if row["role"] == "user"
-                    else None
+                "origin": conversation_message_user_origin(
+                    row["role"],
+                    row.get("metadata_"),
+                    user_role_origin,
                 ),
                 "snippet": make_search_snippet(row["content"], row["snippet_query"]),
                 "timestamp": (
@@ -2720,13 +2730,15 @@ async def get_conversation_prompts(
 ) -> dict:
     """Return a lightweight outline of every meaningful human prompt."""
     doc, read_model = await _get_conversation_identity(db, _user, doc_id)
-    if conversation_user_role_origin(
+    thread_origin = conversation_user_role_origin(
         doc.tool_id,
         doc.relative_path,
         doc.metadata_,
-    ) == "parent_agent":
+    )
+
+    def prompt_payload(prompts: list) -> dict:
         return {
-            "prompts": [],
+            "prompts": prompts,
             **(
                 {
                     "generation": read_model.generation,
@@ -2739,6 +2751,53 @@ async def get_conversation_prompts(
                 else {}
             ),
         }
+
+    if thread_origin == "parent_agent":
+        prompt_rows = (
+            await db.execute(
+                select(
+                    ConversationMessage.id,
+                    ConversationMessage.line_number,
+                    ConversationMessage.content,
+                    ConversationMessage.timestamp,
+                    ConversationMessage.metadata_,
+                )
+                .where(
+                    ConversationMessage.document_id == doc_id,
+                    ConversationMessage.role == "user",
+                )
+                .order_by(ConversationMessage.line_number)
+            )
+        )
+        prompts = []
+        reset = (
+            read_model is not None
+            and generation is not None
+            and generation != read_model.generation
+        )
+        minimum_line = None if reset else after_line
+        for message_id, line_number, content, timestamp, metadata in prompt_rows.all():
+            if minimum_line is not None and line_number <= minimum_line:
+                continue
+            clean = (content or "").strip()
+            origin = conversation_message_user_origin(
+                "user",
+                metadata,
+                thread_origin,
+            )
+            if origin == "parent_agent":
+                continue
+            if not is_meaningful_human_prompt(clean, metadata):
+                continue
+            prompts.append(
+                {
+                    "id": message_id,
+                    "line_number": line_number,
+                    "content": clean[:500],
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                }
+            )
+        return prompt_payload(prompts)
 
     if read_model is not None:
         reset = generation is not None and generation != read_model.generation

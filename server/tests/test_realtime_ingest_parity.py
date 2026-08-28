@@ -397,6 +397,48 @@ RECORDED_DELTA_SEQUENCES = (
             },
         ),
     ),
+    RecordedDeltaSequence(
+        name="claude_entrypoint_origin",
+        tool_id="claude_code",
+        metadata={"session_id": "phase0-entrypoint-origin"},
+        full_rows=(
+            {
+                "type": "user",
+                "uuid": "entrypoint-sdk-cli",
+                "entrypoint": "sdk-cli",
+                "timestamp": "2026-08-28T15:00:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "MEMENTO-DELEGATE-FROM: 035914ae-8e99-4bbf-a9af-3602cf5019bc\n"
+                        "Implement the approved design."
+                    ),
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "user",
+                "uuid": "entrypoint-cli",
+                "entrypoint": "cli",
+                "timestamp": "2026-08-28T15:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": "Please keep the operator messages labeled You.",
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "entrypoint-assistant",
+                "timestamp": "2026-08-28T15:00:02.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": "I will preserve per-message origin.",
+                    "usage": {"input_tokens": 6, "output_tokens": 4},
+                },
+            },
+        ),
+    ),
 )
 
 

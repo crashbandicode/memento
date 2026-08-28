@@ -23,6 +23,7 @@ from server.services.orchestration_events import (
     extract_orchestration_run_ids,
     ingest_orchestration_events,
     orchestration_agent_summary,
+    reconcile_orchestration_for_document,
 )
 
 TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
@@ -246,3 +247,469 @@ async def test_event_retry_and_arrival_order_converge_to_exact_documents(
         assert agent.document_id == child.id
         assert child.metadata_["orchestration_parent_document_id"] == str(parent.id)
         assert child.metadata_["orchestration_agent_name"] == "Review implementation"
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_parentless_delegate_is_stamped_before_parent_linkage(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-parentless",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        child_session_id = str(uuid4())
+        child = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Orphan delegate",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": child_session_id},
+        )
+        db.add(child)
+        await db.flush()
+        occurred_at = datetime.now(timezone.utc)
+        event = {
+            "schema_version": 1,
+            "event_id": str(uuid4()),
+            "occurred_at": occurred_at,
+            "installation_id": str(uuid4()),
+            "orchestrator": "claw-orchestrator",
+            "orchestrator_version": "5.0.0-memento.1",
+            "event": "agent.identity_bound",
+            "run_id": f"session-{uuid4()}",
+            "run_kind": "session",
+            "agent_key": "implementer",
+            "agent_name": "Implement visibility",
+            "engine": "claude",
+            "native_session_id": child_session_id,
+            "agent_status": "running",
+        }
+
+        result = await ingest_orchestration_events(
+            db,
+            machine_id=machine.id,
+            user_id=user.id,
+            events=[event],
+        )
+        await db.flush()
+        await db.refresh(child)
+        run = (await db.execute(select(OrchestrationRun))).scalar_one()
+
+        assert result["accepted"] == 1
+        assert result["linked"] == 1
+        assert run.parent_document_id is None
+        assert child.metadata_["orchestration"] == "claw"
+        assert child.metadata_["is_subagent"] is True
+        assert "orchestration_parent_document_id" not in (child.metadata_ or {})
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_handoff_successor_is_not_stamped_as_claw_delegate(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-handoff",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        parent_session_id = str(uuid4())
+        child_session_id = str(uuid4())
+        run_id = f"session-{uuid4()}"
+        parent = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{parent_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Predecessor",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": parent_session_id},
+        )
+        child = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Successor",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={
+                "session_id": child_session_id,
+                "first_user_message": f"MEMENTO-HANDOFF-FROM: {parent_session_id}\n",
+            },
+        )
+        db.add_all([parent, child])
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=parent.id,
+                line_number=1,
+                role="assistant",
+                content=f"orchestrationRunId: {run_id}",
+            )
+        )
+        db.add(
+            ConversationMessage(
+                document_id=child.id,
+                line_number=1,
+                role="user",
+                content=f"MEMENTO-HANDOFF-FROM: {parent_session_id}\nContinue the work.",
+            )
+        )
+        await db.flush()
+        occurred_at = datetime.now(timezone.utc)
+        await ingest_orchestration_events(
+            db,
+            machine_id=machine.id,
+            user_id=user.id,
+            events=[{
+                "schema_version": 1,
+                "event_id": str(uuid4()),
+                "occurred_at": occurred_at,
+                "installation_id": str(uuid4()),
+                "orchestrator": "claw-orchestrator",
+                "orchestrator_version": "5.0.0-memento.1",
+                "event": "agent.identity_bound",
+                "run_id": run_id,
+                "run_kind": "session",
+                "agent_key": "successor",
+                "agent_name": "Resume",
+                "engine": "claude",
+                "native_session_id": child_session_id,
+                "agent_status": "running",
+            }],
+        )
+        await db.flush()
+        await db.refresh(child)
+        run = (await db.execute(select(OrchestrationRun))).scalar_one()
+
+        assert run.parent_document_id == parent.id
+        assert (child.metadata_ or {}).get("orchestration") != "claw"
+        assert (child.metadata_ or {}).get("is_subagent") is not True
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_delegate_marker_classifies_and_links_parent(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-marker",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "cursor") is None:
+            db.add(Tool(id="cursor", display_name="Cursor"))
+        db.add_all([user, machine])
+        parent_session_id = str(uuid4())
+        child_session_id = str(uuid4())
+        parent = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"agent-transcripts/{parent_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Orchestrator",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": parent_session_id},
+        )
+        child = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"agent-transcripts/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Delegate",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": child_session_id},
+        )
+        db.add_all([parent, child])
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=child.id,
+                line_number=1,
+                role="user",
+                content=(
+                    f"MEMENTO-DELEGATE-FROM: {parent_session_id}\n"
+                    "Implement the visibility design."
+                ),
+            )
+        )
+        await db.flush()
+
+        changed = await reconcile_orchestration_for_document(db, child)
+        await db.flush()
+        await db.refresh(child)
+
+        assert changed == 1
+        assert child.metadata_["orchestration"] == "claw"
+        assert child.metadata_["is_subagent"] is True
+        assert child.metadata_["orchestration_parent_document_id"] == str(parent.id)
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_handoff_without_normalized_rows_is_not_stamped(
+    session_factory,
+    monkeypatch,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-handoff-raw",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        parent_session_id = str(uuid4())
+        child_session_id = str(uuid4())
+        run_id = f"session-{uuid4()}"
+        parent = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{parent_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Predecessor",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": parent_session_id},
+        )
+        child = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Successor",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": child_session_id},
+        )
+        db.add_all([parent, child])
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=parent.id,
+                line_number=1,
+                role="assistant",
+                content=f"orchestrationRunId: {run_id}",
+            )
+        )
+        await db.flush()
+
+        async def fake_prefix(_db, document, *, max_chars):
+            if document.id == child.id:
+                return f"MEMENTO-HANDOFF-FROM: {parent_session_id}\nContinue.\n"
+            return None
+
+        monkeypatch.setattr(
+            "server.services.orchestration_events.document_content_prefix",
+            fake_prefix,
+        )
+        await ingest_orchestration_events(
+            db,
+            machine_id=machine.id,
+            user_id=user.id,
+            events=[{
+                "schema_version": 1,
+                "event_id": str(uuid4()),
+                "occurred_at": datetime.now(timezone.utc),
+                "installation_id": str(uuid4()),
+                "orchestrator": "claw-orchestrator",
+                "orchestrator_version": "5.0.0-memento.1",
+                "event": "agent.identity_bound",
+                "run_id": run_id,
+                "run_kind": "session",
+                "agent_key": "successor",
+                "agent_name": "Resume",
+                "engine": "claude",
+                "native_session_id": child_session_id,
+                "agent_status": "running",
+            }],
+        )
+        await db.flush()
+        await db.refresh(child)
+        assert (child.metadata_ or {}).get("orchestration") != "claw"
+        assert (child.metadata_ or {}).get("is_subagent") is not True
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_invalid_delegate_marker_is_not_stamped(session_factory) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-invalid-marker",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "cursor") is None:
+            db.add(Tool(id="cursor", display_name="Cursor"))
+        db.add_all([user, machine])
+        child = Document(
+            id=uuid4(),
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path="agent-transcripts/invalid.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Invalid marker",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": str(uuid4())},
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=child.id,
+                line_number=1,
+                role="user",
+                content="MEMENTO-DELEGATE-FROM: not-a-uuid\nwork",
+            )
+        )
+        await db.flush()
+
+        changed = await reconcile_orchestration_for_document(db, child)
+        await db.flush()
+        await db.refresh(child)
+
+        assert changed == 0
+        assert (child.metadata_ or {}).get("orchestration") != "claw"
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_invalid_handoff_prefix_does_not_exempt_native_id_stamp(
+    session_factory,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid4(),
+            email=f"{uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid4(),
+            name="orchestration-invalid-handoff",
+            collector_token_hash=str(uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        child_session_id = str(uuid4())
+        run_id = f"session-{uuid4()}"
+        child = Document(
+            id=uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path=f"projects/test/{child_session_id}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="False handoff",
+            content_hash=uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": child_session_id},
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            ConversationMessage(
+                document_id=child.id,
+                line_number=1,
+                role="user",
+                content="MEMENTO-HANDOFF-FROM: not-a-uuid\nContinue.",
+            )
+        )
+        await db.flush()
+        await ingest_orchestration_events(
+            db,
+            machine_id=machine.id,
+            user_id=user.id,
+            events=[{
+                "schema_version": 1,
+                "event_id": str(uuid4()),
+                "occurred_at": datetime.now(timezone.utc),
+                "installation_id": str(uuid4()),
+                "orchestrator": "claw-orchestrator",
+                "orchestrator_version": "5.0.0-memento.1",
+                "event": "agent.identity_bound",
+                "run_id": run_id,
+                "run_kind": "session",
+                "agent_key": "false-handoff",
+                "agent_name": "Resume",
+                "engine": "claude",
+                "native_session_id": child_session_id,
+                "agent_status": "running",
+            }],
+        )
+        await db.flush()
+        await db.refresh(child)
+        assert child.metadata_["orchestration"] == "claw"
+        assert child.metadata_["is_subagent"] is True

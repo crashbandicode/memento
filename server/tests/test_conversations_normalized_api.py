@@ -423,6 +423,43 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["messages"][0]["role"], "user")
         self.assertEqual(payload["messages"][0]["origin"], "parent_agent")
 
+    async def test_per_message_human_origin_overrides_thread_parent_agent(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = (
+            "projects/demo/root-thread/subagents/agent-child.jsonl"
+        )
+        self.doc.metadata_.update({
+            "is_subagent": True,
+            "root_session_id": "root-thread",
+            "parent_thread_id": "root-thread",
+            "session_id": "agent-child",
+            "orchestration": "claw",
+        })
+        human = self.message(1, "user")
+        human.metadata_ = {"message_origin": "human"}
+        parent = self.message(2, "user")
+        parent.metadata_ = {"message_origin": "parent_agent"}
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(scalar_value=2),
+                _Result(rows=[human, parent]),
+            ]
+        )
+
+        payload = await get_conversation_messages(
+            self.doc_id,
+            offset=0,
+            limit=50,
+            line_number=None,
+            context_before=0,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["messages"][0]["origin"], "human")
+        self.assertEqual(payload["messages"][1]["origin"], "parent_agent")
+
     async def test_cursor_child_messages_expose_parent_agent_origin(self) -> None:
         self.doc.tool_id = "cursor"
         self.doc.relative_path = (
@@ -1911,7 +1948,7 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(payload, {"prompts": []})
-        self.assertEqual(len(db.statements), 1)
+        self.assertEqual(len(db.statements), 2)
 
     async def test_cursor_child_parent_messages_are_not_prompt_navigation(self) -> None:
         self.doc.tool_id = "cursor"
@@ -1934,7 +1971,38 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(payload, {"prompts": []})
-        self.assertEqual(len(db.statements), 1)
+        self.assertEqual(len(db.statements), 2)
+
+    async def test_claw_human_origin_prompts_remain_navigable(self) -> None:
+        self.doc.tool_id = "claude_code"
+        self.doc.relative_path = "projects/demo/delegate.jsonl"
+        self.doc.metadata_.update({
+            "orchestration": "claw",
+            "is_subagent": True,
+            "session_id": "delegate",
+        })
+        db = _Db([
+            _Result(scalar_value=self.doc),
+            _Result(
+                rows=[
+                    (1, 1, "MEMENTO-DELEGATE-FROM: parent", self.now, {
+                        "message_origin": "parent_agent",
+                    }),
+                    (2, 2, "Please keep going", self.now, {
+                        "message_origin": "human",
+                    }),
+                ]
+            ),
+        ])
+
+        payload = await get_conversation_prompts(
+            self.doc_id,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(len(payload["prompts"]), 1)
+        self.assertEqual(payload["prompts"][0]["content"], "Please keep going")
 
     async def test_root_claude_false_string_remains_prompt_navigation(self) -> None:
         self.doc.tool_id = "claude_code"
@@ -2009,6 +2077,51 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("conversation_messages.role IN", search_sql)
         self.assertNotIn("documents.content", search_sql)
         self.assertNotIn(" %> ", search_sql)
+
+    @patch(
+        "server.api.conversations.suggest_corrected_query",
+        new_callable=AsyncMock,
+    )
+    async def test_search_prefers_per_message_origin_over_thread(
+        self,
+        correction: AsyncMock,
+    ) -> None:
+        correction.return_value = None
+        self.doc.tool_id = "claude_code"
+        self.doc.metadata_.update({
+            "orchestration": "claw",
+            "is_subagent": True,
+        })
+        db = _Db(
+            [
+                _Result(scalar_value=self.doc),
+                _Result(
+                    rows=[
+                        {
+                            "id": 4,
+                            "line_number": 8,
+                            "role": "user",
+                            "metadata_": {"message_origin": "human"},
+                            "content": "please continue",
+                            "timestamp": self.now,
+                            "score": 3.2,
+                            "match_type": "full_text",
+                        },
+                    ]
+                ),
+            ]
+        )
+
+        payload = await search_conversation_messages(
+            self.doc_id,
+            q="continue",
+            after_line=None,
+            limit=50,
+            db=db,
+            _user=self.owner,
+        )
+
+        self.assertEqual(payload["results"][0]["origin"], "human")
 
     async def test_metadata_counts_normalized_rows_and_scopes_codex_hierarchy(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import unittest
 import uuid
@@ -10,12 +11,29 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+import pytest_asyncio
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
+
+from server.db.models import (  # noqa: E402
+    Base,
+    ConversationMessage,
+    ConversationPromptProjection,
+    ConversationReadModel,
+    Document,
+    Machine,
+    Tool,
+    User,
+)
 
 from server.scripts.backfill_conversation_presentation import (  # noqa: E402
     BackfillStats,
     _claude_context_identities,
+    _claude_user_origin_records,
     _codex_title_from_messages,
     _conversation_embedding_rows_query,
     _cursor_repair_document_ids_query,
@@ -28,6 +46,7 @@ from server.scripts.backfill_conversation_presentation import (  # noqa: E402
     _is_codex_mirror_pair,
     _normalize_codex_stored_message,
     _normalize_cursor_stored_message,
+    _repair_claude_message_origin_batch,
     _repair_cursor_batch,
 )
 from server.services.embedding_service import conversation_embedding_content  # noqa: E402
@@ -70,6 +89,46 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
         self.assertEqual(records, 1)
         self.assertEqual(len(identities), 1)
         iter_lines.assert_called_once_with("raw/x")
+
+    def test_claude_user_origin_records_map_entrypoint(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "sdk-1",
+                        "entrypoint": "sdk-cli",
+                        "timestamp": "2026-08-28T12:00:00Z",
+                        "message": {"role": "user", "content": "Parent dispatch"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "cli-1",
+                        "entrypoint": "cli",
+                        "timestamp": "2026-08-28T12:01:00Z",
+                        "message": {"role": "user", "content": "Typed follow-up"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "plain-1",
+                        "timestamp": "2026-08-28T12:02:00Z",
+                        "message": {"role": "user", "content": "No entrypoint"},
+                    }
+                ),
+            ]
+        )
+
+        by_source, by_identity, records = _claude_user_origin_records(raw)
+
+        self.assertEqual(records, 3)
+        self.assertEqual(by_source["sdk-1"], "parent_agent")
+        self.assertEqual(by_source["cli-1"], "human")
+        self.assertEqual(by_source["plain-1"], "")
+        self.assertEqual(by_identity[("Parent dispatch", "2026-08-28T12:00:00")], "parent_agent")
 
     def test_agents_message_is_reclassified_idempotently(self) -> None:
         message = SimpleNamespace(
@@ -546,6 +605,156 @@ class ConversationPresentationBackfillTests(unittest.TestCase):
 
         self.assertEqual(total.normalized_codex_prompts, 5)
         self.assertEqual(total.renamed_conversations, 4)
+
+
+TEST_DATABASE_URL = os.environ.get("MEMENTO_TASK_TEST_DATABASE_URL")
+requires_postgres = pytest.mark.skipif(
+    not TEST_DATABASE_URL,
+    reason="isolated PostgreSQL task test database is not configured",
+)
+
+
+@pytest_asyncio.fixture
+async def session_factory():
+    assert TEST_DATABASE_URL is not None
+    engine = create_async_engine(TEST_DATABASE_URL)
+    async with engine.begin() as connection:
+        await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        await connection.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False)
+    await engine.dispose()
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_claude_origin_repair_refreshes_stale_prompt_projections(
+    session_factory,
+    monkeypatch,
+) -> None:
+    async with session_factory() as db:
+        user = User(
+            id=uuid.uuid4(),
+            email=f"{uuid.uuid4()}@example.test",
+            role="viewer",
+            status="active",
+        )
+        machine = Machine(
+            id=uuid.uuid4(),
+            name="origin-repair",
+            collector_token_hash=str(uuid.uuid4()),
+            user_id=user.id,
+        )
+        if await db.get(Tool, "claude_code") is None:
+            db.add(Tool(id="claude_code", display_name="Claude Code"))
+        db.add_all([user, machine])
+        document = Document(
+            id=uuid.uuid4(),
+            tool_id="claude_code",
+            machine_id=machine.id,
+            relative_path="projects/test/origin.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            title="Origin repair",
+            content_hash=uuid.uuid4().hex,
+            file_size_bytes=1,
+            metadata_={"session_id": "origin-repair"},
+        )
+        db.add(document)
+        await db.flush()
+        now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+        sdk = ConversationMessage(
+            document_id=document.id,
+            line_number=1,
+            role="user",
+            content="Parent dispatch",
+            metadata_={"source_id": "sdk-1"},
+            timestamp=now,
+        )
+        human = ConversationMessage(
+            document_id=document.id,
+            line_number=2,
+            role="user",
+            content="Typed follow-up",
+            metadata_={"source_id": "cli-1"},
+            timestamp=now,
+        )
+        db.add_all([sdk, human])
+        await db.flush()
+        db.add_all([
+            ConversationPromptProjection(
+                document_id=document.id,
+                message_id=sdk.id,
+                line_number=1,
+                content="Parent dispatch",
+                timestamp=now,
+            ),
+            ConversationPromptProjection(
+                document_id=document.id,
+                message_id=human.id,
+                line_number=2,
+                content="Typed follow-up",
+                timestamp=now,
+            ),
+            ConversationReadModel(
+                document_id=document.id,
+                machine_id=machine.id,
+                tool_id="claude_code",
+                generation=1,
+                projected_through_line=2,
+            ),
+        ])
+        await db.flush()
+
+        raw = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "sdk-1",
+                        "entrypoint": "sdk-cli",
+                        "timestamp": "2026-08-28T12:00:00Z",
+                        "message": {"role": "user", "content": "Parent dispatch"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "cli-1",
+                        "entrypoint": "cli",
+                        "timestamp": "2026-08-28T12:01:00Z",
+                        "message": {"role": "user", "content": "Typed follow-up"},
+                    }
+                ),
+            ]
+        )
+
+        async def fake_content(_db, _document):
+            return raw
+
+        monkeypatch.setattr(
+            "server.scripts.backfill_conversation_presentation.document_content",
+            fake_content,
+        )
+        stats = await _repair_claude_message_origin_batch(db, [document.id])
+        await db.flush()
+        await db.refresh(sdk)
+        await db.refresh(human)
+        projection = await db.get(ConversationReadModel, document.id)
+        prompt_ids = set((
+            await db.execute(
+                select(ConversationPromptProjection.message_id).where(
+                    ConversationPromptProjection.document_id == document.id
+                )
+            )
+        ).scalars().all())
+
+        assert stats.updated_message_origin == 2
+        assert stats.refreshed_prompt_projections == 1
+        assert sdk.metadata_["message_origin"] == "parent_agent"
+        assert human.metadata_["message_origin"] == "human"
+        assert projection.generation == 2
+        assert prompt_ids == {human.id}
 
 
 if __name__ == "__main__":

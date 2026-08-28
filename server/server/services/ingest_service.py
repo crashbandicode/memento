@@ -194,6 +194,8 @@ _ESSENTIAL_METADATA_KEYS = {
     LIVE_INTERACTION_SIGNALS_KEY,
     PENDING_QUESTION_RECONCILIATION_VERSION_KEY,
     "cwd",
+    "briefing_kind",
+    "briefing_session_id",
     "first_user_message",
     "forked_from_id",
     "is_subagent",
@@ -947,6 +949,9 @@ def _conversation_message_metadata(normalized) -> dict:
         meta["task_state"] = normalized.task_state
     if normalized.agent_event:
         meta["agent_event"] = normalized.agent_event
+    origin = str(getattr(normalized, "message_origin", "") or "").strip()
+    if origin in {"human", "parent_agent"}:
+        meta["message_origin"] = origin
     return meta
 
 
@@ -1893,6 +1898,9 @@ def _prepare_document_metadata(
         first_user_message,
         MAX_STORED_MESSAGE_CHARS,
     )
+    from .conversation_hierarchy import persist_conversation_briefing_metadata
+
+    persist_conversation_briefing_metadata(candidate, first_user_message)
 
     history: list[dict] = []
     history_bytes = 0
@@ -3169,9 +3177,43 @@ async def ingest_file(
             )
             writer = "legacy"
         else:
+            # The raw writer commits through its own asyncpg transaction.
+            # Invalidate only tables it can have changed: expiring unrelated
+            # caller-owned Machine/User instances makes ordinary scalar access
+            # attempt async IO outside greenlet context.
+            raw_mutated_tables = {
+                "tools",
+                "documents",
+                "document_delivery_state",
+                "sync_state",
+                "conversation_messages",
+                "conversation_usage_events",
+                "conversation_read_models",
+                "conversation_prompt_projections",
+                "conversation_task_states",
+                "dashboard_document_projections",
+                "projects",
+            }
+            for mapped_instance in tuple(db.identity_map.values()):
+                if getattr(mapped_instance, "__tablename__", None) in raw_mutated_tables:
+                    db.expire(mapped_instance)
             if raw_event is not None:
                 from ..db.session import queue_realtime_event
 
+                if raw_event.get("claw_delegate_metadata"):
+                    queue_realtime_event(
+                        db,
+                        "file_synced",
+                        {
+                            "document_id": str(raw_document.id),
+                            "changes": [
+                                "conversation.metadata",
+                                "dashboard",
+                                "project",
+                            ],
+                        },
+                        user_id=raw_event["user_id"],
+                    )
                 cache_scope = raw_event.get("cache") or {}
                 _stage_ingest_read_cache_invalidations(
                     db,
@@ -3730,6 +3772,15 @@ async def ingest_file(
         existing_metadata = document_metadata(doc)
         existing_metadata.pop("user_history", None)
         existing_metadata.pop("first_user_message", None)
+        if mode != "delta":
+            from .conversation_hierarchy import (
+                clear_stale_briefing_keys_for_full_replacement,
+            )
+
+            clear_stale_briefing_keys_for_full_replacement(
+                existing_metadata,
+                first_user_message,
+            )
         metadata_update = (
             _merge_delta_metadata(existing_metadata, stored_metadata)
             if mode == "delta"

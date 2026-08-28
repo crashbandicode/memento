@@ -10,6 +10,9 @@ parent's history.
 
 from __future__ import annotations
 
+import json
+import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Hashable, Iterable, Mapping
@@ -32,6 +35,48 @@ FOLDABLE_CONVERSATION_TOOLS = frozenset({
     "cursor",
 })
 _PATH_LINKED_SUBAGENT_TOOLS = frozenset({"claude_code", "cursor"})
+_BRIEFING_SESSION_ID = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+HANDOFF_MARKER_PREFIX = "MEMENTO-HANDOFF-FROM:"
+TANGENT_MARKER_PREFIX = "MEMENTO-TANGENT-FROM:"
+DELEGATE_MARKER_PREFIX = "MEMENTO-DELEGATE-FROM:"
+BRIEFING_KIND_METADATA_KEY = "briefing_kind"
+BRIEFING_SESSION_ID_METADATA_KEY = "briefing_session_id"
+BRIEFING_RAW_PREFIX_CHARS = 32 * 1024
+_BRIEFING_CONTENT_CHARS = 2048
+_BRIEFING_KINDS = frozenset({"handoff", "tangent", "delegate"})
+_BRIEFING_KIND_PREFIXES = {
+    "handoff": HANDOFF_MARKER_PREFIX,
+    "tangent": TANGENT_MARKER_PREFIX,
+    "delegate": DELEGATE_MARKER_PREFIX,
+}
+_NON_USER_RECORD_TYPES = frozenset({
+    "assistant",
+    "system",
+    "summary",
+    "progress",
+    "file-history-snapshot",
+    "queue-operation",
+})
+_HANDOFF_MARKER_RE = re.compile(
+    rf"\A{re.escape(HANDOFF_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_TANGENT_MARKER_RE = re.compile(
+    rf"\A{re.escape(TANGENT_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_DELEGATE_MARKER_RE = re.compile(
+    rf"\A{re.escape(DELEGATE_MARKER_PREFIX)}\s*(?P<session_id>"
+    rf"{_BRIEFING_SESSION_ID})(?=\s|\Z)"
+)
+_BRIEFING_MARKER_PATTERNS = (
+    ("handoff", _HANDOFF_MARKER_RE),
+    ("tangent", _TANGENT_MARKER_RE),
+    ("delegate", _DELEGATE_MARKER_RE),
+)
 
 
 def _metadata_flag_is_true(value: object) -> bool:
@@ -41,6 +86,322 @@ def _metadata_flag_is_true(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() == "true"
     return False
+
+
+def _parse_conversation_briefing(content: object) -> tuple[str, str] | None:
+    """Return ``(kind, session_id)`` only when the marker carries a UUID."""
+    if not isinstance(content, str):
+        return None
+    text = content.lstrip()
+    for kind, pattern in _BRIEFING_MARKER_PATTERNS:
+        match = pattern.match(text)
+        if match is None:
+            continue
+        try:
+            return kind, str(uuid.UUID(match.group("session_id")))
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
+def conversation_briefing_kind(content: object) -> str | None:
+    """Classify a first-user-message protocol marker, if one is present.
+
+    A prefix without a parseable UUID is not a marker.
+    """
+    parsed = _parse_conversation_briefing(content)
+    return None if parsed is None else parsed[0]
+
+
+def conversation_briefing_session_id(content: object) -> str | None:
+    """Return the UUID carried by a first-user-message protocol marker."""
+    parsed = _parse_conversation_briefing(content)
+    return None if parsed is None else parsed[1]
+
+
+def persist_conversation_briefing_metadata(
+    metadata: dict[str, Any],
+    first_user_content: str | None,
+) -> dict[str, Any]:
+    """Store a tiny durable briefing marker, or keep an existing one on deltas."""
+    candidate = metadata
+    parsed = _parse_conversation_briefing(first_user_content)
+    if parsed is not None:
+        kind, session_id = parsed
+        candidate[BRIEFING_KIND_METADATA_KEY] = kind
+        candidate[BRIEFING_SESSION_ID_METADATA_KEY] = session_id
+        return candidate
+    if isinstance(first_user_content, str) and first_user_content.strip():
+        candidate.pop(BRIEFING_KIND_METADATA_KEY, None)
+        candidate.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+    return candidate
+
+
+def clear_stale_briefing_keys_for_full_replacement(
+    existing_metadata: dict[str, Any],
+    first_user_content: str | None,
+) -> dict[str, Any]:
+    """Drop durable briefing keys when a FULL replacement's first user is a non-marker.
+
+    Empty first-user text is not authoritative (deltas and incomplete FULL
+    payloads must not wipe a previously stored marker).
+    """
+    if not isinstance(first_user_content, str) or not first_user_content.strip():
+        return existing_metadata
+    if _parse_conversation_briefing(first_user_content) is not None:
+        return existing_metadata
+    existing_metadata.pop(BRIEFING_KIND_METADATA_KEY, None)
+    existing_metadata.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+    return existing_metadata
+
+
+def _user_text_from_raw_record(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content", content)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(parts)
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _payload_is_user_record(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    envelope_type = str(payload.get("type") or "").strip().casefold()
+    envelope_role = str(payload.get("role") or "").strip().casefold()
+    if envelope_type in _NON_USER_RECORD_TYPES or envelope_role in _NON_USER_RECORD_TYPES:
+        return False
+    if envelope_type == "user" or envelope_role == "user":
+        return True
+    message = payload.get("message")
+    if isinstance(message, dict):
+        nested_role = str(message.get("role") or "").strip().casefold()
+        if nested_role == "user" and envelope_type in {"", "user"}:
+            return True
+    return False
+
+
+def _scan_json_line_state(
+    line: str,
+) -> tuple[list[str], bool, bool, bool, int, str]:
+    """One lexical pass over a JSONL line.
+
+    Returns (open_closers_stack, in_string, escaped, string_is_key,
+    current_string_start_index, last_significant_token). The last token is
+    "k"/"v" for a completed key/value string, the structural character
+    otherwise, or "!" for a malformed line (closer without opener).
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    string_is_key = False
+    string_start = -1
+    last_sig = ""
+    for index, char in enumerate(line):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                last_sig = "k" if string_is_key else "v"
+            continue
+        if char in " \t\r\n":
+            continue
+        if char == '"':
+            in_string = True
+            # A string opening right after '{' or ',' at object level is a
+            # key. Inside arrays a ',' precedes values, which at worst makes
+            # the repair drop a trailing array string — never fabricate one.
+            string_is_key = last_sig in ("{", ",")
+            string_start = index
+            continue
+        last_sig = char
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack or stack[-1] != char:
+                return [], False, False, False, -1, "!"
+            stack.pop()
+    return stack, in_string, escaped, string_is_key, string_start, last_sig
+
+
+def _repair_truncated_json_object(line: str) -> dict | None:
+    """Best-effort completion of the truncated final JSONL record.
+
+    The repaired object is subjected to the SAME top-level envelope checks as
+    a complete record, so the repair can only under-approximate: a failed
+    repair leaves the record unresolved, never misclassified.
+    """
+    if not line.startswith("{"):
+        return None
+    stack, in_string, escaped, string_is_key, string_start, last_sig = (
+        _scan_json_line_state(line)
+    )
+    if last_sig == "!":
+        return None
+    base = line
+    if in_string:
+        if string_is_key and string_start >= 0:
+            base = line[:string_start].rstrip().rstrip(",").rstrip()
+        else:
+            if escaped:
+                base = base[:-1]
+            # Poison the cut value with a sentinel (JSON-escaped NULs) so a
+            # truncated string can never be completed into an authoritative
+            # value: '"user-notif…' cut after "user" must not become "user".
+            # Content strings stay truthful at their START, which is the only
+            # part the \A-anchored marker parser reads.
+            base += '\\u0000\\u0000"'
+    elif last_sig == "k" and string_start >= 0:
+        # A completed key string with no value yet.
+        base = line[:string_start].rstrip().rstrip(",").rstrip()
+    else:
+        base = base.rstrip()
+        if base.endswith(":"):
+            base += " null"
+        elif base.endswith(","):
+            base = base[:-1]
+    stack, in_string, _escaped, _is_key, _start, last_sig = (
+        _scan_json_line_state(base)
+    )
+    if in_string or last_sig in {"!", "k"}:
+        return None
+    try:
+        payload = json.loads(base + "".join(reversed(stack)))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def conversation_briefing_from_raw_prefix(raw_prefix: object) -> str:
+    """First user record in a bounded JSONL/plaintext prefix, if one is present.
+
+    Non-user records (summary/system/assistant/...) are skipped. The first user
+    record is authoritative even when it has no marker. A truncated final JSON
+    line may still yield a marker because the protocol text sits at the start
+    of user content; an unresolvable truncated prefix yields no text.
+    """
+    if not isinstance(raw_prefix, str) or not raw_prefix.strip():
+        return ""
+    text = raw_prefix.lstrip("\ufeff")
+    truncated_tail = bool(text) and not text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    last_index = len(lines) - 1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("{"):
+            if _parse_conversation_briefing(stripped) is not None:
+                return stripped[:_BRIEFING_CONTENT_CHARS]
+            continue
+        payload = None
+        try:
+            payload = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            if not _payload_is_user_record(payload):
+                continue
+            extracted = _user_text_from_raw_record(payload)
+            return extracted[:_BRIEFING_CONTENT_CHARS]
+        if payload is not None:
+            continue
+        is_last = index == last_index
+        if is_last and truncated_tail:
+            payload = _repair_truncated_json_object(stripped)
+            if payload is None or not _payload_is_user_record(payload):
+                return ""
+            extracted = _user_text_from_raw_record(payload)
+            # A truncated record is only trusted when a validated marker sits
+            # at the very start of the decoded user content (the parser is
+            # \A-anchored). Anything else — mid-content mentions, cut-off
+            # markers, ordinary prompts — stays unresolved rather than
+            # becoming authoritative.
+            if _parse_conversation_briefing(extracted) is None:
+                return ""
+            return extracted[:_BRIEFING_CONTENT_CHARS]
+    return ""
+
+
+def resolve_conversation_briefing(
+    *,
+    persisted_user_content: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    raw_prefix: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve a validated briefing marker without inventing one from a prefix."""
+    if isinstance(persisted_user_content, str) and persisted_user_content.strip():
+        parsed = _parse_conversation_briefing(persisted_user_content)
+        return (None, None) if parsed is None else parsed
+
+    values = metadata or {}
+    stored_first = str(values.get("first_user_message") or "")
+    if stored_first.strip():
+        parsed = _parse_conversation_briefing(stored_first)
+        return (None, None) if parsed is None else parsed
+
+    durable_kind = str(values.get(BRIEFING_KIND_METADATA_KEY) or "").strip()
+    durable_session = str(values.get(BRIEFING_SESSION_ID_METADATA_KEY) or "").strip()
+    if durable_kind in _BRIEFING_KINDS:
+        try:
+            session_id = str(uuid.UUID(durable_session))
+        except (ValueError, AttributeError):
+            session_id = ""
+        if session_id:
+            reconstructed = f"{_BRIEFING_KIND_PREFIXES[durable_kind]} {session_id}"
+            parsed = _parse_conversation_briefing(reconstructed)
+            if parsed is not None:
+                return parsed
+
+    raw_content = conversation_briefing_from_raw_prefix(raw_prefix)
+    if raw_content:
+        parsed = _parse_conversation_briefing(raw_content)
+        return (None, None) if parsed is None else parsed
+    return None, None
+
+
+def conversation_is_chain_primary(
+    metadata: Mapping[str, Any] | None,
+    *,
+    first_user_content: str | None = None,
+    raw_prefix: str | None = None,
+) -> bool:
+    """Return whether this thread is a handoff successor or tangent primary."""
+    kind, _session_id = resolve_conversation_briefing(
+        persisted_user_content=first_user_content,
+        metadata=metadata,
+        raw_prefix=raw_prefix,
+    )
+    return kind in {"handoff", "tangent"}
+
+
+def conversation_message_user_origin(
+    role: str | None,
+    metadata: Mapping[str, Any] | None,
+    thread_user_role_origin: str | None,
+) -> str | None:
+    """Prefer a persisted per-message origin over thread-level classification."""
+    if (role or "") != "user":
+        return None
+    stored = str((metadata or {}).get("message_origin") or "").strip()
+    if stored in {"human", "parent_agent"}:
+        return stored
+    return thread_user_role_origin
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +488,11 @@ def is_conversation_subagent(
     if values.get("orchestration_parent_document_id"):
         return True
     if (
+        str(values.get("orchestration") or "").strip() == "claw"
+        and _metadata_flag_is_true(values.get("is_subagent"))
+    ):
+        return True
+    if (
         tool_id == "codex"
         and str(values.get("thread_source") or "").strip().lower()
         == "subagent"
@@ -178,17 +544,22 @@ def conversation_user_role_origin(
     metadata: Mapping[str, Any] | None,
 ) -> str | None:
     """Identify child-thread user turns that were dispatched by a parent agent."""
-    if (metadata or {}).get("orchestration_parent_document_id"):
+    values = metadata or {}
+    if conversation_is_chain_primary(values):
+        return None
+    if str(values.get("orchestration") or "").strip() == "claw":
+        return "parent_agent"
+    if values.get("orchestration_parent_document_id"):
         return "parent_agent"
     if (
         tool_id in {"claude_code", "cursor"}
         and (
             is_conversation_subagent(tool_id, relative_path, metadata)
             or (
-                _metadata_flag_is_true((metadata or {}).get("is_subagent"))
+                _metadata_flag_is_true(values.get("is_subagent"))
                 and bool(
-                    (metadata or {}).get("parent_thread_id")
-                    or (metadata or {}).get("root_session_id")
+                    values.get("parent_thread_id")
+                    or values.get("root_session_id")
                 )
             )
         )
@@ -405,6 +776,18 @@ def fold_conversation_subagents(
             existing_children.append(child.document_id)
         subagent_document_ids[canonical_parent_id] = tuple(existing_children)
         subagent_counts[canonical_parent_id] = len(existing_children)
+
+    for child in refs:
+        values = child.metadata or {}
+        if str(values.get("orchestration") or "").strip() != "claw":
+            continue
+        if conversation_is_chain_primary(values):
+            continue
+        if str(values.get("orchestration_parent_document_id") or "").strip():
+            continue
+        if not _metadata_flag_is_true(values.get("is_subagent")):
+            continue
+        orphan_ids.add(child.document_id)
 
     return ConversationHierarchy(
         visible_document_ids=frozenset(visible_ids),

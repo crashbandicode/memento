@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "server"))
 
 from server.config import settings  # noqa: E402
+from server.services.conversation_hierarchy import (  # noqa: E402
+    clear_stale_briefing_keys_for_full_replacement,
+)
 from server.services.ingest_service import (  # noqa: E402
     MAX_DOCUMENT_METADATA_BYTES,
     MAX_STORED_MESSAGE_CHARS,
@@ -24,6 +27,7 @@ from server.services.ingest_service import (  # noqa: E402
     _json_size,
     _is_externalized_delta_update,
     _prepare_document_metadata,
+    _preserve_interaction_provenance,
 )
 from server.services.large_content_store import (  # noqa: E402
     DocumentContentIntegrityError,
@@ -282,6 +286,92 @@ class LargeContentStoreTests(unittest.TestCase):
         self.assertEqual(history, [{"text": "hello", "ts": 42}])
         self.assertEqual(first_prompt, "first")
         self.assertLessEqual(_json_size(metadata), MAX_DOCUMENT_METADATA_BYTES)
+
+    def test_handoff_first_user_message_persists_durable_briefing_marker(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        metadata, _history, first_prompt = _prepare_document_metadata(
+            {
+                "session_id": "successor",
+                "first_user_message": f"MEMENTO-HANDOFF-FROM: {parent_id}\nContinue.",
+            }
+        )
+
+        self.assertNotIn("first_user_message", metadata)
+        self.assertEqual(metadata["briefing_kind"], "handoff")
+        self.assertEqual(metadata["briefing_session_id"], parent_id)
+        self.assertTrue(first_prompt.startswith("MEMENTO-HANDOFF-FROM:"))
+
+    def test_full_replacement_clears_stale_briefing_keys_before_merge(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        existing_metadata = {
+            "session_id": "successor",
+            "briefing_kind": "handoff",
+            "briefing_session_id": parent_id,
+        }
+        stored, _history, first_prompt = _prepare_document_metadata(
+            {
+                "session_id": "successor",
+                "first_user_message": "ordinary replacement",
+            }
+        )
+        self.assertNotIn("briefing_kind", stored)
+        existing_metadata.pop("user_history", None)
+        existing_metadata.pop("first_user_message", None)
+        clear_stale_briefing_keys_for_full_replacement(
+            existing_metadata,
+            first_prompt,
+        )
+        metadata_update = {
+            **existing_metadata,
+            **_preserve_interaction_provenance(existing_metadata, stored),
+        }
+        merged, _, _ = _prepare_document_metadata(metadata_update)
+        self.assertNotIn("briefing_kind", merged)
+        self.assertNotIn("briefing_session_id", merged)
+
+    def test_full_replacement_overlays_new_briefing_marker_keys(self) -> None:
+        old_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        new_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        existing_metadata = {
+            "session_id": "successor",
+            "briefing_kind": "handoff",
+            "briefing_session_id": old_id,
+        }
+        stored, _history, first_prompt = _prepare_document_metadata(
+            {
+                "session_id": "successor",
+                "first_user_message": f"MEMENTO-TANGENT-FROM: {new_id}\nAsk.",
+            }
+        )
+        clear_stale_briefing_keys_for_full_replacement(
+            existing_metadata,
+            first_prompt,
+        )
+        metadata_update = {
+            **existing_metadata,
+            **_preserve_interaction_provenance(existing_metadata, stored),
+        }
+        merged, _, _ = _prepare_document_metadata(metadata_update)
+        self.assertEqual(merged["briefing_kind"], "tangent")
+        self.assertEqual(merged["briefing_session_id"], new_id)
+
+    def test_delta_without_first_user_preserves_durable_briefing_keys(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        existing_metadata = {
+            "session_id": "successor",
+            "briefing_kind": "handoff",
+            "briefing_session_id": parent_id,
+        }
+        stored, _history, first_prompt = _prepare_document_metadata(
+            {"session_id": "successor"}
+        )
+        self.assertEqual(first_prompt, "")
+        clear_stale_briefing_keys_for_full_replacement(
+            existing_metadata,
+            first_prompt,
+        )
+        self.assertEqual(existing_metadata["briefing_kind"], "handoff")
+        self.assertEqual(existing_metadata["briefing_session_id"], parent_id)
 
     def test_small_delta_preserves_externalized_full_snapshot(self) -> None:
         externalized = SimpleNamespace(content=None, content_s3_key="raw/job.txt")

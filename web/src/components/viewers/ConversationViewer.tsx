@@ -34,6 +34,7 @@ import {
   filterMetaConversationInteractions,
   isMetaConversationTool,
 } from "@/lib/conversation-tools";
+import { isParentAgentMessage } from "@/lib/conversation-origin";
 import AssistantIdentityBadge from "./AssistantIdentityBadge";
 import MarkdownViewer from "./MarkdownViewer";
 import SessionContextBody from "./SessionContextBody";
@@ -351,13 +352,7 @@ function isSubagentDispatchMessage(msg: ConversationMessage): boolean {
     || content.includes("\n[Subagent Context]");
 }
 
-function isParentAgentMessage(
-  msg: ConversationMessage,
-  userRoleOrigin?: "parent_agent" | null,
-): boolean {
-  return (msg.role || msg.message_type) === "user"
-    && (msg.origin === "parent_agent" || userRoleOrigin === "parent_agent");
-}
+export { isParentAgentMessage } from "@/lib/conversation-origin";
 
 type PairedQuestionResponse = {
   response: QuestionInteractionResponse;
@@ -2640,9 +2635,11 @@ function ConversationSearchBar({
                 <span style={{ color: result.role === "user" ? "var(--aurora-accent)" : "var(--aurora-success)" }}>
                   {result.role === "user"
                     ? (
-                        result.origin === "parent_agent" || userRoleOrigin === "parent_agent"
-                          ? t.conversation.parentAgent
-                          : t.searchPage.you
+                        result.origin === "human"
+                          ? t.searchPage.you
+                          : result.origin === "parent_agent" || (result.origin == null && userRoleOrigin === "parent_agent")
+                            ? t.conversation.parentAgent
+                            : t.searchPage.you
                       )
                     : t.searchPage.assistant}
                 </span>

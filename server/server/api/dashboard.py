@@ -14,6 +14,7 @@ from sqlalchemy import (
     cast,
     func,
     literal,
+    not_,
     or_,
     select,
     union_all,
@@ -69,6 +70,8 @@ from ..services.user_filter import user_machine_ids, apply_user_filter
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
+RECENT_PRIMARY_LIMIT = 20
+RECENT_CLAW_SAMPLE_LIMIT = 20
 
 
 @router.get("/spend")
@@ -251,6 +254,116 @@ def _row_metadata(row) -> dict:
     return metadata
 
 
+def _is_unlinked_claw_row(row) -> bool:
+    """True for orchestration=claw with no parent document id (Python twin of SQL).
+
+    Path-linked children (``/subagents/`` transcripts) are excluded: the
+    hierarchy fold links them under their parent regardless of orchestration
+    metadata, so counting them in the unlinked aggregate double-counts.
+    """
+    metadata = _row_metadata(row)
+    if str(metadata.get("orchestration") or "").strip().casefold() != "claw":
+        return False
+    if "/subagents/" in str(getattr(row, "relative_path", "") or "").replace("\\", "/"):
+        return False
+    return not str(metadata.get("orchestration_parent_document_id") or "").strip()
+
+
+def _unlinked_claw_hierarchy_sql(hierarchy_metadata, relative_path):
+    """Unlinked-claw predicate over dashboard hierarchy_metadata JSONB."""
+    orchestration = func.lower(
+        func.coalesce(hierarchy_metadata["orchestration"].astext, "")
+    )
+    parent = func.coalesce(
+        hierarchy_metadata["orchestration_parent_document_id"].astext,
+        "",
+    )
+    return and_(
+        orchestration == "claw",
+        parent == "",
+        not_(func.coalesce(relative_path, "").like("%/subagents/%")),
+    )
+
+
+def corrected_claw_delegate_count(
+    raw_count: int,
+    loaded_rows,
+    visible_document_ids,
+    attention_ids: set,
+) -> int:
+    """Reconcile the independent SQL aggregate with rendered group membership.
+
+    The COUNT(*) cannot see hierarchy folding (a delegate represented under
+    its parent) or attention elevation (a delegate rendered as an Attention
+    card); both remove rows from the rendered Claw group, so every loaded
+    unlinked-claw row in either state is subtracted. Rows beyond the candidate
+    cap are by construction unloaded and therefore neither folded nor
+    elevated.
+    """
+    removed = sum(
+        1
+        for row in loaded_rows
+        if _is_unlinked_claw_row(row)
+        and (
+            row.id not in visible_document_ids
+            or row.id in attention_ids
+        )
+    )
+    return max(0, int(raw_count) - removed)
+
+
+def partition_dashboard_candidates_before_limit(
+    rows,
+    *,
+    activity_key,
+    candidate_limit: int = DASHBOARD_CONVERSATION_CANDIDATE_LIMIT,
+    claw_sample_limit: int = RECENT_CLAW_SAMPLE_LIMIT,
+):
+    """Split unlinked claws from primaries before the 600-row candidate cap.
+
+    Mirrors the SQL used by ``get_dashboard``: unlinked claws are counted and
+    sampled independently so delegate volume cannot drown primary rows.
+    """
+    ordered = sorted(rows, key=activity_key, reverse=True)
+    unlinked = [row for row in ordered if _is_unlinked_claw_row(row)]
+    primaries = [row for row in ordered if not _is_unlinked_claw_row(row)]
+    return {
+        "primary_candidates": primaries[:candidate_limit],
+        "claw_count": len(unlinked),
+        "claw_sample": unlinked[:claw_sample_limit],
+    }
+
+
+def _select_recent_conversation_rows(
+    visible_convo_rows,
+    attention_ids: set,
+    activity_key,
+    *,
+    primary_limit: int = RECENT_PRIMARY_LIMIT,
+    claw_sample_limit: int = RECENT_CLAW_SAMPLE_LIMIT,
+):
+    """Partition unlinked Claw rows before applying the Recent primary budget."""
+    attention_rows = [
+        row for row in visible_convo_rows if row.id in attention_ids
+    ]
+    recent_rows = [
+        row for row in visible_convo_rows if row.id not in attention_ids
+    ]
+    # Group membership must match the aggregate-count predicate exactly:
+    # linked/path-linked claw rows that remain visible render as ordinary
+    # rows, never as uncounted members of the aggregate group.
+    claw_rows = [row for row in recent_rows if _is_unlinked_claw_row(row)]
+    primary_rows = [
+        row for row in recent_rows if not _is_unlinked_claw_row(row)
+    ]
+    convos_rows = (
+        sorted(attention_rows, key=activity_key, reverse=True)
+        + sorted(primary_rows, key=activity_key, reverse=True)[:primary_limit]
+        + sorted(claw_rows, key=activity_key, reverse=True)[:claw_sample_limit]
+    )
+    return convos_rows, len(claw_rows)
+
+
 @router.get("")
 async def get_dashboard(
     device_id: str | None = None,
@@ -368,15 +481,50 @@ async def get_dashboard(
         source.c.source_modified_at,
         source.c.synced_at,
     )
+    unlinked_claw = _unlinked_claw_hierarchy_sql(
+        source.c.hierarchy_metadata,
+        source.c.relative_path,
+    )
     recent_convos_q = (
         select(*conversation_columns)
         .outerjoin(Project, source.c.project_id == Project.id)
-        .where(_unarchived_conversation_filter(source))
+        .where(
+            _unarchived_conversation_filter(source),
+            not_(unlinked_claw),
+        )
         .order_by(activity_expr.desc(), source.c.id.desc())
         .limit(DASHBOARD_CONVERSATION_CANDIDATE_LIMIT)
     )
     candidate_rows = list(
         (await db.execute(scoped(recent_convos_q))).all()
+    )
+    claw_delegate_count = int(
+        (
+            await db.execute(
+                scoped(
+                    select(func.count())
+                    .select_from(source)
+                    .where(
+                        _unarchived_conversation_filter(source),
+                        unlinked_claw,
+                    )
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    claw_sample_q = (
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
+        .where(
+            _unarchived_conversation_filter(source),
+            unlinked_claw,
+        )
+        .order_by(activity_expr.desc(), source.c.id.desc())
+        .limit(RECENT_CLAW_SAMPLE_LIMIT)
+    )
+    claw_sample_rows = list(
+        (await db.execute(scoped(claw_sample_q))).all()
     )
 
     attention_convos_q = (
@@ -389,6 +537,8 @@ async def get_dashboard(
     )
     rows_by_id = {row.id: row for row in candidate_rows}
     for row in (await db.execute(scoped(attention_convos_q))).all():
+        rows_by_id[row.id] = row
+    for row in claw_sample_rows:
         rows_by_id[row.id] = row
     candidate_rows = list(rows_by_id.values())
 
@@ -515,12 +665,16 @@ async def get_dashboard(
         if pending_question_counts.get(row.id, 0) > 0
     ]
     attention_ids = {row.id for row in attention_rows}
-    recent_rows = [
-        row for row in visible_convo_rows if row.id not in attention_ids
-    ]
-    convos_rows = (
-        sorted(attention_rows, key=activity_key, reverse=True)
-        + sorted(recent_rows, key=activity_key, reverse=True)[:20]
+    claw_delegate_count = corrected_claw_delegate_count(
+        claw_delegate_count,
+        all_convo_rows,
+        conversation_hierarchy.visible_document_ids,
+        attention_ids,
+    )
+    convos_rows, _sampled_claw_count = _select_recent_conversation_rows(
+        visible_convo_rows,
+        attention_ids,
+        activity_key,
     )
 
     # Only temporary legacy rows fall back to message aggregation. Once the
@@ -590,6 +744,14 @@ async def get_dashboard(
             "message_count": total,
             "pending_question_count": pending_question_counts.get(row.id, 0),
             "agent_mode": row.agent_mode or "",
+            "orchestration": (
+                str(_row_metadata(row).get("orchestration") or "").strip()
+                or None
+            ),
+            # Group membership flag: matches the aggregate-count predicate
+            # exactly (unlinked, not path-linked). Linked claw rows render as
+            # ordinary rows and must not be re-grouped client-side.
+            "claw_delegate": _is_unlinked_claw_row(row),
             "subagent_count": conversation_hierarchy.subagent_counts.get(
                 row.id,
                 0,
@@ -694,6 +856,7 @@ async def get_dashboard(
     return {
         "tools": tools,
         "recent_conversations": recent_conversations,
+        "claw_delegate_count": claw_delegate_count,
         "daily": daily,
         "tool_daily": tool_daily,
         "devices": devices,

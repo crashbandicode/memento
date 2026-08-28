@@ -950,6 +950,22 @@ def reduce_writer_state(
         ordinal += 1
         line_number += 1
     usage_rows.extend(_drain_assistant_usage_rows(view, tool_id, assistant_identity))
+    if new_document:
+        from .conversation_hierarchy import conversation_briefing_kind
+
+        first_user_content = next(
+            (item.content for item in mutations if item.role == "user"),
+            "",
+        )
+        if conversation_briefing_kind(first_user_content) == "delegate":
+            # The normalized path reconciles a delegate marker with existing
+            # orchestration records and mirrors that result into all three
+            # projections.  The raw reducer has no equivalent relational
+            # reconciliation, so it must decline this semantic shape before
+            # any mutation rather than commit an unlinked child view.
+            raise RawWriterUnsupported(
+                "claw delegate marker needs legacy reducer"
+            )
     _reconcile_live_interaction_signals(view, canonical_interaction_ids, clear_all=False)
     _reconcile_live_shell_activities(view, terminal_tool_ids)
     _store_pending_question_ids(view, pending_ids)
@@ -1467,6 +1483,16 @@ async def _apply(
         file_size_bytes=mutation.delivery_values["file_size_bytes"],
     ), {
         "event_type": "file_synced", "user_id": str(user_id) if user_id else None,
+        # The legacy reconciler republishes a delegate's hierarchy metadata on
+        # every advancing revision. Preserve that cache invalidation when a
+        # later DELTA is safely handled by the raw writer.
+        "claw_delegate_metadata": (
+            str(
+                mutation.delivery_values["metadata"].get("orchestration")
+                or ""
+            ).strip()
+            == "claw"
+        ),
         "cache": {
             "daily": mutation.mode == "full" or activity_advanced,
             "project": project_activity_changed,

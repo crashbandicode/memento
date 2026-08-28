@@ -637,6 +637,26 @@ class CursorStructuredToolStorageTests(unittest.TestCase):
         self.assertEqual(stored_calls, parsed_calls)
         self.assertEqual(parsed_calls[1]["interaction"]["questions"][0]["id"], "ship")
 
+    def test_ingest_metadata_persists_message_origin(self) -> None:
+        human = NormalizedMessage(
+            role="user",
+            content="Typed follow-up",
+            message_origin="human",
+        )
+        parent = NormalizedMessage(
+            role="user",
+            content="Injected briefing",
+            message_origin="parent_agent",
+        )
+        unset = NormalizedMessage(role="user", content="No entrypoint")
+
+        self.assertEqual(_conversation_message_metadata(human)["message_origin"], "human")
+        self.assertEqual(
+            _conversation_message_metadata(parent)["message_origin"],
+            "parent_agent",
+        )
+        self.assertNotIn("message_origin", _conversation_message_metadata(unset))
+
     def test_db_fallback_rejects_malformed_metadata_safely(self) -> None:
         self.assertEqual(_stored_tool_calls(None), [])
         self.assertEqual(_stored_tool_calls({"tool_calls": "not-an-array"}), [])

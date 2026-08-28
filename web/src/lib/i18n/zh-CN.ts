@@ -117,6 +117,8 @@ const zhCN = {
     weeklyActivity: "近 7 日活动",
     needsAttention: "需要处理",
     recentConversations: "最近对话",
+    clawDelegatedAgent: "Claw · {count} 个委派代理",
+    clawDelegatedAgents: "Claw · {count} 个委派代理",
   },
 
   // Tools

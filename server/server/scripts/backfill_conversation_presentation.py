@@ -18,7 +18,12 @@ from datetime import datetime
 from sqlalchemy import delete, exists, func, or_, select, text, update
 from sqlalchemy.orm import load_only
 
-from server.db.models import ConversationMessage, Document, DocumentEmbedding
+from server.db.models import (
+    ConversationMessage,
+    ConversationReadModel,
+    Document,
+    DocumentEmbedding,
+)
 from server.db.session import async_session_factory, engine
 from server.services.conversation_parser import (
     _extract_local_command,
@@ -96,6 +101,11 @@ class BackfillStats:
     preserved_manual_cursor_titles: int = 0
     refreshed_activity_documents: int = 0
     updated_activity_documents: int = 0
+    scanned_claude_origin_records: int = 0
+    updated_message_origin: int = 0
+    preserved_message_origin: int = 0
+    unmatched_claude_origin_records: int = 0
+    refreshed_prompt_projections: int = 0
 
     def add(self, other: "BackfillStats") -> None:
         for field in fields(self):
@@ -589,6 +599,144 @@ async def _repair_claude_context_batch(
     return stats
 
 
+def _claude_user_origin_records(
+    raw_content: str,
+) -> tuple[dict[str, str], dict[tuple[str, str], str], int]:
+    """Recompute Claude user-message origins from stored raw JSONL.
+
+    Returns ``(by_source_id, by_content_timestamp, record_count)``. An empty
+    origin string means the raw record had no ``sdk-cli``/``cli`` entrypoint.
+    """
+    by_source: dict[str, str] = {}
+    by_identity: dict[tuple[str, str], str] = {}
+    records = 0
+    for raw_object in _iter_json_objects(raw_content):
+        try:
+            obj = json.loads(raw_object)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "user":
+            continue
+        parsed = parse_conversation_line(raw_object, "claude_code")
+        if parsed is None or parsed.role != "user":
+            continue
+        records += 1
+        origin = parsed.message_origin or ""
+        if parsed.source_id:
+            by_source[str(parsed.source_id)] = origin
+        clean_content = _bounded_message_text(
+            strip_terminal_sequences(parsed.content).replace("\x00", ""),
+            MAX_STORED_MESSAGE_CHARS,
+        )
+        by_identity[(clean_content, _timestamp_bucket(parsed.timestamp))] = origin
+    return by_source, by_identity, records
+
+
+async def _repair_claude_message_origin_batch(
+    db,
+    document_ids: list,
+) -> BackfillStats:
+    """Stamp stored Claude user rows with per-record message_origin."""
+    stats = BackfillStats()
+    rows = await db.execute(
+        select(Document)
+        .options(load_only(
+            Document.id,
+            Document.content_s3_key,
+            Document.content_object_sha256,
+            Document.content_object_size_bytes,
+            Document.content_object_verified_at,
+        ))
+        .where(Document.id.in_(document_ids))
+        .with_for_update(of=Document)
+    )
+    origins_by_document: dict = {}
+    for document in rows.scalars().all():
+        raw_content = await document_content(db, document)
+        if not raw_content:
+            origins_by_document[document.id] = ({}, {}, 0)
+            continue
+        by_source, by_identity, record_count = _claude_user_origin_records(
+            raw_content,
+        )
+        origins_by_document[document.id] = (by_source, by_identity, record_count)
+        stats.scanned_claude_origin_records += record_count
+
+    message_rows = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.document_id.in_(document_ids),
+            ConversationMessage.role == "user",
+        )
+        .order_by(
+            ConversationMessage.document_id,
+            ConversationMessage.line_number,
+            ConversationMessage.id,
+        )
+        .with_for_update(of=ConversationMessage)
+    )
+    matched_source_ids: dict = defaultdict(set)
+    matched_identities: dict = defaultdict(set)
+    changed_by_document: dict = defaultdict(list)
+    for message in message_rows.scalars():
+        by_source, by_identity, _record_count = origins_by_document.get(
+            message.document_id,
+            ({}, {}, 0),
+        )
+        metadata = dict(message.metadata_ or {})
+        source_id = str(metadata.get("source_id") or "")
+        identity = (
+            message.content or "",
+            _timestamp_bucket(message.timestamp),
+        )
+        if source_id and source_id in by_source:
+            origin = by_source[source_id]
+            matched_source_ids[message.document_id].add(source_id)
+        elif identity in by_identity:
+            origin = by_identity[identity]
+            matched_identities[message.document_id].add(identity)
+        else:
+            continue
+        current = str(metadata.get("message_origin") or "")
+        if origin:
+            if current == origin:
+                stats.preserved_message_origin += 1
+                continue
+            metadata["message_origin"] = origin
+        else:
+            if "message_origin" not in metadata:
+                stats.preserved_message_origin += 1
+                continue
+            metadata.pop("message_origin", None)
+        message.metadata_ = metadata
+        stats.updated_message_origin += 1
+        changed_by_document[message.document_id].append(message)
+
+    stats.unmatched_claude_origin_records = sum(
+        (len(by_source) - len(matched_source_ids.get(document_id, set())))
+        if by_source
+        else (len(by_identity) - len(matched_identities.get(document_id, set())))
+        for document_id, (by_source, by_identity, _count)
+        in origins_by_document.items()
+    )
+    await db.flush()
+    if changed_by_document:
+        from server.services.conversation_read_model import _refresh_prompt_projections
+
+        for document_id, messages in changed_by_document.items():
+            await _refresh_prompt_projections(
+                db,
+                document_id,
+                messages,
+                replace=False,
+            )
+            projection = await db.get(ConversationReadModel, document_id)
+            if projection is not None:
+                projection.generation = int(projection.generation or 1) + 1
+            stats.refreshed_prompt_projections += 1
+    return stats
+
+
 async def _set_batch_timeouts(db) -> None:
     await db.execute(text("SET LOCAL statement_timeout = '25min'"))
     await db.execute(
@@ -965,6 +1113,15 @@ async def backfill(
                 await _set_batch_timeouts(db)
                 batch = claude_document_ids[offset:offset + batch_size]
                 stats.add(await _repair_claude_context_batch(db, batch))
+                if dry_run:
+                    await db.rollback()
+                else:
+                    await db.commit()
+
+            for offset in range(0, len(claude_document_ids), batch_size):
+                await _set_batch_timeouts(db)
+                batch = claude_document_ids[offset:offset + batch_size]
+                stats.add(await _repair_claude_message_origin_batch(db, batch))
                 if dry_run:
                     await db.rollback()
                 else:

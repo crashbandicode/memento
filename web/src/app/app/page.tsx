@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useI18n } from "@/lib/i18n";
+import { useI18n, fmt } from "@/lib/i18n";
 import { getApiBase, authFetch } from "@/lib/api-client";
 import { eventInvalidatesDashboard } from "@/lib/realtime-events";
 import { useSSE } from "@/lib/use-sse";
@@ -14,6 +14,7 @@ import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora
 import LowActivitySection from "@/components/conversations/LowActivitySection";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import SpendDashboard from "@/components/dashboard/SpendDashboard";
+import { clawDelegateGroupCount, partitionDashboardRecent } from "@/lib/dashboard-recent";
 
 interface DashboardData {
   tools: {
@@ -38,7 +39,10 @@ interface DashboardData {
     subagent_count?: number;
     is_subagent_orphan?: boolean;
     is_low_activity: boolean;
+    orchestration?: string | null;
+    claw_delegate?: boolean;
   }[];
+  claw_delegate_count?: number;
   daily: { date: string; count: number }[];
   tool_daily: Record<string, { date: string; count: number }[]>;
   devices: {
@@ -195,14 +199,16 @@ export default function Dashboard() {
     ...new Map(data.recent_conversations.map((item) => [item.id, item])).values(),
   ];
   const maxDaily = Math.max(...daily.map((d) => d.count), 1);
-  const attentionConversations = recent_conversations
-    .filter((conversation) => (conversation.pending_question_count || 0) > 0);
-  const attentionIds = new Set(attentionConversations.map((conversation) => conversation.id));
-  const activeRecentConversations = recent_conversations
-    .filter((conversation) => !conversation.is_low_activity && !attentionIds.has(conversation.id))
-    .slice(0, 10);
-  const lowActivityConversations = recent_conversations
-    .filter((conversation) => conversation.is_low_activity && !attentionIds.has(conversation.id));
+  const {
+    attention: attentionConversations,
+    active: activeRecentConversations,
+    lowActivity: lowActivityConversations,
+    clawDelegates: clawDelegateConversations,
+  } = partitionDashboardRecent(recent_conversations);
+  const clawDelegateCount = clawDelegateGroupCount(
+    clawDelegateConversations,
+    data.claw_delegate_count,
+  );
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -437,6 +443,12 @@ export default function Dashboard() {
                       isSubagentOrphan={conv.is_subagent_orphan}
                     />
                   ))}
+                  {clawDelegateCount > 0 && (
+                    <ClawDelegateGroup
+                      conversations={clawDelegateConversations}
+                      count={clawDelegateCount}
+                    />
+                  )}
                   <LowActivitySection
                     compact
                     count={lowActivityConversations.length}
@@ -570,6 +582,90 @@ memento-collector setup`}
           </pre>
         </Glass>
       )}
+    </div>
+  );
+}
+
+function ClawDelegateGroup({
+  conversations,
+  count,
+}: {
+  conversations: DashboardData["recent_conversations"];
+  count: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const { t } = useI18n();
+  const label = fmt(
+    count === 1 ? t.dashboard.clawDelegatedAgent : t.dashboard.clawDelegatedAgents,
+    { count },
+  );
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        aria-expanded={open}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          width: "100%",
+          padding: "10px 12px",
+          border: 0,
+          borderRadius: 14,
+          background: hovered ? "var(--aurora-chip)" : "transparent",
+          transition: "background .15s",
+          cursor: "pointer",
+          textAlign: "left",
+          color: "inherit",
+        }}
+      >
+        <span
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "var(--aurora-chip)",
+            color: "var(--aurora-accent)",
+          }}
+        >
+          <Icon name="command" size={14} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: 13,
+              fontWeight: 500,
+              color: "var(--aurora-fg1)",
+              letterSpacing: "-0.01em",
+            }}
+          >
+            {label}
+          </div>
+        </div>
+        <Icon name={open ? "chevron_up" : "chevron_down"} size={14} style={{ color: "var(--aurora-fg4)" }} />
+      </button>
+      {open && conversations.map((conv) => (
+        <RecentRow
+          key={conv.id}
+          toolId={conv.tool_id}
+          title={conv.title || "Untitled"}
+          subtitle={[
+            conv.project_title,
+            `${conv.message_count} msg`,
+            timeAgo(conv.activity_at || conv.synced_at),
+          ].filter(Boolean).join(" · ")}
+          href={`/conversations/${conv.id}`}
+          subagentCount={conv.subagent_count}
+          isSubagentOrphan={conv.is_subagent_orphan}
+        />
+      ))}
     </div>
   );
 }
