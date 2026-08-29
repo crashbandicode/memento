@@ -141,3 +141,21 @@ worktree before being accepted as baseline: the default-flag test failed with
 - Verify the golden fixture is additive: the new named sequence isolates
   lifecycle metadata and `active`/`is_subagent` lineage rows, without
   re-baselining existing keys.
+
+## Follow-up notes
+
+### F2 — final deferred search-document parity
+
+The deferred Claude parity fixture now snapshots `documents.content_tsv::text`
+after `process_pending_candidates` applies the queued search candidate. Its
+dedicated `claude_deferred_search_document` golden key asserts the resulting
+document content, not merely candidate enqueueing or search invalidation. The
+golden addition was inserted without modifying any existing fixture line.
+
+### F3 — outbox retention-volume observability
+
+The long-lived projector now emits one INFO line every 60 seconds with the
+number of completed candidates pruned during that window plus the current
+total and actionable-pending outbox counts. The count query runs only at that
+window boundary after the prune transaction work, never on every poll cycle;
+targeted projector calls do not contribute a misleading global-volume sample.

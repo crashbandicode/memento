@@ -915,6 +915,66 @@ async def test_projector_prunes_completed_candidates_without_touching_pending(
 
 
 @pytest.mark.asyncio
+async def test_projector_logs_windowed_outbox_volume(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Outbox volume is counted once per INFO window, not per poll cycle."""
+    import server.services.realtime_ingest_projector as projector_module
+
+    clock = [0.0]
+    volume_calls: list[object] = []
+    commits: list[None] = []
+
+    class FakeSession:
+        async def commit(self) -> None:
+            commits.append(None)
+
+    class FakeSessionContext:
+        async def __aenter__(self) -> FakeSession:
+            return FakeSession()
+
+        async def __aexit__(self, *_args) -> bool:
+            return False
+
+    class FakeSessionFactory:
+        def __call__(self) -> FakeSessionContext:
+            return FakeSessionContext()
+
+    async def fake_process(*_args, **_kwargs) -> list[dict[str, object]]:
+        return []
+
+    async def fake_prune(*_args, **_kwargs) -> int:
+        return 2
+
+    async def fake_volume(db) -> tuple[int, int]:
+        volume_calls.append(db)
+        return 11, 4
+
+    monkeypatch.setattr(projector_module, "process_pending_candidates", fake_process)
+    monkeypatch.setattr(
+        projector_module, "prune_completed_projection_candidates", fake_prune
+    )
+    monkeypatch.setattr(projector_module, "projection_candidate_volume", fake_volume)
+    caplog.set_level("INFO", logger="realtime_ingest_projector")
+    projector = RealtimeIngestProjector(
+        session_factory=FakeSessionFactory(), clock=lambda: clock[0]
+    )
+
+    assert await projector.run_once() == []
+    assert volume_calls == []
+
+    clock[0] = 60.0
+    assert await projector.run_once() == []
+
+    assert len(volume_calls) == 1
+    assert len(commits) == 2
+    assert [record.getMessage() for record in caplog.records] == [
+        "Realtime ingest projector outbox: 4 pruned, 11 rows, 4 pending over 60.0s"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runtime_migrations_do_not_replace_current_projection_kind_constraint(
     session_factory,
 ) -> None:

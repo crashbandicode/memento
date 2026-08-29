@@ -34,6 +34,10 @@ class RawWriterCommitUncertain(RuntimeError):
     """COMMIT was attempted but its durable outcome could not be proven."""
 
 
+class _HistoryTimelineRequired(RuntimeError):
+    """The Codex history planner needs its full persisted-row view."""
+
+
 @dataclass(frozen=True, slots=True)
 class RawDocument:
     id: uuid.UUID
@@ -59,6 +63,7 @@ class WriterState:
     recovered_history: tuple[SimpleNamespace, ...] = ()
     ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
     history_timeline_rows: tuple[SimpleNamespace, ...] = ()
+    history_timeline_loaded: bool = False
 
 
 @dataclass(slots=True)
@@ -233,6 +238,7 @@ async def _load_state(
     relative_path: str,
     cursor_state_delta: bool,
     load_recovered_history: bool = False,
+    load_history_timeline: bool = False,
 ) -> WriterState:
     # Raw selection intentionally retains the normal path's machine/owner
     # scope.  The source advisory lock has already serialized this identity.
@@ -301,7 +307,15 @@ async def _load_state(
             relative_path,
             machine_id,
         )
-        return WriterState(None, None, _record(sync), None, None, None)
+        return WriterState(
+            None,
+            None,
+            _record(sync),
+            None,
+            None,
+            None,
+            history_timeline_loaded=load_history_timeline,
+        )
     doc = dict(document)
     sync = doc.pop("sync_row")
     read_model = doc.pop("read_model_row")
@@ -348,7 +362,7 @@ async def _load_state(
     recovered_history: tuple[SimpleNamespace, ...] = ()
     ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
     history_timeline_rows: tuple[SimpleNamespace, ...] = ()
-    if load_recovered_history:
+    if load_recovered_history or load_history_timeline:
         recovered_rows = await connection.fetch(
             """
             SELECT id, document_id, line_number, message_type, role, content,
@@ -375,19 +389,20 @@ async def _load_state(
             document_id,
         )
         ordinary_user_rows = tuple(_message_view(row) for row in source_user_rows)
-        timeline_rows = await connection.fetch(
-            """
-            SELECT id, document_id, line_number, message_type, role, content,
-                   metadata, timestamp
-            FROM conversation_messages
-            WHERE document_id = $1
-            ORDER BY line_number, id
-            """,
-            document_id,
-        )
-        history_timeline_rows = tuple(
-            _message_view(row) for row in timeline_rows
-        )
+        if load_history_timeline:
+            timeline_rows = await connection.fetch(
+                """
+                SELECT id, document_id, line_number, message_type, role, content,
+                       metadata, timestamp
+                FROM conversation_messages
+                WHERE document_id = $1
+                ORDER BY line_number, id
+                """,
+                document_id,
+            )
+            history_timeline_rows = tuple(
+                _message_view(row) for row in timeline_rows
+            )
     return WriterState(
         doc,
         {
@@ -408,6 +423,7 @@ async def _load_state(
         recovered_history,
         ordinary_user_rows,
         history_timeline_rows,
+        load_history_timeline,
     )
 
 
@@ -1443,13 +1459,27 @@ def reduce_writer_state(
     history_reconciled = False
     if has_history_metadata:
         if tool_id == "codex" and settings.realtime_ingest_raw_codex_history:
-            history_reconciled = _plan_codex_history_mutations(
-                state,
-                history=incoming_history,
-                first_user_message=incoming_first_user_message,
-                prospective_mutations=mutations,
-                source_modified_at=document_source_at,
-            )
+            if not state.history_timeline_loaded:
+                # The same bounded recovered/ordinary-user view that proves
+                # flag-off no-ops can prove the raw-on resend is a no-op too.
+                # Only a history shape which will actually merge needs the
+                # complete timeline used for collision-safe line placement.
+                if not _history_metadata_is_already_committed(
+                    state,
+                    tool_id=tool_id,
+                    history=incoming_history,
+                    first_user_message=incoming_first_user_message,
+                    prospective_mutations=mutations,
+                ):
+                    raise _HistoryTimelineRequired
+            else:
+                history_reconciled = _plan_codex_history_mutations(
+                    state,
+                    history=incoming_history,
+                    first_user_message=incoming_first_user_message,
+                    prospective_mutations=mutations,
+                    source_modified_at=document_source_at,
+                )
             # Legacy treats a recovery-row addition, removal, or relocation as
             # a full read/search projection refresh.  The raw path uses this
             # signal both for the projection mode and for its conservative
@@ -2261,14 +2291,34 @@ async def ingest_conversation_raw(
                         or metadata.get("first_user_message")
                     ),
                 )
-                mutation = reduce_writer_state(
-                    state, tool_id=tool_id, category=category, content_type=content_type,
-                    relative_path=relative_path, content=content, content_hash=content_hash,
-                    file_size=file_size, mode=mode, offset=offset, metadata=metadata,
-                    timestamp=timestamp, machine_id=machine, user_id=owner, base_hash=base_hash,
-                    base_offset=base_offset, authoritative_rebase=authoritative_rebase,
-                    had_sensitive=had_sensitive,
-                )
+                try:
+                    mutation = reduce_writer_state(
+                        state, tool_id=tool_id, category=category, content_type=content_type,
+                        relative_path=relative_path, content=content, content_hash=content_hash,
+                        file_size=file_size, mode=mode, offset=offset, metadata=metadata,
+                        timestamp=timestamp, machine_id=machine, user_id=owner, base_hash=base_hash,
+                        base_offset=base_offset, authoritative_rebase=authoritative_rebase,
+                        had_sensitive=had_sensitive,
+                    )
+                except _HistoryTimelineRequired:
+                    state = await _load_state(
+                        connection,
+                        machine_id=machine,
+                        user_id=owner,
+                        tool_id=tool_id,
+                        relative_path=relative_path,
+                        cursor_state_delta=cursor_state_delta,
+                        load_recovered_history=True,
+                        load_history_timeline=True,
+                    )
+                    mutation = reduce_writer_state(
+                        state, tool_id=tool_id, category=category, content_type=content_type,
+                        relative_path=relative_path, content=content, content_hash=content_hash,
+                        file_size=file_size, mode=mode, offset=offset, metadata=metadata,
+                        timestamp=timestamp, machine_id=machine, user_id=owner, base_hash=base_hash,
+                        base_offset=base_offset, authoritative_rebase=authoritative_rebase,
+                        had_sensitive=had_sensitive,
+                    )
                 result, event = await _apply(
                     connection, state=state, mutation=mutation, tool_id=tool_id,
                     category=category, content_type=content_type, relative_path=relative_path,
@@ -2519,6 +2569,10 @@ async def ingest_conversation_raw_chain(
                     # Re-read scalar state inside the still-open transaction.
                     # PostgreSQL exposes our own writes, preserving exact
                     # one-by-one reducer semantics without ORM hydration.
+                    frame_has_history_metadata = bool(
+                        frame["metadata"].get("user_history")
+                        or frame["metadata"].get("first_user_message")
+                    )
                     if preloaded_state is not None:
                         state = preloaded_state
                         preloaded_state = None
@@ -2530,29 +2584,61 @@ async def ingest_conversation_raw_chain(
                             tool_id=tool_id,
                             relative_path=relative_path,
                             cursor_state_delta=cursor_state_delta,
-                            load_recovered_history=load_recovered_history,
+                            load_recovered_history=frame_has_history_metadata,
+                        )
+                    try:
+                        mutation = reduce_writer_state(
+                            state,
+                            tool_id=tool_id,
+                            category=category,
+                            content_type=content_type,
+                            relative_path=relative_path,
+                            content=frame["content"],
+                            content_hash=str(frame["content_hash"]),
+                            file_size=int(frame["file_size"]),
+                            mode="delta",
+                            offset=int(frame["offset"]),
+                            metadata=frame["metadata"],
+                            timestamp=frame.get("timestamp"),
+                            machine_id=machine,
+                            user_id=owner,
+                            base_hash=frame.get("base_hash"),
+                            base_offset=frame.get("base_offset"),
+                            authoritative_rebase=False,
+                            had_sensitive=bool(frame["had_sensitive"]),
+                        )
+                    except _HistoryTimelineRequired:
+                        state = await _load_state(
+                            connection,
+                            machine_id=machine,
+                            user_id=owner,
+                            tool_id=tool_id,
+                            relative_path=relative_path,
+                            cursor_state_delta=cursor_state_delta,
+                            load_recovered_history=True,
+                            load_history_timeline=True,
+                        )
+                        mutation = reduce_writer_state(
+                            state,
+                            tool_id=tool_id,
+                            category=category,
+                            content_type=content_type,
+                            relative_path=relative_path,
+                            content=frame["content"],
+                            content_hash=str(frame["content_hash"]),
+                            file_size=int(frame["file_size"]),
+                            mode="delta",
+                            offset=int(frame["offset"]),
+                            metadata=frame["metadata"],
+                            timestamp=frame.get("timestamp"),
+                            machine_id=machine,
+                            user_id=owner,
+                            base_hash=frame.get("base_hash"),
+                            base_offset=frame.get("base_offset"),
+                            authoritative_rebase=False,
+                            had_sensitive=bool(frame["had_sensitive"]),
                         )
                     last_state = state
-                    mutation = reduce_writer_state(
-                        state,
-                        tool_id=tool_id,
-                        category=category,
-                        content_type=content_type,
-                        relative_path=relative_path,
-                        content=frame["content"],
-                        content_hash=str(frame["content_hash"]),
-                        file_size=int(frame["file_size"]),
-                        mode="delta",
-                        offset=int(frame["offset"]),
-                        metadata=frame["metadata"],
-                        timestamp=frame.get("timestamp"),
-                        machine_id=machine,
-                        user_id=owner,
-                        base_hash=frame.get("base_hash"),
-                        base_offset=frame.get("base_offset"),
-                        authoritative_rebase=False,
-                        had_sensitive=bool(frame["had_sensitive"]),
-                    )
                     result, event = await _apply(
                         connection,
                         state=state,

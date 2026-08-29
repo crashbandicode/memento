@@ -33,6 +33,7 @@ KIND_SUBAGENT_LIFECYCLE = "subagent_lifecycle"
 NOTIFY_CHANNEL = "memento_ingest_projections"
 MAX_GROUPS_PER_CYCLE = 64
 PROJECTOR_LOCK_KEY = b"memento:ingest-projector:v1"
+OUTBOX_VOLUME_LOG_INTERVAL_SECONDS = 60.0
 
 
 def deferred_projections_enabled() -> bool:
@@ -510,6 +511,31 @@ async def prune_completed_projection_candidates(
     return len(tuple(deleted))
 
 
+async def projection_candidate_volume(
+    db: AsyncSession,
+) -> tuple[int, int]:
+    """Return the current total and actionable durable-outbox row counts.
+
+    The projector calls this only once per observability window, never in its
+    normal poll path. Pending matches the same actionable predicate used by
+    the drainer rather than all incomplete historical rows.
+    """
+    from ..db.models import IngestProjectionCandidate
+
+    total, pending = (
+        await db.execute(
+            select(
+                func.count(IngestProjectionCandidate.id),
+                func.count(IngestProjectionCandidate.id).filter(
+                    IngestProjectionCandidate.completed_at.is_(None),
+                    IngestProjectionCandidate.superseded_at.is_(None),
+                ),
+            )
+        )
+    ).one()
+    return int(total or 0), int(pending or 0)
+
+
 async def _publish_projection_event(
     db: AsyncSession,
     *,
@@ -699,6 +725,8 @@ class RealtimeIngestProjector:
         self._wake = asyncio.Event()
         self._retry_after: dict[tuple[uuid.UUID, str], float] = {}
         self._attempts: dict[tuple[uuid.UUID, str], int] = {}
+        self._outbox_window_started_at = self._clock()
+        self._pruned_in_outbox_window = 0
 
     def stop(self) -> None:
         self._stopping.set()
@@ -722,6 +750,12 @@ class RealtimeIngestProjector:
     ) -> list[dict[str, Any]]:
         now = self._clock()
         skip = {pair for pair, when in self._retry_after.items() if when > now}
+        volume_due = (
+            document_ids is None
+            and now - self._outbox_window_started_at
+            >= OUTBOX_VOLUME_LOG_INTERVAL_SECONDS
+        )
+        outbox_volume: tuple[int, int] | None = None
         factory = self._factory()
         async with factory() as session:
             results = await process_pending_candidates(
@@ -730,9 +764,26 @@ class RealtimeIngestProjector:
             pruned = await prune_completed_projection_candidates(
                 session, document_ids=document_ids
             )
+            if volume_due:
+                outbox_volume = await projection_candidate_volume(session)
             await session.commit()
         if pruned:
             logger.debug("Pruned %s completed ingest projection candidates", pruned)
+        if document_ids is None:
+            self._pruned_in_outbox_window += pruned
+        if outbox_volume is not None:
+            row_count, pending_count = outbox_volume
+            elapsed = max(0.0, now - self._outbox_window_started_at)
+            logger.info(
+                "Realtime ingest projector outbox: %s pruned, %s rows, "
+                "%s pending over %.1fs",
+                self._pruned_in_outbox_window,
+                row_count,
+                pending_count,
+                elapsed,
+            )
+            self._outbox_window_started_at = now
+            self._pruned_in_outbox_window = 0
         for result in results:
             pair = (uuid.UUID(result["document_id"]), str(result["kind"]))
             if result["status"] == "error":
