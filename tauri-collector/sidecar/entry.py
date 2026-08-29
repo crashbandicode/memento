@@ -20,6 +20,10 @@ def cli() -> None:
         from collector.claude_pending_hook import main as hook_main
 
         sys.exit(hook_main([]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "claude-governor-hook":
+        from collector.handoff_governor_hook import main as governor_main
+
+        sys.exit(governor_main(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "install-claude-hooks":
         from collector.claude_pending_hook import main as hook_main
 

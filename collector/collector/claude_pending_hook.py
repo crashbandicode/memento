@@ -12,9 +12,11 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import orjson
+
+from .handoff_governor_hook import governor_enabled
 
 _HOOK_SPECS = {
     "PreToolUse": ("AskUserQuestion", "Bash", "PowerShell", "Shell"),
@@ -44,6 +46,14 @@ _MEMENTO_HOOK_MARKERS = (
     "pending_question_hook.py",
     "collector.claude_pending_hook",
     " claude-hook",
+)
+_GOVERNOR_HOOK_SPECS = {
+    "PostToolUse": ("*",),
+    "Stop": ("*",),
+}
+_MEMENTO_GOVERNOR_HOOK_MARKERS = (
+    "collector.handoff_governor_hook",
+    " claude-governor-hook",
 )
 
 
@@ -1099,6 +1109,13 @@ def _hook_command() -> str:
     return f'"{executable}" -m collector.claude_pending_hook'
 
 
+def _governor_hook_command() -> str:
+    executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
+    if getattr(sys, "frozen", False):
+        return f'"{executable}" claude-governor-hook --enabled'
+    return f'"{executable}" -m collector.handoff_governor_hook --enabled'
+
+
 def _is_memento_hook(hook: object) -> bool:
     if not isinstance(hook, dict) or hook.get("type") != "command":
         return False
@@ -1106,11 +1123,20 @@ def _is_memento_hook(hook: object) -> bool:
     return any(marker in command for marker in _MEMENTO_HOOK_MARKERS)
 
 
+def _is_memento_governor_hook(hook: object) -> bool:
+    if not isinstance(hook, dict) or hook.get("type") != "command":
+        return False
+    command = str(hook.get("command") or "")
+    return any(marker in command for marker in _MEMENTO_GOVERNOR_HOOK_MARKERS)
+
+
 def _merge_event_hooks(
     hooks: dict[str, Any],
     event_name: str,
     matchers: tuple[str, ...],
     command: str,
+    *,
+    managed_hook: Callable[[object], bool] = _is_memento_hook,
 ) -> bool:
     entries = hooks.setdefault(event_name, [])
     if not isinstance(entries, list):
@@ -1123,7 +1149,7 @@ def _merge_event_hooks(
             cleaned_entries.append(entry)
             continue
         entry_hooks = [
-            hook for hook in entry["hooks"] if not _is_memento_hook(hook)
+            hook for hook in entry["hooks"] if not managed_hook(hook)
         ]
         if entry_hooks:
             entry["hooks"] = entry_hooks
@@ -1151,6 +1177,42 @@ def _merge_event_hooks(
     return before != after
 
 
+def _remove_event_hooks(
+    hooks: dict[str, Any],
+    event_name: str,
+    *,
+    managed_hook: Callable[[object], bool],
+) -> bool:
+    entries = hooks.get(event_name)
+    if entries is None:
+        return False
+    if not isinstance(entries, list):
+        raise TypeError(f"hooks.{event_name} must be a list")
+    before = json.dumps(entries, ensure_ascii=False, sort_keys=True, default=str)
+    cleaned_entries: list[object] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            cleaned_entries.append(entry)
+            continue
+        retained_hooks = [
+            hook for hook in entry["hooks"] if not managed_hook(hook)
+        ]
+        if retained_hooks:
+            entry["hooks"] = retained_hooks
+            cleaned_entries.append(entry)
+    if cleaned_entries:
+        entries[:] = cleaned_entries
+    else:
+        hooks.pop(event_name)
+    after = json.dumps(
+        hooks.get(event_name, []),
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return before != after
+
+
 def install_claude_pending_hooks() -> tuple[Path, bool]:
     """Idempotently install hooks that call back into this collector package."""
     settings_path = _settings_path()
@@ -1169,11 +1231,38 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
     if not isinstance(hooks, dict):
         raise TypeError("settings hooks must be an object")
 
+    before_hooks = json.dumps(
+        hooks,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
     command = _hook_command()
-    changed = False
     for event_name, matchers in _HOOK_SPECS.items():
-        if _merge_event_hooks(hooks, event_name, matchers, command):
-            changed = True
+        _merge_event_hooks(hooks, event_name, matchers, command)
+    if governor_enabled():
+        governor_command = _governor_hook_command()
+        for event_name, matchers in _GOVERNOR_HOOK_SPECS.items():
+            _merge_event_hooks(
+                hooks,
+                event_name,
+                matchers,
+                governor_command,
+                managed_hook=_is_memento_governor_hook,
+            )
+    else:
+        for event_name in _GOVERNOR_HOOK_SPECS:
+            _remove_event_hooks(
+                hooks,
+                event_name,
+                managed_hook=_is_memento_governor_hook,
+            )
+    changed = before_hooks != json.dumps(
+        hooks,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
     if not changed:
         return settings_path, False
 
