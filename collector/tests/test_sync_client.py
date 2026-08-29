@@ -85,10 +85,20 @@ class _FakeQueue:
 
 
 class _Response:
-    def __init__(self, status_code: int = 200, payload: dict | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int = 200,
+        payload: dict | None = None,
+        *,
+        text: str = "response",
+        content_type: str | None = "application/json",
+    ) -> None:
         self.status_code = status_code
-        self.text = "response"
+        self.text = text
         self.payload = payload or {}
+        self.headers = (
+            {"content-type": content_type} if content_type is not None else {}
+        )
 
     def json(self) -> dict:
         return self.payload
@@ -139,6 +149,14 @@ class _ScriptedHttpClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class _RaisingHttpClient:
+    def __init__(self, exception: Exception) -> None:
+        self.exception = exception
+
+    def post(self, _path: str, **_kwargs) -> _Response:
+        raise self.exception
 
 
 class _CommitHttpClient:
@@ -935,6 +953,69 @@ class SyncClientStreamingTests(unittest.TestCase):
         }
 
         self.assertFalse(client._upload(item))
+
+    def test_html_4xx_errors_retry_instead_of_quarantining(self) -> None:
+        for status in (404, 405, 410):
+            with self.subTest(status=status):
+                outcome = _classify_http_response(
+                    _Response(
+                        status,
+                        text="<!DOCTYPE html><html lang=\"en\">router response</html>",
+                        content_type="text/html; charset=utf-8",
+                    ),
+                    endpoint="/api/ingest/file",
+                )
+                self.assertEqual(
+                    outcome.state,
+                    UploadOutcomeState.TRANSIENT_RETRY,
+                )
+                self.assertEqual(outcome.diagnostic_code, "unstructured_http_error")
+                self.assertEqual(outcome.http_status, status)
+
+    def test_structured_json_404_remains_permanently_quarantined(self) -> None:
+        outcome = _classify_http_response(
+            _Response(
+                404,
+                {"detail": {"code": "document_not_found"}},
+                content_type=None,
+            ),
+            endpoint="/api/ingest/file",
+        )
+
+        self.assertEqual(
+            outcome.state,
+            UploadOutcomeState.PERMANENT_QUARANTINE,
+        )
+        self.assertEqual(outcome.diagnostic_code, "http_404")
+
+    def test_connection_refused_remains_a_network_retry(self) -> None:
+        request = httpx.Request("POST", "https://example.test/api/ingest/file")
+        client = self._client(
+            _FakeQueue(1),
+            _RaisingHttpClient(httpx.ConnectError("connection refused", request=request)),
+        )
+
+        outcome = client._upload(self._item(1))
+
+        self.assertEqual(outcome.state, UploadOutcomeState.TRANSIENT_RETRY)
+        self.assertEqual(outcome.diagnostic_code, "network_error")
+        self.assertIsNone(outcome.http_status)
+
+    def test_structured_409_spool_terminal_remains_quarantined(self) -> None:
+        outcome = _classify_http_response(
+            _Response(
+                409,
+                {"detail": {"code": "spool_job_terminal"}},
+                content_type=None,
+            ),
+            endpoint="/api/ingest/file",
+        )
+
+        self.assertEqual(
+            outcome.state,
+            UploadOutcomeState.PERMANENT_QUARANTINE,
+        )
+        self.assertEqual(outcome.diagnostic_code, "http_409")
 
     def test_every_upload_endpoint_uses_the_same_typed_status_policy(self) -> None:
         endpoints = (

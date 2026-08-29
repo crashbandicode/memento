@@ -60,6 +60,25 @@ def _response_diagnostic(response, endpoint: str) -> str:
     return f"{endpoint} returned HTTP {int(response.status_code)}{detail}"
 
 
+def _is_structured_api_error(response) -> bool:
+    """Return whether an error response can be safely attributed to our API."""
+
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            content_type = str(headers.get("content-type", ""))
+        except AttributeError:
+            content_type = ""
+        if "json" in content_type.lower():
+            return True
+
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "detail" in payload
+
+
 def _classify_http_response(
     response,
     *,
@@ -72,6 +91,15 @@ def _classify_http_response(
     diagnostic = _response_diagnostic(response, endpoint)
     if 200 <= status < 300:
         return UploadOutcome.success(diagnostic)
+    if not _is_structured_api_error(response):
+        # During an API deploy, Traefik can route this path to the web app.
+        # An HTML (or otherwise unstructured) error body is not a server
+        # disposition and must retain the payload for ordinary queue backoff.
+        return UploadOutcome.transient(
+            diagnostic,
+            diagnostic_code="unstructured_http_error",
+            http_status=status,
+        )
     if status in (401, 403):
         return UploadOutcome.authentication_blocked(
             diagnostic,
