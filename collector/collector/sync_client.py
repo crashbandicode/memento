@@ -60,6 +60,21 @@ def _response_diagnostic(response, endpoint: str) -> str:
     return f"{endpoint} returned HTTP {int(response.status_code)}{detail}"
 
 
+def _is_structured_api_error(response) -> bool:
+    """Return whether an error response can be safely attributed to our API.
+
+    Only a body that actually parses as the API's JSON error object counts.
+    A content-type header alone is not proof: a router answering for a down
+    API can claim JSON while serving the web app's HTML error page.
+    """
+
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and "detail" in payload
+
+
 def _classify_http_response(
     response,
     *,
@@ -72,6 +87,15 @@ def _classify_http_response(
     diagnostic = _response_diagnostic(response, endpoint)
     if 200 <= status < 300:
         return UploadOutcome.success(diagnostic)
+    if not _is_structured_api_error(response):
+        # During an API deploy, Traefik can route this path to the web app.
+        # An HTML (or otherwise unstructured) error body is not a server
+        # disposition and must retain the payload for ordinary queue backoff.
+        return UploadOutcome.transient(
+            diagnostic,
+            diagnostic_code="unstructured_http_error",
+            http_status=status,
+        )
     if status in (401, 403):
         return UploadOutcome.authentication_blocked(
             diagnostic,
@@ -1149,7 +1173,9 @@ class SyncClient:
                             diagnostic_code="invalid_commit_status",
                         )
                 else:
-                    if response.status_code == 404:
+                    if response.status_code == 404 and _is_structured_api_error(
+                        response
+                    ):
                         return UploadOutcome.source_repair(
                             _response_diagnostic(
                                 response,
@@ -1186,6 +1212,11 @@ class SyncClient:
     @staticmethod
     def _raise_delta_conflict(response, payload: dict) -> None:
         if response.status_code == 409 and payload.get("mode") == "delta":
+            if not _is_structured_api_error(response):
+                # A router/proxy can answer 409 with an HTML body while the
+                # API is down; that is not a server delta disposition. Fall
+                # through to the caller's classifier for ordinary retry.
+                return
             expected_hash = None
             expected_offset = 0
             try:
