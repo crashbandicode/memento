@@ -426,6 +426,7 @@ def _codex_history_state(
         recovered_history=(history_row,) if history_row is not None else (),
         ordinary_user_rows=ordinary_user_rows,
         history_timeline_rows=history_timeline_rows,
+        history_timeline_loaded=bool(history_timeline_rows),
     )
 
 
@@ -478,6 +479,135 @@ def test_unchanged_codex_history_is_ignored_by_raw_reducer() -> None:
 
     assert mutation.disposition == "committed"
     assert mutation.messages[0].role == "assistant"
+
+
+def test_raw_on_history_noop_does_not_need_full_timeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
+
+    mutation = _reduce_codex_history(
+        history=[{"text": "Use Core staging.", "ts": 1_785_672_000}],
+    )
+
+    assert mutation.disposition == "committed"
+    assert mutation.messages[0].role == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_raw_on_history_loads_timeline_only_after_failed_noop_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services import realtime_raw_writer as raw_module
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
+    history_timestamp = datetime.fromtimestamp(1_785_672_000, tz=timezone.utc)
+    assistant = SimpleNamespace(
+        id=7,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="agent_message",
+        role="assistant",
+        content="Persisted assistant response.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+    minimal_state = _codex_history_state(None)
+    full_state = _codex_history_state(
+        None,
+        history_timeline_rows=(assistant,),
+        tail=(assistant,),
+    )
+    load_requests: list[tuple[bool, bool]] = []
+    applied = []
+
+    class FakeTransaction:
+        async def start(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class FakeConnection:
+        def transaction(self) -> FakeTransaction:
+            return FakeTransaction()
+
+        async def execute(self, *_args) -> None:
+            return None
+
+    class FakeAcquire:
+        async def __aenter__(self) -> FakeConnection:
+            return FakeConnection()
+
+        async def __aexit__(self, *_args) -> bool:
+            return False
+
+    class FakePool:
+        def acquire(self) -> FakeAcquire:
+            return FakeAcquire()
+
+    async def fake_pool(_database_url):
+        return FakePool()
+
+    async def fake_identity_path(*_args, **_kwargs) -> None:
+        return None
+
+    async def fake_load_state(*_args, **kwargs) -> WriterState:
+        load_requests.append((
+            bool(kwargs["load_recovered_history"]),
+            bool(kwargs.get("load_history_timeline")),
+        ))
+        return full_state if kwargs.get("load_history_timeline") else minimal_state
+
+    async def fake_apply(_connection, **kwargs):
+        applied.append(kwargs["mutation"])
+        return raw_module.RawDocument(_DOCUMENT_ID), None
+
+    monkeypatch.setattr(raw_module, "_pool", fake_pool)
+    monkeypatch.setattr(raw_module, "_ensure_supported_identity_path", fake_identity_path)
+    monkeypatch.setattr(raw_module, "_load_state", fake_load_state)
+    monkeypatch.setattr(raw_module, "_apply", fake_apply)
+
+    content = json.dumps(
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-02T11:00:03Z",
+            "payload": {"type": "agent_message", "message": "New response."},
+        }
+    )
+    document, event = await raw_module.ingest_conversation_raw(
+        tool_id="codex",
+        category="conversation",
+        content_type="jsonl",
+        relative_path="phase45/history.jsonl",
+        content=content,
+        content_hash="c" * 64,
+        file_size=len(content.encode("utf-8")),
+        mode="delta",
+        offset=_BASE_OFFSET + len(content.encode("utf-8")),
+        metadata={
+            "session_id": "codex-history-state",
+            "user_history": [{"text": "Recovered prompt.", "ts": history_timestamp.timestamp()}],
+            "first_user_message": "Recovered prompt.",
+        },
+        timestamp=_OBSERVED_AT.timestamp(),
+        machine_id="22222222-2222-2222-2222-222222222222",
+        user_id="33333333-3333-3333-3333-333333333333",
+        base_hash=_BASE_HASH,
+        base_offset=_BASE_OFFSET,
+        authoritative_rebase=False,
+    )
+
+    assert document.disposition == "committed"
+    assert event is None
+    assert load_requests == [(True, False), (True, True)]
+    assert applied[0].force_projection_rebuild is True
 
 
 @pytest.mark.parametrize(

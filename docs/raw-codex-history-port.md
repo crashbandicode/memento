@@ -91,3 +91,16 @@ keys were not edited.  Final command tallies are recorded in
    rebuild and a search invalidation, but a resend no-op does not.
 5. Confirm the default-off flag retains the exact prior fallback reason in
    both singleton and coalesced-chain writers.
+
+## Follow-up notes
+
+### F1 — proof-sized history state load
+
+History metadata now first loads only the rows consumed by
+`_history_metadata_is_already_committed`: all recovered rows and all ordinary
+user rows. That preserves the default-off no-op proof without materializing
+the complete conversation timeline. With the raw Codex-history flag on, a
+frame whose proof is not already committed retries the pure reducer after a
+second, complete timeline read; that is the only path that invokes the
+collision-safe history merge. Raw-on resends that the proof accepts retain the
+proof-sized read, while changed history has the same full merge input as before.
