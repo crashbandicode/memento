@@ -95,6 +95,8 @@ class RecordedDeltaSequence:
     delta_rows: tuple[dict[str, object], ...]
     relative_path: str | None = None
     deferred_projection_fixture: bool = False
+    delta_metadata: dict[str, object] | None = None
+    authoritative_rebase_fixture: bool = False
 
     @property
     def full(self) -> str:
@@ -263,6 +265,153 @@ RECORDED_DELTA_SEQUENCES = (
                 "payload": {
                     "type": "agent_message",
                     "message": "Core staging preserves the transcript.",
+                },
+            },
+        ),
+        authoritative_rebase_fixture=True,
+    ),
+    RecordedDeltaSequence(
+        name="codex_history_recovered_prompt",
+        tool_id="codex",
+        metadata={"session_id": "phase-history-recovered"},
+        delta_metadata={
+            "session_id": "phase-history-recovered",
+            "user_history": [{
+                "text": "Recovered prompt before the DELTA.",
+                "ts": 1_754_093_610,
+            }],
+            "first_user_message": "Recovered prompt before the DELTA.",
+        },
+        full_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Persisted response before recovery.",
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:20Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "DELTA response after recovery.",
+                },
+            },
+        ),
+    ),
+    RecordedDeltaSequence(
+        name="codex_history_resent_dedup",
+        tool_id="codex",
+        metadata={
+            "session_id": "phase-history-resent",
+            "user_history": [{
+                "text": "Persist this history prompt once.",
+                "ts": 1_754_093_610,
+            }],
+            "first_user_message": "Persist this history prompt once.",
+        },
+        delta_metadata={
+            "session_id": "phase-history-resent",
+            "user_history": [{
+                "text": "Persist this history prompt once.",
+                "ts": 1_754_093_610,
+            }],
+            "first_user_message": "Persist this history prompt once.",
+        },
+        full_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Response that precedes the history row.",
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:20Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Repeated-history DELTA response.",
+                },
+            },
+        ),
+    ),
+    RecordedDeltaSequence(
+        name="codex_history_interleaved_positive_append",
+        tool_id="codex",
+        metadata={"session_id": "phase-history-interleave"},
+        delta_metadata={
+            "session_id": "phase-history-interleave",
+            "user_history": [{
+                "text": "Recovered prompt before normal append.",
+                "ts": 1_754_093_610,
+            }],
+            "first_user_message": "Recovered prompt before normal append.",
+        },
+        full_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Baseline response.",
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:20Z",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Normal positive-line append.",
+                },
+            },
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:30Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Assistant after normal append.",
+                },
+            },
+        ),
+    ),
+    RecordedDeltaSequence(
+        name="codex_history_entry_bound",
+        tool_id="codex",
+        metadata={"session_id": "phase-history-bound"},
+        delta_metadata={
+            "session_id": "phase-history-bound",
+            "user_history": [
+                {"text": f"Bounded recovery prompt {index}", "ts": 0}
+                for index in range(2_001)
+            ],
+        },
+        full_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:00Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Bounded history baseline.",
+                },
+            },
+        ),
+        delta_rows=(
+            {
+                "type": "event_msg",
+                "timestamp": "2025-08-02T11:00:20Z",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Bounded history DELTA.",
                 },
             },
         ),
@@ -906,7 +1055,11 @@ async def _run_sequence(
                 offset=offset,
                 base_hash=base_hash,
                 base_offset=base_offset,
-                metadata=dict(sequence.metadata),
+                metadata=dict(
+                    sequence.delta_metadata
+                    if mode == "delta" and sequence.delta_metadata is not None
+                    else sequence.metadata
+                ),
                 timestamp=1_785_672_000.0 + (mode == "delta"),
                 machine_id=machine_id,
                 user_id=user_id,
@@ -973,7 +1126,7 @@ async def _run_sequence(
         await session.commit()
         session.info.pop(_PENDING_REALTIME_EVENTS, None)
 
-        if sequence.tool_id == "codex":
+        if sequence.authoritative_rebase_fixture:
             # An invisible transport record changes the raw FULL revision
             # without changing normalized rows.  This tests the authoritative
             # rebase branch separately from the DELTA writer's golden output.
@@ -1080,6 +1233,7 @@ async def test_recorded_delta_sequences_match_phase0_golden(
     from server.config import settings
 
     monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
     phase0_sequences = tuple(
         sequence
         for sequence in RECORDED_DELTA_SEQUENCES

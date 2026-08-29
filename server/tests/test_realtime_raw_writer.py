@@ -393,6 +393,8 @@ def _codex_history_state(
     history_row: SimpleNamespace | None,
     *,
     ordinary_user_rows: tuple[SimpleNamespace, ...] = (),
+    history_timeline_rows: tuple[SimpleNamespace, ...] = (),
+    tail: tuple[SimpleNamespace, ...] = (),
 ) -> WriterState:
     metadata = {"session_id": "codex-history-state"}
     return WriterState(
@@ -420,8 +422,10 @@ def _codex_history_state(
         read_model=None,
         task_state=None,
         dashboard=None,
+        tail=tail,
         recovered_history=(history_row,) if history_row is not None else (),
         ordinary_user_rows=ordinary_user_rows,
+        history_timeline_rows=history_timeline_rows,
     )
 
 
@@ -486,12 +490,140 @@ def test_unchanged_codex_history_is_ignored_by_raw_reducer() -> None:
         ],
     ),
 )
-def test_changed_or_new_codex_history_falls_back(history: list[dict[str, object]]) -> None:
+def test_changed_or_new_codex_history_falls_back_when_flag_off(
+    history: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", False)
     with pytest.raises(
         RawWriterUnsupported,
         match="authoritative rebuild/history needs legacy reducer",
     ):
         _reduce_codex_history(history=history)
+
+
+def test_new_codex_history_commits_with_collision_free_positive_slots_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
+    history_timestamp = datetime.fromtimestamp(1_785_672_000, tz=timezone.utc)
+    assistant = SimpleNamespace(
+        id=7,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="agent_message",
+        role="assistant",
+        content="Persisted assistant response.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+    state = _codex_history_state(
+        None,
+        history_timeline_rows=(assistant,),
+        tail=(assistant,),
+    )
+
+    mutation = _reduce_codex_history(
+        history=[{"text": "Recovered earlier prompt.", "ts": 1_785_672_000}],
+        state=state,
+    )
+
+    recovered = next(
+        item
+        for item in mutation.messages
+        if item.message_type == "history_user_message"
+    )
+    moved = next(item for item in mutation.messages if item.existing_id == 7)
+    source_append = next(
+        item
+        for item in mutation.messages
+        if item.operation == "insert" and item.message_type == "agent_message"
+    )
+    assert recovered.line_number == 1
+    assert recovered.timestamp == history_timestamp
+    assert moved.line_number == 2
+    assert source_append.line_number == 3
+    assert len({recovered.line_number, moved.line_number, source_append.line_number}) == 3
+    assert mutation.force_projection_rebuild is True
+
+
+def test_flag_on_history_dedup_does_not_insert_a_second_recovered_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
+    history_timestamp = datetime.fromtimestamp(1_785_672_000, tz=timezone.utc)
+    ordinary = SimpleNamespace(
+        id=8,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="user_message",
+        role="user",
+        content="Already represented prompt.",
+        metadata_={},
+        timestamp=history_timestamp,
+    )
+    state = _codex_history_state(
+        None,
+        ordinary_user_rows=(ordinary,),
+        history_timeline_rows=(ordinary,),
+        tail=(ordinary,),
+    )
+
+    mutation = _reduce_codex_history(
+        history=[{"text": "Already represented prompt.", "ts": 1_785_672_000}],
+        state=state,
+    )
+
+    assert not any(
+        item.message_type == "history_user_message" for item in mutation.messages
+    )
+    assert mutation.force_projection_rebuild is False
+
+
+def test_flag_on_history_respects_the_legacy_entry_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.config import settings
+    from server.services.ingest_service import MAX_USER_HISTORY_ENTRIES
+
+    monkeypatch.setattr(settings, "realtime_ingest_raw_codex_history", True)
+    assistant = SimpleNamespace(
+        id=9,
+        document_id=_DOCUMENT_ID,
+        line_number=1,
+        message_type="agent_message",
+        role="assistant",
+        content="Existing response.",
+        metadata_={},
+        timestamp=_OBSERVED_AT,
+    )
+    state = _codex_history_state(
+        None,
+        history_timeline_rows=(assistant,),
+        tail=(assistant,),
+    )
+    history = [
+        {"text": f"Bounded prompt {index}", "ts": 0}
+        for index in range(MAX_USER_HISTORY_ENTRIES + 1)
+    ]
+
+    mutation = _reduce_codex_history(history=history, state=state)
+
+    recovered = [
+        item
+        for item in mutation.messages
+        if item.message_type == "history_user_message"
+    ]
+    assert len(recovered) == MAX_USER_HISTORY_ENTRIES
+    assert {item.metadata["source_id"] for item in recovered} == {
+        f"codex-history:{index}" for index in range(MAX_USER_HISTORY_ENTRIES)
+    }
 
 
 def test_negative_recovered_history_row_falls_back_for_legacy_reconciliation() -> None:
