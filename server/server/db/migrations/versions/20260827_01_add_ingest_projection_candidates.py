@@ -13,6 +13,7 @@ cutover has a reviewable root migration.  The CREATE TABLE is idempotent.
 from __future__ import annotations
 
 from alembic import op
+from sqlalchemy import text
 
 revision = "20260827_01"
 down_revision = None
@@ -28,6 +29,7 @@ def upgrade() -> None:
             document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             revision_hash VARCHAR(64) NOT NULL,
             kind VARCHAR(32) NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             claimed_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ,
@@ -35,10 +37,40 @@ def upgrade() -> None:
             CONSTRAINT uq_ingest_projection_candidate_fence
                 UNIQUE (document_id, revision_hash, kind),
             CONSTRAINT ck_ingest_projection_candidate_kind
-                CHECK (kind IN ('canvas', 'search'))
+                CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))
         )
         """
     )
+    op.execute(
+        """
+        ALTER TABLE ingest_projection_candidates
+        ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb
+        """
+    )
+    projection_kind_constraint_definition = (
+        "CHECK (((kind)::text = ANY ((ARRAY['canvas'::character varying, "
+        "'search'::character varying, 'claude_lineage'::character varying, "
+        "'subagent_lifecycle'::character varying])::text[])))"
+    )
+    installed_projection_kind_constraint = op.get_bind().execute(text(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid = 'ingest_projection_candidates'::regclass "
+        "AND conname = 'ck_ingest_projection_candidate_kind'"
+    )).scalar_one_or_none()
+    if installed_projection_kind_constraint != projection_kind_constraint_definition:
+        op.execute(
+            """
+            ALTER TABLE ingest_projection_candidates
+            DROP CONSTRAINT IF EXISTS ck_ingest_projection_candidate_kind
+            """
+        )
+        op.execute(
+            """
+            ALTER TABLE ingest_projection_candidates
+            ADD CONSTRAINT ck_ingest_projection_candidate_kind
+            CHECK (kind IN ('canvas', 'search', 'claude_lineage', 'subagent_lifecycle'))
+            """
+        )
     op.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_ingest_projection_candidates_pending

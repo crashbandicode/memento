@@ -298,5 +298,33 @@
         }
       }
     ]
+  },
+  "claude_deferred_lineage_lifecycle": {
+    "lifecycle": {
+      "subagent_lifecycle_status": "completed",
+      "subagent_lifecycle_source": "claude_child_transcript",
+      "subagent_lifecycle_at": "2026-08-28T16:00:02.000Z",
+      "subagent_lifecycle_evidence": "assistant.stop_reason=end_turn"
+    },
+    "lineage_records": [
+      {
+        "record_uuid": "deferred-lineage-root",
+        "parent_uuid": null,
+        "is_subagent": true,
+        "active": true
+      },
+      {
+        "record_uuid": "deferred-lineage-middle",
+        "parent_uuid": "deferred-lineage-root",
+        "is_subagent": true,
+        "active": true
+      },
+      {
+        "record_uuid": "deferred-lineage-terminal",
+        "parent_uuid": "deferred-lineage-middle",
+        "is_subagent": true,
+        "active": true
+      }
+    ]
   }
 }
