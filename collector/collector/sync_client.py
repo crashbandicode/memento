@@ -61,16 +61,12 @@ def _response_diagnostic(response, endpoint: str) -> str:
 
 
 def _is_structured_api_error(response) -> bool:
-    """Return whether an error response can be safely attributed to our API."""
+    """Return whether an error response can be safely attributed to our API.
 
-    headers = getattr(response, "headers", None)
-    if headers is not None:
-        try:
-            content_type = str(headers.get("content-type", ""))
-        except AttributeError:
-            content_type = ""
-        if "json" in content_type.lower():
-            return True
+    Only a body that actually parses as the API's JSON error object counts.
+    A content-type header alone is not proof: a router answering for a down
+    API can claim JSON while serving the web app's HTML error page.
+    """
 
     try:
         payload = response.json()
@@ -1177,7 +1173,9 @@ class SyncClient:
                             diagnostic_code="invalid_commit_status",
                         )
                 else:
-                    if response.status_code == 404:
+                    if response.status_code == 404 and _is_structured_api_error(
+                        response
+                    ):
                         return UploadOutcome.source_repair(
                             _response_diagnostic(
                                 response,
@@ -1214,6 +1212,11 @@ class SyncClient:
     @staticmethod
     def _raise_delta_conflict(response, payload: dict) -> None:
         if response.status_code == 409 and payload.get("mode") == "delta":
+            if not _is_structured_api_error(response):
+                # A router/proxy can answer 409 with an HTML body while the
+                # API is down; that is not a server delta disposition. Fall
+                # through to the caller's classifier for ordinary retry.
+                return
             expected_hash = None
             expected_offset = 0
             try:

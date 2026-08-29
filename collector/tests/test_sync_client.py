@@ -95,6 +95,16 @@ class _Response:
     ) -> None:
         self.status_code = status_code
         self.text = text
+        if (
+            payload is None
+            and status_code >= 300
+            and content_type is not None
+            and "json" in content_type
+        ):
+            # Bare error-status shorthand means "our API answered": since the
+            # classifier now requires a parsed structured body (a JSON header
+            # alone is not proof of origin), the shorthand must carry one.
+            payload = {"detail": {"code": f"http_{status_code}"}}
         self.payload = payload or {}
         self.headers = (
             {"content-type": content_type} if content_type is not None else {}
@@ -1016,6 +1026,98 @@ class SyncClientStreamingTests(unittest.TestCase):
             UploadOutcomeState.PERMANENT_QUARANTINE,
         )
         self.assertEqual(outcome.diagnostic_code, "http_409")
+
+    def test_json_content_type_with_html_body_retries(self) -> None:
+        # A router answering for a down API can claim JSON in the header
+        # while serving the web app's HTML page; permanence requires a
+        # body that actually parses as the API error object.
+        outcome = _classify_http_response(
+            _Response(
+                404,
+                {},
+                text='<!DOCTYPE html><html lang="en">router response</html>',
+                content_type="application/json",
+            ),
+            endpoint="/api/ingest/file",
+        )
+
+        self.assertEqual(outcome.state, UploadOutcomeState.TRANSIENT_RETRY)
+        self.assertEqual(outcome.diagnostic_code, "unstructured_http_error")
+        self.assertEqual(outcome.http_status, 404)
+
+    def test_unstructured_delta_409_falls_through_to_classifier(self) -> None:
+        response = _Response(
+            409,
+            text='<!DOCTYPE html><html lang="en">router response</html>',
+            content_type="text/html; charset=utf-8",
+        )
+
+        # Must NOT raise DeltaBaseConflict for a proxy/router 409.
+        SyncClient._raise_delta_conflict(
+            response,
+            {"mode": "delta", "relative_path": "thread.jsonl"},
+        )
+
+        outcome = _classify_http_response(response, endpoint="/api/ingest/file")
+        self.assertEqual(outcome.state, UploadOutcomeState.TRANSIENT_RETRY)
+        self.assertEqual(outcome.diagnostic_code, "unstructured_http_error")
+
+    def test_chunk_commit_survives_unstructured_status_404(self) -> None:
+        class _SequencedStatusClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post(self, _path: str, json: dict) -> _Response:
+                del json
+                self.calls += 1
+                if self.calls == 1:
+                    return _Response(
+                        404,
+                        text='<!DOCTYPE html><html lang="en">router</html>',
+                        content_type="text/html; charset=utf-8",
+                    )
+                return _Response(
+                    200,
+                    {"status": "completed", "job_id": "job-1"},
+                )
+
+        http_client = _SequencedStatusClient()
+        client = self._client(_FakeQueue(1), http_client)
+        client._sleep_interruptibly = lambda _seconds: None
+
+        outcome = client._wait_for_chunk_commit(
+            {"relative_path": "thread.jsonl", "hash": "d2:" + ("a" * 61)},
+            self._item(1),
+            upload_id="upload-1",
+            job_id="job-1",
+        )
+
+        self.assertEqual(outcome.state, UploadOutcomeState.SUCCESS)
+        self.assertEqual(http_client.calls, 2)
+
+    def test_chunk_commit_structured_status_404_still_repairs(self) -> None:
+        class _StructuredMissingClient:
+            @staticmethod
+            def post(_path: str, json: dict) -> _Response:
+                del json
+                return _Response(
+                    404,
+                    {"detail": {"code": "upload_not_found"}},
+                    content_type=None,
+                )
+
+        client = self._client(_FakeQueue(1), _StructuredMissingClient())
+        client._sleep_interruptibly = lambda _seconds: None
+
+        outcome = client._wait_for_chunk_commit(
+            {"relative_path": "thread.jsonl", "hash": "d2:" + ("a" * 61)},
+            self._item(1),
+            upload_id="upload-1",
+            job_id="job-1",
+        )
+
+        self.assertEqual(outcome.state, UploadOutcomeState.SOURCE_REPAIR_REQUIRED)
+        self.assertEqual(outcome.diagnostic_code, "commit_status_missing")
 
     def test_every_upload_endpoint_uses_the_same_typed_status_policy(self) -> None:
         endpoints = (
