@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -595,6 +596,344 @@ async def test_deferred_claude_kinds_replay_delta_facts_with_revision_fencing(
             assert old.superseded_at is not None
             assert latest.completed_at is not None
             assert latest.superseded_at is None
+
+
+@pytest.mark.asyncio
+async def test_deferred_claude_kinds_do_not_replay_newer_delta_after_full_rewind(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FULL that restores an older fence supersedes the entire queued group."""
+    monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
+    monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
+    full_records = (
+        _claude_record("rewind-root", "user"),
+        _claude_record("rewind-middle", "assistant", parent_uuid="rewind-root"),
+    )
+    terminal_delta = _claude_record(
+        "rewind-terminal",
+        "assistant",
+        parent_uuid="rewind-middle",
+        stop_reason="end_turn",
+    )
+    future_delta = _claude_record(
+        "rewind-future",
+        "assistant",
+        parent_uuid="rewind-terminal",
+    )
+    full = "\n".join(_json_line(record) for record in full_records)
+    terminal_body = _json_line(terminal_delta)
+    first_revision = f"{full}\n{terminal_body}"
+    future_body = _json_line(future_delta)
+    second_revision = f"{first_revision}\n{future_body}"
+    path = f"phase4/subagents/rewind-{uuid.uuid4().hex}.jsonl"
+    metadata = {
+        "session_id": path.rsplit("/", 1)[-1].removesuffix(".jsonl"),
+        "parent_thread_id": str(uuid.uuid4()),
+        "is_subagent": True,
+    }
+
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session, suffix="claude-rewind")
+        document = await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=full,
+            content_hash=_hash(full),
+            file_size=len(full.encode("utf-8")),
+            mode="full",
+            offset=len(full.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_000.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            writer="legacy",
+        )
+        document_id = document.id
+        await session.commit()
+
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=terminal_body,
+            content_hash=_hash(first_revision),
+            file_size=len(terminal_body.encode("utf-8")),
+            mode="delta",
+            offset=len(first_revision.encode("utf-8")),
+            base_hash=_hash(full),
+            base_offset=len(full.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_001.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=True,
+            writer="raw",
+        )
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=future_body,
+            content_hash=_hash(second_revision),
+            file_size=len(future_body.encode("utf-8")),
+            mode="delta",
+            offset=len(second_revision.encode("utf-8")),
+            base_hash=_hash(first_revision),
+            base_offset=len(first_revision.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_002.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            use_core_delta_message_staging=True,
+            writer="raw",
+        )
+        await session.commit()
+
+        # The authoritative legacy FULL deliberately restores the first DELTA
+        # revision while both raw candidates remain pending.
+        await ingest_file(
+            session,
+            tool_id="claude_code",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content=first_revision,
+            content_hash=_hash(first_revision),
+            file_size=len(first_revision.encode("utf-8")),
+            mode="full",
+            offset=len(first_revision.encode("utf-8")),
+            metadata=metadata,
+            timestamp=1_785_672_003.0,
+            machine_id=machine.id,
+            user_id=str(user.id),
+            schedule_post_ingest=False,
+            writer="legacy",
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        before = set(
+            (
+                await session.scalars(
+                    select(ClaudeConversationLineageRecord.record_uuid).where(
+                        ClaudeConversationLineageRecord.document_id == document_id,
+                        ClaudeConversationLineageRecord.active.is_(True),
+                    )
+                )
+            ).all()
+        )
+        assert before == {"rewind-root", "rewind-middle", "rewind-terminal"}
+
+    import server.services.realtime_ingest_projector as projector_module
+
+    async def unexpected_apply(*_args, **_kwargs) -> bool:
+        raise AssertionError("stale Claude candidate group must not be applied")
+
+    monkeypatch.setattr(projector_module, "_apply_claude_lineage", unexpected_apply)
+    monkeypatch.setattr(
+        projector_module, "_apply_subagent_lifecycle", unexpected_apply
+    )
+    async with session_factory() as session:
+        results = await process_pending_candidates(session, document_ids=(document_id,))
+        await session.commit()
+
+    deferred = {
+        result["kind"]: result
+        for result in results
+        if result["kind"] in {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+    }
+    assert set(deferred) == {KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE}
+    for result in deferred.values():
+        assert result["status"] == "superseded"
+        assert result["changed"] is False
+        assert result["candidates"] == 2
+        assert result["superseded"] == 2
+
+    async with session_factory() as session:
+        after = set(
+            (
+                await session.scalars(
+                    select(ClaudeConversationLineageRecord.record_uuid).where(
+                        ClaudeConversationLineageRecord.document_id == document_id,
+                        ClaudeConversationLineageRecord.active.is_(True),
+                    )
+                )
+            ).all()
+        )
+        assert after == before
+        candidates = (
+            (
+                await session.execute(
+                    select(IngestProjectionCandidate).where(
+                        IngestProjectionCandidate.document_id == document_id,
+                        IngestProjectionCandidate.kind.in_(
+                            (KIND_CLAUDE_LINEAGE, KIND_SUBAGENT_LIFECYCLE)
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(candidates) == 4
+        assert all(row.completed_at is not None for row in candidates)
+        assert all(row.superseded_at is not None for row in candidates)
+
+
+@pytest.mark.asyncio
+async def test_projector_prunes_completed_candidates_without_touching_pending(
+    session_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retention reclaims payload rows in a bounded batch across all kinds."""
+    monkeypatch.setattr(
+        settings, "realtime_ingest_projection_candidate_retention_hours", 1.0
+    )
+    monkeypatch.setattr(
+        settings, "realtime_ingest_projection_candidate_prune_batch_size", 4
+    )
+    now = datetime.now(timezone.utc)
+    expired_at = now - timedelta(hours=2)
+    expired_kinds = (
+        KIND_CANVAS,
+        KIND_SEARCH,
+        KIND_CLAUDE_LINEAGE,
+        KIND_SUBAGENT_LIFECYCLE,
+    )
+
+    async with session_factory() as session:
+        _user, machine = await _seed_owner(session, suffix="candidate-retention")
+        completed_document = Document(
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"phase4/retention-completed-{uuid.uuid4().hex}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            content_hash="a" * 64,
+            file_size_bytes=0,
+        )
+        pending_document = Document(
+            tool_id="cursor",
+            machine_id=machine.id,
+            relative_path=f"phase4/retention-pending-{uuid.uuid4().hex}.jsonl",
+            category="conversation",
+            content_type="jsonl",
+            content_hash="b" * 64,
+            file_size_bytes=0,
+        )
+        session.add_all((completed_document, pending_document))
+        await session.flush()
+        for index, kind in enumerate(expired_kinds):
+            session.add(
+                IngestProjectionCandidate(
+                    document_id=completed_document.id,
+                    revision_hash=f"{index + 1}" * 64,
+                    kind=kind,
+                    payload={"records": [{"uuid": f"retention-{kind}"}]},
+                    created_at=expired_at - timedelta(minutes=index + 1),
+                    claimed_at=expired_at - timedelta(minutes=index + 1),
+                    completed_at=expired_at - timedelta(minutes=index + 1),
+                    superseded_at=expired_at if kind == KIND_SEARCH else None,
+                )
+            )
+        session.add(
+            IngestProjectionCandidate(
+                document_id=completed_document.id,
+                revision_hash="5" * 64,
+                kind=KIND_CANVAS,
+                payload={"records": [{"uuid": "retention-extra"}]},
+                created_at=expired_at + timedelta(minutes=1),
+                claimed_at=expired_at + timedelta(minutes=1),
+                completed_at=expired_at + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            IngestProjectionCandidate(
+                document_id=pending_document.id,
+                revision_hash="6" * 64,
+                kind=KIND_CANVAS,
+                payload={"records": [{"uuid": "retention-pending"}]},
+            )
+        )
+        await session.commit()
+        completed_document_id = completed_document.id
+        pending_document_id = pending_document.id
+
+    import server.services.realtime_ingest_projector as projector_module
+
+    pruned_counts: list[int] = []
+    original_prune = projector_module.prune_completed_projection_candidates
+
+    async def count_pruned(*args, **kwargs) -> int:
+        count = await original_prune(*args, **kwargs)
+        pruned_counts.append(count)
+        return count
+
+    monkeypatch.setattr(
+        projector_module, "prune_completed_projection_candidates", count_pruned
+    )
+    projector = RealtimeIngestProjector(session_factory=session_factory)
+    assert await projector.run_once(document_ids=(completed_document_id,)) == []
+    assert pruned_counts == [4]
+
+    async with session_factory() as session:
+        completed_rows = (
+            (
+                await session.execute(
+                    select(IngestProjectionCandidate)
+                    .where(
+                        IngestProjectionCandidate.document_id == completed_document_id
+                    )
+                    .order_by(IngestProjectionCandidate.revision_hash)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [row.revision_hash for row in completed_rows] == ["5" * 64]
+        assert completed_rows[0].payload == {"records": [{"uuid": "retention-extra"}]}
+        pending_row = await session.scalar(
+            select(IngestProjectionCandidate).where(
+                IngestProjectionCandidate.document_id == pending_document_id
+            )
+        )
+        assert pending_row is not None
+        assert pending_row.completed_at is None
+        assert pending_row.superseded_at is None
+        assert pending_row.payload == {"records": [{"uuid": "retention-pending"}]}
+
+
+@pytest.mark.asyncio
+async def test_runtime_migrations_do_not_replace_current_projection_kind_constraint(
+    session_factory,
+) -> None:
+    """An ordinary API boot must not validate the already-widened CHECK."""
+    from server.main import _run_migrations
+
+    constraint_oid_sql = text(
+        "SELECT oid FROM pg_constraint "
+        "WHERE conrelid = 'ingest_projection_candidates'::regclass "
+        "AND conname = 'ck_ingest_projection_candidate_kind'"
+    )
+    async with session_factory() as session:
+        before = await session.scalar(constraint_oid_sql)
+        assert before is not None
+        connection = await session.connection()
+        await connection.run_sync(_run_migrations)
+        after = await session.scalar(constraint_oid_sql)
+        assert after == before
+        await session.rollback()
 
 
 @pytest.mark.asyncio

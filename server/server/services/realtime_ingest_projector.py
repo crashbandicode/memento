@@ -15,10 +15,10 @@ import signal
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -453,6 +453,63 @@ def _candidate_source_records(
     return tuple(records)
 
 
+async def prune_completed_projection_candidates(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    limit: int | None = None,
+    document_ids: list[uuid.UUID] | tuple[uuid.UUID, ...] | None = None,
+) -> int:
+    """Delete one bounded batch of committed outbox history.
+
+    Completed candidates cannot be replayed, including rows superseded by a
+    revision fence. Locking the selected IDs means concurrent projector
+    lifecycles skip each other's batch, while doing the deletion in the same
+    transaction as the cycle means a crash rolls it back safely.
+    """
+    from ..db.models import IngestProjectionCandidate
+
+    retention_hours = max(
+        0.0, float(settings.realtime_ingest_projection_candidate_retention_hours)
+    )
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=retention_hours)
+    cap = (
+        max(1, int(settings.realtime_ingest_projection_candidate_prune_batch_size))
+        if limit is None
+        else max(1, int(limit))
+    )
+    completed_filter = [
+        IngestProjectionCandidate.completed_at.is_not(None),
+        IngestProjectionCandidate.completed_at < cutoff,
+    ]
+    if document_ids:
+        completed_filter.append(
+            IngestProjectionCandidate.document_id.in_(tuple(document_ids))
+        )
+    candidate_ids = tuple(
+        (
+            await db.scalars(
+                select(IngestProjectionCandidate.id)
+                .where(*completed_filter)
+                .order_by(
+                    IngestProjectionCandidate.completed_at,
+                    IngestProjectionCandidate.id,
+                )
+                .limit(cap)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+    )
+    if not candidate_ids:
+        return 0
+    deleted = await db.scalars(
+        delete(IngestProjectionCandidate)
+        .where(IngestProjectionCandidate.id.in_(candidate_ids))
+        .returning(IngestProjectionCandidate.id)
+    )
+    return len(tuple(deleted))
+
+
 async def _publish_projection_event(
     db: AsyncSession,
     *,
@@ -556,7 +613,7 @@ async def process_pending_candidates(
                     # sequence. Only replay it when its newest fence matches
                     # the current revision; otherwise the normal fence marks
                     # every stale fact superseded without mutating projections.
-                    if any(row.revision_hash == current_revision for row in rows):
+                    if rows[-1].revision_hash == current_revision:
                         source_records = _candidate_source_records(rows)
                         if kind == KIND_CLAUDE_LINEAGE:
                             changed = await _apply_claude_lineage(
@@ -580,10 +637,11 @@ async def process_pending_candidates(
                     await _publish_projection_event(
                         db, document_id=document_id, changes=[namespace]
                     )
+                supersede_group = status == "superseded"
                 for row in rows:
                     row.claimed_at = now
                     row.completed_at = now
-                    if current_revision is None or row.revision_hash != current_revision:
+                    if supersede_group or row.revision_hash != current_revision:
                         row.superseded_at = now
         except Exception:
             # Poison-group protection: roll back only this SAVEPOINT and keep
@@ -615,7 +673,7 @@ async def process_pending_candidates(
                 "superseded": sum(
                     1
                     for row in rows
-                    if current_revision is None or row.revision_hash != current_revision
+                    if supersede_group or row.revision_hash != current_revision
                 ),
             }
         )
@@ -669,7 +727,12 @@ class RealtimeIngestProjector:
             results = await process_pending_candidates(
                 session, limit=limit, document_ids=document_ids, skip_pairs=skip
             )
+            pruned = await prune_completed_projection_candidates(
+                session, document_ids=document_ids
+            )
             await session.commit()
+        if pruned:
+            logger.debug("Pruned %s completed ingest projection candidates", pruned)
         for result in results:
             pair = (uuid.UUID(result["document_id"]), str(result["kind"]))
             if result["status"] == "error":

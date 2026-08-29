@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # so it is not a kill-switch.
     realtime_ingest_deferred_projections: bool = True
     realtime_ingest_projector_poll_seconds: float = 0.10
+    # Completed outbox rows are audit-free replay history. Retain them briefly
+    # for operational inspection, then let the projector reclaim bounded
+    # batches so compact Claude DELTA payloads never accumulate indefinitely.
+    realtime_ingest_projection_candidate_retention_hours: float = 24.0
+    realtime_ingest_projection_candidate_prune_batch_size: int = 256
 
     # Redis
     redis_url: str = "redis://localhost:6380/0"
