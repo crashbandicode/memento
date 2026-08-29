@@ -58,6 +58,7 @@ class WriterState:
     cursor_sources: tuple[SimpleNamespace, ...] = ()
     recovered_history: tuple[SimpleNamespace, ...] = ()
     ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
+    history_timeline_rows: tuple[SimpleNamespace, ...] = ()
 
 
 @dataclass(slots=True)
@@ -92,6 +93,23 @@ class IngestMutation:
     disposition: str = "committed"
     canvas_candidate: bool = False
     search_candidate: bool = False
+    force_projection_rebuild: bool = False
+
+
+@dataclass(slots=True)
+class _HistoryWorkingRow:
+    """A pre-commit conversation row used by the Codex recovery planner."""
+
+    key: object
+    existing_id: int | None
+    line_number: int
+    original_line_number: int
+    message_type: str | None
+    role: str | None
+    content: str
+    metadata: dict[str, Any]
+    timestamp: datetime | None
+    mutation: MessageMutation | None = None
 
 
 _pools: dict[tuple[int, str], asyncpg.Pool] = {}
@@ -329,6 +347,7 @@ async def _load_state(
         cursor_sources = [_message_view(row) for row in source_rows]
     recovered_history: tuple[SimpleNamespace, ...] = ()
     ordinary_user_rows: tuple[SimpleNamespace, ...] = ()
+    history_timeline_rows: tuple[SimpleNamespace, ...] = ()
     if load_recovered_history:
         recovered_rows = await connection.fetch(
             """
@@ -356,6 +375,19 @@ async def _load_state(
             document_id,
         )
         ordinary_user_rows = tuple(_message_view(row) for row in source_user_rows)
+        timeline_rows = await connection.fetch(
+            """
+            SELECT id, document_id, line_number, message_type, role, content,
+                   metadata, timestamp
+            FROM conversation_messages
+            WHERE document_id = $1
+            ORDER BY line_number, id
+            """,
+            document_id,
+        )
+        history_timeline_rows = tuple(
+            _message_view(row) for row in timeline_rows
+        )
     return WriterState(
         doc,
         {
@@ -375,6 +407,7 @@ async def _load_state(
         tuple(cursor_sources),
         recovered_history,
         ordinary_user_rows,
+        history_timeline_rows,
     )
 
 
@@ -598,6 +631,442 @@ def _history_metadata_is_already_committed(
             for mutation in prospective_mutations
         )
     )
+
+
+def _history_working_row(
+    row: SimpleNamespace,
+    *,
+    key: object | None = None,
+    mutation: MessageMutation | None = None,
+) -> _HistoryWorkingRow:
+    """Copy a persisted (or prospective) row into the recovery simulation."""
+    existing_id = int(row.id) if getattr(row, "id", None) is not None else None
+    line_number = int(row.line_number)
+    return _HistoryWorkingRow(
+        key=key if key is not None else ("stored", existing_id),
+        existing_id=existing_id,
+        line_number=line_number,
+        original_line_number=line_number,
+        message_type=row.message_type,
+        role=row.role,
+        content=row.content,
+        metadata=dict(row.metadata_ or {}),
+        timestamp=row.timestamp,
+        mutation=mutation,
+    )
+
+
+def _plan_codex_history_mutations(
+    state: WriterState,
+    *,
+    history: list[dict[str, Any]],
+    first_user_message: str,
+    prospective_mutations: list[MessageMutation],
+    source_modified_at: datetime | None,
+) -> bool:
+    """Port the legacy Codex recovery merge into raw-writer mutations.
+
+    The legacy branch first stages the source DELTA, allocates a bounded
+    negative slot for each missing history source identity, and then reconciles
+    the combined rows.  This planner simulates that final transaction before
+    staging any raw rows.  It deliberately imports the shared one-to-one
+    matching and anchor functions rather than recoding their transport window.
+    """
+    from .conversation_parser import normalize_codex_user_payload
+    from .history_recovery import (
+        UserOccurrence,
+        partition_recovered_occurrences,
+        recovered_occurrence_anchors,
+    )
+    from .ingest_service import (
+        MAX_STORED_MESSAGE_CHARS,
+        MAX_USER_HISTORY_ENTRIES,
+        _bounded_message_text,
+        _history_line_number,
+    )
+
+    # The loader supplies every current row for real raw writes.  The compact
+    # fallback keeps reducer-only tests that construct a WriterState directly
+    # useful without weakening the production load requirement.
+    persisted_rows = state.history_timeline_rows
+    if not persisted_rows:
+        by_id: dict[int, SimpleNamespace] = {}
+        for row in (*state.ordinary_user_rows, *state.recovered_history):
+            by_id[int(row.id)] = row
+        persisted_rows = tuple(by_id.values())
+
+    working: dict[object, _HistoryWorkingRow] = {
+        ("stored", int(row.id)): _history_working_row(row)
+        for row in persisted_rows
+    }
+    existing_updates = {
+        int(mutation.existing_id): mutation
+        for mutation in prospective_mutations
+        if mutation.operation == "update" and mutation.existing_id is not None
+    }
+    for mutation in prospective_mutations:
+        if mutation.operation == "insert":
+            row = SimpleNamespace(
+                id=None,
+                line_number=mutation.line_number,
+                message_type=mutation.message_type,
+                role=mutation.role,
+                content=mutation.content,
+                metadata_=mutation.metadata,
+                timestamp=mutation.timestamp,
+            )
+            working[("new", mutation.ordinal)] = _history_working_row(
+                row,
+                key=("new", mutation.ordinal),
+                mutation=mutation,
+            )
+        elif mutation.operation == "update" and mutation.existing_id is not None:
+            item = working.get(("stored", int(mutation.existing_id)))
+            if item is None:
+                raise RawWriterUnsupported(
+                    "history reconciliation needs the full committed timeline"
+                )
+            item.line_number = mutation.line_number
+            item.message_type = mutation.message_type
+            item.role = mutation.role
+            item.content = mutation.content
+            item.metadata = dict(mutation.metadata)
+            item.timestamp = mutation.timestamp
+            item.mutation = mutation
+
+    def source_occurrences() -> list[UserOccurrence]:
+        return [
+            UserOccurrence(
+                key=item.key,
+                content=item.content,
+                timestamp=item.timestamp,
+                line_number=item.line_number,
+            )
+            for item in working.values()
+            if (
+                item.role == "user"
+                and item.message_type != "history_user_message"
+            )
+        ]
+
+    next_ordinal = max(
+        (mutation.ordinal for mutation in prospective_mutations),
+        default=-1,
+    ) + 1
+
+    def append_insert(item: _HistoryWorkingRow) -> None:
+        nonlocal next_ordinal
+        prospective_mutations.append(
+            MessageMutation(
+                ordinal=next_ordinal,
+                operation="insert",
+                line_number=item.line_number,
+                message_type=item.message_type,
+                role=item.role,
+                content=item.content,
+                metadata=dict(item.metadata),
+                timestamp=item.timestamp,
+                projection_dirty=True,
+            )
+        )
+        next_ordinal += 1
+
+    def append_delete(item: _HistoryWorkingRow) -> None:
+        nonlocal next_ordinal
+        if item.existing_id is None:
+            return
+        if item.existing_id in existing_updates:
+            raise RawWriterUnsupported(
+                "history reconciliation conflicts with a source-row update"
+            )
+        prospective_mutations.append(
+            MessageMutation(
+                ordinal=next_ordinal,
+                operation="delete",
+                existing_id=item.existing_id,
+                line_number=item.original_line_number,
+                message_type=item.message_type,
+                role=item.role,
+                content=item.content,
+                metadata=dict(item.metadata),
+                timestamp=item.timestamp,
+                projection_dirty=True,
+                previous_role=item.role,
+                previous_metadata=dict(item.metadata),
+            )
+        )
+        next_ordinal += 1
+
+    def record_line_number(item: _HistoryWorkingRow) -> None:
+        nonlocal next_ordinal
+        if item.mutation is not None:
+            item.mutation.line_number = item.line_number
+            item.mutation.projection_dirty = True
+            return
+        if item.existing_id is None:
+            return
+        update = existing_updates.get(item.existing_id)
+        if update is not None:
+            update.line_number = item.line_number
+            update.projection_dirty = True
+            return
+        update = MessageMutation(
+            ordinal=next_ordinal,
+            operation="update",
+            existing_id=item.existing_id,
+            line_number=item.line_number,
+            message_type=item.message_type,
+            role=item.role,
+            content=item.content,
+            metadata=dict(item.metadata),
+            timestamp=item.timestamp,
+            projection_dirty=True,
+            previous_role=item.role,
+            previous_metadata=dict(item.metadata),
+        )
+        prospective_mutations.append(update)
+        existing_updates[item.existing_id] = update
+        next_ordinal += 1
+
+    history_changed = False
+    if history:
+        existing_history = [
+            item
+            for item in working.values()
+            if item.message_type == "history_user_message"
+        ]
+        existing_source_ids = {
+            str(item.metadata.get("source_id") or "")
+            for item in existing_history
+            if item.metadata.get("source_id")
+        }
+        used_history_lines = {
+            item.line_number
+            for item in existing_history
+            if item.line_number < 0
+        }
+        prepared_history: list[tuple[int, str, datetime | None, str]] = []
+        for history_index, entry in enumerate(history):
+            text = str(entry.get("text", "") or "").strip()
+            history_role, text = normalize_codex_user_payload(text)
+            if history_role != "user" or not text:
+                continue
+            timestamp = _legacy_history_timestamp(entry.get("ts", 0))
+            clean_history = _bounded_message_text(
+                text.replace("\x00", ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            source_id = f"codex-history:{history_index}"
+            if source_id not in existing_source_ids:
+                prepared_history.append(
+                    (history_index, clean_history, timestamp, source_id)
+                )
+
+        _, missing_history = partition_recovered_occurrences(
+            source_occurrences(),
+            [
+                UserOccurrence(
+                    key=history_index,
+                    content=content,
+                    timestamp=timestamp,
+                )
+                for history_index, content, timestamp, _ in prepared_history
+            ],
+        )
+        missing_indexes = {int(item.key) for item in missing_history}
+        next_free_history_index = 0
+        injected: list[_HistoryWorkingRow] = []
+        for history_index, content, timestamp, source_id in prepared_history:
+            if history_index not in missing_indexes:
+                continue
+            preferred_line = _history_line_number(history_index)
+            if preferred_line in used_history_lines:
+                while (
+                    next_free_history_index < MAX_USER_HISTORY_ENTRIES
+                    and _history_line_number(next_free_history_index)
+                    in used_history_lines
+                ):
+                    next_free_history_index += 1
+                if next_free_history_index >= MAX_USER_HISTORY_ENTRIES:
+                    break
+                history_line = _history_line_number(next_free_history_index)
+                next_free_history_index += 1
+            else:
+                history_line = preferred_line
+            used_history_lines.add(history_line)
+            injected.append(
+                _HistoryWorkingRow(
+                    key=("new-history", history_index),
+                    existing_id=None,
+                    line_number=history_line,
+                    original_line_number=history_line,
+                    message_type="history_user_message",
+                    role="user",
+                    content=content,
+                    metadata={"source_id": source_id},
+                    timestamp=timestamp,
+                )
+            )
+
+        # `_reconcile_recovered_history_rows` reads this timestamp/slot/id
+        # order before invoking the shared partition helper.  New identities
+        # are unique, so their stable source ID resolves the otherwise absent
+        # database ID tie-breaker.
+        history_candidates = sorted(
+            [*existing_history, *injected],
+            key=lambda item: (
+                item.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+                item.line_number,
+                item.existing_id if item.existing_id is not None else 0,
+            ),
+        )
+        matched, unresolved = partition_recovered_occurrences(
+            source_occurrences(),
+            [
+                UserOccurrence(
+                    key=item.key,
+                    content=item.content,
+                    timestamp=item.timestamp,
+                    line_number=item.line_number,
+                )
+                for item in history_candidates
+            ],
+        )
+        candidate_by_key = {item.key: item for item in history_candidates}
+        matched_keys = {item.key for item in matched}
+        for key in matched_keys:
+            item = candidate_by_key[key]
+            if item.existing_id is not None:
+                append_delete(item)
+            working.pop(key, None)
+        for item in injected:
+            if item.key not in matched_keys:
+                working[item.key] = item
+
+        pending = [
+            candidate_by_key[item.key]
+            for item in unresolved
+            if candidate_by_key[item.key].line_number < 1
+        ]
+        if pending:
+            timeline = [
+                UserOccurrence(
+                    key=item.key,
+                    content=item.content,
+                    timestamp=item.timestamp,
+                    line_number=item.line_number,
+                )
+                for item in working.values()
+                if (
+                    item.line_number >= 1
+                    and item.message_type != "history_user_message"
+                )
+            ]
+            anchors = recovered_occurrence_anchors(
+                timeline,
+                [
+                    UserOccurrence(
+                        key=item.key,
+                        content=item.content,
+                        timestamp=item.timestamp,
+                        line_number=item.line_number,
+                    )
+                    for item in pending
+                ],
+            )
+            groups: dict[int, list[_HistoryWorkingRow]] = {}
+            for item in pending:
+                groups.setdefault(anchors[item.key], []).append(item)
+            for anchor in sorted(groups, reverse=True):
+                group = sorted(
+                    groups[anchor],
+                    key=lambda item: (
+                        item.timestamp or datetime.max.replace(tzinfo=timezone.utc),
+                        str(item.metadata.get("source_id") or ""),
+                        item.existing_id if item.existing_id is not None else 0,
+                    ),
+                )
+                for item in working.values():
+                    if item.line_number >= anchor:
+                        item.line_number += len(group)
+                for index, item in enumerate(group):
+                    item.line_number = anchor + index
+
+        history_changed = bool(injected or matched_keys) or any(
+            item.existing_id is not None
+            and item.line_number != item.original_line_number
+            for item in working.values()
+        )
+        for item in working.values():
+            if item.existing_id is not None and (
+                item.line_number != item.original_line_number
+            ):
+                record_line_number(item)
+            elif item.mutation is not None:
+                item.mutation.line_number = item.line_number
+        for item in injected:
+            if item.key in working:
+                append_insert(item)
+    else:
+        # This is the legacy state_5.sqlite fallback used only when bounded
+        # history is absent.  It anchors the first real user prompt before the
+        # first non-system source line and opens the same positive line range.
+        first_user_msg = (first_user_message or "").strip()
+        if first_user_msg:
+            first_role, first_user_msg = normalize_codex_user_payload(
+                first_user_msg
+            )
+            if first_role != "user":
+                first_user_msg = ""
+        if first_user_msg and not any(
+            item.role == "user" for item in working.values()
+        ):
+            clean_first_user = _bounded_message_text(
+                first_user_msg.replace("\x00", ""),
+                MAX_STORED_MESSAGE_CHARS,
+            )
+            positive = [
+                item for item in working.values() if item.line_number >= 1
+            ]
+            first_non_system = min(
+                (
+                    item.line_number
+                    for item in positive
+                    if item.role != "system"
+                ),
+                default=None,
+            )
+            max_line = max(
+                (item.line_number for item in positive),
+                default=0,
+            )
+            anchor = first_non_system or max_line + 1
+            for item in working.values():
+                if item.line_number >= anchor:
+                    item.line_number += 1
+            first = _HistoryWorkingRow(
+                key=("first-user", next_ordinal),
+                existing_id=None,
+                line_number=anchor,
+                original_line_number=anchor,
+                message_type="first_user_message",
+                role="user",
+                content=clean_first_user,
+                metadata={},
+                timestamp=source_modified_at,
+            )
+            working[first.key] = first
+            for item in working.values():
+                if item is not first and item.existing_id is not None and (
+                    item.line_number != item.original_line_number
+                ):
+                    record_line_number(item)
+                elif item is not first and item.mutation is not None:
+                    item.mutation.line_number = item.line_number
+            append_insert(first)
+            history_changed = True
+
+    return history_changed
 
 
 def reduce_writer_state(
@@ -971,14 +1440,33 @@ def reduce_writer_state(
     _store_pending_question_ids(view, pending_ids)
     _store_latest_human_timestamp(view, latest_human)
     _store_assistant_identity(view, assistant_identity)
-    if has_history_metadata and not _history_metadata_is_already_committed(
-        state,
-        tool_id=tool_id,
-        history=incoming_history,
-        first_user_message=incoming_first_user_message,
-        prospective_mutations=mutations,
-    ):
-        raise RawWriterUnsupported("authoritative rebuild/history needs legacy reducer")
+    history_reconciled = False
+    if has_history_metadata:
+        if tool_id == "codex" and settings.realtime_ingest_raw_codex_history:
+            history_reconciled = _plan_codex_history_mutations(
+                state,
+                history=incoming_history,
+                first_user_message=incoming_first_user_message,
+                prospective_mutations=mutations,
+                source_modified_at=document_source_at,
+            )
+            # Legacy treats a recovery-row addition, removal, or relocation as
+            # a full read/search projection refresh.  The raw path uses this
+            # signal both for the projection mode and for its conservative
+            # search invalidation below.
+            if history_reconciled:
+                has_search_text = True
+                has_user_search_text = True
+        elif not _history_metadata_is_already_committed(
+            state,
+            tool_id=tool_id,
+            history=incoming_history,
+            first_user_message=incoming_first_user_message,
+            prospective_mutations=mutations,
+        ):
+            raise RawWriterUnsupported(
+                "authoritative rebuild/history needs legacy reducer"
+            )
     from .canvas_artifacts import canvas_message_can_have_reference
     from .ingest_service import _conversation_search_index_needs_refresh
     from .realtime_ingest_projector import message_is_canvas_projection_candidate
@@ -987,12 +1475,12 @@ def reduce_writer_state(
     # retain the pre-update role/metadata so a replacement which removes a
     # Canvas-capable or indexed row still reconciles the stale projection.
     candidate_has_search_text = has_search_text or any(
-        item.operation == "update"
+        item.operation in {"update", "delete"}
         and item.previous_role in {"user", "assistant"}
         for item in mutations
     )
     candidate_has_user_search_text = has_user_search_text or any(
-        item.operation == "update" and item.previous_role == "user"
+        item.operation in {"update", "delete"} and item.previous_role == "user"
         for item in mutations
     )
     canvas_candidate = any(
@@ -1050,6 +1538,7 @@ def reduce_writer_state(
         title_changed=not new_document and previous_title != view.title,
         canvas_candidate=canvas_candidate,
         search_candidate=search_candidate,
+        force_projection_rebuild=history_reconciled,
     )
 
 
@@ -1082,34 +1571,95 @@ async def _stage_messages(
         ),
         columns=("ordinal", "operation", "existing_id", "document_id", "line_number", "message_type", "role", "content", "metadata_text", "timestamp"),
     )
-    applied = await connection.fetch(
+    returned_ids: dict[int, int] = {}
+    deleted = await connection.fetch(
         """
-        WITH updated AS (
-            UPDATE conversation_messages AS message SET
-                message_type = stage.message_type, role = stage.role,
-                content = stage.content, metadata = stage.metadata_text::jsonb,
-                timestamp = stage.timestamp
-            FROM memento_raw_message_stage AS stage
-            WHERE stage.operation = 'update' AND message.id = stage.existing_id
-            RETURNING message.id, stage.ordinal
-        ), inserted AS (
+        DELETE FROM conversation_messages AS message
+        USING memento_raw_message_stage AS stage
+        WHERE stage.operation = 'delete'
+          AND message.id = stage.existing_id
+        RETURNING message.id, stage.ordinal
+        """
+    )
+    returned_ids.update(
+        {int(row["ordinal"]): int(row["id"]) for row in deleted}
+    )
+    update_count = await connection.fetchval(
+        """
+        SELECT count(*)
+        FROM memento_raw_message_stage
+        WHERE operation = 'update'
+        """
+    )
+    if update_count:
+        min_line = await connection.fetchval(
+            "SELECT min(line_number) FROM conversation_messages WHERE document_id=$1",
+            document_id,
+        )
+        temporary_start = int(min_line if min_line is not None else 0) - int(update_count) - 1
+        if temporary_start < -2_147_483_648:
+            raise RawWriterUnsupported(
+                "history reconciliation cannot reserve temporary line slots"
+            )
+        moved = await connection.fetch(
+            """
+            WITH moves AS (
+                SELECT existing_id,
+                       row_number() OVER (ORDER BY ordinal)::integer AS position
+                FROM memento_raw_message_stage
+                WHERE operation = 'update'
+            )
+            UPDATE conversation_messages AS message
+            SET line_number = $1 + moves.position
+            FROM moves
+            WHERE message.id = moves.existing_id
+            RETURNING message.id
+            """,
+            temporary_start,
+        )
+        if len(moved) != int(update_count):
+            raise RuntimeError("message stage could not reserve every update slot")
+    updated = await connection.fetch(
+        """
+        UPDATE conversation_messages AS message SET
+            line_number = stage.line_number,
+            message_type = stage.message_type,
+            role = stage.role,
+            content = stage.content,
+            metadata = stage.metadata_text::jsonb,
+            timestamp = stage.timestamp
+        FROM memento_raw_message_stage AS stage
+        WHERE stage.operation = 'update' AND message.id = stage.existing_id
+        RETURNING message.id, stage.ordinal
+        """
+    )
+    returned_ids.update(
+        {int(row["ordinal"]): int(row["id"]) for row in updated}
+    )
+    inserted = await connection.fetch(
+        """
+        WITH inserted AS (
             INSERT INTO conversation_messages
                 (document_id, line_number, message_type, role, content, metadata, timestamp)
-            SELECT document_id, line_number, message_type, role, content, metadata_text::jsonb, timestamp
-            FROM memento_raw_message_stage WHERE operation = 'insert'
+            SELECT document_id, line_number, message_type, role, content,
+                   metadata_text::jsonb, timestamp
+            FROM memento_raw_message_stage
+            WHERE operation = 'insert'
             ORDER BY ordinal
             RETURNING id, document_id, line_number
         )
-        SELECT updated.id, updated.ordinal FROM updated
-        UNION ALL
         SELECT inserted.id, stage.ordinal
-        FROM inserted JOIN memento_raw_message_stage AS stage
-          ON stage.operation = 'insert' AND stage.document_id = inserted.document_id
+        FROM inserted
+        JOIN memento_raw_message_stage AS stage
+          ON stage.operation = 'insert'
+         AND stage.document_id = inserted.document_id
          AND stage.line_number = inserted.line_number
-        ORDER BY ordinal
+        ORDER BY stage.ordinal
         """
     )
-    returned_ids = {int(row["ordinal"]): int(row["id"]) for row in applied}
+    returned_ids.update(
+        {int(row["ordinal"]): int(row["id"]) for row in inserted}
+    )
     if len(returned_ids) != len(mutations):
         raise RuntimeError("message stage did not apply every mutation")
     rows = [
@@ -1125,7 +1675,11 @@ async def _stage_messages(
         )
         for mutation in mutations
     ]
-    dirty = {mutation.line_number for mutation in mutations if mutation.projection_dirty}
+    dirty = {
+        mutation.line_number
+        for mutation in mutations
+        if mutation.projection_dirty or mutation.operation == "delete"
+    }
     return rows, dirty
 
 
@@ -1170,9 +1724,31 @@ async def _refresh_projections(
     from .dashboard_projection import dashboard_projection_values
 
     existing = _view(**state.read_model) if state.read_model else None
-    incremental = mutation.mode == "delta" and existing is not None and int(existing.projection_version or 0) == READ_MODEL_VERSION
+    incremental = (
+        mutation.mode == "delta"
+        and existing is not None
+        and int(existing.projection_version or 0) == READ_MODEL_VERSION
+        and not mutation.force_projection_rebuild
+    )
+    projection_rows = rows
+    if mutation.force_projection_rebuild:
+        current_rows = await connection.fetch(
+            """
+            SELECT id, document_id, line_number, message_type, role, content,
+                   metadata, timestamp
+            FROM conversation_messages
+            WHERE document_id = $1
+            ORDER BY line_number, id
+            """,
+            mutation.document_id,
+        )
+        projection_rows = [_message_view(row) for row in current_rows]
     previous_through = int(existing.projected_through_line or 0) if incremental else 0
-    inserted = [row for row, source in zip(rows, mutation.messages) if source.operation == "insert"]
+    inserted = [
+        row
+        for row, source in zip(rows, mutation.messages)
+        if source.operation == "insert"
+    ]
     if incremental and dirty:
         stats = await connection.fetchrow(
             """SELECT count(*) AS messages, count(*) FILTER (WHERE role='user') AS users,
@@ -1188,16 +1764,23 @@ async def _refresh_projections(
         assistant_count = int(existing.assistant_message_count or 0) + sum(row.role == "assistant" for row in inserted)
         character_count = int(existing.human_character_count or 0) + sum(len(row.content or "") for row in inserted if row.role in {"user", "assistant"})
     else:
-        message_count = len(rows)
-        user_count = sum(row.role == "user" for row in rows)
-        assistant_count = sum(row.role == "assistant" for row in rows)
-        character_count = sum(len(row.content or "") for row in rows if row.role in {"user", "assistant"})
+        message_count = len(projection_rows)
+        user_count = sum(row.role == "user" for row in projection_rows)
+        assistant_count = sum(row.role == "assistant" for row in projection_rows)
+        character_count = sum(
+            len(row.content or "")
+            for row in projection_rows
+            if row.role in {"user", "assistant"}
+        )
     accumulator = _Accumulator(existing if incremental else None)
-    for row in rows:
+    for row in projection_rows:
         accumulator.observe(row)
-    projected = max([previous_through, *(row.line_number for row in rows)], default=previous_through)
+    projected = max(
+        [previous_through, *(row.line_number for row in projection_rows)],
+        default=previous_through,
+    )
     latest_assistant = existing.latest_assistant_line if incremental else None
-    for row in rows:
+    for row in projection_rows:
         if (row.role or row.message_type) == "assistant":
             latest_assistant = max(int(latest_assistant or 0), row.line_number)
     previous_generation = int(existing.generation or 0) if existing is not None else 0
@@ -1235,7 +1818,7 @@ async def _refresh_projections(
         await connection.execute("DELETE FROM conversation_prompt_projections WHERE document_id=$1", mutation.document_id)
     elif updated_ids:
         await connection.execute("DELETE FROM conversation_prompt_projections WHERE document_id=$1 AND message_id = ANY($2::bigint[])", mutation.document_id, updated_ids)
-    prompt_rows = [_prompt_projection_value(row) for row in rows]
+    prompt_rows = [_prompt_projection_value(row) for row in projection_rows]
     prompt_rows = [row for row in prompt_rows if row is not None]
     if prompt_rows:
         await connection.executemany(
@@ -1243,7 +1826,11 @@ async def _refresh_projections(
             [(row["document_id"], row["message_id"], row["line_number"], row["content"], row["timestamp"]) for row in prompt_rows],
         )
     # Task projection is derived from the same staged rows and generated IDs.
-    candidates = [row for row in rows if _state_from_metadata(row.metadata_) is not None]
+    candidates = [
+        row
+        for row in projection_rows
+        if _state_from_metadata(row.metadata_) is not None
+    ]
     if candidates:
         source = max(candidates, key=lambda row: (
             int(((_state_from_metadata(row.metadata_) or {}).get("is_current")) and ((_state_from_metadata(row.metadata_) or {}).get("quality") != "partial")), row.line_number, row.id

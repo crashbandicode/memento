@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Canary Claude subagent transcript DELTAs through the raw writer.
     # Pairing sidecars and FULLs remain on the legacy path regardless.
     realtime_ingest_raw_subagent_transcripts: bool = False
+    # Canary Codex DELTAs that need recovered prompt-history reconciliation
+    # through the raw writer. FULL authoritative rebuilds remain legacy-only.
+    realtime_ingest_raw_codex_history: bool = False
 
     # Phase 5 defaults capability-negotiated conversation DELTAs to durable
     # spool admission. Setting this false is the kill-switch that reverts them
