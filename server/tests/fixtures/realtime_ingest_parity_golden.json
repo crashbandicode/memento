@@ -328,6 +328,9 @@
     ]
   }
 ,
+  "claude_deferred_search_document": {
+    "search_document": "'carry':1,7 'complete':23 'deferred':19 'delta':6,12 'durable':17 'initial':14 'is':16,22 'lineage':2,8,15 'raw':5,11 'state':21 'terminal':20 'the':4,10,13,18 'through':3,9"
+  },
   "codex_history_entry_bound": {
     "dashboard_projection": {
       "activity_at": "2025-08-02T11:00:20Z",

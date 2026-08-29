@@ -141,3 +141,13 @@ worktree before being accepted as baseline: the default-flag test failed with
 - Verify the golden fixture is additive: the new named sequence isolates
   lifecycle metadata and `active`/`is_subagent` lineage rows, without
   re-baselining existing keys.
+
+## Follow-up notes
+
+### F2 — final deferred search-document parity
+
+The deferred Claude parity fixture now snapshots `documents.content_tsv::text`
+after `process_pending_candidates` applies the queued search candidate. Its
+dedicated `claude_deferred_search_document` golden key asserts the resulting
+document content, not merely candidate enqueueing or search invalidation. The
+golden addition was inserted without modifying any existing fixture line.

@@ -716,6 +716,17 @@ def _first_difference(
     return None
 
 
+async def _search_document_snapshot(
+    session: AsyncSession, document_id: uuid.UUID
+) -> str | None:
+    return (
+        await session.execute(
+            text("SELECT content_tsv::text FROM documents WHERE id = :id"),
+            {"id": document_id},
+        )
+    ).scalar()
+
+
 async def _snapshot(
     session: AsyncSession,
     *,
@@ -960,6 +971,9 @@ async def _snapshot(
             )
             for row in lineage
         ]
+        snapshot["search_document"] = await _search_document_snapshot(
+            session, document_id
+        )
     return snapshot
 
 
@@ -997,6 +1011,13 @@ def _deferred_projection_golden_snapshot(
             if isinstance(row, dict)
         ],
     }
+
+
+def _deferred_search_document_golden_snapshot(
+    snapshot: dict[str, object],
+) -> dict[str, object]:
+    """Capture the projector-applied search document, not just its invalidation."""
+    return {"search_document": snapshot["search_document"]}
 
 
 async def _run_sequence(
@@ -1270,21 +1291,29 @@ async def test_deferred_claude_lineage_lifecycle_matches_golden(
     )
     monkeypatch.setattr(settings, "realtime_ingest_deferred_projections", True)
     monkeypatch.setattr(settings, "realtime_ingest_raw_subagent_transcripts", True)
-    actual = _deferred_projection_golden_snapshot(
-        await _run_sequence(
-            session_factory,
-            sequence,
-            use_core_delta_message_staging=True,
-            writer="raw",
-            full_writer="legacy",
-            apply_deferred_projections=True,
-        )
+    snapshot = await _run_sequence(
+        session_factory,
+        sequence,
+        use_core_delta_message_staging=True,
+        writer="raw",
+        full_writer="legacy",
+        apply_deferred_projections=True,
     )
-    expected = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))[sequence.name]
+    golden = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+    actual = _deferred_projection_golden_snapshot(snapshot)
+    expected = golden[sequence.name]
     difference = _first_difference(actual, expected)
     assert difference is None, (
         "raw deferred lineage/lifecycle drifted from the legacy golden at "
         f"{difference[0]}: expected {difference[1]!r}, got {difference[2]!r}"
+    )
+    search_actual = _deferred_search_document_golden_snapshot(snapshot)
+    search_expected = golden["claude_deferred_search_document"]
+    search_difference = _first_difference(search_actual, search_expected)
+    assert search_difference is None, (
+        "raw deferred search document drifted from the golden at "
+        f"{search_difference[0]}: expected {search_difference[1]!r}, "
+        f"got {search_difference[2]!r}"
     )
 
 
