@@ -201,6 +201,8 @@ def test_registration_adds_governor_only_when_enabled(
     command = post_entries[0]["hooks"][0]["command"]
     assert command.startswith('"')
     assert "-m collector.handoff_governor_hook --enabled" in command
+    assert post_entries[0]["hooks"][0]["timeout"] == 10
+    assert stop_entries[0]["hooks"][0]["timeout"] == 10
 
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
     _settings_path, changed = pending_hook.install_claude_pending_hooks()
@@ -216,3 +218,80 @@ def test_registration_adds_governor_only_when_enabled(
         if isinstance(hook, dict)
     )
     assert "Stop" not in settings["hooks"]
+
+
+def test_frozen_reconciler_migrates_old_hooks_to_versioned_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old onefile commands are replaced only after an onedir copy succeeds."""
+
+    config = tmp_path / ".claude"
+    config.mkdir()
+    settings_path = config / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": '"C:\\\\old\\\\memento-collector-sidecar.exe" claude-hook',
+                    }],
+                }],
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": (
+                            '"C:\\\\old\\\\memento-collector-sidecar.exe" '
+                            "claude-governor-hook --enabled"
+                        ),
+                    }],
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    bundled_runner = tmp_path / "bundle" / "memento-hook-runner"
+    (bundled_runner / "_internal").mkdir(parents=True)
+    (bundled_runner / "memento-hook-runner.exe").write_bytes(b"runner")
+    (bundled_runner / "_internal" / "python.dll").write_bytes(b"dll")
+    local_app_data = tmp_path / "local-app-data"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(bundled_runner))
+    monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
+    monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+
+    _settings_path, changed = pending_hook.install_claude_pending_hooks()
+
+    installed_runner = (
+        local_app_data
+        / "Memento"
+        / "hooks"
+        / "0.0.55"
+        / "memento-hook-runner.exe"
+    )
+    assert changed is True
+    assert installed_runner.read_bytes() == b"runner"
+    assert (installed_runner.parent / "_internal" / "python.dll").read_bytes() == b"dll"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    managed_hooks = [
+        hook
+        for entries in settings["hooks"].values()
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if (
+            pending_hook._is_memento_hook(hook)
+            or pending_hook._is_memento_governor_hook(hook)
+        )
+    ]
+    assert managed_hooks
+    assert all(hook["timeout"] == 10 for hook in managed_hooks)
+    assert all(str(installed_runner) in hook["command"] for hook in managed_hooks)
+    assert not any("memento-collector-sidecar" in hook["command"] for hook in managed_hooks)
+
+    _settings_path, changed = pending_hook.install_claude_pending_hooks()
+    assert changed is False

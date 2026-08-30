@@ -40,7 +40,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [],
+    "resources": [
+      "binaries/memento-hook-runner"
+    ],
     "externalBin": [
       "binaries/memento-collector-sidecar",
       "binaries/memento-mcp-sidecar"

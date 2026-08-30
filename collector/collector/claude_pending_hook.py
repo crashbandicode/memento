@@ -55,6 +55,8 @@ _MEMENTO_GOVERNOR_HOOK_MARKERS = (
     "collector.handoff_governor_hook",
     " claude-governor-hook",
 )
+_HOOK_TIMEOUT_SECONDS = 10
+_HOOK_RUNNER_NAME = "memento-hook-runner"
 
 
 def _pending_directory() -> Path:
@@ -1102,14 +1104,120 @@ def _settings_path() -> Path:
     return root / "settings.json"
 
 
-def _hook_command() -> str:
+def _hook_runner_filename() -> str:
+    return f"{_HOOK_RUNNER_NAME}.exe" if os.name == "nt" else _HOOK_RUNNER_NAME
+
+
+def _hook_runner_is_complete(directory: Path) -> bool:
+    """Return whether an onedir hook-runner directory is executable."""
+
+    return (
+        (directory / _hook_runner_filename()).is_file()
+        and (directory / "_internal").is_dir()
+    )
+
+
+def _bundled_hook_runner_directory() -> Path | None:
+    """Locate the onedir runner packaged beside a frozen desktop sidecar."""
+
+    configured = os.environ.get("MEMENTO_HOOK_RUNNER_SOURCE", "").strip()
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    if getattr(sys, "frozen", False):
+        executable_directory = Path(sys.executable).resolve().parent
+        candidates.extend(
+            (
+                # Tauri bundles configured resources below this Windows path.
+                executable_directory
+                / "resources"
+                / "binaries"
+                / _HOOK_RUNNER_NAME,
+                # These fallbacks support direct PyInstaller builds and the
+                # macOS resource layout without making the runtime depend on
+                # Tauri internals.
+                executable_directory / _HOOK_RUNNER_NAME,
+                executable_directory
+                / "Resources"
+                / "binaries"
+                / _HOOK_RUNNER_NAME,
+            )
+        )
+    return next(
+        (candidate for candidate in candidates if _hook_runner_is_complete(candidate)),
+        None,
+    )
+
+
+def _hook_runner_install_directory() -> Path:
+    """Return this immutable collector version's local hook-runner directory."""
+
+    from ._version import __version__
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return root / "Memento" / "hooks" / __version__
+
+
+def _install_hook_runner() -> Path | None:
+    """Install a versioned runner without replacing files a live hook may lock.
+
+    A desktop collector update carries a fresh resource directory.  We copy it
+    into a previously unused versioned destination and only then repoint managed
+    registrations.  Old version directories are intentionally retained: a
+    concurrently running hook may still have DLLs open from one of them.
+    """
+
+    if not (os.name == "nt" and getattr(sys, "frozen", False)):
+        return None
+    source = _bundled_hook_runner_directory()
+    if source is None:
+        raise OSError("Bundled Memento hook runner is unavailable")
+    destination = _hook_runner_install_directory()
+    executable = destination / _hook_runner_filename()
+    if _hook_runner_is_complete(destination):
+        return executable
+
+    import shutil
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        if staging.exists():
+            shutil.rmtree(staging)
+        shutil.copytree(source, staging)
+        if not _hook_runner_is_complete(staging):
+            raise OSError("Bundled Memento hook runner is incomplete")
+        try:
+            os.replace(staging, destination)
+        except FileExistsError:
+            # Another collector process won the race.  Its complete immutable
+            # destination is equivalent, so use it rather than replacing a
+            # directory that could already have live hook processes.
+            if not _hook_runner_is_complete(destination):
+                raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    if not _hook_runner_is_complete(destination):
+        raise OSError("Memento hook runner installation did not complete")
+    return executable
+
+
+def _hook_command(hook_runner: Path | None = None) -> str:
+    if hook_runner is not None:
+        executable = str(hook_runner.resolve()).replace('"', '\\"')
+        return f'"{executable}" claude-hook'
     executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
     if getattr(sys, "frozen", False):
         return f'"{executable}" claude-hook'
     return f'"{executable}" -m collector.claude_pending_hook'
 
 
-def _governor_hook_command() -> str:
+def _governor_hook_command(hook_runner: Path | None = None) -> str:
+    if hook_runner is not None:
+        executable = str(hook_runner.resolve()).replace('"', '\\"')
+        return f'"{executable}" claude-governor-hook --enabled'
     executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
     if getattr(sys, "frozen", False):
         return f'"{executable}" claude-governor-hook --enabled'
@@ -1137,6 +1245,7 @@ def _merge_event_hooks(
     command: str,
     *,
     managed_hook: Callable[[object], bool] = _is_memento_hook,
+    timeout: int = _HOOK_TIMEOUT_SECONDS,
 ) -> bool:
     entries = hooks.setdefault(event_name, [])
     if not isinstance(entries, list):
@@ -1171,7 +1280,11 @@ def _merge_event_hooks(
         if target is None:
             target = {"matcher": matcher, "hooks": []}
             entries.append(target)
-        target["hooks"].append({"type": "command", "command": command})
+        target["hooks"].append({
+            "type": "command",
+            "command": command,
+            "timeout": timeout,
+        })
 
     after = json.dumps(entries, ensure_ascii=False, sort_keys=True, default=str)
     return before != after
@@ -1237,11 +1350,12 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         sort_keys=True,
         default=str,
     )
-    command = _hook_command()
+    hook_runner = _install_hook_runner()
+    command = _hook_command(hook_runner)
     for event_name, matchers in _HOOK_SPECS.items():
         _merge_event_hooks(hooks, event_name, matchers, command)
     if governor_enabled():
-        governor_command = _governor_hook_command()
+        governor_command = _governor_hook_command(hook_runner)
         for event_name, matchers in _GOVERNOR_HOOK_SPECS.items():
             _merge_event_hooks(
                 hooks,

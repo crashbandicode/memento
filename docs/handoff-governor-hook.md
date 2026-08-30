@@ -7,6 +7,24 @@ their prompt prefix consumes the context window. The governor is a managed,
 inert-by-default pair of Claude Code hooks that provides a staged nudge and a
 last-resort Stop guard.
 
+## Hook execution and latency
+
+On Windows collector 0.0.55, managed Claude hook registrations invoke the
+dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
+It is a small PyInstaller **onedir** bundle, copied on collector startup from
+the desktop application's packaged resource to a versioned directory such as
+`%LOCALAPPDATA%\Memento\hooks\0.0.55\`. Its `_internal` directory stays beside
+the executable, so a hook process does not unpack a 40 MB onefile bundle into a
+new `_MEI*` temp directory for every Claude event.
+
+The installer writes each managed command hook with `"timeout": 10`. This is a
+fail-open ceiling if a damaged runner, filesystem problem, or an unexpectedly
+slow invocation occurs; normal hook work must complete well below that limit.
+The collector installs a new immutable version directory before it rewrites
+managed commands. It deliberately leaves prior version directories in place,
+because a concurrently running hook may still hold one of their DLLs open on
+Windows. The daemon/`run` sidecar remains the existing onefile artifact.
+
 ## Load-bearing design decisions
 
 1. **Measure the live prompt prefix, not a display estimate.** The hook reads a
@@ -52,9 +70,20 @@ decision; make threshold/path variables visible to the Claude Code process
    writes the two governor entries into `~/.claude/settings.json`.
 2. Optionally set the threshold and handoff-path variables above for the
    Claude Code process, then restart Claude Code.
-3. Confirm the project handoff document has a Markdown section that names the
-   active session id. The Stop guard accepts neither mere file existence nor a
+3. Confirm the project handoff document has a Markdown **section heading**
+   that names the active session id, for example
+   `## Current session 9d9aca8e-427c-480a-a648-f9ab2e13a29e`. The production
+   `memento-run-4` validation on 2026-08-29 found that a body-text mention did
+   not satisfy Stop verification; use the heading form rather than relying on
+   a prose mention. The Stop guard accepts neither mere file existence nor a
    section for another session.
+
+   The current source matcher identifies headings and searches the text through
+   the next heading, so it also recognizes an exact, delimiter-bounded id in a
+   heading's body. That is broader than the production observation above; no
+   governor logic changed in 0.0.55, and heading placement is the durable
+   operational contract until that environment discrepancy is independently
+   resolved.
 4. To deactivate, remove or set `MEMENTO_GOVERNOR_ENABLED` false and restart
    the collector. Its next reconcile removes only its own governor entries;
    existing Memento pending-question hooks and user hooks remain intact.

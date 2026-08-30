@@ -1713,6 +1713,7 @@ def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
         command = memento_entries[0]["hooks"][0]["command"]
         assert "-m collector.claude_pending_hook" in command
         assert "Downloads" not in command
+        assert memento_entries[0]["hooks"][0]["timeout"] == 10
     assert settings["hooks"]["PermissionRequest"][0]["matcher"] == ".*"
     assert settings["hooks"]["Elicitation"][0]["matcher"] == ".*"
     assert settings["hooks"]["ElicitationResult"][0]["matcher"] == ".*"
