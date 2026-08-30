@@ -195,4 +195,78 @@ test.describe("smart conversation links", () => {
       }
     });
   }
+
+  test("fenced code has an exact, accessible copy control", async ({ page }) => {
+    await openConversation(page, smartLinkScenarios[0]);
+    await page.getByTestId("message-expand-toggle").click();
+
+    const fencedCode = page.locator("pre code");
+    const codeBlock = page.getByTestId("markdown-code-block");
+    const copy = page.getByTestId("code-block-copy");
+    const inlineCode = page.getByTestId("inline-code");
+
+    await expect(codeBlock).toHaveCount(1);
+    await expect(copy).toBeVisible();
+    await expect(copy).toHaveAttribute("data-copy-status", "idle");
+    await expect(copy).toHaveAccessibleName("Copy");
+    await expect(inlineCode.locator("xpath=ancestor::*[@data-testid='markdown-code-block']")).toHaveCount(0);
+
+    await page.evaluate(() => {
+      /** @type {any} */ (window).__copiedFencedCode = undefined;
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: async (value) => {
+            /** @type {any} */ (window).__copiedFencedCode = value;
+          },
+        },
+      });
+    });
+
+    await copy.click();
+    await expect(copy).toHaveAttribute("data-copy-status", "copied");
+    await expect(copy).toHaveAccessibleName("Copied");
+    expect(await page.evaluate(() => /** @type {any} */ (window).__copiedFencedCode))
+      .toBe("run_refresh_active_via_bjobs()");
+
+    // The control wraps the block rather than its highlighted contents, so
+    // copy affordance changes do not alter the source or highlight class.
+    await expect(fencedCode).toHaveText("run_refresh_active_via_bjobs()");
+    await expect(fencedCode).toHaveClass(/(?:^|\s)language-python(?:\s|$)/);
+  });
+
+  test("fenced code copy control stays reachable on a narrow viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openConversation(page, smartLinkScenarios[0]);
+    await page.getByTestId("message-expand-toggle").click();
+
+    const copy = page.getByTestId("code-block-copy");
+    await expect(copy).toBeVisible();
+    const box = await copy.boundingBox();
+    expect(box?.x ?? -1).toBeGreaterThanOrEqual(0);
+    expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual(390);
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+  });
+
+  test("Mermaid remains a diagram without a code copy control", async ({ page }) => {
+    const base = smartLinkScenarios[0];
+    const scenario = {
+      ...base,
+      docId: `${base.docId}-mermaid`,
+      meta: { ...base.meta, id: `${base.meta.id}-mermaid` },
+      messages: base.messages.map((message) => message.id === 2
+        ? {
+            ...message,
+            content: `${message.content}\n\n\`\`\`mermaid\ngraph LR\n  A[Source] --> B[Diagram]\n\`\`\``,
+          }
+        : message),
+    };
+    await openConversation(page, scenario);
+    await page.getByTestId("message-expand-toggle").click();
+
+    const diagram = page.locator("[data-mermaid-diagram]");
+    await expect(diagram).toBeVisible();
+    await expect(diagram.getByTestId("code-block-copy")).toHaveCount(0);
+    await expect(diagram.getByTestId("markdown-code-block")).toHaveCount(0);
+  });
 });

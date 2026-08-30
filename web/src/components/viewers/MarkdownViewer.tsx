@@ -1,19 +1,31 @@
 "use client";
 
-import { Children, isValidElement, type ReactNode } from "react";
+import {
+  Children,
+  isValidElement,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import MermaidDiagram from "./MermaidDiagram";
 import { SmartCode, SmartLink } from "./SmartLink";
+import { Icon } from "@/components/aurora/Icon";
 import { CanvasArtifactProvider } from "@/lib/canvas-context";
 import {
   isSafeCanvasPath,
   looksLikeCanvasArtifact,
   type CanvasArtifact,
 } from "@/lib/canvas-artifact.mjs";
+import { copyText } from "@/lib/copy-text";
+import { useI18n } from "@/lib/i18n";
 import "highlight.js/styles/github-dark.min.css";
+import styles from "./MarkdownViewer.module.css";
 
 function nodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -31,6 +43,67 @@ function mermaidSource(children: ReactNode): string | null {
   return nodeText(child.props.children).replace(/\n$/, "");
 }
 
+function CodeCopyButton({ source }: { source: string }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
+  }, []);
+
+  const handleCopy = async () => {
+    try {
+      await copyText(source);
+      setCopied(true);
+      if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
+      feedbackTimer.current = setTimeout(() => {
+        feedbackTimer.current = null;
+        setCopied(false);
+      }, 1600);
+    } catch {
+      // Do not claim success when the Clipboard API and its fallback both fail.
+      if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
+      feedbackTimer.current = null;
+      setCopied(false);
+    }
+  };
+
+  const label = copied ? t.common.copied : t.common.copy;
+
+  return (
+    <button
+      type="button"
+      className={styles.copyButton}
+      data-testid="code-block-copy"
+      data-copy-status={copied ? "copied" : "idle"}
+      aria-label={label}
+      title={label}
+      onClick={() => { void handleCopy(); }}
+    >
+      <Icon name={copied ? "check" : "copy"} size={15} aria-hidden="true" />
+      <span aria-live="polite" aria-atomic="true">{label}</span>
+    </button>
+  );
+}
+
+function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
+  const source = mermaidSource(children);
+  if (source !== null) return <MermaidDiagram source={source} />;
+
+  // react-markdown appends one terminal newline to fenced blocks. Strip only
+  // that parser artifact so blank lines deliberately included in the source
+  // remain part of the copied value.
+  const copySource = nodeText(children).replace(/\n$/, "");
+
+  return (
+    <div className={styles.codeBlock} data-testid="markdown-code-block">
+      <pre {...props}>{children}</pre>
+      <CodeCopyButton source={copySource} />
+    </div>
+  );
+}
+
 const canvasAwareUrlTransform: UrlTransform = (url) => {
   if (looksLikeCanvasArtifact(url) && isSafeCanvasPath(url)) return url;
   return defaultUrlTransform(url);
@@ -39,12 +112,7 @@ const canvasAwareUrlTransform: UrlTransform = (url) => {
 const markdownComponents: Components = {
   a: SmartLink,
   code: SmartCode,
-  pre: ({ children, ...props }) => {
-    const source = mermaidSource(children);
-    return source === null
-      ? <pre {...props}>{children}</pre>
-      : <MermaidDiagram source={source} />;
-  },
+  pre: CodeBlock,
   table: ({ children, ...props }) => (
     <div
       style={{

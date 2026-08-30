@@ -1,0 +1,48 @@
+.codeBlock {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  margin: 1em 0;
+}
+
+.codeBlock > pre {
+  margin: 0 !important;
+  padding-top: 3.75rem !important;
+}
+
+.copyButton {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 0.7rem;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 0.45rem;
+  background: rgba(15, 23, 42, 0.88);
+  color: #f8fafc;
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.copyButton:hover {
+  background: rgba(51, 65, 85, 0.96);
+}
+
+.copyButton[data-copy-status="copied"] {
+  border-color: rgba(74, 222, 128, 0.7);
+  color: #bbf7d0;
+}
+
+.copyButton:focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: 2px;
+}
