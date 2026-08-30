@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +25,31 @@ def _write_complete_runner(directory: Path) -> Path:
     runner.write_bytes(b"runner")
     (directory / "_internal" / "python.dll").write_bytes(b"dll")
     return runner
+
+
+def _runner_tree_snapshot(directory: Path) -> list[tuple[str, int, str]]:
+    """Capture every runner file so live-cleanup tests detect partial deletion."""
+
+    return sorted(
+        (
+            path.relative_to(directory).as_posix(),
+            path.stat().st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in directory.rglob("*")
+        if path.is_file()
+    )
+
+
+def _built_hook_runner_executable() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "tauri-collector"
+        / "src-tauri"
+        / "binaries"
+        / "memento-hook-runner"
+        / "memento-hook-runner.exe"
+    )
 
 
 def _assistant_record(
@@ -460,7 +489,7 @@ def test_runner_install_recognizes_generic_windows_already_exists_error() -> Non
     )
 
 
-def test_runner_retention_keeps_current_previous_and_skips_locked_cleanup(
+def test_runner_retention_rename_refusal_keeps_live_directory_intact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -471,18 +500,132 @@ def test_runner_retention_keeps_current_previous_and_skips_locked_cleanup(
     current = root / "0.0.55"
     for directory in (old_deleted, old_locked, previous, current):
         _write_complete_runner(directory)
-    real_rmtree = shutil.rmtree
+    old_deleted_before = _runner_tree_snapshot(old_deleted)
+    old_locked_before = _runner_tree_snapshot(old_locked)
+    real_rename = os.rename
 
-    def skip_locked(directory: Path, *args: object, **kwargs: object) -> None:
-        if Path(directory) == old_locked:
-            raise PermissionError(5, "in use", str(directory))
-        real_rmtree(directory, *args, **kwargs)
+    def refuse_live_rename(source: Path, target: Path) -> None:
+        if Path(source) == old_locked:
+            raise PermissionError(5, "in use", str(source))
+        real_rename(source, target)
 
-    monkeypatch.setattr(shutil, "rmtree", skip_locked)
+    monkeypatch.setattr(pending_hook.os, "rename", refuse_live_rename)
 
     pending_hook._cleanup_hook_runner_versions(root, current)
 
     assert not old_deleted.exists()
+    tombstone = next(root.glob("0.0.52.trash-*"))
+    assert _runner_tree_snapshot(tombstone) == old_deleted_before
     assert old_locked.exists()
+    assert _runner_tree_snapshot(old_locked) == old_locked_before
     assert previous.exists()
     assert current.exists()
+
+    expired = time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
+    os.utime(tombstone, (expired, expired))
+    pending_hook._cleanup_hook_runner_versions(root, current)
+
+    assert not tombstone.exists()
+
+
+def test_runner_retention_protects_registered_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    old_deleted = root / "0.0.51"
+    registered = root / "0.0.52"
+    previous = root / "0.0.54"
+    current = root / "0.0.55"
+    for directory in (old_deleted, registered, previous, current):
+        _write_complete_runner(directory)
+
+    pending_hook._cleanup_hook_runner_versions(
+        root,
+        current,
+        registered_directory=registered,
+    )
+
+    assert not old_deleted.exists()
+    assert registered.exists()
+    assert previous.exists()
+    assert current.exists()
+
+
+def test_runner_retention_sweeps_leftover_tombstones(tmp_path: Path) -> None:
+    root = tmp_path / "hooks"
+    current = root / "0.0.55"
+    tombstone = root / "0.0.52.trash-prior-attempt"
+    _write_complete_runner(current)
+    _write_complete_runner(tombstone)
+    expired = time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
+    os.utime(tombstone, (expired, expired))
+
+    pending_hook._cleanup_hook_runner_versions(root, current)
+
+    assert current.exists()
+    assert not tombstone.exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not _built_hook_runner_executable().is_file(),
+    reason="requires the locally built Windows onedir hook runner",
+)
+def test_runner_retention_never_partially_deletes_live_frozen_runner(
+    tmp_path: Path,
+) -> None:
+    """A live onedir process stays intact through detachment and the grace."""
+
+    root = tmp_path / "hooks"
+    old_live = root / "0.0.53"
+    previous = root / "0.0.54"
+    current = root / "0.0.55"
+    runner_source = _built_hook_runner_executable().parent
+    shutil.copytree(runner_source, old_live)
+    _write_complete_runner(previous)
+    _write_complete_runner(current)
+    before_cleanup = _runner_tree_snapshot(old_live)
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            [str(old_live / "memento-hook-runner.exe"), "claude-hook"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        # Keep stdin open after startup so the hook is running from old_live.
+        time.sleep(0.5)
+        assert process.poll() is None
+
+        pending_hook._cleanup_hook_runner_versions(root, current)
+
+        assert not old_live.exists()
+        tombstone = next(root.glob("0.0.53.trash-*"))
+        assert _runner_tree_snapshot(tombstone) == before_cleanup
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+        assert process.stdout is not None
+        assert process.stderr is not None
+        assert process.stdout.read().strip() == "{}"
+        assert process.stderr.read() == ""
+
+        expired = (
+            time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
+        )
+        os.utime(tombstone, (expired, expired))
+        pending_hook._cleanup_hook_runner_versions(root, current)
+
+        assert not tombstone.exists()
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()

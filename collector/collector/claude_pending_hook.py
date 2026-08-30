@@ -57,6 +57,8 @@ _MEMENTO_GOVERNOR_HOOK_MARKERS = (
 )
 _HOOK_TIMEOUT_SECONDS = 10
 _HOOK_RUNNER_NAME = "memento-hook-runner"
+_HOOK_RUNNER_TOMBSTONE_MARKER = ".trash-"
+_HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS = _HOOK_TIMEOUT_SECONDS + 1
 
 
 def _pending_directory() -> Path:
@@ -1188,37 +1190,97 @@ def _hook_runner_version_key(directory: Path) -> tuple[int, ...]:
     return tuple(int(part) for part in parts) if parts else (0,)
 
 
-def _cleanup_hook_runner_versions(root: Path, current: Path) -> None:
-    """Best-effort retention: current plus one previous complete runner."""
+def _hook_runner_tombstone_path(directory: Path) -> Path:
+    """Return a unique sibling name for an atomically retired runner."""
+
+    return directory.with_name(
+        f"{directory.name}{_HOOK_RUNNER_TOMBSTONE_MARKER}"
+        f"{os.getpid()}-{time.time_ns()}"
+    )
+
+
+def _sweep_hook_runner_tombstones(root: Path) -> None:
+    """Remove detached runners only after the hook timeout grace period."""
+
+    try:
+        tombstones = [
+            directory
+            for directory in root.iterdir()
+            if directory.is_dir() and _HOOK_RUNNER_TOMBSTONE_MARKER in directory.name
+        ]
+    except OSError:
+        return
+    import shutil
+
+    now = time.time()
+    for tombstone in tombstones:
+        try:
+            detached_age = now - tombstone.stat().st_mtime
+        except OSError:
+            continue
+        if detached_age < _HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS:
+            continue
+        try:
+            shutil.rmtree(tombstone)
+        except OSError:
+            # A prior deletion may have hit a transient filesystem failure.
+            # Tombstones are unreachable by registrations, so retry next start.
+            continue
+
+
+def _cleanup_hook_runner_versions(
+    root: Path,
+    current: Path,
+    registered_directory: Path | None = None,
+) -> None:
+    """Retain current, registered, and newest previous runners without live deletion."""
+
+    _sweep_hook_runner_tombstones(root)
 
     try:
         installed = [
             directory
             for directory in root.iterdir()
-            if directory.is_dir() and _hook_runner_is_complete(directory)
+            if (
+                directory.is_dir()
+                and _HOOK_RUNNER_TOMBSTONE_MARKER not in directory.name
+                and _hook_runner_is_complete(directory)
+            )
         ]
     except OSError:
         return
+    retained = {current}
+    if registered_directory is not None:
+        retained.add(registered_directory)
     previous = max(
-        (directory for directory in installed if directory != current),
+        (directory for directory in installed if directory not in retained),
         key=_hook_runner_version_key,
         default=None,
     )
-    retained = {current}
     if previous is not None:
         retained.add(previous)
+
+    import shutil
+
     for directory in installed:
         if directory in retained:
             continue
+        tombstone = _hook_runner_tombstone_path(directory)
         try:
-            import shutil
-
-            shutil.rmtree(directory)
+            # Detach first, never recursively delete an original version path.
+            # Some Windows handles allow a directory rename while a process is
+            # live, so deletion is deferred for longer than Claude's 10-second
+            # external hook timeout rather than treating rename as liveness
+            # proof.
+            os.rename(directory, tombstone)
         except OSError:
-            # A running old hook may still have an _internal DLL open on
-            # Windows. Leave it for a later collector start; cleanup can never
-            # block installation or reconciliation.
             continue
+        try:
+            os.utime(tombstone, None)
+        except OSError:
+            # A failed timestamp update only retains an unreachable tombstone;
+            # it must not turn cleanup into an in-place recursive delete.
+            pass
 
 
 def _is_lost_hook_runner_install_race(error: OSError) -> bool:
@@ -1233,10 +1295,10 @@ def _is_lost_hook_runner_install_race(error: OSError) -> bool:
 def _install_hook_runner() -> Path | None:
     """Install a versioned runner without replacing files a live hook may lock.
 
-    A desktop collector update carries a fresh resource directory.  We copy it
-    into a previously unused versioned destination and only then repoint managed
-    registrations.  Old version directories are intentionally retained: a
-    concurrently running hook may still have DLLs open from one of them.
+    A desktop collector update carries a fresh resource directory. We copy it
+    into a previously unused versioned destination and only then repoint
+    managed registrations. Retention runs after that reconciliation, using an
+    atomic rename probe so a live old hook is never partly deleted.
     """
 
     if not (os.name == "nt" and getattr(sys, "frozen", False)):
@@ -1244,7 +1306,6 @@ def _install_hook_runner() -> Path | None:
     destination = _hook_runner_install_directory()
     executable = destination / _hook_runner_filename()
     if _hook_runner_is_complete(destination):
-        _cleanup_hook_runner_versions(destination.parent, destination)
         return executable
 
     source = _bundled_hook_runner_directory()
@@ -1282,7 +1343,6 @@ def _install_hook_runner() -> Path | None:
             shutil.rmtree(staging, ignore_errors=True)
     if not _hook_runner_is_complete(destination):
         return None
-    _cleanup_hook_runner_versions(destination.parent, destination)
     return executable
 
 
@@ -1460,6 +1520,12 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         default=str,
     )
     if not changed:
+        if hook_runner is not None:
+            _cleanup_hook_runner_versions(
+                hook_runner.parent.parent,
+                hook_runner.parent,
+                registered_directory=hook_runner.parent,
+            )
         return settings_path, False
 
     previous_mode = None
@@ -1478,6 +1544,12 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         os.replace(temporary, settings_path)
     finally:
         temporary.unlink(missing_ok=True)
+    if hook_runner is not None:
+        _cleanup_hook_runner_versions(
+            hook_runner.parent.parent,
+            hook_runner.parent,
+            registered_directory=hook_runner.parent,
+        )
     return settings_path, True
 
 
