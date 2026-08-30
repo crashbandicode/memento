@@ -1,9 +1,21 @@
 "use client";
 
-import { PointerEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent } from "react";
 import { Icon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { authFetch, getApiBase } from "@/lib/api-client";
+import {
+  bucketLabel,
+  chartTooltipPlacement,
+  computeSpendBuckets,
+  formatTokenCount,
+  nearestBucketIndex,
+  scaledModelRows,
+  tokenDayForHover,
+  tooltipResolution,
+} from "@/lib/spend-tooltip";
+import type { ModelSeriesForTooltip, TokenLedgerForTooltip } from "@/lib/spend-tooltip";
+import { hasProjectionMath, projectionMathTooltip, type ProjectionMathKey } from "@/lib/spend-projection-math";
 
 type SpendSource = "all" | "claude" | "cursor" | "codex";
 type SpendRange = "6h" | "24h" | "7d" | "30d" | "mtd";
@@ -62,6 +74,11 @@ interface StackTrace {
 
 interface HistoryView {
   points?: StackPoint[];
+  modelSeries?: ModelSeriesForTooltip & {
+    totals?: Record<string, number>;
+    chart?: Array<StackPoint & { models?: Record<string, number>; modelCum?: Record<string, number> }>;
+  };
+  tokenLedger?: TokenLedgerForTooltip;
   stack?: {
     traces?: StackTrace[];
     outline?: StackPoint[];
@@ -104,6 +121,7 @@ interface ProjectionView {
     worst?: ProjectionScenario;
     realistic?: ProjectionScenario;
     average?: ProjectionScenario;
+    math?: unknown;
   };
 }
 
@@ -210,7 +228,7 @@ function coverageLabel(value: BreakdownView["coverage"]): string | undefined {
 }
 
 function shortModel(value: string): string {
-  return value.replace(/^claude-/i, "").replace(/-\d{8}$/i, "");
+  return value.replace(/^(claude|gpt)-/i, "").replace(/-\d{8}$/i, "");
 }
 
 function dateLabel(value?: string | null): string {
@@ -262,11 +280,98 @@ function ProjectionRows({ projection }: { projection?: ProjectionView["projectio
     ["Realistic", "realistic", projection?.realistic],
     ["Average", "average", projection?.average],
   ] as const;
+  const math = hasProjectionMath(projection?.math) ? projection.math : null;
+  const [activeKey, setActiveKey] = useState<ProjectionMathKey | null>(null);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0, visible: false });
+  const activeAnchor = useRef<HTMLDivElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const pointerInteraction = useRef(false);
+  const touchInteraction = useRef(false);
+  const touchOpenKey = useRef<ProjectionMathKey | null>(null);
+
+  const hideTooltip = useCallback(() => {
+    activeAnchor.current = null;
+    pointerInteraction.current = false;
+    touchInteraction.current = false;
+    touchOpenKey.current = null;
+    setActiveKey(null);
+    setTooltipPosition((position) => ({ ...position, visible: false }));
+  }, []);
+
+  const showTooltip = useCallback((key: ProjectionMathKey, anchor: HTMLDivElement) => {
+    activeAnchor.current = anchor;
+    setTooltipPosition((position) => ({ ...position, visible: false }));
+    setActiveKey(key);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!activeKey || !activeAnchor.current || !tooltipRef.current) return undefined;
+    const reposition = () => {
+      const anchor = activeAnchor.current;
+      const tooltip = tooltipRef.current;
+      if (!anchor || !tooltip) return;
+      const bounds = anchor.getBoundingClientRect();
+      const tooltipWidth = tooltip.offsetWidth || 220;
+      const tooltipHeight = tooltip.offsetHeight || 80;
+      const left = Math.max(tooltipWidth / 2 + 8, Math.min(window.innerWidth - tooltipWidth / 2 - 8, bounds.left + bounds.width / 2));
+      const above = bounds.top - tooltipHeight - 10;
+      setTooltipPosition({ left, top: above < 8 ? bounds.bottom + 10 : above, visible: true });
+    };
+    const frame = window.requestAnimationFrame(reposition);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", hideTooltip, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", hideTooltip, true);
+    };
+  }, [activeKey, hideTooltip]);
+
+  useEffect(() => {
+    if (!activeKey) return undefined;
+    const dismissOutside = (event: globalThis.PointerEvent) => {
+      if (activeAnchor.current && !activeAnchor.current.contains(event.target as Node)) hideTooltip();
+    };
+    document.addEventListener("pointerdown", dismissOutside, true);
+    return () => document.removeEventListener("pointerdown", dismissOutside, true);
+  }, [activeKey, hideTooltip]);
+
   if (!scenarios.some(([, , scenario]) => scenario?.dollars || scenario?.cents != null)) return null;
+  const activeTooltip = math && activeKey ? projectionMathTooltip(math, activeKey) : null;
   return (
     <div className="spend-projection-rows" aria-label="Cycle projections">
-      {scenarios.map(([label, key, scenario]) => (
-        <div key={key}>
+      {scenarios.map(([label, key, scenario]) => {
+        const interaction = math ? {
+          tabIndex: 0,
+          onMouseEnter: (event: MouseEvent<HTMLDivElement>) => showTooltip(key, event.currentTarget),
+          onMouseLeave: hideTooltip,
+          onPointerDown: (event: PointerEvent<HTMLDivElement>) => {
+            pointerInteraction.current = true;
+            touchInteraction.current = event.pointerType === "touch";
+          },
+          onFocus: (event: React.FocusEvent<HTMLDivElement>) => {
+            if (pointerInteraction.current) return;
+            touchInteraction.current = false;
+            showTooltip(key, event.currentTarget);
+          },
+          onBlur: () => {
+            if (!touchInteraction.current) hideTooltip();
+          },
+          onClick: (event: MouseEvent<HTMLDivElement>) => {
+            const isTouch = touchInteraction.current;
+            pointerInteraction.current = false;
+            if (isTouch) {
+              if (touchOpenKey.current === key) hideTooltip();
+              else {
+                showTooltip(key, event.currentTarget);
+                touchOpenKey.current = key;
+              }
+            } else if (activeKey === key) hideTooltip();
+            else showTooltip(key, event.currentTarget);
+          },
+        } : {};
+        return (
+        <div key={key} className={`spend-projection-row ${math ? "spend-projection-row-interactive" : ""}`} {...interaction}>
           <span>{label}</span>
           <strong style={{ color: PROJECTION_COLORS[key] }}>
             {scenario?.dollars || centsLabel(finite(scenario?.cents))}
@@ -275,7 +380,26 @@ function ProjectionRows({ projection }: { projection?: ProjectionView["projectio
             {finite(scenario?.pctOfLimit).toFixed(0)}% of limit{formatHit(scenario?.hits100Pct)}
           </small>
         </div>
-      ))}
+        );
+      })}
+      {activeTooltip && (
+        <div
+          ref={tooltipRef}
+          className="spend-projection-math-tooltip"
+          data-testid="projection-math-tooltip"
+          role="tooltip"
+          style={{ left: tooltipPosition.left, top: tooltipPosition.top, visibility: tooltipPosition.visible ? "visible" : "hidden" }}
+        >
+          <div className="spend-projection-math-title">{activeTooltip.heading}</div>
+          {activeTooltip.lines.map((line, index) => (
+            <p className={line.kind === "equation" ? "spend-projection-math-equation" : undefined} key={`${line.kind}-${index}`}>
+              {line.segments.map((segment, segmentIndex) => segment.bold
+                ? <strong key={segmentIndex}>{segment.text}</strong>
+                : <span key={segmentIndex}>{segment.text}</span>)}
+            </p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -288,6 +412,7 @@ function SpendHistoryChart({
   summary,
   projection,
   projectionsVisible,
+  modelColors,
 }: {
   history?: HistoryView;
   source: SpendSource;
@@ -296,25 +421,32 @@ function SpendHistoryChart({
   summary: SpendSummary;
   projection?: ProjectionView["projection"];
   projectionsVisible: boolean;
+  modelColors: string[];
 }) {
   const narrowLayout = useNarrowSpendLayout();
   const width = 600;
   const height = 300;
   const inset = { left: 46, right: 18, top: 22, bottom: 35 };
-  const rawTraces = source === "all" ? [] : history?.stack?.traces ?? [];
-  const traces = rawTraces
-    .map((trace) => ({ ...trace, points: filterRange(trace.points ?? [], range, cycleStart) }))
-    .filter((trace) => (trace.points?.length ?? 0) > 1);
-  const rawOutline = history?.stack?.outline?.length ? history.stack.outline : history?.points ?? [];
-  const outline = filterRange(rawOutline, range, cycleStart);
-  const allPoints = [...outline, ...traces.flatMap((trace) => trace.points ?? [])];
-  const timestamps = allPoints.map((point) => timestamp(point.t)).filter(Number.isFinite);
-  const minTime = Math.min(...timestamps);
-  const maxTime = Math.max(...timestamps);
-  const maxUsage = Math.max(
-    1,
-    ...allPoints.map((point) => Math.max(finite(point.u), finite(point.y1), finite(point.l))),
-  );
+  const resolution = tooltipResolution(range);
+  const chartData = useMemo(() => {
+    const rawTraces = source === "all" ? [] : history?.stack?.traces ?? [];
+    const traces = rawTraces
+      .map((trace) => ({ ...trace, points: filterRange(trace.points ?? [], range, cycleStart) }))
+      .filter((trace) => (trace.points?.length ?? 0) > 1);
+    const rawOutline = history?.stack?.outline?.length ? history.stack.outline : history?.points ?? [];
+    const outline = filterRange(rawOutline, range, cycleStart);
+    const allPoints = [...outline, ...traces.flatMap((trace) => trace.points ?? [])];
+    const timestamps = allPoints.map((point) => timestamp(point.t)).filter(Number.isFinite);
+    return {
+      traces,
+      outline,
+      buckets: computeSpendBuckets(outline, resolution),
+      minTime: Math.min(...timestamps),
+      maxTime: Math.max(...timestamps),
+      maxUsage: Math.max(1, ...allPoints.map((point) => Math.max(finite(point.u), finite(point.y1), finite(point.l)))),
+    };
+  }, [cycleStart, history, range, resolution, source]);
+  const { traces, outline, buckets, minTime, maxTime, maxUsage } = chartData;
   const projectionValues = projectionsVisible
     ? [projection?.worst?.cents, projection?.realistic?.cents, projection?.average?.cents]
         .map(finite)
@@ -355,22 +487,73 @@ function SpendHistoryChart({
   };
   const hasChart = Number.isFinite(minTime) && Number.isFinite(maxTime) && maxTime > minTime && outline.length > 1;
   const [hover, setHover] = useState<number | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const touchHideTimeout = useRef<number | null>(null);
+  const [tooltipPlacement, setTooltipPlacement] = useState<{ placement: "above" | "below"; offset: number }>({ placement: "above", offset: -12 });
 
-  const setHoverFromPointer = (event: PointerEvent<SVGSVGElement>) => {
+  const clearTouchHide = useCallback(() => {
+    if (touchHideTimeout.current != null) window.clearTimeout(touchHideTimeout.current);
+    touchHideTimeout.current = null;
+  }, []);
+  const hideTooltip = useCallback(() => {
+    clearTouchHide();
+    setHover(null);
+  }, [clearTouchHide]);
+  const scheduleTouchHide = useCallback(() => {
+    clearTouchHide();
+    touchHideTimeout.current = window.setTimeout(() => {
+      touchHideTimeout.current = null;
+      setHover(null);
+    }, 1800);
+  }, [clearTouchHide]);
+  const hoverDetails = useMemo(() => {
+    const hoverBucket = hover == null ? null : buckets[hover] ?? null;
+    if (!hoverBucket) return null;
+    return {
+      hoverBucket,
+      hoverValue: hoverBucket.cum,
+      modelRows: source !== "all" ? scaledModelRows(history?.modelSeries, hoverBucket) : [],
+      tokenDay: source === "cursor" ? tokenDayForHover(history?.tokenLedger, hoverBucket.lastT) : null,
+    };
+  }, [buckets, history?.modelSeries, history?.tokenLedger, hover, source]);
+  const hoverBucket = hoverDetails?.hoverBucket ?? null;
+  const hoverValue = hoverDetails?.hoverValue ?? 0;
+  const modelRows = hoverDetails?.modelRows ?? [];
+  const tokenDay = hoverDetails?.tokenDay ?? null;
+  const tooltipPointY = hoverBucket ? y(hoverValue) : 0;
+
+  useLayoutEffect(() => {
+    const tooltip = tooltipRef.current;
+    if (!hoverBucket || !tooltip) return;
+    const plotHeight = tooltip.parentElement?.getBoundingClientRect().height ?? 0;
+    const nextPlacement = chartTooltipPlacement((tooltipPointY / height) * plotHeight, tooltip.offsetHeight);
+    setTooltipPlacement((current) => current.placement === nextPlacement.placement ? current : nextPlacement);
+  }, [hoverBucket, tooltipPointY]);
+
+  useEffect(() => () => clearTouchHide(), [clearTouchHide]);
+  useEffect(() => {
+    if (hover == null) return undefined;
+    window.addEventListener("scroll", hideTooltip, { passive: true });
+    return () => window.removeEventListener("scroll", hideTooltip);
+  }, [hideTooltip, hover]);
+
+  const setHoverFromPointer = (event: PointerEvent<SVGSVGElement> | MouseEvent<SVGSVGElement>) => {
     if (!hasChart) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const localX = ((event.clientX - rect.left) / rect.width) * width;
     const target = minTime + ((localX - inset.left) / historyWidth) * historySpan;
-    let best = 0;
-    let distance = Number.POSITIVE_INFINITY;
-    outline.forEach((point, index) => {
-      const next = Math.abs(timestamp(point.t) - target);
-      if (next < distance) {
-        distance = next;
-        best = index;
-      }
-    });
-    setHover(best);
+    setHover(nearestBucketIndex(buckets, target));
+  };
+  const handlePointerMove = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType !== "touch") clearTouchHide();
+    setHoverFromPointer(event);
+  };
+  const handlePointerDown = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType === "touch") clearTouchHide();
+    setHoverFromPointer(event);
+  };
+  const handlePointerUp = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType === "touch") scheduleTouchHide();
   };
 
   if (!hasChart) {
@@ -387,8 +570,14 @@ function SpendHistoryChart({
   const currentX = x(current.t);
   const currentY = y(currentValue);
   const rayEndX = showProjectionRays ? x(resetTime) : width - inset.right;
-  const hoverPoint = hover == null ? null : outline[hover];
-  const hoverValue = hoverPoint ? finite(hoverPoint.u) || finite(hoverPoint.y1) : 0;
+  const tooltipHasDetails = modelRows.length > 0 || Boolean(tokenDay);
+  const tooltipIsWide = tooltipHasDetails;
+  const tooltipPercent = hoverBucket && hoverBucket.limit > 0 ? (hoverBucket.cum / hoverBucket.limit) * 100 : null;
+  const tooltipLeft = hoverBucket ? Math.min(78, Math.max(8, (x(hoverBucket.lastT) / width) * 100)) : 0;
+  const modelColor = (model: string, index: number) => {
+    const trace = traces.find((candidate) => candidate.model === model);
+    return trace?.color || modelColors[index % modelColors.length] || SOURCE_COLORS[source];
+  };
   const tickValues = brokenScale ? [0, usageTop, highMax] : [0, highMax / 2, highMax];
 
   return (
@@ -399,8 +588,14 @@ function SpendHistoryChart({
           viewBox={`0 0 ${width} ${height}`}
           role="img"
           aria-label={`${source} month-to-date spend history`}
-          onPointerMove={setHoverFromPointer}
-          onPointerLeave={() => setHover(null)}
+          onPointerMove={handlePointerMove}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={hideTooltip}
+          onTouchEnd={scheduleTouchHide}
+          onTouchCancel={hideTooltip}
+          onClick={setHoverFromPointer}
+          onPointerLeave={hideTooltip}
         >
           <title>{source} month-to-date spend history</title>
           {tickValues.map((value) => (
@@ -438,10 +633,10 @@ function SpendHistoryChart({
             </g>
           )}
           <circle cx={currentX} cy={currentY} r="3" fill="var(--aurora-fg1)" />
-          {hoverPoint && (
+          {hoverBucket && (
             <g>
-              <line x1={x(hoverPoint.t)} x2={x(hoverPoint.t)} y1={plotTop} y2={plotBottom} stroke="var(--aurora-fg4)" strokeWidth="1" strokeDasharray="3 4" />
-              <circle cx={x(hoverPoint.t)} cy={y(hoverValue)} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
+              <line x1={x(hoverBucket.lastT)} x2={x(hoverBucket.lastT)} y1={plotTop} y2={plotBottom} stroke="var(--aurora-fg4)" strokeWidth="1" strokeDasharray="3 4" />
+              <circle data-testid="spend-tooltip-dot" cx={x(hoverBucket.lastT)} cy={tooltipPointY} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
             </g>
           )}
           <text x={inset.left} y={height - 8} fill="var(--aurora-fg4)" fontSize="10">{new Date(minTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
@@ -450,10 +645,46 @@ function SpendHistoryChart({
           )}
           <text x={width - inset.right} y={height - 8} textAnchor="end" fill="var(--aurora-fg4)" fontSize="10">{new Date(showProjectionRays ? resetTime : maxTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
         </svg>
-        {hoverPoint && (
-          <div className="spend-tooltip" style={{ left: `${Math.min(78, Math.max(8, (x(hoverPoint.t) / width) * 100))}%` }}>
-            <span>{new Date(timestamp(hoverPoint.t)).toLocaleString()}</span>
-            <strong>{centsLabel(hoverValue, 2)}</strong>
+        {hoverBucket && (
+          <div
+            ref={tooltipRef}
+            className={`spend-tooltip ${tooltipIsWide ? "spend-tooltip-wide" : ""} ${tokenDay ? "spend-tooltip-token" : ""} ${tooltipLeft <= 20 ? "spend-tooltip-near-left" : ""} ${tooltipPlacement.placement === "below" ? "spend-tooltip-below" : ""}`}
+            data-testid="spend-tooltip"
+            style={{ left: `${tooltipLeft}%`, top: `calc(${(tooltipPointY / height) * 100}% ${tooltipPlacement.offset >= 0 ? "+" : "-"} ${Math.abs(tooltipPlacement.offset)}px)` }}
+          >
+            <span className="spend-tooltip-date">{bucketLabel(hoverBucket, resolution)}</span>
+            <div className="spend-tooltip-row">
+              <span className="spend-tooltip-key"><i style={{ background: SOURCE_COLORS[source] }} />{resolution === "hour" ? "This hour" : "This day"}</span>
+              <strong>{centsLabel(hoverBucket.spend, 2)}</strong>
+            </div>
+            {modelRows.length > 0 && (
+              <>
+                <div className="spend-tooltip-separator" />
+                <span className="spend-tooltip-heading">{source === "codex" ? "By model" : "Daily by model"}</span>
+                {modelRows.map((row, index) => (
+                  <div className="spend-tooltip-row" key={row.model}>
+                    <span className="spend-tooltip-key spend-tooltip-model-name"><i style={{ background: modelColor(row.model, index) }} />{shortModel(row.model)}</span>
+                    <strong>{centsLabel(row.value, 2)} <small>{row.percent.toFixed(1)}%</small></strong>
+                  </div>
+                ))}
+                <div className="spend-tooltip-separator" />
+                <div className="spend-tooltip-row spend-tooltip-total"><span>Daily total</span><strong>{centsLabel(hoverBucket.spend, 2)}</strong></div>
+              </>
+            )}
+            {tokenDay && (
+              <>
+                <div className="spend-tooltip-separator" />
+                <span className="spend-tooltip-heading">Daily tokens</span>
+                <div className="spend-tooltip-row"><span>Generated</span><strong>{formatTokenCount(tokenDay.output)}</strong></div>
+                <div className="spend-tooltip-row"><span>Uncached in</span><strong>{formatTokenCount(tokenDay.input)}</strong></div>
+                <div className="spend-tooltip-row"><span>Cache read</span><strong>{formatTokenCount(tokenDay.cacheRead)}</strong></div>
+                <div className="spend-tooltip-row"><span>Cache write</span><strong>{formatTokenCount(tokenDay.cacheWrite)}</strong></div>
+                <div className="spend-tooltip-row spend-tooltip-total"><span>Token total</span><strong>{formatTokenCount(tokenDay.total)}</strong></div>
+              </>
+            )}
+            {!tooltipHasDetails && <div className="spend-tooltip-separator" />}
+            <div className="spend-tooltip-row spend-tooltip-total"><span>Cumulative</span><strong>{centsLabel(hoverBucket.cum, 2)}</strong></div>
+            {tooltipPercent != null && <div className="spend-tooltip-row spend-tooltip-limit"><span>of limit</span><span>{tooltipPercent.toFixed(1)}%</span></div>}
           </div>
         )}
       </div>
@@ -585,7 +816,7 @@ export default function SpendDashboard() {
   const toolView = snapshot?.tools?.[selectedSource];
   const history = snapshot?.history?.[selectedSource];
   const projection = snapshot?.projections?.[selectedSource]?.projection;
-  const modelColors = snapshot?.ui?.modelBarColors || ["#2dd4bf", "#5b8def", "#6cc08a", "#c47ab3", "#e0a64a"];
+  const modelColors = snapshot?.ui?.modelBarColors?.length ? snapshot.ui.modelBarColors : ["#2dd4bf", "#5b8def", "#6cc08a", "#c47ab3", "#e0a64a"];
   const models = useMemo(() => modelView?.models || [], [modelView]);
   const tools = useMemo(() => toolView?.tools || [], [toolView]);
 
@@ -640,7 +871,7 @@ export default function SpendDashboard() {
               <div className="spend-ranges" role="group" aria-label="Usage range">
                 {RANGES.map((range) => <button type="button" key={range.id} className={selectedRange === range.id ? "active" : ""} onClick={() => setSelectedRange(range.id)}>{range.label}</button>)}
               </div>
-              <SpendHistoryChart history={history} source={selectedSource} range={selectedRange} cycleStart={summary.billingCycleStart} summary={summary} projection={projection} projectionsVisible={projectionsVisible} />
+              <SpendHistoryChart history={history} source={selectedSource} range={selectedRange} cycleStart={summary.billingCycleStart} summary={summary} projection={projection} projectionsVisible={projectionsVisible} modelColors={modelColors} />
             </div>
 
             <Breakdown title="Models this cycle" subtitle={coverageLabel(modelView?.coverage) || (modelView?.primary ? `by ${modelView.primary}` : undefined)} rows={models} colors={modelColors} />
@@ -659,6 +890,38 @@ export default function SpendDashboard() {
         .spend-section{margin-bottom:28px;min-width:0}.spend-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 4px 12px}.spend-section-heading>div{display:flex;align-items:center;gap:8px;color:var(--aurora-fg4);font-size:11px}.spend-shell{width:100%;max-width:680px;margin:0 auto}.spend-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:12px;padding:4px;border:1px solid var(--aurora-border);border-radius:14px;background:color-mix(in srgb,var(--aurora-chip) 65%,transparent)}.spend-tabs button{min-height:40px;border:0;border-radius:10px;background:transparent;color:var(--aurora-fg3);font:inherit;font-size:13px;font-weight:650;cursor:pointer}.spend-tabs button.active{background:var(--aurora-surface);color:var(--aurora-fg1);box-shadow:0 2px 9px rgba(15,23,42,.08)}.spend-card{padding:26px 28px 22px}.spend-account{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:11px;margin-bottom:20px}.spend-avatar{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;color:white;font-size:13px;font-weight:750}.spend-account>div:nth-child(2){min-width:0}.spend-account strong,.spend-account span{display:block}.spend-account strong{color:var(--aurora-fg1);font-size:14px}.spend-account span{color:var(--aurora-fg4);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.spend-overview{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:22px;margin:4px 0 20px}.spend-ring{position:relative;width:130px;height:130px}.spend-ring svg{width:100%;height:100%;transform:rotate(-90deg)}.spend-ring>div{position:absolute;inset:0;display:grid;place-content:center;text-align:center}.spend-ring strong,.spend-ring span{display:block}.spend-ring strong{font-size:24px;color:var(--aurora-fg1);letter-spacing:-.03em}.spend-ring span{font-size:10px;color:var(--aurora-fg4)}.spend-used strong,.spend-days strong{display:block;color:var(--aurora-fg1);font-size:clamp(27px,5vw,38px);line-height:1;letter-spacing:-.035em}.spend-used span,.spend-days span{display:block;margin-top:5px;color:var(--aurora-fg4);font-size:12px}.spend-days{text-align:right}.spend-facts{display:grid;gap:9px;padding:16px 0;border-top:1px solid var(--aurora-border);border-bottom:1px solid var(--aurora-border)}.spend-facts>div{display:flex;justify-content:space-between;gap:16px;font-size:12px}.spend-facts span{color:var(--aurora-fg4)}.spend-facts strong{max-width:65%;color:var(--aurora-fg1);text-align:right;overflow-wrap:anywhere}.spend-provider-list{display:grid;gap:9px;padding:14px 0;border-bottom:1px solid var(--aurora-border)}.spend-provider{display:grid;grid-template-columns:90px 1fr;align-items:center;gap:10px}.spend-provider>strong{font-size:12px;color:var(--aurora-fg2)}.spend-provider>div{display:grid;grid-template-columns:minmax(80px,1fr) auto;align-items:center;gap:10px}.spend-provider-track,.spend-breakdown-track{height:7px;overflow:hidden;border-radius:999px;background:var(--aurora-chip)}.spend-provider-track i,.spend-breakdown-track i{display:block;height:100%;border-radius:inherit}.spend-provider small{color:var(--aurora-fg4);font-size:10px;white-space:nowrap}.spend-provider small b{color:var(--aurora-fg2)}.spend-trend{margin-top:16px;padding-top:2px}.spend-trend-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.spend-trend-heading>strong{color:var(--aurora-fg1);font-size:13px}.spend-trend-heading button{min-height:32px;border:1px solid var(--aurora-border);border-radius:9px;padding:5px 12px;background:transparent;color:var(--aurora-fg3);font-size:11px;cursor:pointer}.spend-trend-heading button.active{border-color:${PROJECTION_COLORS.average};background:color-mix(in srgb,${PROJECTION_COLORS.average} 12%,transparent);color:${PROJECTION_COLORS.average};font-weight:700}.spend-ranges{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin:10px 0}.spend-ranges button{min-height:32px;border:1px solid var(--aurora-border);border-radius:8px;background:transparent;color:var(--aurora-fg4);font-size:11px;cursor:pointer}.spend-ranges button.active{border-color:${SOURCE_COLORS.claude};background:${SOURCE_COLORS.claude};color:white;font-weight:700}.spend-chart-wrap{min-width:0}.spend-plot{position:relative}.spend-chart{display:block;width:100%;height:auto;touch-action:pan-y}.spend-tooltip{position:absolute;top:42%;z-index:2;transform:translate(-50%,-100%);display:grid;gap:2px;padding:7px 9px;border:1px solid var(--aurora-border);border-radius:9px;background:var(--aurora-surface);box-shadow:0 8px 24px rgba(15,23,42,.18);pointer-events:none;white-space:nowrap}.spend-tooltip span{font-size:9px;color:var(--aurora-fg4)}.spend-tooltip strong{font-size:11px;color:var(--aurora-fg1)}.spend-projection-rows{display:grid;gap:7px;margin-top:8px}.spend-projection-rows>div{display:flex;align-items:baseline;gap:8px;min-width:0}.spend-projection-rows span{width:64px;color:var(--aurora-fg4);font-size:11px}.spend-projection-rows strong{font-size:12px}.spend-projection-rows small{min-width:0;color:var(--aurora-fg4);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spend-legend{display:flex;flex-wrap:wrap;gap:7px 13px;margin-top:11px}.spend-legend span{display:inline-flex;align-items:center;gap:5px;color:var(--aurora-fg4);font-size:10px}.spend-legend i{width:8px;height:8px;border-radius:2px}.spend-empty{min-height:210px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;padding:20px;color:var(--aurora-fg4);font-size:12px;text-align:center}.spend-breakdown{margin-top:18px;padding-top:15px;border-top:1px solid var(--aurora-border)}.spend-breakdown-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.spend-breakdown-heading strong{color:var(--aurora-fg1);font-size:13px}.spend-breakdown-heading span{color:var(--aurora-fg4);font-size:10px}.spend-breakdown-list{display:grid;gap:10px}.spend-breakdown-row{display:grid;grid-template-columns:minmax(110px,1.1fr) minmax(100px,1.5fr) auto;align-items:center;gap:10px}.spend-breakdown-row>div:first-child{min-width:0}.spend-breakdown-row strong,.spend-breakdown-row small{display:block}.spend-breakdown-row strong{overflow:hidden;color:var(--aurora-fg2);font-size:12px;text-overflow:ellipsis;white-space:nowrap}.spend-breakdown-row small{margin-top:2px;color:var(--aurora-fg4);font-size:10px}.spend-breakdown-row>b{min-width:40px;color:var(--aurora-fg1);font-size:12px;text-align:right}.spend-note{margin:12px 0 0;color:var(--aurora-fg4);font-size:10px}.spend-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;color:var(--aurora-fg4);font-size:10px}.spend-footer button{display:inline-flex;align-items:center;gap:6px;min-height:34px;border:1px solid var(--aurora-border);border-radius:9px;padding:6px 12px;background:var(--aurora-surface);color:var(--aurora-fg2);font-size:11px;cursor:pointer}.spend-footer button:disabled{opacity:.5;cursor:wait}.spend-skeleton{width:180px;height:24px;border-radius:10px;background:var(--aurora-chip);animation:spend-pulse 1.4s ease-in-out infinite}.spend-skeleton-chart{width:100%;height:240px;margin-top:18px}@keyframes spend-pulse{50%{opacity:.45}}
         @media(max-width:760px){.spend-section-heading>div>span{display:none}.spend-card{padding:18px 14px 16px}.spend-account{margin-bottom:14px}.spend-overview{grid-template-columns:auto 1fr auto;gap:10px}.spend-ring{width:96px;height:96px}.spend-ring strong{font-size:18px}.spend-used strong,.spend-days strong{font-size:26px}.spend-used span,.spend-days span{font-size:10px}.spend-facts>div{font-size:11px}.spend-provider{grid-template-columns:76px 1fr}.spend-provider>div{grid-template-columns:1fr}.spend-provider small{text-align:right}.spend-trend-heading{align-items:stretch}.spend-trend-heading button{min-width:140px}.spend-ranges{margin-top:8px}.spend-projection-rays{display:none}.spend-projection-rows{margin-top:2px}.spend-projection-rows>div{display:grid;grid-template-columns:60px auto minmax(0,1fr)}.spend-breakdown-row{grid-template-columns:1fr auto;grid-template-areas:"label pct" "bar bar";gap:4px 10px}.spend-breakdown-row>div:first-child{grid-area:label}.spend-breakdown-row>.spend-breakdown-track{grid-area:bar}.spend-breakdown-row>b{grid-area:pct}.spend-footer button{min-width:120px;justify-content:center}}
         @media(max-width:390px){.spend-overview{grid-template-columns:auto 1fr;grid-template-areas:"ring used" "ring days";gap:5px 10px}.spend-ring{grid-area:ring}.spend-used{grid-area:used}.spend-days{grid-area:days;text-align:left}.spend-ranges{grid-template-columns:repeat(3,minmax(0,1fr))}.spend-ranges button:last-child{grid-column:2}.spend-projection-rows small{white-space:normal}.spend-account>:last-child{display:none}}
+      `}</style>
+      <style jsx global>{`
+        .spend-tooltip{top:42%;min-width:138px;max-width:calc(100% - 16px);width:max-content;gap:5px;padding:9px 10px;white-space:normal}
+        .spend-tooltip.spend-tooltip-wide{min-width:180px}
+        .spend-tooltip.spend-tooltip-token{min-width:200px}
+        .spend-tooltip.spend-tooltip-near-left{transform:translate(0,-100%)}
+        .spend-tooltip.spend-tooltip-below{transform:translate(-50%,0)}
+        .spend-tooltip.spend-tooltip-near-left.spend-tooltip-below{transform:translate(0,0)}
+        .spend-tooltip-date,.spend-tooltip-heading{display:block;color:var(--aurora-fg4);font-size:9px;line-height:1.25}
+        .spend-tooltip-heading{margin-bottom:-1px}
+        .spend-tooltip-row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;min-width:0;color:var(--aurora-fg3);font-size:10px;line-height:1.25}
+        .spend-tooltip-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+        .spend-tooltip-row strong{display:flex;flex:0 0 auto;align-items:baseline;gap:4px;color:var(--aurora-fg1);font-size:10px;white-space:nowrap}
+        .spend-tooltip-row strong small{color:var(--aurora-fg4);font-size:9px;font-weight:600}
+        .spend-tooltip-key{display:inline-flex;align-items:center;gap:5px;min-width:0}
+        .spend-tooltip-key i{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--aurora-fg4)}
+        .spend-tooltip-model-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .spend-tooltip-separator{height:1px;margin:1px -1px;background:var(--aurora-border)}
+        .spend-tooltip-total{font-weight:750}
+        .spend-tooltip-total>span,.spend-tooltip-total strong{color:var(--aurora-fg1)}
+        .spend-tooltip-limit{color:var(--aurora-fg4);font-size:9px}
+        @media(max-width:760px){.spend-tooltip{max-width:calc(100% - 12px);font-size:9px}.spend-tooltip.spend-tooltip-wide{min-width:min(180px,calc(100% - 12px))}.spend-tooltip.spend-tooltip-token{min-width:min(200px,calc(100% - 12px))}}
+      `}</style>
+      <style jsx global>{`
+        .spend-projection-row-interactive{cursor:help}
+        .spend-projection-row-interactive:focus-visible{outline:2px solid color-mix(in srgb,var(--aurora-accent) 72%,transparent);outline-offset:3px;border-radius:6px}
+        .spend-projection-math-tooltip{position:fixed;z-index:12;min-width:220px;max-width:min(360px,92vw);transform:translateX(-50%);padding:9px 11px;border:1px solid var(--aurora-border);border-radius:10px;background:var(--aurora-surface);box-shadow:0 8px 24px rgba(15,23,42,.18);pointer-events:none;white-space:normal}
+        .spend-projection-math-title{margin-bottom:6px;color:var(--aurora-fg4);font-size:11px;line-height:1.25}
+        .spend-projection-math-tooltip p{margin:0 0 6px;color:var(--aurora-fg4);font-size:11.5px;line-height:1.45}
+        .spend-projection-math-tooltip p:last-child{margin-bottom:0}
+        .spend-projection-math-tooltip .spend-projection-math-equation{color:var(--aurora-fg1);font-variant-numeric:tabular-nums}
+        @media(max-width:760px){.spend-projection-math-tooltip{max-width:92vw;min-width:min(220px,92vw)}}
       `}</style>
     </section>
   );

@@ -33,6 +33,53 @@ const projection = {
   average: { cents: 42000, dollars: "$420.00", pctOfLimit: 84 },
 };
 
+const projectionMath = {
+  nowMs: now,
+  endMs: now + 10 * 86400000,
+  remDays: 10,
+  fullDaysLeft: 8,
+  currentCents: 18000,
+  limitCents: 50000,
+  peakDayCents: 4400,
+  avgDayCents: 3000,
+  remainingTodayRealCents: 800,
+  remainingTodayAvgCents: 0,
+  // Contract acceptance identities: current + rate * days (+ today) = end.
+  worstEndCents: 62000,
+  realEndCents: 54000,
+  avgEndCents: 42000,
+  worstCrossAtMs: now + (32000 / 4400) * 86400000,
+  realCrossAtMs: now + (31200 / 4400) * 86400000,
+  avgCrossAtMs: null,
+};
+
+const claudeProjection = {
+  daysLeft: 10,
+  current: 9000,
+  limit: 20000,
+  worst: { cents: 39000, dollars: "$390.00", pctOfLimit: 195, hits100Pct: at(4 * 86400000) },
+  realistic: { cents: 33000, dollars: "$330.00", pctOfLimit: 165, hits100Pct: at(4 * 86400000) },
+  average: { cents: 25000, dollars: "$250.00", pctOfLimit: 125, hits100Pct: at(6 * 86400000) },
+  math: {
+    nowMs: now,
+    endMs: now + 10 * 86400000,
+    remDays: 10,
+    fullDaysLeft: 8,
+    currentCents: 9000,
+    limitCents: 20000,
+    peakDayCents: 3000,
+    avgDayCents: 2000,
+    remainingTodayRealCents: 0,
+    remainingTodayAvgCents: 0,
+    worstEndCents: 39000,
+    realEndCents: 33000,
+    avgEndCents: 25000,
+    worstCrossAtMs: now + (11000 / 3000) * 86400000,
+    realCrossAtMs: now + (11000 / 3000) * 86400000,
+    avgCrossAtMs: now + (11000 / 2000) * 86400000,
+  },
+};
+
 const snapshot = {
   fetchedAt: new Date(now).toISOString(),
   purpose: "Read-only dashboard view.",
@@ -81,21 +128,72 @@ const snapshot = {
     codex: { tools: [] },
   },
   projections: {
-    all: { projection }, claude: { projection }, cursor: { projection }, codex: { projection },
+    all: { projection: { ...projection, math: projectionMath } },
+    claude: { projection: claudeProjection },
+    // Cursor deliberately has no math block to exercise safe rollout fallback.
+    cursor: { projection },
+    codex: { projection },
   },
   history: {
+    // These fields mirror getHistoryView() in the source dashboard exactly:
+    // modelSeries has layers/totals/days/chart; cursor tokenLedger has a
+    // timezone and days with key/t/input/output/cacheRead/cacheWrite/total.
     all: { points: [{ t: at(-172800000), u: 3000, l: 50000 }, { t: at(-86400000), u: 10000, l: 50000 }, { t: at(0), u: 18000, l: 50000 }] },
     claude: {
+      modelSeries: {
+        layers: ["claude-opus-4-8", "claude-sonnet-4-6"],
+        totals: { "claude-opus-4-8": 6300, "claude-sonnet-4-6": 2700 },
+        days: [
+          { t: at(-172800000), u: 1800, l: 20000, models: { "claude-opus-4-8": 1000, "claude-sonnet-4-6": 800 }, modelCum: { "claude-opus-4-8": 1000, "claude-sonnet-4-6": 800 } },
+          { t: at(-86400000), u: 6000, l: 20000, models: { "claude-opus-4-8": 3000, "claude-sonnet-4-6": 1200 }, modelCum: { "claude-opus-4-8": 4000, "claude-sonnet-4-6": 2000 } },
+          { t: at(0), u: 9000, l: 20000, models: { "claude-opus-4-8": 2300, "claude-sonnet-4-6": 700 }, modelCum: { "claude-opus-4-8": 6300, "claude-sonnet-4-6": 2700 } },
+        ],
+        chart: [
+          { t: at(-172800000), u: 1800, l: 20000, models: { "claude-opus-4-8": 1000, "claude-sonnet-4-6": 800 }, modelCum: { "claude-opus-4-8": 1000, "claude-sonnet-4-6": 800 } },
+          { t: at(-86400000), u: 6000, l: 20000, models: { "claude-opus-4-8": 3000, "claude-sonnet-4-6": 1200 }, modelCum: { "claude-opus-4-8": 4000, "claude-sonnet-4-6": 2000 } },
+          { t: at(0), u: 9000, l: 20000, models: { "claude-opus-4-8": 2300, "claude-sonnet-4-6": 700 }, modelCum: { "claude-opus-4-8": 6300, "claude-sonnet-4-6": 2700 } },
+        ],
+      },
       stack: {
         traces: [
-          { model: "opus", label: "Claude Opus 4.8", color: "#F97316", points: [{ t: at(-172800000), y0: 0, y1: 1000 }, { t: at(-86400000), y0: 0, y1: 4000 }, { t: at(0), y0: 0, y1: 6300 }] },
-          { model: "sonnet", label: "Claude Sonnet 4.6", color: "#8B5CF6", points: [{ t: at(-172800000), y0: 1000, y1: 1800 }, { t: at(-86400000), y0: 4000, y1: 6000 }, { t: at(0), y0: 6300, y1: 9000 }] },
+          { model: "claude-opus-4-8", label: "Claude Opus 4.8", color: "#F97316", points: [{ t: at(-172800000), y0: 0, y1: 1000 }, { t: at(-86400000), y0: 0, y1: 4000 }, { t: at(0), y0: 0, y1: 6300 }] },
+          { model: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", color: "#8B5CF6", points: [{ t: at(-172800000), y0: 1000, y1: 1800 }, { t: at(-86400000), y0: 4000, y1: 6000 }, { t: at(0), y0: 6300, y1: 9000 }] },
         ],
-        outline: [{ t: at(-172800000), u: 1800 }, { t: at(-86400000), u: 6000 }, { t: at(0), u: 9000 }],
+        outline: [{ t: at(-172800000), u: 1800, l: 20000 }, { t: at(-86400000), u: 6000, l: 20000 }, { t: at(0), u: 9000, l: 20000 }],
       },
     },
-    cursor: { points: [{ t: now - 86400000, u: 2000 }, { t: now, u: 6000 }] },
-    codex: { points: [{ t: at(-86400000), u: 1000 }, { t: at(0), u: 3000 }] },
+    cursor: {
+      points: [{ t: now - 86400000, u: 2000, l: 20000 }, { t: now, u: 6000, l: 20000 }],
+      tokenLedger: {
+        timezone: "America/New_York",
+        days: [
+          { key: "2026-08-20", t: at(-86400000), input: 1200000, output: 3400000, cacheRead: 400000, cacheWrite: 200000, total: 5200000 },
+          { key: "2026-08-21", t: at(0), input: 5600, output: 3400, cacheRead: 1200, cacheWrite: 800, total: 11000 },
+        ],
+      },
+    },
+    codex: {
+      points: [{ t: at(-86400000), u: 1000, l: 10000 }, { t: at(0), u: 3000, l: 10000 }],
+      modelSeries: {
+        layers: ["gpt-5.6", "gpt-5.6-codex"],
+        totals: { "gpt-5.6": 2200, "gpt-5.6-codex": 800 },
+        days: [
+          { t: at(-86400000), u: 1000, l: 10000, models: { "gpt-5.6": 700, "gpt-5.6-codex": 300 }, modelCum: { "gpt-5.6": 700, "gpt-5.6-codex": 300 } },
+          { t: at(0), u: 3000, l: 10000, models: { "gpt-5.6": 1500, "gpt-5.6-codex": 500 }, modelCum: { "gpt-5.6": 2200, "gpt-5.6-codex": 800 } },
+        ],
+        chart: [
+          { t: at(-86400000), u: 1000, l: 10000, models: { "gpt-5.6": 700, "gpt-5.6-codex": 300 }, modelCum: { "gpt-5.6": 700, "gpt-5.6-codex": 300 } },
+          { t: at(0), u: 3000, l: 10000, models: { "gpt-5.6": 1500, "gpt-5.6-codex": 500 }, modelCum: { "gpt-5.6": 2200, "gpt-5.6-codex": 800 } },
+        ],
+      },
+      stack: {
+        traces: [
+          { model: "gpt-5.6", label: "gpt-5.6", color: "#3B82F6", points: [{ t: at(-86400000), y0: 0, y1: 700 }, { t: at(0), y0: 0, y1: 2200 }] },
+          { model: "gpt-5.6-codex", label: "gpt-5.6-codex", color: "#8B5CF6", points: [{ t: at(-86400000), y0: 700, y1: 1000 }, { t: at(0), y0: 2200, y1: 3000 }] },
+        ],
+        outline: [{ t: at(-86400000), u: 1000, l: 10000 }, { t: at(0), u: 3000, l: 10000 }],
+      },
+    },
   },
 };
 
@@ -163,9 +261,146 @@ async function assertSpendDashboard(page) {
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
 }
 
+async function revealSpendTooltip(page, source, interaction) {
+  await page.getByRole("tab", { name: source, exact: true }).click();
+  const chart = page.getByRole("img", { name: `${source.toLowerCase()} month-to-date spend history` });
+  const box = await chart.boundingBox();
+  if (!box) throw new Error("Spend chart has no bounding box");
+  const position = { x: box.width * 0.9, y: box.height * 0.45 };
+  if (interaction === "tap") await chart.tap({ position });
+  else await chart.hover({ position });
+  const tooltip = page.getByTestId("spend-tooltip");
+  await expect(tooltip).toBeVisible();
+  return tooltip;
+}
+
+async function expectChartTooltipAboveHoveredPoint(page) {
+  const [tooltipBox, dotBox] = await Promise.all([
+    page.getByTestId("spend-tooltip").boundingBox(),
+    page.getByTestId("spend-tooltip-dot").boundingBox(),
+  ]);
+  if (!tooltipBox || !dotBox) throw new Error("Spend tooltip or hover point has no bounding box");
+  expect(tooltipBox.y + tooltipBox.height).toBeLessThanOrEqual(dotBox.y + dotBox.height / 2);
+}
+
+async function assertTooltipParity(page, interaction) {
+  // `all` intentionally has no modelSeries or tokenLedger. It must retain the
+  // common spend/cumulative/limit tooltip without data-section placeholders.
+  let tooltip = await revealSpendTooltip(page, "All", interaction);
+  await expect(tooltip).toContainText("This day");
+  await expect(tooltip).toContainText("$80.00");
+  await expect(tooltip).toContainText("Cumulative");
+  await expect(tooltip).toContainText("$180.00");
+  await expect(tooltip).toContainText("of limit");
+  await expect(tooltip).toContainText("36.0%");
+  await expect(tooltip.getByText("Daily by model")).toHaveCount(0);
+  await expect(tooltip.getByText("By model")).toHaveCount(0);
+  await expect(tooltip.getByText("Daily tokens")).toHaveCount(0);
+  await expectChartTooltipAboveHoveredPoint(page);
+
+  tooltip = await revealSpendTooltip(page, "Claude", interaction);
+  await expect(tooltip).toContainText("This day");
+  await expect(tooltip).toContainText("Daily by model");
+  await expect(tooltip).toContainText("opus-4-8");
+  await expect(tooltip).toContainText("$23.00");
+  await expect(tooltip).toContainText("76.7%");
+  await expect(tooltip).toContainText("Daily total");
+  await expect(tooltip).toContainText("$30.00");
+  await expect(tooltip).toContainText("Cumulative");
+  await expect(tooltip).toContainText("$90.00");
+  await expect(tooltip).toContainText("45.0%");
+
+  tooltip = await revealSpendTooltip(page, "Cursor", interaction);
+  await expect(tooltip).toContainText("Daily tokens");
+  await expect(tooltip).toContainText("Generated");
+  await expect(tooltip).toContainText("3.4k");
+  await expect(tooltip).toContainText("Uncached in");
+  await expect(tooltip).toContainText("5.6k");
+  await expect(tooltip).toContainText("Cache read");
+  await expect(tooltip).toContainText("Cache write");
+  await expect(tooltip).toContainText("Token total");
+  await expect(tooltip).toContainText("11.0k");
+  await expect(tooltip).toContainText("Cumulative");
+  await expect(tooltip).toContainText("$60.00");
+  await expect(tooltip).toContainText("30.0%");
+
+  tooltip = await revealSpendTooltip(page, "Codex", interaction);
+  await expect(tooltip).toContainText("By model");
+  await expect(tooltip).toContainText("5.6-codex");
+  await expect(tooltip).toContainText("Daily total");
+  await expect(tooltip).toContainText("$20.00");
+  await expect(tooltip).toContainText("Cumulative");
+  await expect(tooltip).toContainText("$30.00");
+  await expect(tooltip).toContainText("30.0%");
+}
+
+async function assertChartTouchDismissal(page) {
+  await revealSpendTooltip(page, "All", "tap");
+  await page.evaluate(() => window.scrollBy(0, 1));
+  await expect(page.getByTestId("spend-tooltip")).toHaveCount(0);
+
+  await revealSpendTooltip(page, "All", "tap");
+  await page.waitForTimeout(1900);
+  await expect(page.getByTestId("spend-tooltip")).toHaveCount(0);
+}
+
+async function trendProjectionRows(page) {
+  const rows = page.locator(".spend-trend .spend-projection-rows");
+  await expect(rows).toBeVisible();
+  return rows;
+}
+
+async function assertProjectionMathDesktop(page) {
+  await page.getByRole("tab", { name: "All", exact: true }).click();
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await worst.hover();
+  await expect(tooltip).toContainText("Worst projection");
+  await expect(tooltip).toContainText("Assumes every remaining day");
+  await expect(tooltip).toContainText("$180.00 now + $44.00/day × 10.0 days left = $620");
+
+  // The same content must be available to keyboard users, not only hover.
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toHaveCount(0);
+  await worst.focus();
+  await expect(tooltip).toContainText("Worst projection");
+
+  // The cursor fixture has no additive math contract yet: retain the existing
+  // projection rows without focus/hover bindings or runtime console errors.
+  const consoleErrors = [];
+  const onConsole = (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  };
+  page.on("console", onConsole);
+  await page.getByRole("tab", { name: "Cursor", exact: true }).click();
+  const cursorRows = await trendProjectionRows(page);
+  await expect(cursorRows.locator(".spend-projection-row-interactive")).toHaveCount(0);
+  await cursorRows.locator(".spend-projection-row").first().hover();
+  await expect(page.getByTestId("projection-math-tooltip")).toHaveCount(0);
+  page.off("console", onConsole);
+  expect(consoleErrors).toEqual([]);
+}
+
+async function assertProjectionMathMobile(page) {
+  await page.getByRole("tab", { name: "All", exact: true }).click();
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await worst.tap();
+  await expect(tooltip).toContainText("Worst projection");
+  await expect(tooltip).toContainText("$180.00 now + $44.00/day × 10.0 days left = $620");
+  await worst.tap();
+  await expect(tooltip).toHaveCount(0);
+}
+
 test("spend snapshot paints supplied bands and remains coherent on desktop", async ({ page }) => {
   await installRoutes(page);
   await assertSpendDashboard(page);
+  await assertTooltipParity(page, "hover");
+  await assertProjectionMathDesktop(page);
 
   for (const source of ["Claude", "Cursor", "Codex"]) {
     await page.getByRole("tab", { name: source, exact: true }).click();
@@ -182,6 +417,7 @@ test("spend snapshot paints supplied bands and remains coherent on desktop", asy
 test("spend snapshot remains usable at an Android viewport", async ({ browser }) => {
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 },
+    hasTouch: true,
     userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
   });
   const page = await context.newPage();
@@ -189,5 +425,9 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   await assertSpendDashboard(page);
   await page.getByRole("tab", { name: "Claude", exact: true }).click();
   await expect(page.locator('svg[aria-label="claude month-to-date spend history"] .spend-projection-rays')).toHaveCount(0);
+  await assertTooltipParity(page, "tap");
+  await assertChartTouchDismissal(page);
+  await assertProjectionMathMobile(page);
+  await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
   await context.close();
 });
