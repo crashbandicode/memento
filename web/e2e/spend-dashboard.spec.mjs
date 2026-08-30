@@ -33,6 +33,53 @@ const projection = {
   average: { cents: 42000, dollars: "$420.00", pctOfLimit: 84 },
 };
 
+const projectionMath = {
+  nowMs: now,
+  endMs: now + 10 * 86400000,
+  remDays: 10,
+  fullDaysLeft: 8,
+  currentCents: 18000,
+  limitCents: 50000,
+  peakDayCents: 4400,
+  avgDayCents: 3000,
+  remainingTodayRealCents: 800,
+  remainingTodayAvgCents: 0,
+  // Contract acceptance identities: current + rate * days (+ today) = end.
+  worstEndCents: 62000,
+  realEndCents: 54000,
+  avgEndCents: 42000,
+  worstCrossAtMs: now + (32000 / 4400) * 86400000,
+  realCrossAtMs: now + (31200 / 4400) * 86400000,
+  avgCrossAtMs: null,
+};
+
+const claudeProjection = {
+  daysLeft: 10,
+  current: 9000,
+  limit: 20000,
+  worst: { cents: 39000, dollars: "$390.00", pctOfLimit: 195, hits100Pct: at(4 * 86400000) },
+  realistic: { cents: 33000, dollars: "$330.00", pctOfLimit: 165, hits100Pct: at(4 * 86400000) },
+  average: { cents: 25000, dollars: "$250.00", pctOfLimit: 125, hits100Pct: at(6 * 86400000) },
+  math: {
+    nowMs: now,
+    endMs: now + 10 * 86400000,
+    remDays: 10,
+    fullDaysLeft: 8,
+    currentCents: 9000,
+    limitCents: 20000,
+    peakDayCents: 3000,
+    avgDayCents: 2000,
+    remainingTodayRealCents: 0,
+    remainingTodayAvgCents: 0,
+    worstEndCents: 39000,
+    realEndCents: 33000,
+    avgEndCents: 25000,
+    worstCrossAtMs: now + (11000 / 3000) * 86400000,
+    realCrossAtMs: now + (11000 / 3000) * 86400000,
+    avgCrossAtMs: now + (11000 / 2000) * 86400000,
+  },
+};
+
 const snapshot = {
   fetchedAt: new Date(now).toISOString(),
   purpose: "Read-only dashboard view.",
@@ -81,7 +128,11 @@ const snapshot = {
     codex: { tools: [] },
   },
   projections: {
-    all: { projection }, claude: { projection }, cursor: { projection }, codex: { projection },
+    all: { projection: { ...projection, math: projectionMath } },
+    claude: { projection: claudeProjection },
+    // Cursor deliberately has no math block to exercise safe rollout fallback.
+    cursor: { projection },
+    codex: { projection },
   },
   history: {
     // These fields mirror getHistoryView() in the source dashboard exactly:
@@ -273,10 +324,63 @@ async function assertTooltipParity(page, interaction) {
   await expect(tooltip).toContainText("30.0%");
 }
 
+async function trendProjectionRows(page) {
+  const rows = page.locator(".spend-trend .spend-projection-rows");
+  await expect(rows).toBeVisible();
+  return rows;
+}
+
+async function assertProjectionMathDesktop(page) {
+  await page.getByRole("tab", { name: "All", exact: true }).click();
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await worst.hover();
+  await expect(tooltip).toContainText("Worst projection");
+  await expect(tooltip).toContainText("Assumes every remaining day");
+  await expect(tooltip).toContainText("$180.00 now + $44.00/day × 10.0 days left = $620");
+
+  // The same content must be available to keyboard users, not only hover.
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toHaveCount(0);
+  await worst.focus();
+  await expect(tooltip).toContainText("Worst projection");
+
+  // The cursor fixture has no additive math contract yet: retain the existing
+  // projection rows without focus/hover bindings or runtime console errors.
+  const consoleErrors = [];
+  const onConsole = (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  };
+  page.on("console", onConsole);
+  await page.getByRole("tab", { name: "Cursor", exact: true }).click();
+  const cursorRows = await trendProjectionRows(page);
+  await expect(cursorRows.locator(".spend-projection-row-interactive")).toHaveCount(0);
+  await cursorRows.locator(".spend-projection-row").first().hover();
+  await expect(page.getByTestId("projection-math-tooltip")).toHaveCount(0);
+  page.off("console", onConsole);
+  expect(consoleErrors).toEqual([]);
+}
+
+async function assertProjectionMathMobile(page) {
+  await page.getByRole("tab", { name: "All", exact: true }).click();
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await worst.tap();
+  await expect(tooltip).toContainText("Worst projection");
+  await expect(tooltip).toContainText("$180.00 now + $44.00/day × 10.0 days left = $620");
+  await worst.tap();
+  await expect(tooltip).toHaveCount(0);
+}
+
 test("spend snapshot paints supplied bands and remains coherent on desktop", async ({ page }) => {
   await installRoutes(page);
   await assertSpendDashboard(page);
   await assertTooltipParity(page, "hover");
+  await assertProjectionMathDesktop(page);
 
   for (const source of ["Claude", "Cursor", "Codex"]) {
     await page.getByRole("tab", { name: source, exact: true }).click();
@@ -302,6 +406,7 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   await page.getByRole("tab", { name: "Claude", exact: true }).click();
   await expect(page.locator('svg[aria-label="claude month-to-date spend history"] .spend-projection-rays')).toHaveCount(0);
   await assertTooltipParity(page, "tap");
+  await assertProjectionMathMobile(page);
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
   await context.close();
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type MouseEvent, type PointerEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent } from "react";
 import { Icon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { authFetch, getApiBase } from "@/lib/api-client";
@@ -14,6 +14,7 @@ import {
   tooltipResolution,
 } from "@/lib/spend-tooltip";
 import type { ModelSeriesForTooltip, TokenLedgerForTooltip } from "@/lib/spend-tooltip";
+import { hasProjectionMath, projectionMathTooltip, type ProjectionMathKey } from "@/lib/spend-projection-math";
 
 type SpendSource = "all" | "claude" | "cursor" | "codex";
 type SpendRange = "6h" | "24h" | "7d" | "30d" | "mtd";
@@ -119,6 +120,7 @@ interface ProjectionView {
     worst?: ProjectionScenario;
     realistic?: ProjectionScenario;
     average?: ProjectionScenario;
+    math?: unknown;
   };
 }
 
@@ -277,11 +279,98 @@ function ProjectionRows({ projection }: { projection?: ProjectionView["projectio
     ["Realistic", "realistic", projection?.realistic],
     ["Average", "average", projection?.average],
   ] as const;
+  const math = hasProjectionMath(projection?.math) ? projection.math : null;
+  const [activeKey, setActiveKey] = useState<ProjectionMathKey | null>(null);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: 0, top: 0, visible: false });
+  const activeAnchor = useRef<HTMLDivElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const pointerInteraction = useRef(false);
+  const touchInteraction = useRef(false);
+  const touchOpenKey = useRef<ProjectionMathKey | null>(null);
+
+  const hideTooltip = useCallback(() => {
+    activeAnchor.current = null;
+    pointerInteraction.current = false;
+    touchInteraction.current = false;
+    touchOpenKey.current = null;
+    setActiveKey(null);
+    setTooltipPosition((position) => ({ ...position, visible: false }));
+  }, []);
+
+  const showTooltip = useCallback((key: ProjectionMathKey, anchor: HTMLDivElement) => {
+    activeAnchor.current = anchor;
+    setTooltipPosition((position) => ({ ...position, visible: false }));
+    setActiveKey(key);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!activeKey || !activeAnchor.current || !tooltipRef.current) return undefined;
+    const reposition = () => {
+      const anchor = activeAnchor.current;
+      const tooltip = tooltipRef.current;
+      if (!anchor || !tooltip) return;
+      const bounds = anchor.getBoundingClientRect();
+      const tooltipWidth = tooltip.offsetWidth || 220;
+      const tooltipHeight = tooltip.offsetHeight || 80;
+      const left = Math.max(tooltipWidth / 2 + 8, Math.min(window.innerWidth - tooltipWidth / 2 - 8, bounds.left + bounds.width / 2));
+      const above = bounds.top - tooltipHeight - 10;
+      setTooltipPosition({ left, top: above < 8 ? bounds.bottom + 10 : above, visible: true });
+    };
+    const frame = window.requestAnimationFrame(reposition);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", hideTooltip, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", hideTooltip, true);
+    };
+  }, [activeKey, hideTooltip]);
+
+  useEffect(() => {
+    if (!activeKey) return undefined;
+    const dismissOutside = (event: globalThis.PointerEvent) => {
+      if (activeAnchor.current && !activeAnchor.current.contains(event.target as Node)) hideTooltip();
+    };
+    document.addEventListener("pointerdown", dismissOutside, true);
+    return () => document.removeEventListener("pointerdown", dismissOutside, true);
+  }, [activeKey, hideTooltip]);
+
   if (!scenarios.some(([, , scenario]) => scenario?.dollars || scenario?.cents != null)) return null;
+  const activeTooltip = math && activeKey ? projectionMathTooltip(math, activeKey) : null;
   return (
     <div className="spend-projection-rows" aria-label="Cycle projections">
-      {scenarios.map(([label, key, scenario]) => (
-        <div key={key}>
+      {scenarios.map(([label, key, scenario]) => {
+        const interaction = math ? {
+          tabIndex: 0,
+          onMouseEnter: (event: MouseEvent<HTMLDivElement>) => showTooltip(key, event.currentTarget),
+          onMouseLeave: hideTooltip,
+          onPointerDown: (event: PointerEvent<HTMLDivElement>) => {
+            pointerInteraction.current = true;
+            touchInteraction.current = event.pointerType === "touch";
+          },
+          onFocus: (event: React.FocusEvent<HTMLDivElement>) => {
+            if (pointerInteraction.current) return;
+            touchInteraction.current = false;
+            showTooltip(key, event.currentTarget);
+          },
+          onBlur: () => {
+            if (!touchInteraction.current) hideTooltip();
+          },
+          onClick: (event: MouseEvent<HTMLDivElement>) => {
+            const isTouch = touchInteraction.current;
+            pointerInteraction.current = false;
+            if (isTouch) {
+              if (touchOpenKey.current === key) hideTooltip();
+              else {
+                showTooltip(key, event.currentTarget);
+                touchOpenKey.current = key;
+              }
+            } else if (activeKey === key) hideTooltip();
+            else showTooltip(key, event.currentTarget);
+          },
+        } : {};
+        return (
+        <div key={key} className={`spend-projection-row ${math ? "spend-projection-row-interactive" : ""}`} {...interaction}>
           <span>{label}</span>
           <strong style={{ color: PROJECTION_COLORS[key] }}>
             {scenario?.dollars || centsLabel(finite(scenario?.cents))}
@@ -290,7 +379,26 @@ function ProjectionRows({ projection }: { projection?: ProjectionView["projectio
             {finite(scenario?.pctOfLimit).toFixed(0)}% of limit{formatHit(scenario?.hits100Pct)}
           </small>
         </div>
-      ))}
+        );
+      })}
+      {activeTooltip && (
+        <div
+          ref={tooltipRef}
+          className="spend-projection-math-tooltip"
+          data-testid="projection-math-tooltip"
+          role="tooltip"
+          style={{ left: tooltipPosition.left, top: tooltipPosition.top, visibility: tooltipPosition.visible ? "visible" : "hidden" }}
+        >
+          <div className="spend-projection-math-title">{activeTooltip.heading}</div>
+          {activeTooltip.lines.map((line, index) => (
+            <p className={line.kind === "equation" ? "spend-projection-math-equation" : undefined} key={`${line.kind}-${index}`}>
+              {line.segments.map((segment, segmentIndex) => segment.bold
+                ? <strong key={segmentIndex}>{segment.text}</strong>
+                : <span key={segmentIndex}>{segment.text}</span>)}
+            </p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -736,6 +844,16 @@ export default function SpendDashboard() {
         .spend-tooltip-total>span,.spend-tooltip-total strong{color:var(--aurora-fg1)}
         .spend-tooltip-limit{color:var(--aurora-fg4);font-size:9px}
         @media(max-width:760px){.spend-tooltip{max-width:calc(100% - 12px);font-size:9px}.spend-tooltip.spend-tooltip-wide{min-width:min(180px,calc(100% - 12px))}.spend-tooltip.spend-tooltip-token{min-width:min(200px,calc(100% - 12px))}}
+      `}</style>
+      <style jsx global>{`
+        .spend-projection-row-interactive{cursor:help}
+        .spend-projection-row-interactive:focus-visible{outline:2px solid color-mix(in srgb,var(--aurora-accent) 72%,transparent);outline-offset:3px;border-radius:6px}
+        .spend-projection-math-tooltip{position:fixed;z-index:12;min-width:220px;max-width:min(360px,92vw);transform:translateX(-50%);padding:9px 11px;border:1px solid var(--aurora-border);border-radius:10px;background:var(--aurora-surface);box-shadow:0 8px 24px rgba(15,23,42,.18);pointer-events:none;white-space:normal}
+        .spend-projection-math-title{margin-bottom:6px;color:var(--aurora-fg4);font-size:11px;line-height:1.25}
+        .spend-projection-math-tooltip p{margin:0 0 6px;color:var(--aurora-fg4);font-size:11.5px;line-height:1.45}
+        .spend-projection-math-tooltip p:last-child{margin-bottom:0}
+        .spend-projection-math-tooltip .spend-projection-math-equation{color:var(--aurora-fg1);font-variant-numeric:tabular-nums}
+        @media(max-width:760px){.spend-projection-math-tooltip{max-width:92vw;min-width:min(220px,92vw)}}
       `}</style>
     </section>
   );
