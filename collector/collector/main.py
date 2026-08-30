@@ -770,7 +770,9 @@ def main() -> None:
     )
     _check_windows_task_health(logger)
     try:
-        hook_settings, hooks_changed = install_claude_pending_hooks()
+        hook_settings, hooks_changed = install_claude_pending_hooks(
+            sweep_retired=True
+        )
         if hooks_changed:
             logger.info("Installed Claude prompt hooks in %s", hook_settings)
     except (OSError, TypeError, ValueError) as exc:

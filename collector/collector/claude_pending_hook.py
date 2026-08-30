@@ -10,7 +10,7 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -57,8 +57,9 @@ _MEMENTO_GOVERNOR_HOOK_MARKERS = (
 )
 _HOOK_TIMEOUT_SECONDS = 10
 _HOOK_RUNNER_NAME = "memento-hook-runner"
-_HOOK_RUNNER_TOMBSTONE_MARKER = ".trash-"
-_HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS = _HOOK_TIMEOUT_SECONDS + 1
+_HOOK_RUNNER_RETIREMENT_MARKER = "retired-at.json"
+_HOOK_RUNNER_RETENTION_HOURS_ENV = "MEMENTO_HOOK_RUNNER_RETENTION_HOURS"
+_HOOK_RUNNER_RETENTION_DEFAULT_HOURS = 24.0
 
 
 def _pending_directory() -> Path:
@@ -1183,104 +1184,158 @@ def _hook_runner_install_directory() -> Path:
     return root / "Memento" / "hooks" / __version__
 
 
-def _hook_runner_version_key(directory: Path) -> tuple[int, ...]:
-    """Sort ordinary dotted release directories without importing packaging."""
-
-    parts = re.findall(r"\d+", directory.name)
-    return tuple(int(part) for part in parts) if parts else (0,)
+def _hook_runner_retirement_marker(directory: Path) -> Path:
+    return directory / _HOOK_RUNNER_RETIREMENT_MARKER
 
 
-def _hook_runner_tombstone_path(directory: Path) -> Path:
-    """Return a unique sibling name for an atomically retired runner."""
-
-    return directory.with_name(
-        f"{directory.name}{_HOOK_RUNNER_TOMBSTONE_MARKER}"
-        f"{os.getpid()}-{time.time_ns()}"
-    )
-
-
-def _sweep_hook_runner_tombstones(root: Path) -> None:
-    """Remove detached runners only after the hook timeout grace period."""
-
+def _hook_runner_retention_age() -> timedelta:
+    raw_hours = os.environ.get(_HOOK_RUNNER_RETENTION_HOURS_ENV, "").strip()
+    if not raw_hours:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
     try:
-        tombstones = [
-            directory
-            for directory in root.iterdir()
-            if directory.is_dir() and _HOOK_RUNNER_TOMBSTONE_MARKER in directory.name
-        ]
+        hours = float(raw_hours)
+    except ValueError:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+    if hours < 0:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+    return timedelta(hours=hours)
+
+
+def _write_hook_runner_retirement_marker(
+    directory: Path,
+    *,
+    retired_at: datetime | None = None,
+) -> bool:
+    """Durably mark an unregistered version without touching its runner files."""
+
+    marker = _hook_runner_retirement_marker(directory)
+    if marker.exists():
+        return True
+    timestamp = retired_at or datetime.now(timezone.utc)
+    payload = {
+        "retired_at": timestamp.astimezone(timezone.utc).isoformat(),
+        "retiring_collector_version": directory.name,
+    }
+    try:
+        with marker.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        return True
     except OSError:
-        return
-    import shutil
-
-    now = time.time()
-    for tombstone in tombstones:
-        try:
-            detached_age = now - tombstone.stat().st_mtime
-        except OSError:
-            continue
-        if detached_age < _HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS:
-            continue
-        try:
-            shutil.rmtree(tombstone)
-        except OSError:
-            # A prior deletion may have hit a transient filesystem failure.
-            # Tombstones are unreachable by registrations, so retry next start.
-            continue
+        return False
+    return True
 
 
-def _cleanup_hook_runner_versions(
-    root: Path,
-    current: Path,
-    registered_directory: Path | None = None,
-) -> None:
-    """Retain current, registered, and newest previous runners without live deletion."""
+def _hook_runner_retirement_age(marker: Path) -> timedelta | None:
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        retired_at = payload.get("retired_at") if isinstance(payload, dict) else None
+        if not isinstance(retired_at, str):
+            return None
+        timestamp = datetime.fromisoformat(retired_at)
+        if timestamp.tzinfo is None:
+            return None
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    return datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)
 
-    _sweep_hook_runner_tombstones(root)
+
+def _hook_runner_version_directories(root: Path) -> list[Path]:
+    """Return installed or previously-retired runner version directories."""
 
     try:
-        installed = [
+        return [
             directory
             for directory in root.iterdir()
             if (
                 directory.is_dir()
-                and _HOOK_RUNNER_TOMBSTONE_MARKER not in directory.name
-                and _hook_runner_is_complete(directory)
+                and not directory.name.startswith(".")
+                and (
+                    (directory / _hook_runner_filename()).is_file()
+                    or _hook_runner_retirement_marker(directory).is_file()
+                )
             )
         ]
     except OSError:
-        return
-    retained = {current}
-    if registered_directory is not None:
-        retained.add(registered_directory)
-    previous = max(
-        (directory for directory in installed if directory not in retained),
-        key=_hook_runner_version_key,
-        default=None,
+        return []
+
+
+def _mark_unregistered_hook_runner_versions(
+    root: Path,
+    current: Path,
+    registered_directories: set[Path],
+) -> None:
+    """Mark all non-current, unregistered runner versions as retired."""
+
+    protected = {current, *registered_directories}
+    for directory in _hook_runner_version_directories(root):
+        if directory not in protected:
+            _write_hook_runner_retirement_marker(directory)
+
+
+def _sweep_retired_hook_runner_versions(
+    root: Path,
+    current: Path,
+    registered_directories: set[Path],
+) -> None:
+    """Delete aged retired versions only after removing their executable first."""
+
+    protected = {current, *registered_directories}
+    retention_age = _hook_runner_retention_age()
+    for directory in _hook_runner_version_directories(root):
+        if directory in protected:
+            continue
+        marker = _hook_runner_retirement_marker(directory)
+        if not marker.is_file():
+            _write_hook_runner_retirement_marker(directory)
+            continue
+        retired_for = _hook_runner_retirement_age(marker)
+        if retired_for is None or retired_for < retention_age:
+            continue
+
+        executable = directory / _hook_runner_filename()
+        if executable.exists():
+            try:
+                # This is deliberately the first mutation. Windows cannot
+                # remove a live process image, so failure leaves every file in
+                # the directory untouched for a later daemon startup.
+                os.remove(executable)
+            except OSError:
+                continue
+        try:
+            import shutil
+
+            shutil.rmtree(directory)
+        except OSError:
+            # The executable is already gone, so this directory cannot launch
+            # again; residual files are safe to retry on a later daemon start.
+            continue
+
+
+def _maintain_hook_runner_versions(
+    hook_runner: Path,
+    *,
+    sweep_retired: bool,
+) -> None:
+    """Mark obsolete versions; only the collector daemon may sweep them."""
+
+    current = hook_runner.parent
+    root = current.parent
+    registered_directories = {current}
+    _mark_unregistered_hook_runner_versions(
+        root,
+        current,
+        registered_directories,
     )
-    if previous is not None:
-        retained.add(previous)
-
-    import shutil
-
-    for directory in installed:
-        if directory in retained:
-            continue
-        tombstone = _hook_runner_tombstone_path(directory)
-        try:
-            # Detach first, never recursively delete an original version path.
-            # Some Windows handles allow a directory rename while a process is
-            # live, so deletion is deferred for longer than Claude's 10-second
-            # external hook timeout rather than treating rename as liveness
-            # proof.
-            os.rename(directory, tombstone)
-        except OSError:
-            continue
-        try:
-            os.utime(tombstone, None)
-        except OSError:
-            # A failed timestamp update only retains an unreachable tombstone;
-            # it must not turn cleanup into an in-place recursive delete.
-            pass
+    if sweep_retired:
+        _sweep_retired_hook_runner_versions(
+            root,
+            current,
+            registered_directories,
+        )
 
 
 def _is_lost_hook_runner_install_race(error: OSError) -> bool:
@@ -1468,7 +1523,10 @@ def _remove_event_hooks(
     return before != after
 
 
-def install_claude_pending_hooks() -> tuple[Path, bool]:
+def install_claude_pending_hooks(
+    *,
+    sweep_retired: bool = False,
+) -> tuple[Path, bool]:
     """Idempotently install hooks that call back into this collector package."""
     settings_path = _settings_path()
     if not settings_path.parent.is_dir():
@@ -1521,10 +1579,9 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
     )
     if not changed:
         if hook_runner is not None:
-            _cleanup_hook_runner_versions(
-                hook_runner.parent.parent,
-                hook_runner.parent,
-                registered_directory=hook_runner.parent,
+            _maintain_hook_runner_versions(
+                hook_runner,
+                sweep_retired=sweep_retired,
             )
         return settings_path, False
 
@@ -1545,10 +1602,9 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
     finally:
         temporary.unlink(missing_ok=True)
     if hook_runner is not None:
-        _cleanup_hook_runner_versions(
-            hook_runner.parent.parent,
-            hook_runner.parent,
-            registered_directory=hook_runner.parent,
+        _maintain_hook_runner_versions(
+            hook_runner,
+            sweep_retired=sweep_retired,
         )
     return settings_path, True
 

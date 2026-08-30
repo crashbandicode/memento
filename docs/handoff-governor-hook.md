@@ -22,15 +22,21 @@ fail-open ceiling if a damaged runner, filesystem problem, or an unexpectedly
 slow invocation occurs; normal hook work must complete well below that limit.
 The collector installs a new immutable version directory before it rewrites
 managed commands. Only after reconciliation points commands at the new runner
-does retention run: it protects that registered/current directory and one
-previous complete runner. An eligible older directory is atomically renamed to
-a unique sibling `.trash-<pid>-<stamp>` tombstone; the original path is never
-recursively deleted. Windows can permit a rename even while a PyInstaller
-process is live, so rename is deliberately not treated as liveness proof.
-Tombstones wait at least eleven seconds (the 10-second hook timeout plus one
-second) before a later collector start sweeps them. A failed rename leaves the
-old directory untouched; a failed tombstone cleanup is harmless and retried
-later. The daemon/`run` sidecar remains the existing onefile artifact.
+does retirement maintenance run. It never renames a version directory. Each
+now-unregistered version receives a durable `retired-at.json` marker with an
+ISO timestamp and version; a markerless old directory is marked and retained,
+never deleted in the same pass. Only collector-daemon startup—not the hook
+installer command—may sweep a marker older than 24 hours (tunable with
+`MEMENTO_HOOK_RUNNER_RETENTION_HOURS`). The current/registered version and
+legacy-sidecar fallback state are never marked or swept.
+
+For an aged, unregistered version, deletion is executable-gated: the first
+filesystem mutation is removal of `memento-hook-runner.exe`. Windows refuses
+to remove a live process image, so any failure leaves the entire directory
+unchanged for a later daemon start. Only after that executable removal succeeds
+may the remaining directory be removed; a residual cleanup failure is harmless
+because the executable is already gone and the retired version can never launch
+again. The daemon/`run` sidecar remains the existing onefile artifact.
 
 On Windows, the packaged source is discovered first at Tauri's resource layout
 next to the frozen sidecar:
@@ -120,6 +126,6 @@ decision; make threshold/path variables visible to the Claude Code process
 
 ## Verification
 
-- Focused governor/runner registration tests: `27 passed in 2.66s`.
+- Focused governor/runner registration tests: `28 passed in 2.49s`.
 - Existing Claude pending-hook tests: `39 passed in 4.00s`.
-- Full collector suite: `354 passed, 2 skipped, 169 subtests passed in 30.39s`.
+- Full collector suite: `355 passed, 2 skipped, 169 subtests passed in 36.69s`.

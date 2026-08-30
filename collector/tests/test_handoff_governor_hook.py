@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -298,6 +299,8 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
     bundled_runner = app_directory / "binaries" / "memento-hook-runner"
     _write_complete_runner(bundled_runner)
     local_app_data = tmp_path / "local-app-data"
+    retired_runner = local_app_data / "Memento" / "hooks" / "0.0.54"
+    _write_complete_runner(retired_runner)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
@@ -332,6 +335,13 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
     assert all(hook["timeout"] == 10 for hook in managed_hooks)
     assert all(str(installed_runner) in hook["command"] for hook in managed_hooks)
     assert not any("memento-collector-sidecar" in hook["command"] for hook in managed_hooks)
+    retirement = json.loads(
+        pending_hook._hook_runner_retirement_marker(retired_runner).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert retirement["retiring_collector_version"] == "0.0.54"
+    assert isinstance(retirement["retired_at"], str)
 
     _settings_path, changed = pending_hook.install_claude_pending_hooks()
     assert changed is False
@@ -422,8 +432,12 @@ def test_frozen_missing_runner_reconciles_with_legacy_timeout_and_removes_govern
     sidecar = tmp_path / "manual sidecar" / "memento-collector-sidecar.exe"
     sidecar.parent.mkdir()
     sidecar.write_bytes(b"sidecar")
+    local_app_data = tmp_path / "no-runner-local-app-data"
+    old_version = local_app_data / "Memento" / "hooks" / "0.0.54"
+    _write_complete_runner(old_version)
+    old_version_before = _runner_tree_snapshot(old_version)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "no-runner-local-app-data"))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.delenv("MEMENTO_HOOK_RUNNER_SOURCE", raising=False)
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED", raising=False)
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
@@ -452,6 +466,8 @@ def test_frozen_missing_runner_reconciles_with_legacy_timeout_and_removes_govern
     assert settings["hooks"]["Stop"][0]["hooks"] == [
         {"type": "command", "command": "user-stop-hook"},
     ]
+    assert _runner_tree_snapshot(old_version) == old_version_before
+    assert not pending_hook._hook_runner_retirement_marker(old_version).exists()
 
 
 def test_runner_install_lost_windows_rename_race_uses_winner(
@@ -489,135 +505,159 @@ def test_runner_install_recognizes_generic_windows_already_exists_error() -> Non
     )
 
 
-def test_runner_retention_rename_refusal_keeps_live_directory_intact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "hooks"
-    old_deleted = root / "0.0.52"
-    old_locked = root / "0.0.53"
-    previous = root / "0.0.54"
-    current = root / "0.0.55"
-    for directory in (old_deleted, old_locked, previous, current):
-        _write_complete_runner(directory)
-    old_deleted_before = _runner_tree_snapshot(old_deleted)
-    old_locked_before = _runner_tree_snapshot(old_locked)
-    real_rename = os.rename
-
-    def refuse_live_rename(source: Path, target: Path) -> None:
-        if Path(source) == old_locked:
-            raise PermissionError(5, "in use", str(source))
-        real_rename(source, target)
-
-    monkeypatch.setattr(pending_hook.os, "rename", refuse_live_rename)
-
-    pending_hook._cleanup_hook_runner_versions(root, current)
-
-    assert not old_deleted.exists()
-    tombstone = next(root.glob("0.0.52.trash-*"))
-    assert _runner_tree_snapshot(tombstone) == old_deleted_before
-    assert old_locked.exists()
-    assert _runner_tree_snapshot(old_locked) == old_locked_before
-    assert previous.exists()
-    assert current.exists()
-
-    expired = time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
-    os.utime(tombstone, (expired, expired))
-    pending_hook._cleanup_hook_runner_versions(root, current)
-
-    assert not tombstone.exists()
-
-
-def test_runner_retention_protects_registered_directory(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "hooks"
-    old_deleted = root / "0.0.51"
-    registered = root / "0.0.52"
-    previous = root / "0.0.54"
-    current = root / "0.0.55"
-    for directory in (old_deleted, registered, previous, current):
-        _write_complete_runner(directory)
-
-    pending_hook._cleanup_hook_runner_versions(
-        root,
-        current,
-        registered_directory=registered,
+def _expired_retirement_time() -> datetime:
+    return (
+        datetime.now(timezone.utc)
+        - pending_hook._hook_runner_retention_age()
+        - timedelta(seconds=1)
     )
 
-    assert not old_deleted.exists()
-    assert registered.exists()
-    assert previous.exists()
-    assert current.exists()
+
+def test_runner_retention_age_defaults_to_24_hours_and_is_tunable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", raising=False)
+    assert pending_hook._hook_runner_retention_age() == timedelta(hours=24)
+
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", "0.5")
+    assert pending_hook._hook_runner_retention_age() == timedelta(minutes=30)
 
 
-def test_runner_retention_sweeps_leftover_tombstones(tmp_path: Path) -> None:
+def test_runner_sweep_marks_missing_retirement_marker_without_deleting(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "hooks"
+    old = root / "0.0.53"
     current = root / "0.0.55"
-    tombstone = root / "0.0.52.trash-prior-attempt"
+    _write_complete_runner(old)
     _write_complete_runner(current)
-    _write_complete_runner(tombstone)
-    expired = time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
-    os.utime(tombstone, (expired, expired))
+    before_marker = _runner_tree_snapshot(old)
 
-    pending_hook._cleanup_hook_runner_versions(root, current)
+    pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
 
-    assert current.exists()
-    assert not tombstone.exists()
+    marker = pending_hook._hook_runner_retirement_marker(old)
+    assert old.exists()
+    assert [
+        entry
+        for entry in _runner_tree_snapshot(old)
+        if entry[0] != pending_hook._HOOK_RUNNER_RETIREMENT_MARKER
+    ] == before_marker
+    marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_payload["retiring_collector_version"] == "0.0.53"
+    assert isinstance(marker_payload["retired_at"], str)
+
+
+def test_runner_sweep_keeps_fresh_retirement_marker_untouched(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    old = root / "0.0.53"
+    current = root / "0.0.55"
+    _write_complete_runner(old)
+    _write_complete_runner(current)
+    assert pending_hook._write_hook_runner_retirement_marker(old)
+    before_sweep = _runner_tree_snapshot(old)
+
+    pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+    assert _runner_tree_snapshot(old) == before_sweep
+
+
+def test_runner_sweep_never_touches_current_or_registered_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    registered = root / "0.0.53"
+    current = root / "0.0.55"
+    for directory in (registered, current):
+        _write_complete_runner(directory)
+        assert pending_hook._write_hook_runner_retirement_marker(
+            directory,
+            retired_at=_expired_retirement_time(),
+        )
+    registered_before = _runner_tree_snapshot(registered)
+    current_before = _runner_tree_snapshot(current)
+
+    pending_hook._sweep_retired_hook_runner_versions(
+        root,
+        current,
+        {current, registered},
+    )
+
+    assert _runner_tree_snapshot(registered) == registered_before
+    assert _runner_tree_snapshot(current) == current_before
 
 
 @pytest.mark.skipif(
     os.name != "nt" or not _built_hook_runner_executable().is_file(),
     reason="requires the locally built Windows onedir hook runner",
 )
-def test_runner_retention_never_partially_deletes_live_frozen_runner(
+def test_runner_sweep_preserves_live_governor_straggler_then_reclaims_it(
     tmp_path: Path,
 ) -> None:
-    """A live onedir process stays intact through detachment and the grace."""
+    """The executable gate must preserve a live Stop hook's block decision."""
 
     root = tmp_path / "hooks"
     old_live = root / "0.0.53"
     previous = root / "0.0.54"
     current = root / "0.0.55"
-    runner_source = _built_hook_runner_executable().parent
-    shutil.copytree(runner_source, old_live)
+    project = tmp_path / "project"
+    project.mkdir()
+    transcript = _write_transcript(
+        project / "thread.jsonl",
+        [_assistant_record(cache_read=0, cache_creation=100, input_tokens=0)],
+    )
+    payload = _payload(transcript, event="Stop", stop_hook_active=False)
+    shutil.copytree(_built_hook_runner_executable().parent, old_live)
     _write_complete_runner(previous)
     _write_complete_runner(current)
-    before_cleanup = _runner_tree_snapshot(old_live)
+    assert pending_hook._write_hook_runner_retirement_marker(
+        old_live,
+        retired_at=_expired_retirement_time(),
+    )
+    before_sweep = _runner_tree_snapshot(old_live)
     process: subprocess.Popen[str] | None = None
     try:
+        environment = {
+            **os.environ,
+            "MEMENTO_GOVERNOR_HYGIENE_TOKENS": "1",
+            "MEMENTO_GOVERNOR_HANDOFF_TOKENS": "1",
+            "MEMENTO_GOVERNOR_BLOCK_TOKENS": "1",
+            "USERPROFILE": str(tmp_path / "profile"),
+        }
         process = subprocess.Popen(
-            [str(old_live / "memento-hook-runner.exe"), "claude-hook"],
+            [
+                str(old_live / "memento-hook-runner.exe"),
+                "claude-governor-hook",
+                "--enabled",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            env=environment,
         )
-        # Keep stdin open after startup so the hook is running from old_live.
-        time.sleep(0.5)
+        # Hold stdin past warm startup so the executable is a real straggler.
+        time.sleep(0.75)
         assert process.poll() is None
 
-        pending_hook._cleanup_hook_runner_versions(root, current)
+        pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
 
-        assert not old_live.exists()
-        tombstone = next(root.glob("0.0.53.trash-*"))
-        assert _runner_tree_snapshot(tombstone) == before_cleanup
+        assert _runner_tree_snapshot(old_live) == before_sweep
         assert process.stdin is not None
+        process.stdin.write(json.dumps(payload))
         process.stdin.close()
         assert process.wait(timeout=10) == 0
         assert process.stdout is not None
         assert process.stderr is not None
-        assert process.stdout.read().strip() == "{}"
+        response = json.loads(process.stdout.read())
+        assert response["decision"] == "block"
         assert process.stderr.read() == ""
 
-        expired = (
-            time.time() - pending_hook._HOOK_RUNNER_TOMBSTONE_GRACE_SECONDS - 1
-        )
-        os.utime(tombstone, (expired, expired))
-        pending_hook._cleanup_hook_runner_versions(root, current)
+        pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
 
-        assert not tombstone.exists()
+        assert not old_live.exists()
     finally:
         if process is not None:
             if process.stdin is not None and not process.stdin.closed:
