@@ -1,9 +1,19 @@
 "use client";
 
-import { PointerEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type MouseEvent, type PointerEvent } from "react";
 import { Icon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { authFetch, getApiBase } from "@/lib/api-client";
+import {
+  bucketLabel,
+  computeSpendBuckets,
+  formatTokenCount,
+  nearestBucketIndex,
+  scaledModelRows,
+  tokenDayForHover,
+  tooltipResolution,
+} from "@/lib/spend-tooltip";
+import type { ModelSeriesForTooltip, TokenLedgerForTooltip } from "@/lib/spend-tooltip";
 
 type SpendSource = "all" | "claude" | "cursor" | "codex";
 type SpendRange = "6h" | "24h" | "7d" | "30d" | "mtd";
@@ -62,6 +72,11 @@ interface StackTrace {
 
 interface HistoryView {
   points?: StackPoint[];
+  modelSeries?: ModelSeriesForTooltip & {
+    totals?: Record<string, number>;
+    chart?: Array<StackPoint & { models?: Record<string, number>; modelCum?: Record<string, number> }>;
+  };
+  tokenLedger?: TokenLedgerForTooltip;
   stack?: {
     traces?: StackTrace[];
     outline?: StackPoint[];
@@ -210,7 +225,7 @@ function coverageLabel(value: BreakdownView["coverage"]): string | undefined {
 }
 
 function shortModel(value: string): string {
-  return value.replace(/^claude-/i, "").replace(/-\d{8}$/i, "");
+  return value.replace(/^(claude|gpt)-/i, "").replace(/-\d{8}$/i, "");
 }
 
 function dateLabel(value?: string | null): string {
@@ -288,6 +303,7 @@ function SpendHistoryChart({
   summary,
   projection,
   projectionsVisible,
+  modelColors,
 }: {
   history?: HistoryView;
   source: SpendSource;
@@ -296,6 +312,7 @@ function SpendHistoryChart({
   summary: SpendSummary;
   projection?: ProjectionView["projection"];
   projectionsVisible: boolean;
+  modelColors: string[];
 }) {
   const narrowLayout = useNarrowSpendLayout();
   const width = 600;
@@ -307,6 +324,8 @@ function SpendHistoryChart({
     .filter((trace) => (trace.points?.length ?? 0) > 1);
   const rawOutline = history?.stack?.outline?.length ? history.stack.outline : history?.points ?? [];
   const outline = filterRange(rawOutline, range, cycleStart);
+  const resolution = tooltipResolution(range);
+  const buckets = computeSpendBuckets(outline, resolution);
   const allPoints = [...outline, ...traces.flatMap((trace) => trace.points ?? [])];
   const timestamps = allPoints.map((point) => timestamp(point.t)).filter(Number.isFinite);
   const minTime = Math.min(...timestamps);
@@ -356,21 +375,12 @@ function SpendHistoryChart({
   const hasChart = Number.isFinite(minTime) && Number.isFinite(maxTime) && maxTime > minTime && outline.length > 1;
   const [hover, setHover] = useState<number | null>(null);
 
-  const setHoverFromPointer = (event: PointerEvent<SVGSVGElement>) => {
+  const setHoverFromPointer = (event: PointerEvent<SVGSVGElement> | MouseEvent<SVGSVGElement>) => {
     if (!hasChart) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const localX = ((event.clientX - rect.left) / rect.width) * width;
     const target = minTime + ((localX - inset.left) / historyWidth) * historySpan;
-    let best = 0;
-    let distance = Number.POSITIVE_INFINITY;
-    outline.forEach((point, index) => {
-      const next = Math.abs(timestamp(point.t) - target);
-      if (next < distance) {
-        distance = next;
-        best = index;
-      }
-    });
-    setHover(best);
+    setHover(nearestBucketIndex(buckets, target));
   };
 
   if (!hasChart) {
@@ -387,8 +397,18 @@ function SpendHistoryChart({
   const currentX = x(current.t);
   const currentY = y(currentValue);
   const rayEndX = showProjectionRays ? x(resetTime) : width - inset.right;
-  const hoverPoint = hover == null ? null : outline[hover];
-  const hoverValue = hoverPoint ? finite(hoverPoint.u) || finite(hoverPoint.y1) : 0;
+  const hoverBucket = hover == null ? null : buckets[hover] ?? null;
+  const hoverValue = hoverBucket?.cum ?? 0;
+  const modelRows = hoverBucket && source !== "all" ? scaledModelRows(history?.modelSeries, hoverBucket) : [];
+  const tokenDay = hoverBucket && source === "cursor" ? tokenDayForHover(history?.tokenLedger, hoverBucket.lastT) : null;
+  const tooltipHasDetails = modelRows.length > 0 || Boolean(tokenDay);
+  const tooltipIsWide = tooltipHasDetails;
+  const tooltipPercent = hoverBucket && hoverBucket.limit > 0 ? (hoverBucket.cum / hoverBucket.limit) * 100 : null;
+  const tooltipLeft = hoverBucket ? Math.min(78, Math.max(8, (x(hoverBucket.lastT) / width) * 100)) : 0;
+  const modelColor = (model: string, index: number) => {
+    const trace = traces.find((candidate) => candidate.model === model);
+    return trace?.color || modelColors[index % modelColors.length] || SOURCE_COLORS[source];
+  };
   const tickValues = brokenScale ? [0, usageTop, highMax] : [0, highMax / 2, highMax];
 
   return (
@@ -400,6 +420,8 @@ function SpendHistoryChart({
           role="img"
           aria-label={`${source} month-to-date spend history`}
           onPointerMove={setHoverFromPointer}
+          onPointerDown={setHoverFromPointer}
+          onClick={setHoverFromPointer}
           onPointerLeave={() => setHover(null)}
         >
           <title>{source} month-to-date spend history</title>
@@ -438,10 +460,10 @@ function SpendHistoryChart({
             </g>
           )}
           <circle cx={currentX} cy={currentY} r="3" fill="var(--aurora-fg1)" />
-          {hoverPoint && (
+          {hoverBucket && (
             <g>
-              <line x1={x(hoverPoint.t)} x2={x(hoverPoint.t)} y1={plotTop} y2={plotBottom} stroke="var(--aurora-fg4)" strokeWidth="1" strokeDasharray="3 4" />
-              <circle cx={x(hoverPoint.t)} cy={y(hoverValue)} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
+              <line x1={x(hoverBucket.lastT)} x2={x(hoverBucket.lastT)} y1={plotTop} y2={plotBottom} stroke="var(--aurora-fg4)" strokeWidth="1" strokeDasharray="3 4" />
+              <circle cx={x(hoverBucket.lastT)} cy={y(hoverValue)} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
             </g>
           )}
           <text x={inset.left} y={height - 8} fill="var(--aurora-fg4)" fontSize="10">{new Date(minTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
@@ -450,10 +472,45 @@ function SpendHistoryChart({
           )}
           <text x={width - inset.right} y={height - 8} textAnchor="end" fill="var(--aurora-fg4)" fontSize="10">{new Date(showProjectionRays ? resetTime : maxTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
         </svg>
-        {hoverPoint && (
-          <div className="spend-tooltip" style={{ left: `${Math.min(78, Math.max(8, (x(hoverPoint.t) / width) * 100))}%` }}>
-            <span>{new Date(timestamp(hoverPoint.t)).toLocaleString()}</span>
-            <strong>{centsLabel(hoverValue, 2)}</strong>
+        {hoverBucket && (
+          <div
+            className={`spend-tooltip ${tooltipIsWide ? "spend-tooltip-wide" : ""} ${tokenDay ? "spend-tooltip-token" : ""} ${tooltipLeft <= 20 ? "spend-tooltip-near-left" : ""}`}
+            data-testid="spend-tooltip"
+            style={{ left: `${tooltipLeft}%` }}
+          >
+            <span className="spend-tooltip-date">{bucketLabel(hoverBucket, resolution)}</span>
+            <div className="spend-tooltip-row">
+              <span className="spend-tooltip-key"><i style={{ background: SOURCE_COLORS[source] }} />{resolution === "hour" ? "This hour" : "This day"}</span>
+              <strong>{centsLabel(hoverBucket.spend, 2)}</strong>
+            </div>
+            {modelRows.length > 0 && (
+              <>
+                <div className="spend-tooltip-separator" />
+                <span className="spend-tooltip-heading">{source === "codex" ? "By model" : "Daily by model"}</span>
+                {modelRows.map((row, index) => (
+                  <div className="spend-tooltip-row" key={row.model}>
+                    <span className="spend-tooltip-key spend-tooltip-model-name"><i style={{ background: modelColor(row.model, index) }} />{shortModel(row.model)}</span>
+                    <strong>{centsLabel(row.value, 2)} <small>{row.percent.toFixed(1)}%</small></strong>
+                  </div>
+                ))}
+                <div className="spend-tooltip-separator" />
+                <div className="spend-tooltip-row spend-tooltip-total"><span>Daily total</span><strong>{centsLabel(hoverBucket.spend, 2)}</strong></div>
+              </>
+            )}
+            {tokenDay && (
+              <>
+                <div className="spend-tooltip-separator" />
+                <span className="spend-tooltip-heading">Daily tokens</span>
+                <div className="spend-tooltip-row"><span>Generated</span><strong>{formatTokenCount(tokenDay.output)}</strong></div>
+                <div className="spend-tooltip-row"><span>Uncached in</span><strong>{formatTokenCount(tokenDay.input)}</strong></div>
+                <div className="spend-tooltip-row"><span>Cache read</span><strong>{formatTokenCount(tokenDay.cacheRead)}</strong></div>
+                <div className="spend-tooltip-row"><span>Cache write</span><strong>{formatTokenCount(tokenDay.cacheWrite)}</strong></div>
+                <div className="spend-tooltip-row spend-tooltip-total"><span>Token total</span><strong>{formatTokenCount(tokenDay.total)}</strong></div>
+              </>
+            )}
+            {!tooltipHasDetails && <div className="spend-tooltip-separator" />}
+            <div className="spend-tooltip-row spend-tooltip-total"><span>Cumulative</span><strong>{centsLabel(hoverBucket.cum, 2)}</strong></div>
+            {tooltipPercent != null && <div className="spend-tooltip-row spend-tooltip-limit"><span>of limit</span><span>{tooltipPercent.toFixed(1)}%</span></div>}
           </div>
         )}
       </div>
@@ -585,7 +642,7 @@ export default function SpendDashboard() {
   const toolView = snapshot?.tools?.[selectedSource];
   const history = snapshot?.history?.[selectedSource];
   const projection = snapshot?.projections?.[selectedSource]?.projection;
-  const modelColors = snapshot?.ui?.modelBarColors || ["#2dd4bf", "#5b8def", "#6cc08a", "#c47ab3", "#e0a64a"];
+  const modelColors = snapshot?.ui?.modelBarColors?.length ? snapshot.ui.modelBarColors : ["#2dd4bf", "#5b8def", "#6cc08a", "#c47ab3", "#e0a64a"];
   const models = useMemo(() => modelView?.models || [], [modelView]);
   const tools = useMemo(() => toolView?.tools || [], [toolView]);
 
@@ -640,7 +697,7 @@ export default function SpendDashboard() {
               <div className="spend-ranges" role="group" aria-label="Usage range">
                 {RANGES.map((range) => <button type="button" key={range.id} className={selectedRange === range.id ? "active" : ""} onClick={() => setSelectedRange(range.id)}>{range.label}</button>)}
               </div>
-              <SpendHistoryChart history={history} source={selectedSource} range={selectedRange} cycleStart={summary.billingCycleStart} summary={summary} projection={projection} projectionsVisible={projectionsVisible} />
+              <SpendHistoryChart history={history} source={selectedSource} range={selectedRange} cycleStart={summary.billingCycleStart} summary={summary} projection={projection} projectionsVisible={projectionsVisible} modelColors={modelColors} />
             </div>
 
             <Breakdown title="Models this cycle" subtitle={coverageLabel(modelView?.coverage) || (modelView?.primary ? `by ${modelView.primary}` : undefined)} rows={models} colors={modelColors} />
@@ -659,6 +716,26 @@ export default function SpendDashboard() {
         .spend-section{margin-bottom:28px;min-width:0}.spend-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:8px 4px 12px}.spend-section-heading>div{display:flex;align-items:center;gap:8px;color:var(--aurora-fg4);font-size:11px}.spend-shell{width:100%;max-width:680px;margin:0 auto}.spend-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:12px;padding:4px;border:1px solid var(--aurora-border);border-radius:14px;background:color-mix(in srgb,var(--aurora-chip) 65%,transparent)}.spend-tabs button{min-height:40px;border:0;border-radius:10px;background:transparent;color:var(--aurora-fg3);font:inherit;font-size:13px;font-weight:650;cursor:pointer}.spend-tabs button.active{background:var(--aurora-surface);color:var(--aurora-fg1);box-shadow:0 2px 9px rgba(15,23,42,.08)}.spend-card{padding:26px 28px 22px}.spend-account{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:11px;margin-bottom:20px}.spend-avatar{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;color:white;font-size:13px;font-weight:750}.spend-account>div:nth-child(2){min-width:0}.spend-account strong,.spend-account span{display:block}.spend-account strong{color:var(--aurora-fg1);font-size:14px}.spend-account span{color:var(--aurora-fg4);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.spend-overview{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:22px;margin:4px 0 20px}.spend-ring{position:relative;width:130px;height:130px}.spend-ring svg{width:100%;height:100%;transform:rotate(-90deg)}.spend-ring>div{position:absolute;inset:0;display:grid;place-content:center;text-align:center}.spend-ring strong,.spend-ring span{display:block}.spend-ring strong{font-size:24px;color:var(--aurora-fg1);letter-spacing:-.03em}.spend-ring span{font-size:10px;color:var(--aurora-fg4)}.spend-used strong,.spend-days strong{display:block;color:var(--aurora-fg1);font-size:clamp(27px,5vw,38px);line-height:1;letter-spacing:-.035em}.spend-used span,.spend-days span{display:block;margin-top:5px;color:var(--aurora-fg4);font-size:12px}.spend-days{text-align:right}.spend-facts{display:grid;gap:9px;padding:16px 0;border-top:1px solid var(--aurora-border);border-bottom:1px solid var(--aurora-border)}.spend-facts>div{display:flex;justify-content:space-between;gap:16px;font-size:12px}.spend-facts span{color:var(--aurora-fg4)}.spend-facts strong{max-width:65%;color:var(--aurora-fg1);text-align:right;overflow-wrap:anywhere}.spend-provider-list{display:grid;gap:9px;padding:14px 0;border-bottom:1px solid var(--aurora-border)}.spend-provider{display:grid;grid-template-columns:90px 1fr;align-items:center;gap:10px}.spend-provider>strong{font-size:12px;color:var(--aurora-fg2)}.spend-provider>div{display:grid;grid-template-columns:minmax(80px,1fr) auto;align-items:center;gap:10px}.spend-provider-track,.spend-breakdown-track{height:7px;overflow:hidden;border-radius:999px;background:var(--aurora-chip)}.spend-provider-track i,.spend-breakdown-track i{display:block;height:100%;border-radius:inherit}.spend-provider small{color:var(--aurora-fg4);font-size:10px;white-space:nowrap}.spend-provider small b{color:var(--aurora-fg2)}.spend-trend{margin-top:16px;padding-top:2px}.spend-trend-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.spend-trend-heading>strong{color:var(--aurora-fg1);font-size:13px}.spend-trend-heading button{min-height:32px;border:1px solid var(--aurora-border);border-radius:9px;padding:5px 12px;background:transparent;color:var(--aurora-fg3);font-size:11px;cursor:pointer}.spend-trend-heading button.active{border-color:${PROJECTION_COLORS.average};background:color-mix(in srgb,${PROJECTION_COLORS.average} 12%,transparent);color:${PROJECTION_COLORS.average};font-weight:700}.spend-ranges{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin:10px 0}.spend-ranges button{min-height:32px;border:1px solid var(--aurora-border);border-radius:8px;background:transparent;color:var(--aurora-fg4);font-size:11px;cursor:pointer}.spend-ranges button.active{border-color:${SOURCE_COLORS.claude};background:${SOURCE_COLORS.claude};color:white;font-weight:700}.spend-chart-wrap{min-width:0}.spend-plot{position:relative}.spend-chart{display:block;width:100%;height:auto;touch-action:pan-y}.spend-tooltip{position:absolute;top:42%;z-index:2;transform:translate(-50%,-100%);display:grid;gap:2px;padding:7px 9px;border:1px solid var(--aurora-border);border-radius:9px;background:var(--aurora-surface);box-shadow:0 8px 24px rgba(15,23,42,.18);pointer-events:none;white-space:nowrap}.spend-tooltip span{font-size:9px;color:var(--aurora-fg4)}.spend-tooltip strong{font-size:11px;color:var(--aurora-fg1)}.spend-projection-rows{display:grid;gap:7px;margin-top:8px}.spend-projection-rows>div{display:flex;align-items:baseline;gap:8px;min-width:0}.spend-projection-rows span{width:64px;color:var(--aurora-fg4);font-size:11px}.spend-projection-rows strong{font-size:12px}.spend-projection-rows small{min-width:0;color:var(--aurora-fg4);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spend-legend{display:flex;flex-wrap:wrap;gap:7px 13px;margin-top:11px}.spend-legend span{display:inline-flex;align-items:center;gap:5px;color:var(--aurora-fg4);font-size:10px}.spend-legend i{width:8px;height:8px;border-radius:2px}.spend-empty{min-height:210px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;padding:20px;color:var(--aurora-fg4);font-size:12px;text-align:center}.spend-breakdown{margin-top:18px;padding-top:15px;border-top:1px solid var(--aurora-border)}.spend-breakdown-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.spend-breakdown-heading strong{color:var(--aurora-fg1);font-size:13px}.spend-breakdown-heading span{color:var(--aurora-fg4);font-size:10px}.spend-breakdown-list{display:grid;gap:10px}.spend-breakdown-row{display:grid;grid-template-columns:minmax(110px,1.1fr) minmax(100px,1.5fr) auto;align-items:center;gap:10px}.spend-breakdown-row>div:first-child{min-width:0}.spend-breakdown-row strong,.spend-breakdown-row small{display:block}.spend-breakdown-row strong{overflow:hidden;color:var(--aurora-fg2);font-size:12px;text-overflow:ellipsis;white-space:nowrap}.spend-breakdown-row small{margin-top:2px;color:var(--aurora-fg4);font-size:10px}.spend-breakdown-row>b{min-width:40px;color:var(--aurora-fg1);font-size:12px;text-align:right}.spend-note{margin:12px 0 0;color:var(--aurora-fg4);font-size:10px}.spend-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;color:var(--aurora-fg4);font-size:10px}.spend-footer button{display:inline-flex;align-items:center;gap:6px;min-height:34px;border:1px solid var(--aurora-border);border-radius:9px;padding:6px 12px;background:var(--aurora-surface);color:var(--aurora-fg2);font-size:11px;cursor:pointer}.spend-footer button:disabled{opacity:.5;cursor:wait}.spend-skeleton{width:180px;height:24px;border-radius:10px;background:var(--aurora-chip);animation:spend-pulse 1.4s ease-in-out infinite}.spend-skeleton-chart{width:100%;height:240px;margin-top:18px}@keyframes spend-pulse{50%{opacity:.45}}
         @media(max-width:760px){.spend-section-heading>div>span{display:none}.spend-card{padding:18px 14px 16px}.spend-account{margin-bottom:14px}.spend-overview{grid-template-columns:auto 1fr auto;gap:10px}.spend-ring{width:96px;height:96px}.spend-ring strong{font-size:18px}.spend-used strong,.spend-days strong{font-size:26px}.spend-used span,.spend-days span{font-size:10px}.spend-facts>div{font-size:11px}.spend-provider{grid-template-columns:76px 1fr}.spend-provider>div{grid-template-columns:1fr}.spend-provider small{text-align:right}.spend-trend-heading{align-items:stretch}.spend-trend-heading button{min-width:140px}.spend-ranges{margin-top:8px}.spend-projection-rays{display:none}.spend-projection-rows{margin-top:2px}.spend-projection-rows>div{display:grid;grid-template-columns:60px auto minmax(0,1fr)}.spend-breakdown-row{grid-template-columns:1fr auto;grid-template-areas:"label pct" "bar bar";gap:4px 10px}.spend-breakdown-row>div:first-child{grid-area:label}.spend-breakdown-row>.spend-breakdown-track{grid-area:bar}.spend-breakdown-row>b{grid-area:pct}.spend-footer button{min-width:120px;justify-content:center}}
         @media(max-width:390px){.spend-overview{grid-template-columns:auto 1fr;grid-template-areas:"ring used" "ring days";gap:5px 10px}.spend-ring{grid-area:ring}.spend-used{grid-area:used}.spend-days{grid-area:days;text-align:left}.spend-ranges{grid-template-columns:repeat(3,minmax(0,1fr))}.spend-ranges button:last-child{grid-column:2}.spend-projection-rows small{white-space:normal}.spend-account>:last-child{display:none}}
+      `}</style>
+      <style jsx global>{`
+        .spend-tooltip{top:42%;min-width:138px;max-width:calc(100% - 16px);width:max-content;gap:5px;padding:9px 10px;white-space:normal}
+        .spend-tooltip.spend-tooltip-wide{min-width:180px}
+        .spend-tooltip.spend-tooltip-token{min-width:200px}
+        .spend-tooltip.spend-tooltip-near-left{transform:translate(0,-100%)}
+        .spend-tooltip-date,.spend-tooltip-heading{display:block;color:var(--aurora-fg4);font-size:9px;line-height:1.25}
+        .spend-tooltip-heading{margin-bottom:-1px}
+        .spend-tooltip-row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;min-width:0;color:var(--aurora-fg3);font-size:10px;line-height:1.25}
+        .spend-tooltip-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+        .spend-tooltip-row strong{display:flex;flex:0 0 auto;align-items:baseline;gap:4px;color:var(--aurora-fg1);font-size:10px;white-space:nowrap}
+        .spend-tooltip-row strong small{color:var(--aurora-fg4);font-size:9px;font-weight:600}
+        .spend-tooltip-key{display:inline-flex;align-items:center;gap:5px;min-width:0}
+        .spend-tooltip-key i{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--aurora-fg4)}
+        .spend-tooltip-model-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .spend-tooltip-separator{height:1px;margin:1px -1px;background:var(--aurora-border)}
+        .spend-tooltip-total{font-weight:750}
+        .spend-tooltip-total>span,.spend-tooltip-total strong{color:var(--aurora-fg1)}
+        .spend-tooltip-limit{color:var(--aurora-fg4);font-size:9px}
+        @media(max-width:760px){.spend-tooltip{max-width:calc(100% - 12px);font-size:9px}.spend-tooltip.spend-tooltip-wide{min-width:min(180px,calc(100% - 12px))}.spend-tooltip.spend-tooltip-token{min-width:min(200px,calc(100% - 12px))}}
       `}</style>
     </section>
   );
