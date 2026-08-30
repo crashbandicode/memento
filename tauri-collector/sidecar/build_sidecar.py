@@ -7,6 +7,7 @@ Workflow:
 
 Output:
   ../src-tauri/binaries/memento-collector-sidecar-<triple>{.exe?}
+  ../src-tauri/binaries/memento-hook-runner/
 
 The `<triple>` suffix is Tauri's requirement — it matches the running
 host triple at install time so the right binary lands in the bundle.
@@ -109,6 +110,47 @@ def _build_one(spec_name: str, exe_name: str, triple: str, exe_suffix: str) -> P
     return target
 
 
+def _build_onedir(spec_name: str, directory_name: str) -> Path:
+    """Build a PyInstaller onedir artifact and place its whole directory.
+
+    The hook runner is not an external Tauri sidecar: it is bundled as a
+    resource and copied to a versioned local directory by the collector.  Keep
+    the directory intact so its executable and `_internal` DLL tree remain
+    adjacent at invocation time.
+    """
+
+    spec = HERE / spec_name
+    work = HERE / "build"
+    dist = HERE / "dist"
+    for directory in (work, dist):
+        if directory.exists():
+            shutil.rmtree(directory)
+
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--clean",
+        "--workpath", str(work),
+        "--distpath", str(dist),
+        str(spec),
+    ]
+    print("->", " ".join(cmd))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(str(path) for path in SOURCE_PATHS)
+    subprocess.run(cmd, check=True, env=env)
+
+    source = dist / directory_name
+    if not source.is_dir():
+        raise RuntimeError(f"PyInstaller did not produce {source}")
+    target = BIN_DIR / directory_name
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.move(str(source), str(target))
+
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.rmtree(dist, ignore_errors=True)
+    return target
+
+
 def main() -> int:
     triple = host_triple()
     print(f"Building sidecars for triple: {triple}")
@@ -163,6 +205,9 @@ def main() -> int:
         "collector.spec", "memento-collector-sidecar", triple, exe_suffix
     )
     print(f"\nv Collector sidecar -> {collector_path}")
+
+    hook_runner_path = _build_onedir("hook_runner.spec", "memento-hook-runner")
+    print(f"v Hook runner       -> {hook_runner_path}")
 
     # Then MCP server — larger dep tree (mcp SDK + openai + asyncpg + ...).
     mcp_path = _build_one(

@@ -7,6 +7,49 @@ their prompt prefix consumes the context window. The governor is a managed,
 inert-by-default pair of Claude Code hooks that provides a staged nudge and a
 last-resort Stop guard.
 
+## Hook execution and latency
+
+On Windows collector 0.0.55, managed Claude hook registrations invoke the
+dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
+It is a small PyInstaller **onedir** bundle, copied on collector startup from
+the desktop application's packaged resource to a versioned directory such as
+`%LOCALAPPDATA%\Memento\hooks\0.0.55\`. Its `_internal` directory stays beside
+the executable, so a hook process does not unpack a 40 MB onefile bundle into a
+new `_MEI*` temp directory for every Claude event.
+
+The installer writes each managed command hook with `"timeout": 10`. This is a
+fail-open ceiling if a damaged runner, filesystem problem, or an unexpectedly
+slow invocation occurs; normal hook work must complete well below that limit.
+The collector installs a new immutable version directory before it rewrites
+managed commands. Only after reconciliation points commands at the new runner
+does retirement maintenance run. It never renames a version directory. Each
+now-unregistered version receives a durable `retired-at.json` marker with an
+ISO timestamp and version; a markerless old directory is marked and retained,
+never deleted in the same pass. Only collector-daemon startup—not the hook
+installer command—may sweep a marker older than 24 hours (tunable with
+`MEMENTO_HOOK_RUNNER_RETENTION_HOURS`). The current/registered version and
+legacy-sidecar fallback state are never marked or swept.
+
+For an aged, unregistered version, deletion is executable-gated: the first
+filesystem mutation is removal of `memento-hook-runner.exe`. Windows refuses
+to remove a live process image, so any failure leaves the entire directory
+unchanged for a later daemon start. Only after that executable removal succeeds
+may the remaining directory be removed; a residual cleanup failure is harmless
+because the executable is already gone and the retired version can never launch
+again. The daemon/`run` sidecar remains the existing onefile artifact.
+
+On Windows, the packaged source is discovered first at Tauri's resource layout
+next to the frozen sidecar:
+`<sidecar-dir>\binaries\memento-hook-runner\`. A manual fleet sidecar under
+`%LOCALAPPDATA%\Memento\memento-collector-sidecar.exe` uses the analogous
+`%LOCALAPPDATA%\Memento\binaries\memento-hook-runner\` location. Direct-build
+and non-Windows resource fallbacks remain supported. If no complete runner
+source can be found or copied, reconciliation still completes: managed entries
+temporarily retain the valid legacy onefile-sidecar command with `timeout: 10`.
+That preserves fail-open behavior and, crucially, still removes governor
+entries when `MEMENTO_GOVERNOR_ENABLED` is disabled. A later collector start
+migrates the commands to the runner once its source is available.
+
 ## Load-bearing design decisions
 
 1. **Measure the live prompt prefix, not a display estimate.** The hook reads a
@@ -52,9 +95,20 @@ decision; make threshold/path variables visible to the Claude Code process
    writes the two governor entries into `~/.claude/settings.json`.
 2. Optionally set the threshold and handoff-path variables above for the
    Claude Code process, then restart Claude Code.
-3. Confirm the project handoff document has a Markdown section that names the
-   active session id. The Stop guard accepts neither mere file existence nor a
+3. Confirm the project handoff document has a Markdown **section heading**
+   that names the active session id, for example
+   `## Current session 9d9aca8e-427c-480a-a648-f9ab2e13a29e`. The production
+   `memento-run-4` validation on 2026-08-29 found that a body-text mention did
+   not satisfy Stop verification; use the heading form rather than relying on
+   a prose mention. The Stop guard accepts neither mere file existence nor a
    section for another session.
+
+   The current source matcher identifies headings and searches the text through
+   the next heading, so it also recognizes an exact, delimiter-bounded id in a
+   heading's body. That is broader than the production observation above; no
+   governor logic changed in 0.0.55, and heading placement is the durable
+   operational contract until that environment discrepancy is independently
+   resolved.
 4. To deactivate, remove or set `MEMENTO_GOVERNOR_ENABLED` false and restart
    the collector. Its next reconcile removes only its own governor entries;
    existing Memento pending-question hooks and user hooks remain intact.
@@ -72,6 +126,6 @@ decision; make threshold/path variables visible to the Claude Code process
 
 ## Verification
 
-- Focused governor hook tests: `13 passed in 0.24s`.
-- Existing Claude pending-hook tests: `39 passed in 3.28s`.
-- Full collector suite: `333 passed, 2 skipped, 169 subtests passed in 30.07s`.
+- Focused governor/runner registration tests: `28 passed in 2.49s`.
+- Existing Claude pending-hook tests: `39 passed in 4.00s`.
+- Full collector suite: `355 passed, 2 skipped, 169 subtests passed in 36.69s`.

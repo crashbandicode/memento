@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
+import shutil
+import subprocess
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,6 +18,39 @@ sys.path.insert(0, str(ROOT))
 
 from collector import claude_pending_hook as pending_hook  # noqa: E402
 from collector import handoff_governor_hook as governor  # noqa: E402
+
+
+def _write_complete_runner(directory: Path) -> Path:
+    (directory / "_internal").mkdir(parents=True)
+    runner = directory / "memento-hook-runner.exe"
+    runner.write_bytes(b"runner")
+    (directory / "_internal" / "python.dll").write_bytes(b"dll")
+    return runner
+
+
+def _runner_tree_snapshot(directory: Path) -> list[tuple[str, int, str]]:
+    """Capture every runner file so live-cleanup tests detect partial deletion."""
+
+    return sorted(
+        (
+            path.relative_to(directory).as_posix(),
+            path.stat().st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in directory.rglob("*")
+        if path.is_file()
+    )
+
+
+def _built_hook_runner_executable() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "tauri-collector"
+        / "src-tauri"
+        / "binaries"
+        / "memento-hook-runner"
+        / "memento-hook-runner.exe"
+    )
 
 
 def _assistant_record(
@@ -201,6 +240,8 @@ def test_registration_adds_governor_only_when_enabled(
     command = post_entries[0]["hooks"][0]["command"]
     assert command.startswith('"')
     assert "-m collector.handoff_governor_hook --enabled" in command
+    assert post_entries[0]["hooks"][0]["timeout"] == 10
+    assert stop_entries[0]["hooks"][0]["timeout"] == 10
 
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
     _settings_path, changed = pending_hook.install_claude_pending_hooks()
@@ -216,3 +257,415 @@ def test_registration_adds_governor_only_when_enabled(
         if isinstance(hook, dict)
     )
     assert "Stop" not in settings["hooks"]
+
+
+def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old onefile commands are replaced only after an onedir copy succeeds."""
+
+    config = tmp_path / ".claude"
+    config.mkdir()
+    settings_path = config / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": '"C:\\\\old\\\\memento-collector-sidecar.exe" claude-hook',
+                    }],
+                }],
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": (
+                            '"C:\\\\old\\\\memento-collector-sidecar.exe" '
+                            "claude-governor-hook --enabled"
+                        ),
+                    }],
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    app_directory = tmp_path / "Tauri app with spaces"
+    sidecar = app_directory / "memento-collector-sidecar.exe"
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"sidecar")
+    bundled_runner = app_directory / "binaries" / "memento-hook-runner"
+    _write_complete_runner(bundled_runner)
+    local_app_data = tmp_path / "local-app-data"
+    retired_runner = local_app_data / "Memento" / "hooks" / "0.0.54"
+    _write_complete_runner(retired_runner)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
+    monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(pending_hook.sys, "executable", str(sidecar))
+
+    _settings_path, changed = pending_hook.install_claude_pending_hooks()
+
+    installed_runner = (
+        local_app_data
+        / "Memento"
+        / "hooks"
+        / "0.0.55"
+        / "memento-hook-runner.exe"
+    )
+    assert changed is True
+    assert installed_runner.read_bytes() == b"runner"
+    assert (installed_runner.parent / "_internal" / "python.dll").read_bytes() == b"dll"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    managed_hooks = [
+        hook
+        for entries in settings["hooks"].values()
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if (
+            pending_hook._is_memento_hook(hook)
+            or pending_hook._is_memento_governor_hook(hook)
+        )
+    ]
+    assert managed_hooks
+    assert all(hook["timeout"] == 10 for hook in managed_hooks)
+    assert all(str(installed_runner) in hook["command"] for hook in managed_hooks)
+    assert not any("memento-collector-sidecar" in hook["command"] for hook in managed_hooks)
+    retirement = json.loads(
+        pending_hook._hook_runner_retirement_marker(retired_runner).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert retirement["retiring_collector_version"] == "0.0.54"
+    assert isinstance(retirement["retired_at"], str)
+
+    _settings_path, changed = pending_hook.install_claude_pending_hooks()
+    assert changed is False
+
+
+@pytest.mark.parametrize(
+    "layout",
+    (
+        "configured",
+        "tauri_windows",
+        "manual_fleet",
+        "legacy_resources",
+        "direct_build",
+        "macos_resources",
+    ),
+)
+def test_bundled_runner_discovery_supports_each_packaged_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    app_directory = tmp_path / "app bundle"
+    sidecar = app_directory / "memento-collector-sidecar.exe"
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"sidecar")
+    local_app_data = tmp_path / "manual fleet local app data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.delenv("MEMENTO_HOOK_RUNNER_SOURCE", raising=False)
+    monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(pending_hook.sys, "executable", str(sidecar))
+
+    locations = {
+        "configured": tmp_path / "explicit source" / "memento-hook-runner",
+        "tauri_windows": app_directory / "binaries" / "memento-hook-runner",
+        "manual_fleet": (
+            local_app_data / "Memento" / "binaries" / "memento-hook-runner"
+        ),
+        "legacy_resources": (
+            app_directory / "resources" / "binaries" / "memento-hook-runner"
+        ),
+        "direct_build": app_directory / "memento-hook-runner",
+        "macos_resources": (
+            app_directory / "Resources" / "binaries" / "memento-hook-runner"
+        ),
+    }
+    expected = locations[layout]
+    _write_complete_runner(expected)
+    if layout == "configured":
+        monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(expected))
+
+    assert pending_hook._bundled_hook_runner_directory() == expected
+
+
+def test_frozen_missing_runner_reconciles_with_legacy_timeout_and_removes_governor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / ".claude"
+    config.mkdir()
+    settings_path = config / "settings.json"
+    settings_path.write_text(
+        json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": '"C:\\\\old\\\\memento-collector-sidecar.exe" claude-hook',
+                    }],
+                }],
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": "user-stop-hook"},
+                        {
+                            "type": "command",
+                            "command": (
+                                '"C:\\\\old\\\\memento-collector-sidecar.exe" '
+                                "claude-governor-hook --enabled"
+                            ),
+                        },
+                    ],
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    sidecar = tmp_path / "manual sidecar" / "memento-collector-sidecar.exe"
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"sidecar")
+    local_app_data = tmp_path / "no-runner-local-app-data"
+    old_version = local_app_data / "Memento" / "hooks" / "0.0.54"
+    _write_complete_runner(old_version)
+    old_version_before = _runner_tree_snapshot(old_version)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.delenv("MEMENTO_HOOK_RUNNER_SOURCE", raising=False)
+    monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED", raising=False)
+    monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(pending_hook.sys, "executable", str(sidecar))
+
+    _settings_path, changed = pending_hook.install_claude_pending_hooks()
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert changed is True
+    pending_handlers = [
+        hook
+        for entries in settings["hooks"].values()
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if pending_hook._is_memento_hook(hook)
+    ]
+    assert pending_handlers
+    assert all(str(sidecar.resolve()) in hook["command"] for hook in pending_handlers)
+    assert all(hook["timeout"] == 10 for hook in pending_handlers)
+    assert all(
+        not pending_hook._is_memento_governor_hook(hook)
+        for entry in settings["hooks"]["Stop"]
+        for hook in entry["hooks"]
+    )
+    assert settings["hooks"]["Stop"][0]["hooks"] == [
+        {"type": "command", "command": "user-stop-hook"},
+    ]
+    assert _runner_tree_snapshot(old_version) == old_version_before
+    assert not pending_hook._hook_runner_retirement_marker(old_version).exists()
+
+
+def test_runner_install_lost_windows_rename_race_uses_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "memento-hook-runner"
+    _write_complete_runner(source)
+    local_app_data = tmp_path / "local-app-data"
+    destination = local_app_data / "Memento" / "hooks" / "0.0.55"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
+    monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+
+    def lose_race(staging: Path, target: Path) -> None:
+        shutil.copytree(staging, target)
+        raise PermissionError(5, "Access is denied", str(target))
+
+    monkeypatch.setattr(pending_hook.os, "replace", lose_race)
+
+    assert pending_hook._install_hook_runner() == (
+        destination / "memento-hook-runner.exe"
+    )
+    assert pending_hook._hook_runner_is_complete(destination)
+
+
+def test_runner_install_recognizes_generic_windows_already_exists_error() -> None:
+    class WindowsAlreadyExistsError(OSError):
+        @property
+        def winerror(self) -> int:
+            return 183
+
+    assert pending_hook._is_lost_hook_runner_install_race(
+        WindowsAlreadyExistsError(1, "already exists")
+    )
+
+
+def _expired_retirement_time() -> datetime:
+    return (
+        datetime.now(timezone.utc)
+        - pending_hook._hook_runner_retention_age()
+        - timedelta(seconds=1)
+    )
+
+
+def test_runner_retention_age_defaults_to_24_hours_and_is_tunable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", raising=False)
+    assert pending_hook._hook_runner_retention_age() == timedelta(hours=24)
+
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", "0.5")
+    assert pending_hook._hook_runner_retention_age() == timedelta(minutes=30)
+
+
+def test_runner_sweep_marks_missing_retirement_marker_without_deleting(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    old = root / "0.0.53"
+    current = root / "0.0.55"
+    _write_complete_runner(old)
+    _write_complete_runner(current)
+    before_marker = _runner_tree_snapshot(old)
+
+    pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+    marker = pending_hook._hook_runner_retirement_marker(old)
+    assert old.exists()
+    assert [
+        entry
+        for entry in _runner_tree_snapshot(old)
+        if entry[0] != pending_hook._HOOK_RUNNER_RETIREMENT_MARKER
+    ] == before_marker
+    marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_payload["retiring_collector_version"] == "0.0.53"
+    assert isinstance(marker_payload["retired_at"], str)
+
+
+def test_runner_sweep_keeps_fresh_retirement_marker_untouched(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    old = root / "0.0.53"
+    current = root / "0.0.55"
+    _write_complete_runner(old)
+    _write_complete_runner(current)
+    assert pending_hook._write_hook_runner_retirement_marker(old)
+    before_sweep = _runner_tree_snapshot(old)
+
+    pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+    assert _runner_tree_snapshot(old) == before_sweep
+
+
+def test_runner_sweep_never_touches_current_or_registered_versions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hooks"
+    registered = root / "0.0.53"
+    current = root / "0.0.55"
+    for directory in (registered, current):
+        _write_complete_runner(directory)
+        assert pending_hook._write_hook_runner_retirement_marker(
+            directory,
+            retired_at=_expired_retirement_time(),
+        )
+    registered_before = _runner_tree_snapshot(registered)
+    current_before = _runner_tree_snapshot(current)
+
+    pending_hook._sweep_retired_hook_runner_versions(
+        root,
+        current,
+        {current, registered},
+    )
+
+    assert _runner_tree_snapshot(registered) == registered_before
+    assert _runner_tree_snapshot(current) == current_before
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not _built_hook_runner_executable().is_file(),
+    reason="requires the locally built Windows onedir hook runner",
+)
+def test_runner_sweep_preserves_live_governor_straggler_then_reclaims_it(
+    tmp_path: Path,
+) -> None:
+    """The executable gate must preserve a live Stop hook's block decision."""
+
+    root = tmp_path / "hooks"
+    old_live = root / "0.0.53"
+    previous = root / "0.0.54"
+    current = root / "0.0.55"
+    project = tmp_path / "project"
+    project.mkdir()
+    transcript = _write_transcript(
+        project / "thread.jsonl",
+        [_assistant_record(cache_read=0, cache_creation=100, input_tokens=0)],
+    )
+    payload = _payload(transcript, event="Stop", stop_hook_active=False)
+    shutil.copytree(_built_hook_runner_executable().parent, old_live)
+    _write_complete_runner(previous)
+    _write_complete_runner(current)
+    assert pending_hook._write_hook_runner_retirement_marker(
+        old_live,
+        retired_at=_expired_retirement_time(),
+    )
+    before_sweep = _runner_tree_snapshot(old_live)
+    process: subprocess.Popen[str] | None = None
+    try:
+        environment = {
+            **os.environ,
+            "MEMENTO_GOVERNOR_HYGIENE_TOKENS": "1",
+            "MEMENTO_GOVERNOR_HANDOFF_TOKENS": "1",
+            "MEMENTO_GOVERNOR_BLOCK_TOKENS": "1",
+            "USERPROFILE": str(tmp_path / "profile"),
+        }
+        process = subprocess.Popen(
+            [
+                str(old_live / "memento-hook-runner.exe"),
+                "claude-governor-hook",
+                "--enabled",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
+        # Hold stdin past warm startup so the executable is a real straggler.
+        time.sleep(0.75)
+        assert process.poll() is None
+
+        pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+        assert _runner_tree_snapshot(old_live) == before_sweep
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload))
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+        assert process.stdout is not None
+        assert process.stderr is not None
+        response = json.loads(process.stdout.read())
+        assert response["decision"] == "block"
+        assert process.stderr.read() == ""
+
+        pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+        assert not old_live.exists()
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()

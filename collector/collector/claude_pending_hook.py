@@ -10,7 +10,7 @@ import stat
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +55,11 @@ _MEMENTO_GOVERNOR_HOOK_MARKERS = (
     "collector.handoff_governor_hook",
     " claude-governor-hook",
 )
+_HOOK_TIMEOUT_SECONDS = 10
+_HOOK_RUNNER_NAME = "memento-hook-runner"
+_HOOK_RUNNER_RETIREMENT_MARKER = "retired-at.json"
+_HOOK_RUNNER_RETENTION_HOURS_ENV = "MEMENTO_HOOK_RUNNER_RETENTION_HOURS"
+_HOOK_RUNNER_RETENTION_DEFAULT_HOURS = 24.0
 
 
 def _pending_directory() -> Path:
@@ -1102,14 +1107,314 @@ def _settings_path() -> Path:
     return root / "settings.json"
 
 
-def _hook_command() -> str:
+def _hook_runner_filename() -> str:
+    return f"{_HOOK_RUNNER_NAME}.exe" if os.name == "nt" else _HOOK_RUNNER_NAME
+
+
+def _hook_runner_is_complete(directory: Path) -> bool:
+    """Return whether an onedir hook-runner directory is executable."""
+
+    return (
+        (directory / _hook_runner_filename()).is_file()
+        and (directory / "_internal").is_dir()
+    )
+
+
+def _bundled_hook_runner_directory() -> Path | None:
+    """Locate the onedir runner packaged beside a frozen desktop sidecar."""
+
+    configured = os.environ.get("MEMENTO_HOOK_RUNNER_SOURCE", "").strip()
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    if getattr(sys, "frozen", False):
+        executable_directory = Path(sys.executable).resolve().parent
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if os.name == "nt":
+            # Tauri's Windows resource directory is the app executable's
+            # parent. The frozen collector sidecar is installed there too.
+            candidates.append(
+                executable_directory / "binaries" / _HOOK_RUNNER_NAME
+            )
+            # A fleet can hand-swap the sidecar under LocalAppData instead of
+            # replacing a complete app bundle. Probe that known sidecar
+            # location separately in case sys.executable still points at an
+            # older app-bundle copy during a restart.
+            if local_app_data:
+                manual_sidecar = (
+                    Path(local_app_data)
+                    / "Memento"
+                    / "memento-collector-sidecar.exe"
+                )
+                candidates.append(
+                    manual_sidecar.parent
+                    / "binaries"
+                    / _HOOK_RUNNER_NAME
+                )
+        candidates.extend(
+            (
+                # Existing direct-build and non-Windows resource layouts.
+                executable_directory
+                / "resources"
+                / "binaries"
+                / _HOOK_RUNNER_NAME,
+                # These fallbacks support direct PyInstaller builds and the
+                # macOS resource layout without making the runtime depend on
+                # Tauri internals.
+                executable_directory / _HOOK_RUNNER_NAME,
+                executable_directory
+                / "Resources"
+                / "binaries"
+                / _HOOK_RUNNER_NAME,
+            )
+        )
+    return next(
+        (candidate for candidate in candidates if _hook_runner_is_complete(candidate)),
+        None,
+    )
+
+
+def _hook_runner_install_directory() -> Path:
+    """Return this immutable collector version's local hook-runner directory."""
+
+    from ._version import __version__
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return root / "Memento" / "hooks" / __version__
+
+
+def _hook_runner_retirement_marker(directory: Path) -> Path:
+    return directory / _HOOK_RUNNER_RETIREMENT_MARKER
+
+
+def _hook_runner_retention_age() -> timedelta:
+    raw_hours = os.environ.get(_HOOK_RUNNER_RETENTION_HOURS_ENV, "").strip()
+    if not raw_hours:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+    try:
+        hours = float(raw_hours)
+    except ValueError:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+    if hours < 0:
+        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+    return timedelta(hours=hours)
+
+
+def _write_hook_runner_retirement_marker(
+    directory: Path,
+    *,
+    retired_at: datetime | None = None,
+) -> bool:
+    """Durably mark an unregistered version without touching its runner files."""
+
+    marker = _hook_runner_retirement_marker(directory)
+    if marker.exists():
+        return True
+    timestamp = retired_at or datetime.now(timezone.utc)
+    payload = {
+        "retired_at": timestamp.astimezone(timezone.utc).isoformat(),
+        "retiring_collector_version": directory.name,
+    }
+    try:
+        with marker.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _hook_runner_retirement_age(marker: Path) -> timedelta | None:
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        retired_at = payload.get("retired_at") if isinstance(payload, dict) else None
+        if not isinstance(retired_at, str):
+            return None
+        timestamp = datetime.fromisoformat(retired_at)
+        if timestamp.tzinfo is None:
+            return None
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    return datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)
+
+
+def _hook_runner_version_directories(root: Path) -> list[Path]:
+    """Return installed or previously-retired runner version directories."""
+
+    try:
+        return [
+            directory
+            for directory in root.iterdir()
+            if (
+                directory.is_dir()
+                and not directory.name.startswith(".")
+                and (
+                    (directory / _hook_runner_filename()).is_file()
+                    or _hook_runner_retirement_marker(directory).is_file()
+                )
+            )
+        ]
+    except OSError:
+        return []
+
+
+def _mark_unregistered_hook_runner_versions(
+    root: Path,
+    current: Path,
+    registered_directories: set[Path],
+) -> None:
+    """Mark all non-current, unregistered runner versions as retired."""
+
+    protected = {current, *registered_directories}
+    for directory in _hook_runner_version_directories(root):
+        if directory not in protected:
+            _write_hook_runner_retirement_marker(directory)
+
+
+def _sweep_retired_hook_runner_versions(
+    root: Path,
+    current: Path,
+    registered_directories: set[Path],
+) -> None:
+    """Delete aged retired versions only after removing their executable first."""
+
+    protected = {current, *registered_directories}
+    retention_age = _hook_runner_retention_age()
+    for directory in _hook_runner_version_directories(root):
+        if directory in protected:
+            continue
+        marker = _hook_runner_retirement_marker(directory)
+        if not marker.is_file():
+            _write_hook_runner_retirement_marker(directory)
+            continue
+        retired_for = _hook_runner_retirement_age(marker)
+        if retired_for is None or retired_for < retention_age:
+            continue
+
+        executable = directory / _hook_runner_filename()
+        if executable.exists():
+            try:
+                # This is deliberately the first mutation. Windows cannot
+                # remove a live process image, so failure leaves every file in
+                # the directory untouched for a later daemon startup.
+                os.remove(executable)
+            except OSError:
+                continue
+        try:
+            import shutil
+
+            shutil.rmtree(directory)
+        except OSError:
+            # The executable is already gone, so this directory cannot launch
+            # again; residual files are safe to retry on a later daemon start.
+            continue
+
+
+def _maintain_hook_runner_versions(
+    hook_runner: Path,
+    *,
+    sweep_retired: bool,
+) -> None:
+    """Mark obsolete versions; only the collector daemon may sweep them."""
+
+    current = hook_runner.parent
+    root = current.parent
+    registered_directories = {current}
+    _mark_unregistered_hook_runner_versions(
+        root,
+        current,
+        registered_directories,
+    )
+    if sweep_retired:
+        _sweep_retired_hook_runner_versions(
+            root,
+            current,
+            registered_directories,
+        )
+
+
+def _is_lost_hook_runner_install_race(error: OSError) -> bool:
+    """Recognize Windows' two observed directory-exists error forms."""
+
+    return getattr(error, "winerror", None) in {5, 183} or (
+        isinstance(error, (FileExistsError, PermissionError))
+        and error.errno in {5, 17}
+    )
+
+
+def _install_hook_runner() -> Path | None:
+    """Install a versioned runner without replacing files a live hook may lock.
+
+    A desktop collector update carries a fresh resource directory. We copy it
+    into a previously unused versioned destination and only then repoint
+    managed registrations. Retention runs after that reconciliation, using an
+    atomic rename probe so a live old hook is never partly deleted.
+    """
+
+    if not (os.name == "nt" and getattr(sys, "frozen", False)):
+        return None
+    destination = _hook_runner_install_directory()
+    executable = destination / _hook_runner_filename()
+    if _hook_runner_is_complete(destination):
+        return executable
+
+    source = _bundled_hook_runner_directory()
+    if source is None:
+        return None
+
+    import shutil
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    staging = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        if staging.exists():
+            shutil.rmtree(staging)
+        shutil.copytree(source, staging)
+        if not _hook_runner_is_complete(staging):
+            return None
+        try:
+            os.replace(staging, destination)
+        except OSError as error:
+            # Another collector process won the race.  Its complete immutable
+            # destination is equivalent, so use it rather than replacing a
+            # directory that could already have live hook processes.
+            if not (
+                _is_lost_hook_runner_install_race(error)
+                and _hook_runner_is_complete(destination)
+            ):
+                raise
+    except OSError:
+        return None
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    if not _hook_runner_is_complete(destination):
+        return None
+    return executable
+
+
+def _hook_command(hook_runner: Path | None = None) -> str:
+    if hook_runner is not None:
+        executable = str(hook_runner.resolve()).replace('"', '\\"')
+        return f'"{executable}" claude-hook'
     executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
     if getattr(sys, "frozen", False):
         return f'"{executable}" claude-hook'
     return f'"{executable}" -m collector.claude_pending_hook'
 
 
-def _governor_hook_command() -> str:
+def _governor_hook_command(hook_runner: Path | None = None) -> str:
+    if hook_runner is not None:
+        executable = str(hook_runner.resolve()).replace('"', '\\"')
+        return f'"{executable}" claude-governor-hook --enabled'
     executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
     if getattr(sys, "frozen", False):
         return f'"{executable}" claude-governor-hook --enabled'
@@ -1137,6 +1442,7 @@ def _merge_event_hooks(
     command: str,
     *,
     managed_hook: Callable[[object], bool] = _is_memento_hook,
+    timeout: int = _HOOK_TIMEOUT_SECONDS,
 ) -> bool:
     entries = hooks.setdefault(event_name, [])
     if not isinstance(entries, list):
@@ -1171,7 +1477,11 @@ def _merge_event_hooks(
         if target is None:
             target = {"matcher": matcher, "hooks": []}
             entries.append(target)
-        target["hooks"].append({"type": "command", "command": command})
+        target["hooks"].append({
+            "type": "command",
+            "command": command,
+            "timeout": timeout,
+        })
 
     after = json.dumps(entries, ensure_ascii=False, sort_keys=True, default=str)
     return before != after
@@ -1213,7 +1523,10 @@ def _remove_event_hooks(
     return before != after
 
 
-def install_claude_pending_hooks() -> tuple[Path, bool]:
+def install_claude_pending_hooks(
+    *,
+    sweep_retired: bool = False,
+) -> tuple[Path, bool]:
     """Idempotently install hooks that call back into this collector package."""
     settings_path = _settings_path()
     if not settings_path.parent.is_dir():
@@ -1237,11 +1550,12 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         sort_keys=True,
         default=str,
     )
-    command = _hook_command()
+    hook_runner = _install_hook_runner()
+    command = _hook_command(hook_runner)
     for event_name, matchers in _HOOK_SPECS.items():
         _merge_event_hooks(hooks, event_name, matchers, command)
     if governor_enabled():
-        governor_command = _governor_hook_command()
+        governor_command = _governor_hook_command(hook_runner)
         for event_name, matchers in _GOVERNOR_HOOK_SPECS.items():
             _merge_event_hooks(
                 hooks,
@@ -1264,6 +1578,11 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         default=str,
     )
     if not changed:
+        if hook_runner is not None:
+            _maintain_hook_runner_versions(
+                hook_runner,
+                sweep_retired=sweep_retired,
+            )
         return settings_path, False
 
     previous_mode = None
@@ -1282,6 +1601,11 @@ def install_claude_pending_hooks() -> tuple[Path, bool]:
         os.replace(temporary, settings_path)
     finally:
         temporary.unlink(missing_ok=True)
+    if hook_runner is not None:
+        _maintain_hook_runner_versions(
+            hook_runner,
+            sweep_retired=sweep_retired,
+        )
     return settings_path, True
 
 
