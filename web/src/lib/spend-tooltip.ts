@@ -129,6 +129,13 @@ export function nearestBucketIndex(buckets: SpendTooltipBucket[], target: number
   return bestDistance === Number.POSITIVE_INFINITY ? null : bestIndex;
 }
 
+export function chartTooltipPlacement(pointTop: number, tooltipHeight: number): { placement: "above" | "below"; offset: number } {
+  if (!Number.isFinite(pointTop) || !Number.isFinite(tooltipHeight) || pointTop - tooltipHeight - 14 >= 0) {
+    return { placement: "above", offset: -12 };
+  }
+  return { placement: "below", offset: 16 };
+}
+
 /** Scales the nearest raw model-day mix so tooltip rows add up to the hover bucket spend. */
 export function scaledModelRows(
   series: ModelSeriesForTooltip | undefined,

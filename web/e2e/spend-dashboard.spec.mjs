@@ -274,6 +274,15 @@ async function revealSpendTooltip(page, source, interaction) {
   return tooltip;
 }
 
+async function expectChartTooltipAboveHoveredPoint(page) {
+  const [tooltipBox, dotBox] = await Promise.all([
+    page.getByTestId("spend-tooltip").boundingBox(),
+    page.getByTestId("spend-tooltip-dot").boundingBox(),
+  ]);
+  if (!tooltipBox || !dotBox) throw new Error("Spend tooltip or hover point has no bounding box");
+  expect(tooltipBox.y + tooltipBox.height).toBeLessThanOrEqual(dotBox.y + dotBox.height / 2);
+}
+
 async function assertTooltipParity(page, interaction) {
   // `all` intentionally has no modelSeries or tokenLedger. It must retain the
   // common spend/cumulative/limit tooltip without data-section placeholders.
@@ -287,6 +296,7 @@ async function assertTooltipParity(page, interaction) {
   await expect(tooltip.getByText("Daily by model")).toHaveCount(0);
   await expect(tooltip.getByText("By model")).toHaveCount(0);
   await expect(tooltip.getByText("Daily tokens")).toHaveCount(0);
+  await expectChartTooltipAboveHoveredPoint(page);
 
   tooltip = await revealSpendTooltip(page, "Claude", interaction);
   await expect(tooltip).toContainText("This day");
@@ -322,6 +332,16 @@ async function assertTooltipParity(page, interaction) {
   await expect(tooltip).toContainText("Cumulative");
   await expect(tooltip).toContainText("$30.00");
   await expect(tooltip).toContainText("30.0%");
+}
+
+async function assertChartTouchDismissal(page) {
+  await revealSpendTooltip(page, "All", "tap");
+  await page.evaluate(() => window.scrollBy(0, 1));
+  await expect(page.getByTestId("spend-tooltip")).toHaveCount(0);
+
+  await revealSpendTooltip(page, "All", "tap");
+  await page.waitForTimeout(1900);
+  await expect(page.getByTestId("spend-tooltip")).toHaveCount(0);
 }
 
 async function trendProjectionRows(page) {
@@ -406,6 +426,7 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   await page.getByRole("tab", { name: "Claude", exact: true }).click();
   await expect(page.locator('svg[aria-label="claude month-to-date spend history"] .spend-projection-rays')).toHaveCount(0);
   await assertTooltipParity(page, "tap");
+  await assertChartTouchDismissal(page);
   await assertProjectionMathMobile(page);
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
   await context.close();

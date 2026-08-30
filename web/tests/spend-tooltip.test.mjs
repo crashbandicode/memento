@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   bucketLabel,
+  chartTooltipPlacement,
   computeSpendBuckets,
   formatTokenCount,
   nearestBucketIndex,
@@ -10,6 +11,12 @@ import {
   tokenDayForHover,
   tooltipResolution,
 } from "../src/lib/spend-tooltip.ts";
+
+test("chart tooltip placement stays point-relative and flips below only when above would clip", () => {
+  assert.deepEqual(chartTooltipPlacement(190, 120), { placement: "above", offset: -12 });
+  assert.deepEqual(chartTooltipPlacement(120, 120), { placement: "below", offset: 16 });
+  assert.deepEqual(chartTooltipPlacement(Number.NaN, 120), { placement: "above", offset: -12 });
+});
 
 test("hour buckets use each bucket's last cumulative value as the next baseline", () => {
   const buckets = computeSpendBuckets([

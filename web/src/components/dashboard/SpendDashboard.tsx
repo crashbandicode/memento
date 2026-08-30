@@ -6,6 +6,7 @@ import { Chip, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { authFetch, getApiBase } from "@/lib/api-client";
 import {
   bucketLabel,
+  chartTooltipPlacement,
   computeSpendBuckets,
   formatTokenCount,
   nearestBucketIndex,
@@ -426,22 +427,26 @@ function SpendHistoryChart({
   const width = 600;
   const height = 300;
   const inset = { left: 46, right: 18, top: 22, bottom: 35 };
-  const rawTraces = source === "all" ? [] : history?.stack?.traces ?? [];
-  const traces = rawTraces
-    .map((trace) => ({ ...trace, points: filterRange(trace.points ?? [], range, cycleStart) }))
-    .filter((trace) => (trace.points?.length ?? 0) > 1);
-  const rawOutline = history?.stack?.outline?.length ? history.stack.outline : history?.points ?? [];
-  const outline = filterRange(rawOutline, range, cycleStart);
   const resolution = tooltipResolution(range);
-  const buckets = computeSpendBuckets(outline, resolution);
-  const allPoints = [...outline, ...traces.flatMap((trace) => trace.points ?? [])];
-  const timestamps = allPoints.map((point) => timestamp(point.t)).filter(Number.isFinite);
-  const minTime = Math.min(...timestamps);
-  const maxTime = Math.max(...timestamps);
-  const maxUsage = Math.max(
-    1,
-    ...allPoints.map((point) => Math.max(finite(point.u), finite(point.y1), finite(point.l))),
-  );
+  const chartData = useMemo(() => {
+    const rawTraces = source === "all" ? [] : history?.stack?.traces ?? [];
+    const traces = rawTraces
+      .map((trace) => ({ ...trace, points: filterRange(trace.points ?? [], range, cycleStart) }))
+      .filter((trace) => (trace.points?.length ?? 0) > 1);
+    const rawOutline = history?.stack?.outline?.length ? history.stack.outline : history?.points ?? [];
+    const outline = filterRange(rawOutline, range, cycleStart);
+    const allPoints = [...outline, ...traces.flatMap((trace) => trace.points ?? [])];
+    const timestamps = allPoints.map((point) => timestamp(point.t)).filter(Number.isFinite);
+    return {
+      traces,
+      outline,
+      buckets: computeSpendBuckets(outline, resolution),
+      minTime: Math.min(...timestamps),
+      maxTime: Math.max(...timestamps),
+      maxUsage: Math.max(1, ...allPoints.map((point) => Math.max(finite(point.u), finite(point.y1), finite(point.l)))),
+    };
+  }, [cycleStart, history, range, resolution, source]);
+  const { traces, outline, buckets, minTime, maxTime, maxUsage } = chartData;
   const projectionValues = projectionsVisible
     ? [projection?.worst?.cents, projection?.realistic?.cents, projection?.average?.cents]
         .map(finite)
@@ -482,6 +487,55 @@ function SpendHistoryChart({
   };
   const hasChart = Number.isFinite(minTime) && Number.isFinite(maxTime) && maxTime > minTime && outline.length > 1;
   const [hover, setHover] = useState<number | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const touchHideTimeout = useRef<number | null>(null);
+  const [tooltipPlacement, setTooltipPlacement] = useState<{ placement: "above" | "below"; offset: number }>({ placement: "above", offset: -12 });
+
+  const clearTouchHide = useCallback(() => {
+    if (touchHideTimeout.current != null) window.clearTimeout(touchHideTimeout.current);
+    touchHideTimeout.current = null;
+  }, []);
+  const hideTooltip = useCallback(() => {
+    clearTouchHide();
+    setHover(null);
+  }, [clearTouchHide]);
+  const scheduleTouchHide = useCallback(() => {
+    clearTouchHide();
+    touchHideTimeout.current = window.setTimeout(() => {
+      touchHideTimeout.current = null;
+      setHover(null);
+    }, 1800);
+  }, [clearTouchHide]);
+  const hoverDetails = useMemo(() => {
+    const hoverBucket = hover == null ? null : buckets[hover] ?? null;
+    if (!hoverBucket) return null;
+    return {
+      hoverBucket,
+      hoverValue: hoverBucket.cum,
+      modelRows: source !== "all" ? scaledModelRows(history?.modelSeries, hoverBucket) : [],
+      tokenDay: source === "cursor" ? tokenDayForHover(history?.tokenLedger, hoverBucket.lastT) : null,
+    };
+  }, [buckets, history?.modelSeries, history?.tokenLedger, hover, source]);
+  const hoverBucket = hoverDetails?.hoverBucket ?? null;
+  const hoverValue = hoverDetails?.hoverValue ?? 0;
+  const modelRows = hoverDetails?.modelRows ?? [];
+  const tokenDay = hoverDetails?.tokenDay ?? null;
+  const tooltipPointY = hoverBucket ? y(hoverValue) : 0;
+
+  useLayoutEffect(() => {
+    const tooltip = tooltipRef.current;
+    if (!hoverBucket || !tooltip) return;
+    const plotHeight = tooltip.parentElement?.getBoundingClientRect().height ?? 0;
+    const nextPlacement = chartTooltipPlacement((tooltipPointY / height) * plotHeight, tooltip.offsetHeight);
+    setTooltipPlacement((current) => current.placement === nextPlacement.placement ? current : nextPlacement);
+  }, [hoverBucket, tooltipPointY]);
+
+  useEffect(() => () => clearTouchHide(), [clearTouchHide]);
+  useEffect(() => {
+    if (hover == null) return undefined;
+    window.addEventListener("scroll", hideTooltip, { passive: true });
+    return () => window.removeEventListener("scroll", hideTooltip);
+  }, [hideTooltip, hover]);
 
   const setHoverFromPointer = (event: PointerEvent<SVGSVGElement> | MouseEvent<SVGSVGElement>) => {
     if (!hasChart) return;
@@ -489,6 +543,17 @@ function SpendHistoryChart({
     const localX = ((event.clientX - rect.left) / rect.width) * width;
     const target = minTime + ((localX - inset.left) / historyWidth) * historySpan;
     setHover(nearestBucketIndex(buckets, target));
+  };
+  const handlePointerMove = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType !== "touch") clearTouchHide();
+    setHoverFromPointer(event);
+  };
+  const handlePointerDown = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType === "touch") clearTouchHide();
+    setHoverFromPointer(event);
+  };
+  const handlePointerUp = (event: PointerEvent<SVGSVGElement>) => {
+    if (event.pointerType === "touch") scheduleTouchHide();
   };
 
   if (!hasChart) {
@@ -505,10 +570,6 @@ function SpendHistoryChart({
   const currentX = x(current.t);
   const currentY = y(currentValue);
   const rayEndX = showProjectionRays ? x(resetTime) : width - inset.right;
-  const hoverBucket = hover == null ? null : buckets[hover] ?? null;
-  const hoverValue = hoverBucket?.cum ?? 0;
-  const modelRows = hoverBucket && source !== "all" ? scaledModelRows(history?.modelSeries, hoverBucket) : [];
-  const tokenDay = hoverBucket && source === "cursor" ? tokenDayForHover(history?.tokenLedger, hoverBucket.lastT) : null;
   const tooltipHasDetails = modelRows.length > 0 || Boolean(tokenDay);
   const tooltipIsWide = tooltipHasDetails;
   const tooltipPercent = hoverBucket && hoverBucket.limit > 0 ? (hoverBucket.cum / hoverBucket.limit) * 100 : null;
@@ -527,10 +588,14 @@ function SpendHistoryChart({
           viewBox={`0 0 ${width} ${height}`}
           role="img"
           aria-label={`${source} month-to-date spend history`}
-          onPointerMove={setHoverFromPointer}
-          onPointerDown={setHoverFromPointer}
+          onPointerMove={handlePointerMove}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={hideTooltip}
+          onTouchEnd={scheduleTouchHide}
+          onTouchCancel={hideTooltip}
           onClick={setHoverFromPointer}
-          onPointerLeave={() => setHover(null)}
+          onPointerLeave={hideTooltip}
         >
           <title>{source} month-to-date spend history</title>
           {tickValues.map((value) => (
@@ -571,7 +636,7 @@ function SpendHistoryChart({
           {hoverBucket && (
             <g>
               <line x1={x(hoverBucket.lastT)} x2={x(hoverBucket.lastT)} y1={plotTop} y2={plotBottom} stroke="var(--aurora-fg4)" strokeWidth="1" strokeDasharray="3 4" />
-              <circle cx={x(hoverBucket.lastT)} cy={y(hoverValue)} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
+              <circle data-testid="spend-tooltip-dot" cx={x(hoverBucket.lastT)} cy={tooltipPointY} r="4" fill={SOURCE_COLORS[source]} stroke="var(--aurora-surface)" strokeWidth="2" />
             </g>
           )}
           <text x={inset.left} y={height - 8} fill="var(--aurora-fg4)" fontSize="10">{new Date(minTime).toLocaleDateString(undefined, { month: "numeric", day: "numeric" })}</text>
@@ -582,9 +647,10 @@ function SpendHistoryChart({
         </svg>
         {hoverBucket && (
           <div
-            className={`spend-tooltip ${tooltipIsWide ? "spend-tooltip-wide" : ""} ${tokenDay ? "spend-tooltip-token" : ""} ${tooltipLeft <= 20 ? "spend-tooltip-near-left" : ""}`}
+            ref={tooltipRef}
+            className={`spend-tooltip ${tooltipIsWide ? "spend-tooltip-wide" : ""} ${tokenDay ? "spend-tooltip-token" : ""} ${tooltipLeft <= 20 ? "spend-tooltip-near-left" : ""} ${tooltipPlacement.placement === "below" ? "spend-tooltip-below" : ""}`}
             data-testid="spend-tooltip"
-            style={{ left: `${tooltipLeft}%` }}
+            style={{ left: `${tooltipLeft}%`, top: `calc(${(tooltipPointY / height) * 100}% ${tooltipPlacement.offset >= 0 ? "+" : "-"} ${Math.abs(tooltipPlacement.offset)}px)` }}
           >
             <span className="spend-tooltip-date">{bucketLabel(hoverBucket, resolution)}</span>
             <div className="spend-tooltip-row">
@@ -830,6 +896,8 @@ export default function SpendDashboard() {
         .spend-tooltip.spend-tooltip-wide{min-width:180px}
         .spend-tooltip.spend-tooltip-token{min-width:200px}
         .spend-tooltip.spend-tooltip-near-left{transform:translate(0,-100%)}
+        .spend-tooltip.spend-tooltip-below{transform:translate(-50%,0)}
+        .spend-tooltip.spend-tooltip-near-left.spend-tooltip-below{transform:translate(0,0)}
         .spend-tooltip-date,.spend-tooltip-heading{display:block;color:var(--aurora-fg4);font-size:9px;line-height:1.25}
         .spend-tooltip-heading{margin-bottom:-1px}
         .spend-tooltip-row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;min-width:0;color:var(--aurora-fg3);font-size:10px;line-height:1.25}
