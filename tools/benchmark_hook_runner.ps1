@@ -76,6 +76,16 @@ $commands = [ordered]@{
     claude_governor_hook_enabled = @("claude-governor-hook", "--enabled")
 }
 
+# The production baseline is warm. Prime each command once so the reported
+# waited-process measurements exclude its first import and image-cache load.
+foreach ($command in $commands.GetEnumerator()) {
+    $warmupInvocation = Start-HookInvocation -Arguments $command.Value -Payload $payloads.empty
+    $warmup = Complete-HookInvocation $warmupInvocation
+    if ($warmup.exit_code -ne 0) {
+        throw "Warmup failed for $($command.Key): $($warmup.stderr)"
+    }
+}
+
 $rows = foreach ($command in $commands.GetEnumerator()) {
     foreach ($payload in $payloads.GetEnumerator()) {
         foreach ($concurrency in 1, 3) {

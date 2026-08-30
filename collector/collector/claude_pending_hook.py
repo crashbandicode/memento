@@ -1126,9 +1126,31 @@ def _bundled_hook_runner_directory() -> Path | None:
         candidates.append(Path(configured).expanduser())
     if getattr(sys, "frozen", False):
         executable_directory = Path(sys.executable).resolve().parent
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if os.name == "nt":
+            # Tauri's Windows resource directory is the app executable's
+            # parent. The frozen collector sidecar is installed there too.
+            candidates.append(
+                executable_directory / "binaries" / _HOOK_RUNNER_NAME
+            )
+            # A fleet can hand-swap the sidecar under LocalAppData instead of
+            # replacing a complete app bundle. Probe that known sidecar
+            # location separately in case sys.executable still points at an
+            # older app-bundle copy during a restart.
+            if local_app_data:
+                manual_sidecar = (
+                    Path(local_app_data)
+                    / "Memento"
+                    / "memento-collector-sidecar.exe"
+                )
+                candidates.append(
+                    manual_sidecar.parent
+                    / "binaries"
+                    / _HOOK_RUNNER_NAME
+                )
         candidates.extend(
             (
-                # Tauri bundles configured resources below this Windows path.
+                # Existing direct-build and non-Windows resource layouts.
                 executable_directory
                 / "resources"
                 / "binaries"
@@ -1159,6 +1181,55 @@ def _hook_runner_install_directory() -> Path:
     return root / "Memento" / "hooks" / __version__
 
 
+def _hook_runner_version_key(directory: Path) -> tuple[int, ...]:
+    """Sort ordinary dotted release directories without importing packaging."""
+
+    parts = re.findall(r"\d+", directory.name)
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def _cleanup_hook_runner_versions(root: Path, current: Path) -> None:
+    """Best-effort retention: current plus one previous complete runner."""
+
+    try:
+        installed = [
+            directory
+            for directory in root.iterdir()
+            if directory.is_dir() and _hook_runner_is_complete(directory)
+        ]
+    except OSError:
+        return
+    previous = max(
+        (directory for directory in installed if directory != current),
+        key=_hook_runner_version_key,
+        default=None,
+    )
+    retained = {current}
+    if previous is not None:
+        retained.add(previous)
+    for directory in installed:
+        if directory in retained:
+            continue
+        try:
+            import shutil
+
+            shutil.rmtree(directory)
+        except OSError:
+            # A running old hook may still have an _internal DLL open on
+            # Windows. Leave it for a later collector start; cleanup can never
+            # block installation or reconciliation.
+            continue
+
+
+def _is_lost_hook_runner_install_race(error: OSError) -> bool:
+    """Recognize Windows' two observed directory-exists error forms."""
+
+    return getattr(error, "winerror", None) in {5, 183} or (
+        isinstance(error, (FileExistsError, PermissionError))
+        and error.errno in {5, 17}
+    )
+
+
 def _install_hook_runner() -> Path | None:
     """Install a versioned runner without replacing files a live hook may lock.
 
@@ -1170,37 +1241,48 @@ def _install_hook_runner() -> Path | None:
 
     if not (os.name == "nt" and getattr(sys, "frozen", False)):
         return None
-    source = _bundled_hook_runner_directory()
-    if source is None:
-        raise OSError("Bundled Memento hook runner is unavailable")
     destination = _hook_runner_install_directory()
     executable = destination / _hook_runner_filename()
     if _hook_runner_is_complete(destination):
+        _cleanup_hook_runner_versions(destination.parent, destination)
         return executable
+
+    source = _bundled_hook_runner_directory()
+    if source is None:
+        return None
 
     import shutil
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
     staging = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     try:
         if staging.exists():
             shutil.rmtree(staging)
         shutil.copytree(source, staging)
         if not _hook_runner_is_complete(staging):
-            raise OSError("Bundled Memento hook runner is incomplete")
+            return None
         try:
             os.replace(staging, destination)
-        except FileExistsError:
+        except OSError as error:
             # Another collector process won the race.  Its complete immutable
             # destination is equivalent, so use it rather than replacing a
             # directory that could already have live hook processes.
-            if not _hook_runner_is_complete(destination):
+            if not (
+                _is_lost_hook_runner_install_race(error)
+                and _hook_runner_is_complete(destination)
+            ):
                 raise
+    except OSError:
+        return None
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
     if not _hook_runner_is_complete(destination):
-        raise OSError("Memento hook runner installation did not complete")
+        return None
+    _cleanup_hook_runner_versions(destination.parent, destination)
     return executable
 
 

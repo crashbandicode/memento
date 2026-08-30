@@ -21,9 +21,23 @@ The installer writes each managed command hook with `"timeout": 10`. This is a
 fail-open ceiling if a damaged runner, filesystem problem, or an unexpectedly
 slow invocation occurs; normal hook work must complete well below that limit.
 The collector installs a new immutable version directory before it rewrites
-managed commands. It deliberately leaves prior version directories in place,
-because a concurrently running hook may still hold one of their DLLs open on
-Windows. The daemon/`run` sidecar remains the existing onefile artifact.
+managed commands. After a successful install it retains the current version
+and one previous complete runner; older directories are deleted best-effort.
+An in-use/locked directory is skipped rather than risking a live hook or
+failing startup, and is retried on a later collector start. The daemon/`run`
+sidecar remains the existing onefile artifact.
+
+On Windows, the packaged source is discovered first at Tauri's resource layout
+next to the frozen sidecar:
+`<sidecar-dir>\binaries\memento-hook-runner\`. A manual fleet sidecar under
+`%LOCALAPPDATA%\Memento\memento-collector-sidecar.exe` uses the analogous
+`%LOCALAPPDATA%\Memento\binaries\memento-hook-runner\` location. Direct-build
+and non-Windows resource fallbacks remain supported. If no complete runner
+source can be found or copied, reconciliation still completes: managed entries
+temporarily retain the valid legacy onefile-sidecar command with `timeout: 10`.
+That preserves fail-open behavior and, crucially, still removes governor
+entries when `MEMENTO_GOVERNOR_ENABLED` is disabled. A later collector start
+migrates the commands to the runner once its source is available.
 
 ## Load-bearing design decisions
 
@@ -101,6 +115,6 @@ decision; make threshold/path variables visible to the Claude Code process
 
 ## Verification
 
-- Focused governor hook tests: `13 passed in 0.24s`.
-- Existing Claude pending-hook tests: `39 passed in 3.28s`.
-- Full collector suite: `333 passed, 2 skipped, 169 subtests passed in 30.07s`.
+- Focused governor/runner registration tests: `23 passed in 0.29s`.
+- Existing Claude pending-hook tests: `39 passed in 4.00s`.
+- Full collector suite: `351 passed, 2 skipped, 169 subtests passed in 28.50s`.
