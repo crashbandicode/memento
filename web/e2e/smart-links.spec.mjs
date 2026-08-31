@@ -291,7 +291,11 @@ test.describe("smart conversation links", () => {
     const pre = codeBlock.locator("pre");
     const copy = codeBlock.getByTestId("code-block-copy");
     await expect(copy).toBeVisible();
-    const [box, preBox] = await Promise.all([copy.boundingBox(), pre.boundingBox()]);
+    const [box, preBox, blockBox] = await Promise.all([
+      copy.boundingBox(),
+      pre.boundingBox(),
+      codeBlock.boundingBox(),
+    ]);
     const presentation = await copy.evaluate((element) => {
       const styles = window.getComputedStyle(element);
       return {
@@ -306,8 +310,9 @@ test.describe("smart conversation links", () => {
       };
     });
 
-    expect(box?.x ?? -1).toBeGreaterThanOrEqual(preBox?.x ?? 0);
-    expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual((preBox?.x ?? 0) + (preBox?.width ?? 390));
+    expect(preBox?.x ?? -1).toBeGreaterThanOrEqual(blockBox?.x ?? 0);
+    expect((preBox?.x ?? 0) + (preBox?.width ?? 390)).toBeLessThanOrEqual(box?.x ?? -1);
+    expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual((blockBox?.x ?? 0) + (blockBox?.width ?? 390));
     expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
     expect(presentation.width).toBeLessThanOrEqual(46);
     expect(presentation.opacity).toBeLessThanOrEqual(0.55);
