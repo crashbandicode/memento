@@ -916,9 +916,9 @@ export default function SpendDashboard() {
       <style jsx global>{`
         .spend-projection-row-interactive{cursor:help}
         .spend-projection-row-interactive:focus-visible{outline:2px solid color-mix(in srgb,var(--aurora-accent) 72%,transparent);outline-offset:3px;border-radius:6px}
-        .spend-projection-math-tooltip{position:fixed;z-index:12;min-width:220px;max-width:min(360px,92vw);transform:translateX(-50%);padding:9px 11px;border:1px solid var(--aurora-border);border-radius:10px;background:var(--aurora-surface);box-shadow:0 8px 24px rgba(15,23,42,.18);pointer-events:none;white-space:normal}
-        .spend-projection-math-title{margin-bottom:6px;color:var(--aurora-fg4);font-size:11px;line-height:1.25}
-        .spend-projection-math-tooltip p{margin:0 0 6px;color:var(--aurora-fg4);font-size:11.5px;line-height:1.45}
+        .spend-projection-math-tooltip{position:fixed;z-index:12;min-width:220px;max-width:min(360px,92vw);transform:translateX(-50%);padding:9px 11px;border:1px solid var(--aurora-border-strong);border-radius:10px;background:var(--aurora-surface-solid);box-shadow:0 8px 24px rgba(15,23,42,.24);pointer-events:none;white-space:normal}
+        .spend-projection-math-title{margin-bottom:6px;color:var(--aurora-fg1);font-size:11px;font-weight:700;line-height:1.25}
+        .spend-projection-math-tooltip p{margin:0 0 6px;color:var(--aurora-fg2);font-size:11.5px;line-height:1.45}
         .spend-projection-math-tooltip p:last-child{margin-bottom:0}
         .spend-projection-math-tooltip .spend-projection-math-equation{color:var(--aurora-fg1);font-variant-numeric:tabular-nums}
         @media(max-width:760px){.spend-projection-math-tooltip{max-width:92vw;min-width:min(220px,92vw)}}

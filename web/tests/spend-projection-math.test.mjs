@@ -51,6 +51,20 @@ test("projection explainers retain the original copy and equations for all scena
   assert.equal(average.lines[0].segments.some((segment) => segment.bold && segment.text === "average day"), true);
 });
 
+test("projection explainers retain full thousands-scale money precision", () => {
+  const thousands = projectionMathTooltip({
+    ...math,
+    currentCents: 1_618_474,
+    limitCents: 1_700_000,
+    peakDayCents: 152_949,
+    worstEndCents: 1_767_300,
+  }, "worst");
+
+  assert.equal(textLines(thousands)[0], "Assumes every remaining day — including the rest of today — spends like your busiest day so far ($1,529.49).");
+  assert.equal(textLines(thousands)[1], "$16,184.74 now + $1,529.49/day × 10.0 days left = $17,673");
+  assert.match(textLines(thousands).at(2), /^Reaches \$17,000 /);
+});
+
 test("hit-100 builders cover already-over, worst, fits-today, and spills-days branches", () => {
   const alreadyOver = projectionMathTooltip({ ...math, currentCents: 52000, worstEndCents: 112000 }, "worst");
   assert.equal(textLines(alreadyOver).at(-1), "Already over the limit: $520.00 now vs $500 cap.");

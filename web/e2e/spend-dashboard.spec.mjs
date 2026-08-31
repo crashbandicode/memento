@@ -197,7 +197,7 @@ const snapshot = {
   },
 };
 
-async function installRoutes(page) {
+async function installRoutes(page, spendSnapshot = snapshot) {
   await seedAuth(page);
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -219,7 +219,7 @@ async function installRoutes(page) {
       return;
     }
     if (request.method() === "GET" && url.pathname === "/api/dashboard/spend") {
-      await route.fulfill({ status: 200, headers: JSON_HEADERS, body: JSON.stringify({ available: true, stale: false, cached_at: new Date(now).toISOString(), snapshot }) });
+      await route.fulfill({ status: 200, headers: JSON_HEADERS, body: JSON.stringify({ available: true, stale: false, cached_at: new Date(now).toISOString(), snapshot: spendSnapshot }) });
       return;
     }
     if (request.method() === "GET" && url.pathname === "/api/dashboard") {
@@ -411,6 +411,65 @@ test("spend snapshot paints supplied bands and remains coherent on desktop", asy
       x2: Number(line.getAttribute("x2")),
     })));
     expect(coordinates.every(({ x1, x2 }) => Number.isFinite(x1) && Number.isFinite(x2) && x1 < x2)).toBe(true);
+  }
+});
+
+test("projection math tooltip stays opaque and keeps thousands-scale precision", async ({ page }) => {
+  const largeMath = {
+    ...projectionMath,
+    currentCents: 1_618_474,
+    limitCents: 1_700_000,
+    peakDayCents: 152_949,
+    worstEndCents: 1_767_300,
+  };
+  const largeSnapshot = {
+    ...snapshot,
+    projections: {
+      ...snapshot.projections,
+      all: {
+        projection: {
+          ...snapshot.projections.all.projection,
+          math: largeMath,
+        },
+      },
+    },
+  };
+  await installRoutes(page, largeSnapshot);
+  await page.goto("/app");
+  await expect(page.getByRole("region", { name: "AI spend" })).toBeVisible();
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await worst.hover();
+  await expect(tooltip).toContainText("$16,184.74 now + $1,529.49/day × 10.0 days left = $17,673");
+  await expect(tooltip).toContainText("Reaches $17,000");
+
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((value) => {
+      document.documentElement.dataset.theme = value;
+    }, theme);
+    const presentation = await tooltip.evaluate((element) => {
+      const parse = (value) => {
+        const channels = value.match(/rgba?\(([^)]+)\)/)?.[1].split(",").map(Number);
+        if (!channels || channels.length < 3) throw new Error(`Unexpected CSS color: ${value}`);
+        return { red: channels[0], green: channels[1], blue: channels[2], alpha: channels[3] ?? 1 };
+      };
+      const luminance = ({ red, green, blue }) => [red, green, blue]
+        .map((channel) => {
+          const normalized = channel / 255;
+          return normalized <= 0.03928
+            ? normalized / 12.92
+            : ((normalized + 0.055) / 1.055) ** 2.4;
+        })
+        .reduce((total, channel, index) => total + channel * [0.2126, 0.7152, 0.0722][index], 0);
+      const background = parse(window.getComputedStyle(element).backgroundColor);
+      const foreground = parse(window.getComputedStyle(element.querySelector("p")).color);
+      const [light, dark] = [luminance(background), luminance(foreground)].sort((a, b) => b - a);
+      return { alpha: background.alpha, contrast: (light + 0.05) / (dark + 0.05) };
+    });
+    expect(presentation.alpha).toBe(1);
+    expect(presentation.contrast).toBeGreaterThanOrEqual(4.5);
   }
 });
 

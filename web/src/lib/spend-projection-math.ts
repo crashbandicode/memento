@@ -68,9 +68,6 @@ export function hasProjectionMath(value: unknown): value is ProjectionMath {
 }
 
 export function projectionMoney(value: number, digits = 0): string {
-  if (Math.abs(value) >= 100_000) {
-    return `$${(value / 100_000).toFixed(value >= 1_000_000 ? 0 : 1)}k`;
-  }
   return `$${(value / 100).toLocaleString(undefined, {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
