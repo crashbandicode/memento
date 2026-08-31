@@ -232,6 +232,23 @@ export function useSSE(
       resume();
     }
 
+    function handleFreeze() {
+      // Chromium's Page Lifecycle API can freeze a backgrounded mobile tab
+      // without delivering the visibility/blur pair first. Stop the socket so
+      // resume always creates a fresh stream instead of retaining a dead one.
+      wasBackgrounded = true;
+      closeStream();
+    }
+
+    function handleLifecycleResume() {
+      // A resumed frozen document can retain a perfectly valid SSE watermark,
+      // but replay alone cannot prove that every cached conversation snapshot
+      // is current. Reconcile once even when visibilitychange was omitted.
+      wasBackgrounded = false;
+      reconcile("lifecycle_resume");
+      resume();
+    }
+
     function handleBlur() {
       windowBlurred = true;
     }
@@ -245,6 +262,8 @@ export function useSSE(
     void connect();
     startLivenessWatchdog();
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    document.addEventListener("freeze", handleFreeze);
+    document.addEventListener("resume", handleLifecycleResume);
     window.addEventListener("pageshow", handlePageShow);
     window.addEventListener("online", resume);
     window.addEventListener("blur", handleBlur);
@@ -255,6 +274,8 @@ export function useSSE(
       closeStream();
       clearLivenessTimer();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      document.removeEventListener("freeze", handleFreeze);
+      document.removeEventListener("resume", handleLifecycleResume);
       window.removeEventListener("pageshow", handlePageShow);
       window.removeEventListener("online", resume);
       window.removeEventListener("blur", handleBlur);
