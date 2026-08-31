@@ -2,7 +2,7 @@
 
 Workflow:
   cd tauri-collector/sidecar
-  pip install -e ../../collector pyinstaller
+  pip install -e ../../collector -e ../../mcp_server pyinstaller
   python build_sidecar.py
 
 Output:
@@ -17,12 +17,23 @@ this script's prerequisite (`cargo tauri`), so the user already has it.
 
 from __future__ import annotations
 
-import platform
+from collections import deque
+from dataclasses import dataclass
+from importlib import metadata
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
+from typing import Callable, Iterable, Mapping
+from urllib.parse import unquote, urlparse
 from pathlib import Path
+
+from packaging.markers import default_environment
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 # Windows defaults stdout/stderr to cp1252 (a.k.a. "charmap"). The `→` and
 # `✓` we print below blow up with UnicodeEncodeError on Windows runners
@@ -41,6 +52,249 @@ REPO_ROOT = HERE.parents[1]
 COLLECTOR_SOURCE = REPO_ROOT / "collector"
 MCP_SOURCE = REPO_ROOT / "mcp_server"
 SOURCE_PATHS = (COLLECTOR_SOURCE, MCP_SOURCE)
+
+# The sidecars import source from this worktree, but PyInstaller resolves their
+# dependency metadata from the active interpreter.  Requiring local project
+# installs keeps those two views in sync instead of freezing whatever stale
+# wheel happens to be present in a shared virtual environment.
+SIDECAR_ROOT_DISTRIBUTIONS = {
+    "memento-brain-collector": COLLECTOR_SOURCE,
+    "memento-brain-memory": MCP_SOURCE,
+}
+SIDECAR_ROOT_REQUIREMENTS = tuple(
+    Requirement(name) for name in SIDECAR_ROOT_DISTRIBUTIONS
+)
+
+
+@dataclass(frozen=True, order=True)
+class DependencyIssue:
+    """One deterministic, actionable dependency-closure diagnostic."""
+
+    package: str
+    required_by: str
+    message: str
+
+
+class DependencyClosureError(RuntimeError):
+    """Raised before PyInstaller can mutate build or binary directories."""
+
+    def __init__(self, issues: Iterable[DependencyIssue]) -> None:
+        ordered_issues = tuple(sorted(set(issues)))
+        self.issues = ordered_issues
+        report = "\n".join(f"- {issue.message}" for issue in ordered_issues)
+        super().__init__(
+            "Sidecar dependency closure is incomplete or incompatible:\n"
+            f"{report}\n"
+            "Install the local projects and their dependencies from "
+            "tauri-collector/sidecar:\n"
+            "  python -m pip install -e ../../collector -e ../../mcp_server pyinstaller"
+        )
+
+
+DistributionResolver = Callable[[str], metadata.Distribution]
+
+
+def _requirement_is_active(
+    requirement: Requirement,
+    environment: Mapping[str, str],
+    active_extras: set[str],
+) -> bool:
+    """Return whether a metadata requirement applies to this build.
+
+    ``Requires-Dist`` markers are evaluated once for the base distribution and
+    once per requested extra.  This matters for dependencies such as
+    ``sqlalchemy[asyncio]`` whose own metadata can contain
+    ``extra == 'asyncio'`` requirements.
+    """
+
+    if requirement.marker is None:
+        return True
+    return any(
+        requirement.marker.evaluate({**environment, "extra": extra})
+        for extra in ("", *sorted(active_extras))
+    )
+
+
+def dependency_closure_issues(
+    root_requirements: Iterable[Requirement | str],
+    *,
+    distribution_for: DistributionResolver = metadata.distribution,
+    environment: Mapping[str, str] | None = None,
+) -> list[DependencyIssue]:
+    """Inspect only a requested distribution closure, never all site packages.
+
+    The injected resolver and environment deliberately make this pure enough
+    for focused tests.  A package can be visited again when a newly requested
+    extra activates additional requirements.
+    """
+
+    marker_environment = dict(default_environment())
+    if environment is not None:
+        marker_environment.update(environment)
+
+    pending: deque[tuple[Requirement, str]] = deque()
+    for root_requirement in root_requirements:
+        requirement = (
+            root_requirement
+            if isinstance(root_requirement, Requirement)
+            else Requirement(root_requirement)
+        )
+        pending.append((requirement, "sidecar build root"))
+
+    issues: set[DependencyIssue] = set()
+    requested_extras: dict[str, set[str]] = {}
+    expanded_extras: dict[str, frozenset[str]] = {}
+
+    while pending:
+        requirement, required_by = pending.popleft()
+        package = canonicalize_name(requirement.name)
+        try:
+            distribution = distribution_for(package)
+        except metadata.PackageNotFoundError:
+            issues.add(
+                DependencyIssue(
+                    package,
+                    required_by,
+                    f"{requirement} is not installed (required by {required_by})",
+                )
+            )
+            continue
+        except Exception as error:
+            issues.add(
+                DependencyIssue(
+                    package,
+                    required_by,
+                    f"{requirement} metadata could not be read "
+                    f"(required by {required_by}): {type(error).__name__}: {error}",
+                )
+            )
+            continue
+
+        try:
+            installed_version = Version(distribution.version)
+        except InvalidVersion:
+            issues.add(
+                DependencyIssue(
+                    package,
+                    required_by,
+                    f"{package} has invalid installed version {distribution.version!r} "
+                    f"(required by {required_by})",
+                )
+            )
+        else:
+            if requirement.specifier and installed_version not in requirement.specifier:
+                issues.add(
+                    DependencyIssue(
+                        package,
+                        required_by,
+                        f"{package} {installed_version} does not satisfy {requirement} "
+                        f"(required by {required_by})",
+                    )
+                )
+
+        extras = requested_extras.setdefault(package, set())
+        extras.update(requirement.extras)
+        active_extras = frozenset(extras)
+        if expanded_extras.get(package) == active_extras:
+            continue
+        expanded_extras[package] = active_extras
+
+        distribution_name = distribution.metadata.get("Name", package)
+        try:
+            declared_requirements = tuple(distribution.requires or ())
+        except Exception as error:
+            issues.add(
+                DependencyIssue(
+                    package,
+                    required_by,
+                    f"{distribution_name} dependency metadata could not be read: "
+                    f"{type(error).__name__}: {error}",
+                )
+            )
+            continue
+
+        for declared_requirement in sorted(declared_requirements):
+            try:
+                dependency = Requirement(declared_requirement)
+            except InvalidRequirement as error:
+                issues.add(
+                    DependencyIssue(
+                        package,
+                        distribution_name,
+                        f"{distribution_name} declares invalid requirement "
+                        f"{declared_requirement!r}: {error}",
+                    )
+                )
+                continue
+            if _requirement_is_active(dependency, marker_environment, extras):
+                pending.append((dependency, distribution_name))
+
+    return sorted(issues)
+
+
+def _file_url_to_path(url: str) -> Path | None:
+    """Decode PEP 610's local project URL on both Windows and POSIX."""
+
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path)
+    if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return Path(path)
+
+
+def _local_root_distribution_issues(
+    *, distribution_for: DistributionResolver = metadata.distribution
+) -> list[DependencyIssue]:
+    """Require PEP 610 metadata that points each root at this worktree."""
+
+    issues: list[DependencyIssue] = []
+    for package, expected_source in SIDECAR_ROOT_DISTRIBUTIONS.items():
+        try:
+            distribution = distribution_for(package)
+        except metadata.PackageNotFoundError:
+            # dependency_closure_issues already supplies the clearer missing
+            # distribution report for this case.
+            continue
+        try:
+            direct_url = distribution.read_text("direct_url.json")
+            direct_url_data = json.loads(direct_url) if direct_url else None
+            source = _file_url_to_path(direct_url_data["url"])
+        except (KeyError, TypeError, ValueError) as error:
+            source = None
+            metadata_error = f" ({type(error).__name__}: {error})"
+        else:
+            metadata_error = ""
+
+        if source is None:
+            issues.append(
+                DependencyIssue(
+                    package,
+                    "sidecar build root",
+                    f"{package} is not installed from local source "
+                    f"{expected_source}{metadata_error}; direct_url.json must point there",
+                )
+            )
+        elif source.resolve() != expected_source.resolve():
+            issues.append(
+                DependencyIssue(
+                    package,
+                    "sidecar build root",
+                    f"{package} is installed from {source.resolve()}, not local source "
+                    f"{expected_source.resolve()}",
+                )
+            )
+    return issues
+
+
+def ensure_sidecar_dependency_closure() -> None:
+    """Fail before any PyInstaller build-directory or binary mutation occurs."""
+
+    issues = dependency_closure_issues(SIDECAR_ROOT_REQUIREMENTS)
+    issues.extend(_local_root_distribution_issues())
+    if issues:
+        raise DependencyClosureError(issues)
 
 
 def host_triple() -> str:
@@ -152,6 +406,12 @@ def _build_onedir(spec_name: str, directory_name: str) -> Path:
 
 
 def main() -> int:
+    try:
+        ensure_sidecar_dependency_closure()
+    except DependencyClosureError as error:
+        print(error, file=sys.stderr)
+        return 1
+
     triple = host_triple()
     print(f"Building sidecars for triple: {triple}")
 

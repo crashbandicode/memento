@@ -46,15 +46,33 @@ compiler_script = (
     / "canvas_compile.cjs"
 )
 extra_datas.append((str(compiler_script), "collector"))
-for pkg in ("tomli", "pydantic", "pydantic_core", "watchdog", "cryptography",
-            "httpx", "httpcore", "orjson"):
+required_collect_all_packages = (
+    "pydantic",
+    "pydantic_core",
+    "watchdog",
+    "cryptography",
+    "httpx",
+    "httpcore",
+    "orjson",
+)
+
+# This mirrors collector/pyproject.toml's environment marker.  On Python 3.11
+# and newer, the collector uses stdlib tomllib and tomli is genuinely absent.
+# On Python 3.10, it is required and a collection failure must abort the build.
+if sys.version_info < (3, 11):
+    required_collect_all_packages += ("tomli",)
+
+for pkg in required_collect_all_packages:
     try:
         d, b, h = collect_all(pkg)
         extra_datas.extend(d)
         extra_binaries.extend(b)
         hidden.extend(h)
-    except Exception:
-        pass  # Package not installed — skip
+    except Exception as error:
+        raise RuntimeError(
+            f"PyInstaller collect_all failed for required package {pkg!r}. "
+            "Install the full local sidecar dependency closure before building."
+        ) from error
 
 a = Analysis(
     ["entry.py"],
