@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,14 @@ class GovernorThresholds:
     block: int
 
 
+@dataclass(frozen=True)
+class ContextUsage:
+    """One engine's current prompt-prefix usage and optional window size."""
+
+    tokens: int
+    context_window: int | None = None
+
+
 def governor_enabled() -> bool:
     """Return whether the governor was explicitly enabled for this process."""
 
@@ -44,22 +53,39 @@ def _configured_positive_int(name: str, default: int) -> int:
     return value
 
 
-def configured_thresholds() -> GovernorThresholds | None:
+def _default_thresholds(context_window: int | None) -> GovernorThresholds:
+    if context_window is None:
+        return GovernorThresholds(
+            hygiene=DEFAULT_HYGIENE_TOKENS,
+            handoff=DEFAULT_HANDOFF_TOKENS,
+            block=DEFAULT_BLOCK_TOKENS,
+        )
+    return GovernorThresholds(
+        hygiene=min(DEFAULT_HYGIENE_TOKENS, int(context_window * 0.75)),
+        handoff=min(DEFAULT_HANDOFF_TOKENS, int(context_window * 0.85)),
+        block=min(DEFAULT_BLOCK_TOKENS, int(context_window * 0.90)),
+    )
+
+
+def configured_thresholds(
+    context_window: int | None = None,
+) -> GovernorThresholds | None:
     """Read a coherent threshold set, or fail open for invalid configuration."""
 
+    defaults = _default_thresholds(context_window)
     try:
         thresholds = GovernorThresholds(
             hygiene=_configured_positive_int(
                 "MEMENTO_GOVERNOR_HYGIENE_TOKENS",
-                DEFAULT_HYGIENE_TOKENS,
+                defaults.hygiene,
             ),
             handoff=_configured_positive_int(
                 "MEMENTO_GOVERNOR_HANDOFF_TOKENS",
-                DEFAULT_HANDOFF_TOKENS,
+                defaults.handoff,
             ),
             block=_configured_positive_int(
                 "MEMENTO_GOVERNOR_BLOCK_TOKENS",
-                DEFAULT_BLOCK_TOKENS,
+                defaults.block,
             ),
         )
     except (TypeError, ValueError):
@@ -94,8 +120,8 @@ def _usage_integer(usage: dict[str, Any], field: str) -> int | None:
     return value
 
 
-def prefix_tokens_from_transcript(transcript_path: object) -> int | None:
-    """Return the latest primary assistant prompt prefix from a bounded tail."""
+def _usage_from_transcript(transcript_path: object) -> ContextUsage | None:
+    """Read current Claude or Codex usage from a bounded transcript tail."""
 
     if not isinstance(transcript_path, str) or not transcript_path.strip():
         return None
@@ -113,23 +139,118 @@ def prefix_tokens_from_transcript(transcript_path: object) -> int | None:
             record = json.loads(line.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(record, dict) or record.get("type") != "assistant":
+        if not isinstance(record, dict):
             continue
-        if record.get("isSidechain") is True:
-            continue
-        message = record.get("message")
-        usage = message.get("usage") if isinstance(message, dict) else None
-        if not isinstance(usage, dict):
-            return None
-        values = (
-            _usage_integer(usage, "cache_read_input_tokens"),
-            _usage_integer(usage, "cache_creation_input_tokens"),
-            _usage_integer(usage, "input_tokens"),
-        )
-        if any(value is None for value in values):
-            return None
-        return sum(value for value in values if value is not None)
+        if record.get("type") == "event_msg":
+            payload = record.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                return None
+            usage = info.get("last_token_usage")
+            if not isinstance(usage, dict):
+                return None
+            tokens = _usage_integer(usage, "input_tokens")
+            if tokens is None:
+                return None
+            context_window = _usage_integer(info, "model_context_window")
+            return ContextUsage(tokens=tokens, context_window=context_window)
+        if record.get("type") == "assistant":
+            if record.get("isSidechain") is True:
+                continue
+            message = record.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if not isinstance(usage, dict):
+                return None
+            values = (
+                _usage_integer(usage, "cache_read_input_tokens"),
+                _usage_integer(usage, "cache_creation_input_tokens"),
+                _usage_integer(usage, "input_tokens"),
+            )
+            if any(value is None for value in values):
+                return None
+            return ContextUsage(
+                tokens=sum(value for value in values if value is not None)
+            )
     return None
+
+
+def prefix_tokens_from_transcript(transcript_path: object) -> int | None:
+    """Backward-compatible token-only view used by existing callers/tests."""
+
+    usage = _usage_from_transcript(transcript_path)
+    return usage.tokens if usage is not None else None
+
+
+def _cursor_state_db_path() -> Path | None:
+    configured = os.environ.get("MEMENTO_CURSOR_STATE_DB", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        app_data = os.environ.get("APPDATA", "").strip()
+        if not app_data:
+            return None
+        return Path(app_data) / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    return Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def _cursor_usage(session_id: str) -> ContextUsage | None:
+    """Read Cursor's exact per-composer context counters without message text."""
+
+    path = _cursor_state_db_path()
+    if path is None:
+        return None
+    try:
+        if not path.is_file():
+            return None
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+            timeout=0.25,
+        )
+        try:
+            row = connection.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{session_id}",),
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None or not isinstance(row[0], (str, bytes)):
+        return None
+    try:
+        state = json.loads(row[0])
+    except (UnicodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    tokens = _usage_integer(state, "contextTokensUsed")
+    context_window = _usage_integer(state, "contextTokenLimit")
+    if tokens is None:
+        return None
+    return ContextUsage(tokens=tokens, context_window=context_window)
+
+
+def _payload_usage(payload: dict[str, Any]) -> ContextUsage | None:
+    """Use engine-native hook counters when no durable state source exists."""
+
+    context_tokens = _usage_integer(payload, "context_tokens")
+    if context_tokens is not None:
+        return ContextUsage(
+            tokens=context_tokens,
+            context_window=_usage_integer(payload, "context_window_size"),
+        )
+    values = (
+        _usage_integer(payload, "input_tokens"),
+        _usage_integer(payload, "cache_read_tokens"),
+        _usage_integer(payload, "cache_write_tokens"),
+    )
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return ContextUsage(tokens=sum(present))
 
 
 def _governor_directory() -> Path:
@@ -218,10 +339,21 @@ def _event_name(payload: dict[str, Any]) -> str:
 
 
 def _session_id(payload: dict[str, Any]) -> str | None:
-    session_id = payload.get("session_id")
-    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):
-        return None
-    return session_id
+    for field in ("session_id", "conversation_id"):
+        session_id = payload.get(field)
+        if isinstance(session_id, str) and _SAFE_SESSION_ID.fullmatch(session_id):
+            return session_id
+    return None
+
+
+def _context_usage(payload: dict[str, Any], session_id: str) -> ContextUsage | None:
+    transcript_usage = _usage_from_transcript(payload.get("transcript_path"))
+    if transcript_usage is not None:
+        return transcript_usage
+    cursor_usage = _cursor_usage(session_id)
+    if cursor_usage is not None:
+        return cursor_usage
+    return _payload_usage(payload)
 
 
 def _nudge_output(session_id: str, tokens: int, thresholds: GovernorThresholds) -> dict[str, Any] | None:
@@ -244,11 +376,15 @@ def _nudge_output(session_id: str, tokens: int, thresholds: GovernorThresholds) 
         )
     if not messages:
         return None
+    message = "\n\n".join(messages)
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": "\n\n".join(messages),
-        }
+            "additionalContext": message,
+        },
+        # Cursor's native hook adapter consumes snake_case directly. Claude
+        # Code and Codex ignore the extra field and use hookSpecificOutput.
+        "additional_context": message,
     }
 
 
@@ -258,8 +394,17 @@ def _handoff_path(payload: dict[str, Any]) -> Path | None:
         return None
     project = Path(cwd).expanduser()
     configured = os.environ.get("MEMENTO_GOVERNOR_HANDOFF_PATH", "").strip()
-    candidate = Path(configured).expanduser() if configured else Path("MEMENTO_HANDOFF.md")
-    return candidate if candidate.is_absolute() else project / candidate
+    if configured:
+        candidate = Path(configured).expanduser()
+        return candidate if candidate.is_absolute() else project / candidate
+    for directory in (project, *project.parents):
+        candidate = directory / "MEMENTO_HANDOFF.md"
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            return None
+    return project / "MEMENTO_HANDOFF.md"
 
 
 def _document_has_session_section(path: Path, session_id: str) -> bool | None:
@@ -285,7 +430,13 @@ def _document_has_session_section(path: Path, session_id: str) -> bool | None:
 
 
 def _stop_output(payload: dict[str, Any], session_id: str, tokens: int, thresholds: GovernorThresholds) -> dict[str, str] | None:
-    if tokens < thresholds.block or payload.get("stop_hook_active") is True:
+    loop_count = payload.get("loop_count")
+    already_continued = payload.get("stop_hook_active") is True or (
+        isinstance(loop_count, int)
+        and not isinstance(loop_count, bool)
+        and loop_count > 0
+    )
+    if tokens < thresholds.block or already_continued:
         return None
     handoff_path = _handoff_path(payload)
     if handoff_path is None:
@@ -293,12 +444,16 @@ def _stop_output(payload: dict[str, Any], session_id: str, tokens: int, threshol
     handoff_is_real = _document_has_session_section(handoff_path, session_id)
     if handoff_is_real is not False:
         return None
+    reason = (
+        "Write a handoff section naming this session_id, spawn the successor "
+        "(spawn-prime-stop-resume), and print the cd-prefixed resume command."
+    )
     return {
         "decision": "block",
-        "reason": (
-            "Write a handoff section naming this session_id, spawn the successor "
-            "(spawn-prime-stop-resume), and print the cd-prefixed resume command."
-        ),
+        "reason": reason,
+        # Cursor's native Stop response uses this name. Claude Code and Codex
+        # consume decision/reason and ignore the compatibility field.
+        "followup_message": reason,
     }
 
 
@@ -319,15 +474,15 @@ def process_hook_payload(
     session_id = _session_id(payload)
     if session_id is None:
         return None
-    thresholds = configured_thresholds()
+    usage = _context_usage(payload, session_id)
+    if usage is None:
+        return None
+    thresholds = configured_thresholds(usage.context_window)
     if thresholds is None:
         return None
-    tokens = prefix_tokens_from_transcript(payload.get("transcript_path"))
-    if tokens is None:
-        return None
     if event_name == "posttooluse":
-        return _nudge_output(session_id, tokens, thresholds)
-    return _stop_output(payload, session_id, tokens, thresholds)
+        return _nudge_output(session_id, usage.tokens, thresholds)
+    return _stop_output(payload, session_id, usage.tokens, thresholds)
 
 
 def _read_stdin_payload() -> object:

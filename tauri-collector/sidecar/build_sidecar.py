@@ -367,10 +367,9 @@ def _build_one(spec_name: str, exe_name: str, triple: str, exe_suffix: str) -> P
 def _build_onedir(spec_name: str, directory_name: str) -> Path:
     """Build a PyInstaller onedir artifact and place its whole directory.
 
-    The hook runner is not an external Tauri sidecar: it is bundled as a
-    resource and copied to a versioned local directory by the collector.  Keep
-    the directory intact so its executable and `_internal` DLL tree remain
-    adjacent at invocation time.
+    Onedir applications are bundled as Tauri resources rather than external
+    binaries. Keep the directory intact so its executable and `_internal` DLL
+    tree remain adjacent at invocation time.
     """
 
     spec = HERE / spec_name
@@ -470,9 +469,7 @@ def main() -> int:
     print(f"v Hook runner       -> {hook_runner_path}")
 
     # Then MCP server — larger dep tree (mcp SDK + openai + asyncpg + ...).
-    mcp_path = _build_one(
-        "mcp.spec", "memento-mcp-sidecar", triple, exe_suffix
-    )
+    mcp_path = _build_onedir("mcp.spec", "memento-mcp-sidecar")
     print(f"v MCP sidecar       -> {mcp_path}")
 
     print("\nNow run `cargo tauri build` from tauri-collector/.")

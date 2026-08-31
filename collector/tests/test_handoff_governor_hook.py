@@ -73,6 +73,24 @@ def _assistant_record(
     }
 
 
+def _codex_token_record(*, input_tokens: int, context_window: int) -> dict:
+    return {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": max(0, input_tokens - 10),
+                    "output_tokens": 10,
+                    "total_tokens": input_tokens + 10,
+                },
+                "model_context_window": context_window,
+            },
+        },
+    }
+
+
 def _write_transcript(path: Path, records: list[dict]) -> Path:
     path.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
@@ -109,6 +127,110 @@ def test_prefix_uses_latest_primary_assistant_and_all_usage_fields(
     )
 
     assert governor.prefix_tokens_from_transcript(str(transcript)) == 20
+
+
+def test_codex_rollout_usage_drives_window_aware_default_thresholds(
+    tmp_path: Path,
+) -> None:
+    transcript = _write_transcript(
+        tmp_path / "rollout.jsonl",
+        [_codex_token_record(input_tokens=190_000, context_window=256_000)],
+    )
+
+    usage = governor._usage_from_transcript(str(transcript))
+
+    assert usage == governor.ContextUsage(tokens=190_000, context_window=256_000)
+    assert governor.configured_thresholds(usage.context_window) == (
+        governor.GovernorThresholds(
+            hygiene=192_000,
+            handoff=217_600,
+            block=230_400,
+        )
+    )
+
+
+def test_explicit_thresholds_override_window_aware_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HYGIENE_TOKENS", "101")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HANDOFF_TOKENS", "202")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_BLOCK_TOKENS", "303")
+
+    assert governor.configured_thresholds(256_000) == governor.GovernorThresholds(
+        hygiene=101,
+        handoff=202,
+        block=303,
+    )
+
+
+def test_cursor_composer_usage_is_read_by_conversation_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "state.vscdb"
+    connection = governor.sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+        connection.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            (
+                "composerData:cursor-session-1",
+                json.dumps({
+                    "contextTokensUsed": 220_000,
+                    "contextTokenLimit": 256_000,
+                }),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setenv("MEMENTO_CURSOR_STATE_DB", str(database))
+    monkeypatch.setattr(governor, "_governor_directory", lambda: tmp_path / "state")
+
+    response = governor.process_hook_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "conversation_id": "cursor-session-1",
+            "cwd": str(tmp_path),
+        },
+        force_enabled=True,
+    )
+
+    assert response is not None
+    assert "Author the milestone handoff NOW" in response["additional_context"]
+    assert response["hookSpecificOutput"]["additionalContext"] == (
+        response["additional_context"]
+    )
+
+
+@pytest.mark.parametrize("database_contents", [None, b"not-a-sqlite-database"])
+def test_missing_or_invalid_cursor_state_fails_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    database_contents: bytes | None,
+) -> None:
+    database = tmp_path / "state.vscdb"
+    if database_contents is not None:
+        database.write_bytes(database_contents)
+    monkeypatch.setenv("MEMENTO_CURSOR_STATE_DB", str(database))
+
+    assert governor.process_hook_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "conversation_id": "cursor-session-1",
+            "cwd": str(tmp_path),
+        },
+        force_enabled=True,
+    ) is None
+
+
+def test_handoff_path_searches_cwd_ancestors(tmp_path: Path) -> None:
+    handoff = tmp_path / "MEMENTO_HANDOFF.md"
+    handoff.write_text("# Live handoff\n", encoding="utf-8")
+    worktree = tmp_path / "nested" / "worktree"
+    worktree.mkdir(parents=True)
+
+    assert governor._handoff_path({"cwd": str(worktree)}) == handoff
 
 
 def test_post_tool_nudge_latches_each_threshold_once(
@@ -196,6 +318,29 @@ def test_stop_block_requires_threshold_and_missing_real_handoff(
         assert response is None
 
 
+def test_cursor_stop_loop_count_avoids_repeated_continuation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HYGIENE_TOKENS", "10")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HANDOFF_TOKENS", "10")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_BLOCK_TOKENS", "10")
+
+    response = governor.process_hook_payload(
+        {
+            "hook_event_name": "Stop",
+            "conversation_id": "cursor-session-1",
+            "cwd": str(tmp_path),
+            "context_tokens": 10,
+            "context_window_size": 256_000,
+            "loop_count": 1,
+        },
+        force_enabled=True,
+    )
+
+    assert response is None
+
+
 def test_malformed_hook_input_exits_without_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -259,6 +404,66 @@ def test_registration_adds_governor_only_when_enabled(
     assert "Stop" not in settings["hooks"]
 
 
+def test_codex_registration_preserves_user_hooks_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.write_text(
+        json.dumps({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": "user-stop-hook"}],
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    runner = tmp_path / "memento-hook-runner.exe"
+    runner.write_bytes(b"runner")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
+    monkeypatch.setattr(pending_hook, "_install_hook_runner", lambda: runner)
+    monkeypatch.setattr(pending_hook, "_maintain_hook_runner_versions", lambda *args, **kwargs: None)
+
+    installed_path, changed = pending_hook.install_codex_governor_hooks()
+    _installed_path, changed_again = pending_hook.install_codex_governor_hooks()
+    settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+    assert installed_path == hooks_path
+    assert changed is True
+    assert changed_again is False
+    stop_commands = [
+        hook["command"]
+        for entry in settings["hooks"]["Stop"]
+        for hook in entry["hooks"]
+    ]
+    assert "user-stop-hook" in stop_commands
+    assert sum("claude-governor-hook --enabled" in command for command in stop_commands) == 1
+    post_commands = [
+        hook["command"]
+        for entry in settings["hooks"]["PostToolUse"]
+        for hook in entry["hooks"]
+    ]
+    assert len(post_commands) == 1
+    assert str(runner.resolve()) in post_commands[0]
+
+    monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
+    _removed_path, removed = pending_hook.install_codex_governor_hooks()
+    settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+    assert removed is True
+    assert settings["hooks"] == {
+        "Stop": [{
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": "user-stop-hook"}],
+        }],
+    }
+
+
 def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -313,7 +518,7 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
         local_app_data
         / "Memento"
         / "hooks"
-        / "0.0.55"
+        / "0.0.56"
         / "memento-hook-runner.exe"
     )
     assert changed is True
@@ -477,7 +682,7 @@ def test_runner_install_lost_windows_rename_race_uses_winner(
     source = tmp_path / "source" / "memento-hook-runner"
     _write_complete_runner(source)
     local_app_data = tmp_path / "local-app-data"
-    destination = local_app_data / "Memento" / "hooks" / "0.0.55"
+    destination = local_app_data / "Memento" / "hooks" / "0.0.56"
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
@@ -528,7 +733,7 @@ def test_runner_sweep_marks_missing_retirement_marker_without_deleting(
 ) -> None:
     root = tmp_path / "hooks"
     old = root / "0.0.53"
-    current = root / "0.0.55"
+    current = root / "0.0.56"
     _write_complete_runner(old)
     _write_complete_runner(current)
     before_marker = _runner_tree_snapshot(old)
@@ -552,7 +757,7 @@ def test_runner_sweep_keeps_fresh_retirement_marker_untouched(
 ) -> None:
     root = tmp_path / "hooks"
     old = root / "0.0.53"
-    current = root / "0.0.55"
+    current = root / "0.0.56"
     _write_complete_runner(old)
     _write_complete_runner(current)
     assert pending_hook._write_hook_runner_retirement_marker(old)
@@ -568,7 +773,7 @@ def test_runner_sweep_never_touches_current_or_registered_versions(
 ) -> None:
     root = tmp_path / "hooks"
     registered = root / "0.0.53"
-    current = root / "0.0.55"
+    current = root / "0.0.56"
     for directory in (registered, current):
         _write_complete_runner(directory)
         assert pending_hook._write_hook_runner_retirement_marker(
@@ -600,7 +805,7 @@ def test_runner_sweep_preserves_live_governor_straggler_then_reclaims_it(
     root = tmp_path / "hooks"
     old_live = root / "0.0.53"
     previous = root / "0.0.54"
-    current = root / "0.0.55"
+    current = root / "0.0.56"
     project = tmp_path / "project"
     project.mkdir()
     transcript = _write_transcript(

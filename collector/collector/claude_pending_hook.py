@@ -1609,6 +1609,96 @@ def install_claude_pending_hooks(
     return settings_path, True
 
 
+def _codex_hooks_path() -> Path:
+    configured_home = os.environ.get("CODEX_HOME", "").strip()
+    root = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    return root / "hooks.json"
+
+
+def install_codex_governor_hooks(
+    *,
+    sweep_retired: bool = False,
+) -> tuple[Path, bool]:
+    """Idempotently install the shared governor in Codex's native hook file."""
+
+    hooks_path = _codex_hooks_path()
+    if not hooks_path.parent.is_dir():
+        return hooks_path, False
+    settings = _read_mapping(hooks_path) if hooks_path.exists() else {}
+    if hooks_path.exists() and not settings:
+        try:
+            decoded = json.loads(hooks_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot merge invalid JSON in {hooks_path}") from exc
+        if not isinstance(decoded, dict):
+            raise TypeError(f"Cannot merge non-object settings in {hooks_path}")
+        settings = decoded
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise TypeError("Codex hooks must be an object")
+
+    before_hooks = json.dumps(
+        hooks,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    hook_runner = _install_hook_runner() if governor_enabled() else None
+    if governor_enabled():
+        governor_command = _governor_hook_command(hook_runner)
+        for event_name, matchers in _GOVERNOR_HOOK_SPECS.items():
+            _merge_event_hooks(
+                hooks,
+                event_name,
+                matchers,
+                governor_command,
+                managed_hook=_is_memento_governor_hook,
+            )
+    else:
+        for event_name in _GOVERNOR_HOOK_SPECS:
+            _remove_event_hooks(
+                hooks,
+                event_name,
+                managed_hook=_is_memento_governor_hook,
+            )
+    changed = before_hooks != json.dumps(
+        hooks,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    if not changed:
+        if hook_runner is not None:
+            _maintain_hook_runner_versions(
+                hook_runner,
+                sweep_retired=sweep_retired,
+            )
+        return hooks_path, False
+
+    previous_mode = None
+    if hooks_path.exists():
+        previous_mode = stat.S_IMODE(hooks_path.stat().st_mode)
+    temporary = hooks_path.with_name(
+        f".{hooks_path.name}.{os.getpid()}.memento.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if previous_mode is not None:
+            temporary.chmod(previous_mode)
+        os.replace(temporary, hooks_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if hook_runner is not None:
+        _maintain_hook_runner_versions(
+            hook_runner,
+            sweep_retired=sweep_retired,
+        )
+    return hooks_path, True
+
+
 def _hook_main() -> int:
     try:
         try:

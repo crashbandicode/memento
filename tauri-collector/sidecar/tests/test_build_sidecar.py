@@ -218,6 +218,39 @@ class DependencyClosureTests(unittest.TestCase):
         build_onedir.assert_not_called()
         self.assertIn("Sidecar dependency closure is incomplete", stderr.getvalue())
 
+    def test_main_builds_mcp_as_onedir_resource(self) -> None:
+        output = io.StringIO()
+        collector_binary = Path("collector-sidecar.exe")
+        hook_directory = Path("memento-hook-runner")
+        mcp_directory = Path("memento-mcp-sidecar")
+
+        with (
+            mock.patch.object(sidecar, "ensure_sidecar_dependency_closure"),
+            mock.patch.object(sidecar, "host_triple", return_value="test-triple"),
+            mock.patch.object(sidecar, "_build_one", return_value=collector_binary) as build_one,
+            mock.patch.object(
+                sidecar,
+                "_build_onedir",
+                side_effect=[hook_directory, mcp_directory],
+            ) as build_onedir,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(sidecar.main(), 0)
+
+        build_one.assert_called_once_with(
+            "collector.spec",
+            "memento-collector-sidecar",
+            "test-triple",
+            ".exe",
+        )
+        self.assertEqual(
+            build_onedir.call_args_list,
+            [
+                mock.call("hook_runner.spec", "memento-hook-runner"),
+                mock.call("mcp.spec", "memento-mcp-sidecar"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

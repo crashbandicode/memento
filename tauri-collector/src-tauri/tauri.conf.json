@@ -41,11 +41,11 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "binaries/memento-hook-runner"
+      "binaries/memento-hook-runner",
+      "binaries/memento-mcp-sidecar"
     ],
     "externalBin": [
-      "binaries/memento-collector-sidecar",
-      "binaries/memento-mcp-sidecar"
+      "binaries/memento-collector-sidecar"
     ],
     "copyright": "© ddong8 — AGPL-3.0",
     "category": "DeveloperTool",

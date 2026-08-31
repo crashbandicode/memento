@@ -16,7 +16,10 @@ from pathlib import Path
 from concurrent_log_handler import ConcurrentRotatingFileHandler
 
 from .canvas_sync import sync_pending_canvases
-from .claude_pending_hook import install_claude_pending_hooks
+from .claude_pending_hook import (
+    install_claude_pending_hooks,
+    install_codex_governor_hooks,
+)
 from .claude_pending_questions import (
     ClaudePendingPoller,
 )
@@ -777,6 +780,14 @@ def main() -> None:
             logger.info("Installed Claude prompt hooks in %s", hook_settings)
     except (OSError, TypeError, ValueError) as exc:
         logger.warning("Could not install Claude prompt hooks: %s", exc)
+    try:
+        codex_hooks, codex_hooks_changed = install_codex_governor_hooks(
+            sweep_retired=True
+        )
+        if codex_hooks_changed:
+            logger.info("Installed Codex governor hooks in %s", codex_hooks)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Could not install Codex governor hooks: %s", exc)
 
     # Initialize tools
     claude_tool = ClaudeCodeTool()

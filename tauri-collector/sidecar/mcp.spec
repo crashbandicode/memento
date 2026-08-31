@@ -1,6 +1,6 @@
 # PyInstaller spec for the Memento MCP server sidecar.
 #
-# Produces a single executable that AI IDEs (Claude Code, Cursor,
+# Produces an onedir application that AI IDEs (Claude Code, Cursor,
 # Codex, ...) launch over stdio. Bundled inside the Tauri app — the
 # desktop app's Rust layer writes MCP config entries pointing at this
 # binary, so users don't need pip install memento-brain-memory.
@@ -83,10 +83,8 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="memento-mcp-sidecar",
     debug=False,
     bootloader_ignore_signals=False,
@@ -106,4 +104,13 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name="memento-mcp-sidecar",
 )
