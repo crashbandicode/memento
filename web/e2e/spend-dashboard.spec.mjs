@@ -490,3 +490,73 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
   await context.close();
 });
+
+test("long Claude projection tooltip stacks cleanly on mobile", async ({ browser }) => {
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
+  });
+  const page = await context.newPage();
+  const longClaudeMath = {
+    ...claudeProjection.math,
+    currentCents: 1_618_474,
+    limitCents: 1_700_000,
+    peakDayCents: 152_949,
+    worstEndCents: 1_767_300,
+  };
+  const longClaudeSnapshot = {
+    ...snapshot,
+    projections: {
+      ...snapshot.projections,
+      claude: {
+        projection: {
+          ...claudeProjection,
+          math: longClaudeMath,
+        },
+      },
+    },
+  };
+  await installRoutes(page, longClaudeSnapshot);
+  const spendResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/dashboard/spend");
+  await page.goto("/app");
+  await expect((await spendResponse).json()).resolves.toMatchObject({
+    snapshot: { projections: { claude: { projection: { math: { currentCents: 1_618_474 } } } } },
+  });
+  await page.getByRole("tab", { name: "Claude", exact: true }).click();
+  await expect(page.getByRole("tab", { name: "Claude", exact: true })).toHaveAttribute("aria-selected", "true");
+  const rows = await trendProjectionRows(page);
+  const worst = rows.locator(".spend-projection-row").filter({ hasText: "Worst" });
+  const tooltip = page.getByTestId("projection-math-tooltip");
+
+  await expect(worst).toHaveClass(/spend-projection-row-interactive/);
+  await worst.scrollIntoViewIfNeeded();
+  await worst.hover();
+  await expect(tooltip).toContainText("$16,184.74 now + $1,529.49/day × 10.0 days left = $17,673");
+  const layout = await tooltip.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return {
+      display: window.getComputedStyle(element).display,
+      left: bounds.left,
+      right: bounds.right,
+      viewportWidth: window.innerWidth,
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+      paragraphs: Array.from(element.querySelectorAll("p")).map((paragraph) => {
+        const rect = paragraph.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+      }),
+    };
+  });
+
+  expect(layout.display).not.toMatch(/^(grid|flex)$/);
+  expect(layout.left).toBeGreaterThanOrEqual(8);
+  expect(layout.right).toBeLessThanOrEqual(layout.viewportWidth - 8);
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth);
+  expect(layout.paragraphs.length).toBeGreaterThan(2);
+  for (let index = 1; index < layout.paragraphs.length; index++) {
+    expect(layout.paragraphs[index].top).toBeGreaterThanOrEqual(layout.paragraphs[index - 1].bottom);
+  }
+  await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
+  await context.close();
+});

@@ -40,7 +40,9 @@ export function useSSE(
     let stopped = false;
     let generation = 0;
     let windowBlurred = false;
+    let wasBackgrounded = false;
     let lastResumeAt = 0;
+    let lastReconciliationAt = 0;
     let lastEventId = "";
     let streamAttempted = false;
     const MIN_RETRY_MS = 5000;
@@ -65,6 +67,20 @@ export function useSSE(
     function clearLivenessTimer() {
       if (livenessTimer !== null) clearInterval(livenessTimer);
       livenessTimer = null;
+    }
+
+    function reconcile(reason: string) {
+      const now = Date.now();
+      // Foreground visibility, focus, and pageshow are often delivered as a
+      // burst. Reconnect attempts have their own state machine, so keep this
+      // notification coalescer separate from it.
+      if (now - lastReconciliationAt < 750) return;
+      lastReconciliationAt = now;
+      onEventRef.current({
+        type: "realtime_reset",
+        data: { reason },
+        timestamp: now / 1_000,
+      });
     }
 
     function startLivenessWatchdog() {
@@ -187,19 +203,22 @@ export function useSSE(
       const needsReconciliation = streamAttempted && !lastEventId;
       closeStream();
       if (needsReconciliation) {
-        onEventRef.current({
-          type: "realtime_reset",
-          data: { reason: "missing_initial_watermark" },
-          timestamp: Date.now() / 1_000,
-        });
+        reconcile("missing_initial_watermark");
       }
       void connect();
     }
 
     function handleVisibilityChange() {
       if (documentIsHidden()) {
+        wasBackgrounded = true;
         closeStream();
         return;
+      }
+      if (wasBackgrounded) {
+        wasBackgrounded = false;
+        // Replay is cursor-based and may be unavailable after a long mobile
+        // suspension. Reconcile a current snapshot even with a valid cursor.
+        reconcile("foreground_restore");
       }
       resume();
     }
@@ -209,11 +228,7 @@ export function useSSE(
       // A bfcache restore can preserve a stale React tree even when the SSE
       // cursor reconnects successfully. Force every data consumer to fetch a
       // current snapshot before relying on replayed events.
-      onEventRef.current({
-        type: "realtime_reset",
-        data: { reason: "bfcache_restore" },
-        timestamp: Date.now() / 1_000,
-      });
+      reconcile("bfcache_restore");
       resume();
     }
 

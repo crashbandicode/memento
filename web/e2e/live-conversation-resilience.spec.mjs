@@ -205,6 +205,75 @@ test.describe("live conversation resilience", () => {
     await waitForStream(page, 2);
   });
 
+  test("mobile foreground reconciliation refreshes an open thread despite a valid SSE watermark", async ({ browser }) => {
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
+    });
+    const page = await context.newPage();
+    const scenario = structuredClone(urlNavigationLargeThread);
+    const resumedMessage = "MOBILE_FOREGROUND_RECONCILIATION_MESSAGE";
+    let tailRequests = 0;
+    let metadataRequests = 0;
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (
+        url.pathname === `/api/conversations/${scenario.docId}/messages`
+        && url.searchParams.get("tail") === "true"
+      ) tailRequests += 1;
+      if (url.pathname === `/api/conversations/${scenario.docId}`) metadataRequests += 1;
+    });
+
+    await installMockEventSource(page);
+    await openConversation(page, scenario);
+    await waitForStream(page, 1);
+    const initialStreamCount = await page.evaluate(() => window.__mementoMockSse.streams.length);
+    await page.evaluate(() => {
+      window.__mementoMockSse.emit("stream_ready", { type: "stream_ready" }, "watermark-before-mobile-background");
+      let visibility = "visible";
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => visibility,
+      });
+      window.__mementoSetVisibility = (next) => {
+        visibility = next;
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+    });
+    await expect(page.getByText(resumedMessage, { exact: true })).toHaveCount(0);
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("blur"));
+      window.__mementoSetVisibility("hidden");
+    });
+    const nextLine = scenario.messages.length + 1;
+    scenario.messages.push({
+      id: 99_999,
+      line_number: nextLine,
+      role: "assistant",
+      model: "cursor-fixture-model",
+      content: resumedMessage,
+      timestamp: new Date().toISOString(),
+    });
+    scenario.meta.message_count = scenario.messages.length;
+    const beforeReconciliation = { tailRequests, metadataRequests };
+
+    await page.evaluate(() => {
+      window.__mementoSetVisibility("visible");
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitForStream(page, initialStreamCount + 1);
+    await expect(page.getByText(resumedMessage, { exact: true })).toBeVisible();
+    await expect(page.getByText(`${scenario.meta.message_count} messages`, { exact: true })).toBeVisible();
+    await expect.poll(() => tailRequests).toBe(beforeReconciliation.tailRequests + 1);
+    await expect.poll(() => metadataRequests).toBe(beforeReconciliation.metadataRequests + 1);
+    await page.waitForTimeout(1_000);
+    expect(tailRequests).toBe(beforeReconciliation.tailRequests + 1);
+    expect(metadataRequests).toBe(beforeReconciliation.metadataRequests + 1);
+    await context.close();
+  });
+
   test("a rejected stream is re-sessioned and resumes event delivery", async ({ page }) => {
     await installMockEventSource(page);
     let sessionRequests = 0;
