@@ -211,6 +211,32 @@ test.describe("smart conversation links", () => {
     await expect(copy).toHaveAccessibleName("Copy");
     await expect(inlineCode.locator("xpath=ancestor::*[@data-testid='markdown-code-block']")).toHaveCount(0);
 
+    const pre = codeBlock.locator("pre");
+    const idlePresentation = await copy.evaluate((element) => ({
+      opacity: Number.parseFloat(window.getComputedStyle(element).opacity),
+    }));
+    const prePresentation = await pre.evaluate((element) => ({
+      paddingTop: Number.parseFloat(window.getComputedStyle(element).paddingTop),
+    }));
+    const [preBox, copyBox] = await Promise.all([pre.boundingBox(), copy.boundingBox()]);
+    expect(idlePresentation.opacity).toBeLessThanOrEqual(0.55);
+    expect(prePresentation.paddingTop).toBeLessThanOrEqual(20);
+    expect(copyBox?.y ?? -1).toBeGreaterThanOrEqual(preBox?.y ?? 0);
+
+    await codeBlock.hover();
+    await expect.poll(() => copy.evaluate(
+      (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
+    )).toBeGreaterThanOrEqual(0.95);
+
+    await page.mouse.move(0, 0);
+    await copy.focus();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Shift+Tab");
+    await expect(copy).toBeFocused();
+    await expect.poll(() => copy.evaluate(
+      (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
+    )).toBeGreaterThanOrEqual(0.95);
+
     await page.evaluate(() => {
       /** @type {any} */ (window).__copiedFencedCode = undefined;
       Object.defineProperty(navigator, "clipboard", {
@@ -235,17 +261,76 @@ test.describe("smart conversation links", () => {
     await expect(fencedCode).toHaveClass(/(?:^|\s)language-python(?:\s|$)/);
   });
 
-  test("fenced code copy control stays reachable on a narrow viewport", async ({ page }) => {
-    await page.setViewportSize({ width: 390, height: 844 });
-    await openConversation(page, smartLinkScenarios[0]);
+  test("fenced code copy control stays compact and touch-safe over long mobile code", async ({ browser }) => {
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
+    });
+    const page = await context.newPage();
+    const base = smartLinkScenarios[0];
+    const longLine = "$ExportedNamespace = 'hwinf-cisd-lsf-data-api-fastapi-production-with-a-deliberately-long-mobile-value'";
+    const scenario = {
+      ...base,
+      docId: base.docId + "-long-code-mobile",
+      meta: { ...base.meta, id: base.meta.id + "-long-code-mobile" },
+      messages: base.messages.map((message) => message.id === 2
+        ? {
+            ...message,
+            content: message.content
+              .replace("```python", "```powershell")
+              .replace("run_refresh_active_via_bjobs()", longLine),
+          }
+        : message),
+    };
+
+    await openConversation(page, scenario);
     await page.getByTestId("message-expand-toggle").click();
 
-    const copy = page.getByTestId("code-block-copy");
+    const codeBlock = page.getByTestId("markdown-code-block");
+    const pre = codeBlock.locator("pre");
+    const copy = codeBlock.getByTestId("code-block-copy");
     await expect(copy).toBeVisible();
-    const box = await copy.boundingBox();
-    expect(box?.x ?? -1).toBeGreaterThanOrEqual(0);
-    expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual(390);
+    const [box, preBox] = await Promise.all([copy.boundingBox(), pre.boundingBox()]);
+    const presentation = await copy.evaluate((element) => {
+      const styles = window.getComputedStyle(element);
+      return {
+        opacity: Number.parseFloat(styles.opacity),
+        width: Number.parseFloat(styles.width),
+      };
+    });
+    const prePresentation = await pre.evaluate((element) => {
+      const styles = window.getComputedStyle(element);
+      return {
+        paddingTop: Number.parseFloat(styles.paddingTop),
+      };
+    });
+
+    expect(box?.x ?? -1).toBeGreaterThanOrEqual(preBox?.x ?? 0);
+    expect((box?.x ?? 390) + (box?.width ?? 1)).toBeLessThanOrEqual((preBox?.x ?? 0) + (preBox?.width ?? 390));
     expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+    expect(presentation.width).toBeLessThanOrEqual(46);
+    expect(presentation.opacity).toBeLessThanOrEqual(0.55);
+    expect(prePresentation.paddingTop).toBeLessThanOrEqual(20);
+    await expect(pre.locator("code")).toContainText(longLine);
+    await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
+
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async () => undefined },
+      });
+    });
+    await copy.tap();
+    await expect(copy).toHaveAttribute("data-copy-status", "copied");
+    await expect.poll(() => copy.evaluate(
+      (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
+    )).toBeGreaterThanOrEqual(0.95);
+    await expect(copy).toHaveAttribute("data-copy-status", "idle", { timeout: 3_000 });
+    await expect.poll(() => copy.evaluate(
+      (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
+    )).toBeLessThanOrEqual(0.55);
+    await context.close();
   });
 
   test("Mermaid remains a diagram without a code copy control", async ({ page }) => {

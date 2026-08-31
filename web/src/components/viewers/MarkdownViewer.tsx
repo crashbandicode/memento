@@ -82,7 +82,7 @@ function CodeCopyButton({ source }: { source: string }) {
       onClick={() => { void handleCopy(); }}
     >
       <Icon name={copied ? "check" : "copy"} size={15} aria-hidden="true" />
-      <span aria-live="polite" aria-atomic="true">{label}</span>
+      <span className={styles.copyLabel} aria-live="polite" aria-atomic="true">{label}</span>
     </button>
   );
 }
