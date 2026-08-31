@@ -9,11 +9,11 @@ last-resort Stop guard.
 
 ## Hook execution and latency
 
-On Windows collector 0.0.56, managed hook registrations invoke the
+On Windows collector 0.0.57, managed hook registrations invoke the
 dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
 It is a small PyInstaller **onedir** bundle, copied on collector startup from
 the desktop application's packaged resource to a versioned directory such as
-`%LOCALAPPDATA%\Memento\hooks\0.0.56\`. Its `_internal` directory stays beside
+`%LOCALAPPDATA%\Memento\hooks\0.0.57\`. Its `_internal` directory stays beside
 the executable, so a hook process does not unpack a 40 MB onefile bundle into a
 new `_MEI*` temp directory for every Claude event.
 

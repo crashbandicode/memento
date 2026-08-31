@@ -498,6 +498,7 @@ def _read_stdin_payload() -> object:
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments not in ([], ["--enabled"]):
+        print("{}")
         return 0
     try:
         response = process_hook_payload(
@@ -505,9 +506,15 @@ def main(argv: list[str] | None = None) -> int:
             force_enabled=arguments == ["--enabled"],
         )
     except Exception:  # noqa: BLE001, S110 -- a hook must never block work by crashing
-        return 0
-    if response is not None:
-        print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+        response = None
+    # Codex Stop hooks parse successful stdout as JSON, including neutral no-ops.
+    print(
+        json.dumps(
+            response if response is not None else {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 

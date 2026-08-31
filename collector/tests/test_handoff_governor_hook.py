@@ -341,14 +341,31 @@ def test_cursor_stop_loop_count_avoids_repeated_continuation(
     assert response is None
 
 
-def test_malformed_hook_input_exits_without_output(
+def test_malformed_hook_input_emits_neutral_json(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(governor.sys, "stdin", io.StringIO("{malformed"))
 
     assert governor.main(["--enabled"]) == 0
-    assert capsys.readouterr().out == ""
+    assert json.loads(capsys.readouterr().out) == {}
+
+
+def test_noop_hook_input_emits_neutral_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        governor.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(_payload(tmp_path / "missing.jsonl", event="Stop"))
+        ),
+    )
+
+    assert governor.main(["--enabled"]) == 0
+    assert json.loads(capsys.readouterr().out) == {}
 
 
 def test_missing_transcript_noops_cleanly(tmp_path: Path) -> None:
@@ -518,7 +535,7 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
         local_app_data
         / "Memento"
         / "hooks"
-        / "0.0.56"
+        / "0.0.57"
         / "memento-hook-runner.exe"
     )
     assert changed is True
@@ -682,7 +699,7 @@ def test_runner_install_lost_windows_rename_race_uses_winner(
     source = tmp_path / "source" / "memento-hook-runner"
     _write_complete_runner(source)
     local_app_data = tmp_path / "local-app-data"
-    destination = local_app_data / "Memento" / "hooks" / "0.0.56"
+    destination = local_app_data / "Memento" / "hooks" / "0.0.57"
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
