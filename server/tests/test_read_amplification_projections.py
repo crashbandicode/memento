@@ -888,6 +888,55 @@ async def test_projected_dashboard_excludes_archived_conversations(
 
 @requires_postgres
 @pytest.mark.asyncio
+async def test_projected_dashboard_names_handoff_primary_and_predecessor(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user, machine, project = await _seed_dashboard_scope(
+            session,
+            name="handoff-titles",
+        )
+        predecessor_session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        successor_session_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        predecessor = await _document(
+            session,
+            project=project,
+            machine=machine,
+            metadata={"session_id": predecessor_session_id},
+            title=predecessor_session_id,
+        )
+        successor = await _document(
+            session,
+            project=project,
+            machine=machine,
+            metadata={
+                "session_id": successor_session_id,
+                "briefing_kind": "handoff",
+                "briefing_session_id": predecessor_session_id,
+                "handoff_chain_name": "memento-run-6",
+            },
+            title="MEMENTO-HANDOFF-FROM: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        await refresh_dashboard_document_projection(session, predecessor)
+        await refresh_dashboard_document_projection(session, successor)
+        await _mark_dashboard_complete(session)
+
+        payload = await get_dashboard(
+            device_id=None,
+            tz_offset=0,
+            db=session,
+            _user=user,
+        )
+
+        titles = {row["title"] for row in payload["recent_conversations"]}
+        assert {"memento-run-5", "memento-run-6"}.issubset(titles)
+        assert predecessor_session_id not in titles
+        assert not any(title.startswith("MEMENTO-HANDOFF-FROM:") for title in titles)
+        await session.rollback()
+
+
+@requires_postgres
+@pytest.mark.asyncio
 async def test_legacy_dashboard_excludes_archived_conversations(
     session_factory,
 ) -> None:

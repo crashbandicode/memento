@@ -27,7 +27,7 @@ from .subagent_lifecycle import (
     SUBAGENT_LIFECYCLE_STATUS_KEY,
 )
 
-DASHBOARD_PROJECTION_VERSION = 2
+DASHBOARD_PROJECTION_VERSION = 3
 DASHBOARD_PROJECTION_STATE_ID = 1
 DASHBOARD_BACKFILL_BATCH_SIZE = 250
 ARCHIVED_METADATA_KEY = "archived"
@@ -39,6 +39,9 @@ _HIERARCHY_METADATA_KEYS = {
     "agent_nickname",
     "agent_path",
     "agent_tool_use_id",
+    "briefing_kind",
+    "briefing_session_id",
+    "handoff_chain_name",
     "is_subagent",
     "orchestration",
     "orchestration_agent_codename",

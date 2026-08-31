@@ -67,6 +67,37 @@ class ConversationTitleTests(unittest.TestCase):
             "codex",
         ))
 
+    def test_handoff_priming_prompt_uses_its_chain_identity(self) -> None:
+        prompt = (
+            "MEMENTO-HANDOFF-FROM: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n\n"
+            "Adopt the chain identity **memento-run-6**."
+        )
+
+        self.assertTrue(_conversation_title_needs_derivation(prompt, "codex"))
+        self.assertEqual(
+            _friendly_conversation_title(prompt, tool_id="codex"),
+            "memento-run-6",
+        )
+
+        class _Db:
+            async def execute(self, _statement):
+                return SimpleNamespace(scalars=lambda: [prompt])
+
+        doc = SimpleNamespace(
+            id="successor-document",
+            tool_id="codex",
+            title=prompt[:500],
+            metadata_={
+                "memento_title_source": "codex_explicit_rename",
+                "codex_title_revision": 42,
+            },
+        )
+
+        title = asyncio.run(_apply_friendly_conversation_title(_Db(), doc))
+
+        self.assertEqual(title, "memento-run-6")
+        self.assertEqual(doc.title, "memento-run-6")
+
     def test_codex_title_uses_request_suffix_not_ide_context(self) -> None:
         wrapped = (
             "# Context from my IDE setup:\n\n"

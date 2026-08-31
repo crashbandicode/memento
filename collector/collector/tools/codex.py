@@ -503,7 +503,8 @@ class CodexTool(BaseTool):
                 continue
             if not thread_source and str(info.get("agent_path") or "").strip():
                 continue
-            title = str(info.get("title") or "").strip()[:500]
+            source_title = str(info.get("title") or "").strip()
+            title = source_title[:500]
             if not title:
                 continue
             first_user_message = str(
@@ -513,7 +514,7 @@ class CodexTool(BaseTool):
             if title_kind not in {"custom", "fallback"}:
                 title_kind = (
                     "fallback"
-                    if first_user_message and title == first_user_message
+                    if first_user_message and source_title == first_user_message
                     else "custom"
                 )
             record = {

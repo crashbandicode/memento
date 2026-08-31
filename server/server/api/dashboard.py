@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -40,8 +41,10 @@ from ..services.conversation_hierarchy import (
     build_logical_activity_map,
     build_subagent_summaries,
     build_conversation_companion_filter,
+    conversation_display_title,
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
+    handoff_chain_title_overrides,
 )
 from ..services.dashboard_projection import (
     ARCHIVED_METADATA_KEY,
@@ -543,12 +546,18 @@ async def get_dashboard(
     candidate_rows = list(rows_by_id.values())
 
     def conversation_ref(row) -> ConversationRef:
+        metadata = _row_metadata(row)
         return ConversationRef(
             document_id=row.id,
             tool_id=row.tool_id,
             relative_path=row.relative_path,
-            metadata=_row_metadata(row),
-            title=row.title,
+            metadata=metadata,
+            title=conversation_display_title(
+                row.tool_id,
+                row.relative_path,
+                metadata,
+                row.title,
+            ),
             source_modified_at=row.source_modified_at,
             activity_at=row.activity_at,
             synced_at=row.synced_at,
@@ -621,6 +630,14 @@ async def get_dashboard(
 
     all_convo_rows = list(all_convo_rows_by_id.values())
     conversation_refs = [conversation_ref(row) for row in all_convo_rows]
+    title_overrides = handoff_chain_title_overrides(conversation_refs)
+    conversation_refs = [
+        replace(ref, title=title_overrides.get(ref.document_id, ref.title))
+        for ref in conversation_refs
+    ]
+    conversation_titles = {
+        ref.document_id: ref.title for ref in conversation_refs
+    }
     conversation_hierarchy = fold_conversation_subagents(conversation_refs)
     subagents_by_document = build_subagent_summaries(
         conversation_hierarchy,
@@ -737,7 +754,7 @@ async def get_dashboard(
         recent_conversations.append({
             "id": str(row.id),
             "tool_id": row.tool_id,
-            "title": row.title,
+            "title": conversation_titles.get(row.id) or row.title,
             "activity_at": activity_at.isoformat() if activity_at else None,
             "synced_at": row.synced_at.isoformat(),
             "project_title": row.project_title,

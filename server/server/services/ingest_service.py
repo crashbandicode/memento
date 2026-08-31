@@ -196,6 +196,7 @@ _ESSENTIAL_METADATA_KEYS = {
     "cwd",
     "briefing_kind",
     "briefing_session_id",
+    "handoff_chain_name",
     "first_user_message",
     "forked_from_id",
     "is_subagent",
@@ -2245,6 +2246,10 @@ def _conversation_title_needs_derivation(
     candidate = (title or "").strip()
     if not candidate:
         return True
+    from .conversation_hierarchy import conversation_briefing_kind
+
+    if conversation_briefing_kind(candidate) == "handoff":
+        return True
     if tool_id == "codex":
         from .conversation_parser import normalize_codex_user_payload
 
@@ -2293,6 +2298,14 @@ def _friendly_conversation_title(
             text = directives
     if not text or text.lower().startswith(_CLAUDE_LOCAL_COMMAND_PREFIXES):
         return None
+
+    from .conversation_hierarchy import (
+        conversation_briefing_kind,
+        conversation_handoff_chain_name,
+    )
+
+    if conversation_briefing_kind(text) == "handoff":
+        return conversation_handoff_chain_name(text) or "Memento handoff"
 
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"^[#>*`\-\s]+", "", text).strip()

@@ -100,6 +100,7 @@ def _create_state_db(
     rollout_path: Path,
     title: str,
     *,
+    first_user_message: str = "First prompt",
     thread_source: str = "user",
     agent_path: str = "",
 ) -> None:
@@ -125,7 +126,7 @@ def _create_state_db(
                 ROOT_ID,
                 str(rollout_path),
                 title,
-                "First prompt",
+                first_user_message,
                 100,
                 100_123,
                 thread_source,
@@ -206,6 +207,31 @@ def test_state_title_records_refresh_and_include_revision_and_path(
     second = codex_tool.thread_title_records()[ROOT_ID]
     assert second["title"] == "Explicitly renamed"
     assert second["revision"] == 200_456
+
+
+def test_long_fallback_title_is_classified_before_transport_truncation(
+    codex_tool: CodexTool,
+) -> None:
+    path = _rollout_path(codex_tool.root_path, ROOT_ID)
+    _write_records(path, [_session_meta(id=ROOT_ID, session_id=ROOT_ID)])
+    prompt = (
+        "MEMENTO-HANDOFF-FROM: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+        "This is a handoff priming prompt. "
+        + ("context " * 90)
+        + "Adopt the chain identity **memento-run-6**."
+    )
+    assert len(prompt) > 500
+    _create_state_db(
+        codex_tool.root_path,
+        path,
+        prompt,
+        first_user_message=prompt,
+    )
+
+    record = codex_tool.thread_title_records()[ROOT_ID]
+
+    assert len(record["title"]) == 500
+    assert record["title_kind"] == "fallback"
 
 
 def test_changed_only_title_poll_skips_unchanged_sqlite(

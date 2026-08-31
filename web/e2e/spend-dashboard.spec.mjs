@@ -444,6 +444,8 @@ test("projection math tooltip stays opaque and keeps thousands-scale precision",
   await worst.hover();
   await expect(tooltip).toContainText("$16,184.74 now + $1,529.49/day × 10.0 days left = $17,673");
   await expect(tooltip).toContainText("Reaches $17,000");
+  await expect(tooltip).toContainText("$16,184.74 now + $1,529.49/day × 0.53 days = $17,000");
+  await expect(tooltip).toContainText("Hits 100%");
 
   for (const theme of ["light", "dark"]) {
     await page.evaluate((value) => {

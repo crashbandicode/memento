@@ -104,7 +104,7 @@ async def test_detail_api_links_predecessor_to_successor(session_factory) -> Non
         predecessor = await _seed_thread(
             session,
             session_id=predecessor_session_id,
-            title="Original implementation thread",
+            title=str(predecessor_session_id),
             first_user_content="Implement the original task.",
             machine_id=machine.id,
         )
@@ -118,14 +118,21 @@ async def test_detail_api_links_predecessor_to_successor(session_factory) -> Non
             ),
             machine_id=machine.id,
         )
+        successor.metadata_ = {
+            **successor.metadata_,
+            "briefing_kind": "handoff",
+            "briefing_session_id": str(predecessor_session_id),
+            "handoff_chain_name": "memento-run-6",
+        }
         await session.commit()
 
         payload = await get_conversation(predecessor.id, db=session, _user=user)
 
+    assert payload["title"] == "memento-run-5"
     assert payload["handoff_successor"] == {
         "document_id": str(successor.id),
         "tool_id": "claude_code",
-        "title": "Continuation implementation thread",
+        "title": "memento-run-6",
         "canonical_url": f"/conversations/claude/{successor.metadata_['session_id']}",
     }
     assert "handoff_predecessor" not in payload
@@ -154,14 +161,21 @@ async def test_detail_api_links_successor_to_predecessor(session_factory) -> Non
             ),
             machine_id=machine.id,
         )
+        successor.metadata_ = {
+            **successor.metadata_,
+            "briefing_kind": "handoff",
+            "briefing_session_id": str(predecessor_session_id),
+            "handoff_chain_name": "memento-run-6",
+        }
         await session.commit()
 
         payload = await get_conversation(successor.id, db=session, _user=user)
 
+    assert payload["title"] == "memento-run-6"
     assert payload["handoff_predecessor"] == {
         "document_id": str(predecessor.id),
         "tool_id": "claude_code",
-        "title": "Previous thread",
+        "title": "memento-run-5",
         "canonical_url": f"/conversations/claude/{predecessor_session_id}",
     }
     assert "handoff_successor" not in payload

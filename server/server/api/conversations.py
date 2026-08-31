@@ -53,6 +53,7 @@ from ..services.conversation_hierarchy import (
     is_conversation_subagent,
     merge_authoritative_subagent_summaries,
     merge_subagent_event_summaries,
+    previous_handoff_chain_name,
 )
 from ..services.conversation_identity import (
     conversation_native_id,
@@ -791,7 +792,11 @@ def _claude_session_id_from_relative_path(relative_path: object) -> str | None:
         return None
 
 
-def _handoff_conversation_reference(document: Document) -> dict:
+def _handoff_conversation_reference(
+    document: Document,
+    *,
+    title_override: str | None = None,
+) -> dict:
     """Serialize a small, navigable linked-thread reference for detail views."""
     title = conversation_display_title(
         document.tool_id,
@@ -802,7 +807,12 @@ def _handoff_conversation_reference(document: Document) -> dict:
     return {
         "document_id": str(document.id),
         "tool_id": document.tool_id,
-        "title": title or document.relative_path or "Untitled conversation",
+        "title": (
+            title_override
+            or title
+            or document.relative_path
+            or "Untitled conversation"
+        ),
         "canonical_url": (
             native_conversation_url(
                 document.tool_id,
@@ -866,7 +876,15 @@ async def _handoff_predecessor_reference(
     if machine_ids is not None:
         statement = statement.where(Document.machine_id.in_(machine_ids))
     predecessor = (await db.execute(statement)).scalars().first()
-    return _handoff_conversation_reference(predecessor) if predecessor is not None else None
+    if predecessor is None:
+        return None
+    predecessor_title = previous_handoff_chain_name(
+        (document.metadata_ or {}).get("handoff_chain_name")
+    )
+    return _handoff_conversation_reference(
+        predecessor,
+        title_override=predecessor_title,
+    )
 
 
 async def _handoff_successor_reference(
@@ -1638,6 +1656,21 @@ async def get_conversation(
         runtime["token_usage"] = token_usage
     usage_models = await conversation_usage_models(db, doc.id)
     thread_links = await _conversation_thread_links(db, doc, mids)
+    display_title = conversation_display_title(
+        doc.tool_id,
+        doc.relative_path,
+        doc.metadata_,
+        doc.title,
+    )
+    successor = thread_links.get("handoff_successor")
+    predecessor_name = previous_handoff_chain_name(
+        successor.get("title") if isinstance(successor, dict) else None
+    )
+    if (
+        predecessor_name
+        and display_title == current_thread_id(doc.metadata_)
+    ):
+        display_title = predecessor_name
 
     return {
         "id": str(doc.id),
@@ -1658,12 +1691,7 @@ async def get_conversation(
             doc.metadata_,
         ),
         "canvases": conversation_canvases,
-        "title": conversation_display_title(
-            doc.tool_id,
-            doc.relative_path,
-            doc.metadata_,
-            doc.title,
-        ),
+        "title": display_title,
         "relative_path": doc.relative_path,
         "metadata": doc.metadata_,
         "user_role_origin": conversation_user_role_origin(

@@ -44,6 +44,7 @@ TANGENT_MARKER_PREFIX = "MEMENTO-TANGENT-FROM:"
 DELEGATE_MARKER_PREFIX = "MEMENTO-DELEGATE-FROM:"
 BRIEFING_KIND_METADATA_KEY = "briefing_kind"
 BRIEFING_SESSION_ID_METADATA_KEY = "briefing_session_id"
+HANDOFF_CHAIN_NAME_METADATA_KEY = "handoff_chain_name"
 BRIEFING_RAW_PREFIX_CHARS = 32 * 1024
 _BRIEFING_CONTENT_CHARS = 2048
 _BRIEFING_KINDS = frozenset({"handoff", "tangent", "delegate"})
@@ -76,6 +77,16 @@ _BRIEFING_MARKER_PATTERNS = (
     ("handoff", _HANDOFF_MARKER_RE),
     ("tangent", _TANGENT_MARKER_RE),
     ("delegate", _DELEGATE_MARKER_RE),
+)
+_HANDOFF_CHAIN_IDENTITY_RE = re.compile(
+    r"\badopt(?:\s+the)?\s+chain\s+identity\s+"
+    r"(?:is\s+|:\s*)?(?:\*\*|`)?"
+    r"(?P<name>[a-z0-9][a-z0-9_-]*-run-[1-9][0-9]*)\b",
+    re.IGNORECASE,
+)
+_HANDOFF_CHAIN_NAME_RE = re.compile(
+    r"\A(?P<base>[a-z0-9][a-z0-9_-]*-run-)(?P<number>[1-9][0-9]*)\Z",
+    re.IGNORECASE,
 )
 
 
@@ -119,6 +130,27 @@ def conversation_briefing_session_id(content: object) -> str | None:
     return None if parsed is None else parsed[1]
 
 
+def conversation_handoff_chain_name(content: object) -> str | None:
+    """Return the explicitly adopted handoff-chain identity, if present."""
+    if _parse_conversation_briefing(content) is None:
+        return None
+    if conversation_briefing_kind(content) != "handoff":
+        return None
+    match = _HANDOFF_CHAIN_IDENTITY_RE.search(str(content)[:_BRIEFING_CONTENT_CHARS])
+    return match.group("name").lower() if match is not None else None
+
+
+def previous_handoff_chain_name(chain_name: object) -> str | None:
+    """Return the predecessor label encoded by a numbered chain identity."""
+    match = _HANDOFF_CHAIN_NAME_RE.fullmatch(str(chain_name or "").strip())
+    if match is None:
+        return None
+    number = int(match.group("number"))
+    if number <= 1:
+        return None
+    return f"{match.group('base').lower()}{number - 1}"
+
+
 def persist_conversation_briefing_metadata(
     metadata: dict[str, Any],
     first_user_content: str | None,
@@ -130,10 +162,16 @@ def persist_conversation_briefing_metadata(
         kind, session_id = parsed
         candidate[BRIEFING_KIND_METADATA_KEY] = kind
         candidate[BRIEFING_SESSION_ID_METADATA_KEY] = session_id
+        chain_name = conversation_handoff_chain_name(first_user_content)
+        if chain_name:
+            candidate[HANDOFF_CHAIN_NAME_METADATA_KEY] = chain_name
+        else:
+            candidate.pop(HANDOFF_CHAIN_NAME_METADATA_KEY, None)
         return candidate
     if isinstance(first_user_content, str) and first_user_content.strip():
         candidate.pop(BRIEFING_KIND_METADATA_KEY, None)
         candidate.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+        candidate.pop(HANDOFF_CHAIN_NAME_METADATA_KEY, None)
     return candidate
 
 
@@ -152,6 +190,7 @@ def clear_stale_briefing_keys_for_full_replacement(
         return existing_metadata
     existing_metadata.pop(BRIEFING_KIND_METADATA_KEY, None)
     existing_metadata.pop(BRIEFING_SESSION_ID_METADATA_KEY, None)
+    existing_metadata.pop(HANDOFF_CHAIN_NAME_METADATA_KEY, None)
     return existing_metadata
 
 
@@ -442,6 +481,37 @@ def current_thread_id(metadata: Mapping[str, Any] | None) -> str | None:
     return str(value) if value else None
 
 
+def handoff_chain_title_overrides(
+    conversations: Iterable[ConversationRef],
+) -> dict[Hashable, str]:
+    """Name chain primaries and their directly linked predecessor documents."""
+    refs = list(conversations)
+    refs_by_thread: dict[str, list[ConversationRef]] = {}
+    for ref in refs:
+        if thread_id := current_thread_id(ref.metadata):
+            refs_by_thread.setdefault(thread_id, []).append(ref)
+    overrides: dict[Hashable, str] = {}
+    for ref in refs:
+        values = ref.metadata or {}
+        chain_name = str(
+            values.get(HANDOFF_CHAIN_NAME_METADATA_KEY) or ""
+        ).strip().lower()
+        if _HANDOFF_CHAIN_NAME_RE.fullmatch(chain_name) is None:
+            continue
+        thread_id = current_thread_id(values)
+        for copy in refs_by_thread.get(thread_id or "", [ref]):
+            overrides.setdefault(copy.document_id, chain_name)
+        kind, predecessor_thread_id = resolve_conversation_briefing(
+            metadata=values,
+        )
+        predecessor_name = previous_handoff_chain_name(chain_name)
+        predecessors = refs_by_thread.get(predecessor_thread_id or "", [])
+        if kind == "handoff" and predecessor_name:
+            for predecessor in predecessors:
+                overrides.setdefault(predecessor.document_id, predecessor_name)
+    return overrides
+
+
 def explicit_subagent_parent_thread_id(relative_path: str | None) -> str | None:
     """Return the parent UUID encoded by Claude/Cursor subagent paths."""
     path = (relative_path or "").replace("\\", "/")
@@ -517,6 +587,14 @@ def conversation_display_title(
 ) -> str | None:
     """Return a presentation title without changing the source document title."""
     values = metadata or {}
+    chain_name = str(
+        values.get(HANDOFF_CHAIN_NAME_METADATA_KEY) or ""
+    ).strip().lower()
+    if (
+        _HANDOFF_CHAIN_NAME_RE.fullmatch(chain_name) is not None
+        and conversation_is_chain_primary(values)
+    ):
+        return chain_name
     if (
         tool_id == "claude_code"
         and (

@@ -43,11 +43,15 @@ test("projection explainers retain the original copy and equations for all scena
   assert.equal(realistic.heading, "Realistic projection");
   assert.equal(textLines(realistic)[0], "Uses the leftover from your previous peak day after this time of day ($30.00 still today), then $60.00/day for the 9 full days left.");
   assert.equal(textLines(realistic)[1], "$180.00 now + $30.00 today + $60.00 × 9 = $750");
+  assert.equal(textLines(realistic).at(-2), "$180.00 now + $30.00 today + $60.00 × 4.83 days = $500");
+  assert.match(textLines(realistic).at(-1), /^Hits 100% /);
 
   const average = projectionMathTooltip(math, "average");
   assert.equal(average.heading, "Average projection");
   assert.equal(textLines(average)[0], "Uses the typical leftover after this time of day ($20.00 still today), then your average day ($40.00) for the 9 full days left.");
   assert.equal(textLines(average)[1], "$180.00 now + $20.00 today + $40.00 × 9 = $560");
+  assert.equal(textLines(average).at(-2), "$180.00 now + $20.00 today + $40.00 × 7.50 days = $500");
+  assert.match(textLines(average).at(-1), /^Hits 100% /);
   assert.equal(average.lines[0].segments.some((segment) => segment.bold && segment.text === "average day"), true);
 });
 

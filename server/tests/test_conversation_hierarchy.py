@@ -18,16 +18,19 @@ from server.services.conversation_hierarchy import (  # noqa: E402
     conversation_briefing_kind,
     conversation_briefing_session_id,
     conversation_display_title,
+    conversation_handoff_chain_name,
     conversation_is_chain_primary,
     conversation_message_user_origin,
     conversation_user_role_origin,
     effective_conversation_timestamp,
     fold_codex_subagents,
     fold_conversation_subagents,
+    handoff_chain_title_overrides,
     merge_authoritative_subagent_summaries,
     merge_subagent_event_summaries,
     path_linked_subagent_identity,
     persist_conversation_briefing_metadata,
+    previous_handoff_chain_name,
     resolve_conversation_briefing,
 )
 
@@ -632,6 +635,57 @@ class ConversationHierarchyTests(unittest.TestCase):
         self.assertIsNone(
             conversation_user_role_origin("cursor", "agent-transcripts/t.jsonl", tangent)
         )
+
+    def test_handoff_chain_identity_titles_primary_and_predecessor(self) -> None:
+        predecessor_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        successor_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        prompt = (
+            f"MEMENTO-HANDOFF-FROM: {predecessor_id}\n\n"
+            "Prepare and stop. Adopt the chain identity **memento-run-6** "
+            "and record memento-run-7 as the eventual successor."
+        )
+        metadata: dict = {}
+
+        persist_conversation_briefing_metadata(metadata, prompt)
+
+        self.assertEqual(conversation_handoff_chain_name(prompt), "memento-run-6")
+        self.assertEqual(metadata["handoff_chain_name"], "memento-run-6")
+        self.assertEqual(
+            conversation_display_title(
+                "codex",
+                "sessions/successor.jsonl",
+                metadata,
+                prompt,
+            ),
+            "memento-run-6",
+        )
+        self.assertEqual(previous_handoff_chain_name("memento-run-6"), "memento-run-5")
+        refs = [
+            _ref(
+                "successor-document",
+                session_id=successor_id,
+                extra_metadata=metadata,
+            ),
+            _ref("predecessor-document", session_id=predecessor_id),
+            _ref("predecessor-copy", session_id=predecessor_id),
+        ]
+        self.assertEqual(
+            handoff_chain_title_overrides(refs),
+            {
+                "successor-document": "memento-run-6",
+                "predecessor-document": "memento-run-5",
+                "predecessor-copy": "memento-run-5",
+            },
+        )
+
+    def test_handoff_chain_identity_requires_the_authoritative_phrase(self) -> None:
+        predecessor_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        prompt = (
+            f"MEMENTO-HANDOFF-FROM: {predecessor_id}\n"
+            "Predecessor memento-run-5; eventual successor memento-run-7."
+        )
+        self.assertIsNone(conversation_handoff_chain_name(prompt))
+        self.assertIsNone(previous_handoff_chain_name("unrelated-run-name"))
 
     def test_delegate_marker_is_classified_separately_from_chain_primaries(self) -> None:
         parent_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
