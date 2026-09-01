@@ -80,6 +80,36 @@ const claudeProjection = {
   },
 };
 
+const hygiene = {
+  source: "all",
+  available: true,
+  status: "crit",
+  hopLine: 200,
+  hardLine: 400,
+  metric: "cache-read / generated",
+  parts: [
+    {
+      source: "claude",
+      available: true,
+      status: "ok",
+      shown: { dayKey: "2026-08-21", partial: true, cacheRead: 45_468_162, generated: 488_407, ratio: 93, status: "ok" },
+    },
+    {
+      source: "cursor",
+      available: true,
+      status: "warn",
+      shown: { dayKey: "2026-08-21", partial: true, cacheRead: 16_042_610, generated: 73_476, ratio: 218, status: "warn" },
+    },
+    {
+      source: "codex",
+      available: true,
+      status: "crit",
+      usingYesterday: true,
+      shown: { dayKey: "2026-08-20", partial: false, cacheRead: 69_156_608, generated: 163_210, ratio: 424, status: "crit" },
+    },
+  ],
+};
+
 const snapshot = {
   fetchedAt: new Date(now).toISOString(),
   purpose: "Read-only dashboard view.",
@@ -195,6 +225,7 @@ const snapshot = {
       },
     },
   },
+  hygiene,
 };
 
 async function installRoutes(page, spendSnapshot = snapshot) {
@@ -350,6 +381,39 @@ async function trendProjectionRows(page) {
   return rows;
 }
 
+async function assertProjectionRaysReachChartEnd(page, source) {
+  const chart = page.locator(`svg[aria-label="${source.toLowerCase()} month-to-date spend history"]`);
+  const projectionRays = chart.locator(".spend-projection-rays line");
+  await expect(projectionRays).toHaveCount(3);
+  const geometry = await chart.evaluate((svg) => {
+    const plotRight = svg.viewBox.baseVal.x + svg.viewBox.baseVal.width - 18;
+    return {
+      plotRight,
+      rays: Array.from(svg.querySelectorAll(".spend-projection-rays line")).map((line) => {
+        const styles = window.getComputedStyle(line);
+        const bounds = line.getBoundingClientRect();
+        return {
+          x1: Number(line.getAttribute("x1")),
+          x2: Number(line.getAttribute("x2")),
+          width: bounds.width,
+          display: styles.display,
+          visibility: styles.visibility,
+          opacity: Number(styles.opacity),
+        };
+      }),
+    };
+  });
+
+  for (const ray of geometry.rays) {
+    expect(ray.x1).toBeLessThan(ray.x2);
+    expect(ray.x2).toBeCloseTo(geometry.plotRight, 3);
+    expect(ray.width).toBeGreaterThan(0);
+    expect(ray.display).not.toBe("none");
+    expect(ray.visibility).not.toBe("hidden");
+    expect(ray.opacity).toBeGreaterThan(0);
+  }
+}
+
 async function assertProjectionMathDesktop(page) {
   await page.getByRole("tab", { name: "All", exact: true }).click();
   const rows = await trendProjectionRows(page);
@@ -404,13 +468,7 @@ test("spend snapshot paints supplied bands and remains coherent on desktop", asy
 
   for (const source of ["Claude", "Cursor", "Codex"]) {
     await page.getByRole("tab", { name: source, exact: true }).click();
-    const projectionRays = page.locator(`svg[aria-label="${source.toLowerCase()} month-to-date spend history"] .spend-projection-rays line`);
-    await expect(projectionRays).toHaveCount(3);
-    const coordinates = await projectionRays.evaluateAll((lines) => lines.map((line) => ({
-      x1: Number(line.getAttribute("x1")),
-      x2: Number(line.getAttribute("x2")),
-    })));
-    expect(coordinates.every(({ x1, x2 }) => Number.isFinite(x1) && Number.isFinite(x2) && x1 < x2)).toBe(true);
+    await assertProjectionRaysReachChartEnd(page, source);
   }
 });
 
@@ -475,6 +533,63 @@ test("projection math tooltip stays opaque and keeps thousands-scale precision",
   }
 });
 
+test("handoff hygiene follows the selected spend source", async ({ page }) => {
+  await installRoutes(page);
+  await page.goto("/app");
+  await expect(page.getByRole("region", { name: "AI spend" })).toBeVisible();
+
+  const panel = page.getByRole("region", { name: "Handoff hygiene" });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("cache-read / generated · hop at 200:1")).toBeVisible();
+  await expect(panel.locator(".spend-hygiene-card")).toHaveCount(3);
+  await expect(panel.getByText("93:1", { exact: true })).toBeVisible();
+  await expect(panel.getByText("218:1", { exact: true })).toBeVisible();
+  await expect(panel.getByText("424:1", { exact: true })).toBeVisible();
+  await expect(panel.locator('.spend-hygiene-card[data-status="crit"]')).toContainText("Codex");
+  await expect(panel.getByText("yesterday", { exact: true })).toBeVisible();
+
+  await page.getByRole("tab", { name: "Claude", exact: true }).click();
+  await expect(panel.locator(".spend-hygiene-card")).toHaveCount(1);
+  await expect(panel).toContainText("Claude");
+  await expect(panel).toContainText("93:1");
+  await expect(panel).not.toContainText("Cursor");
+});
+
+test("projection rays and hygiene stay responsive across chart widths", async ({ page }) => {
+  await installRoutes(page);
+  await page.goto("/app");
+  await expect(page.getByRole("region", { name: "AI spend" })).toBeVisible();
+  const panel = page.getByRole("region", { name: "Handoff hygiene" });
+
+  for (const width of [390, 540, 760, 900]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.getByRole("tab", { name: "All", exact: true }).click();
+    await assertProjectionRaysReachChartEnd(page, "All");
+    await expect(panel.locator(".spend-hygiene-card")).toHaveCount(3);
+    const layout = await panel.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        left: bounds.left,
+        right: bounds.right,
+        viewportWidth: window.innerWidth,
+        cards: Array.from(element.querySelectorAll(".spend-hygiene-card")).map((card) => {
+          const rect = card.getBoundingClientRect();
+          return { left: rect.left, right: rect.right, width: rect.width };
+        }),
+        documentOverflow: document.documentElement.scrollWidth > window.innerWidth,
+      };
+    });
+    expect(layout.left).toBeGreaterThanOrEqual(0);
+    expect(layout.right).toBeLessThanOrEqual(layout.viewportWidth);
+    expect(layout.documentOverflow).toBe(false);
+    for (const card of layout.cards) {
+      expect(card.width).toBeGreaterThan(0);
+      expect(card.left).toBeGreaterThanOrEqual(layout.left);
+      expect(card.right).toBeLessThanOrEqual(layout.right);
+    }
+  }
+});
+
 test("spend snapshot remains usable at an Android viewport", async ({ browser }) => {
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 },
@@ -485,7 +600,7 @@ test("spend snapshot remains usable at an Android viewport", async ({ browser })
   await installRoutes(page);
   await assertSpendDashboard(page);
   await page.getByRole("tab", { name: "Claude", exact: true }).click();
-  await expect(page.locator('svg[aria-label="claude month-to-date spend history"] .spend-projection-rays')).toHaveCount(0);
+  await assertProjectionRaysReachChartEnd(page, "Claude");
   await assertTooltipParity(page, "tap");
   await assertChartTouchDismissal(page);
   await assertProjectionMathMobile(page);
