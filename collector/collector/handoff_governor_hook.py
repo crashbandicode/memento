@@ -356,7 +356,16 @@ def _context_usage(payload: dict[str, Any], session_id: str) -> ContextUsage | N
     return _payload_usage(payload)
 
 
-def _nudge_output(session_id: str, tokens: int, thresholds: GovernorThresholds) -> dict[str, Any] | None:
+def _is_cursor_payload(payload: dict[str, Any]) -> bool:
+    return isinstance(payload.get("conversation_id"), str)
+
+
+def _nudge_output(
+    payload: dict[str, Any],
+    session_id: str,
+    tokens: int,
+    thresholds: GovernorThresholds,
+) -> dict[str, Any] | None:
     messages: list[str] = []
     if tokens >= thresholds.hygiene and consume_threshold_latch(
         session_id,
@@ -377,14 +386,13 @@ def _nudge_output(session_id: str, tokens: int, thresholds: GovernorThresholds) 
     if not messages:
         return None
     message = "\n\n".join(messages)
+    if _is_cursor_payload(payload):
+        return {"additional_context": message}
     return {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": message,
         },
-        # Cursor's native hook adapter consumes snake_case directly. Claude
-        # Code and Codex ignore the extra field and use hookSpecificOutput.
-        "additional_context": message,
     }
 
 
@@ -448,13 +456,13 @@ def _stop_output(payload: dict[str, Any], session_id: str, tokens: int, threshol
         "Write a handoff section naming this session_id, spawn the successor "
         "(spawn-prime-stop-resume), and print the cd-prefixed resume command."
     )
-    return {
+    response = {
         "decision": "block",
         "reason": reason,
-        # Cursor's native Stop response uses this name. Claude Code and Codex
-        # consume decision/reason and ignore the compatibility field.
-        "followup_message": reason,
     }
+    if _is_cursor_payload(payload):
+        response["followup_message"] = reason
+    return response
 
 
 def process_hook_payload(
@@ -481,7 +489,7 @@ def process_hook_payload(
     if thresholds is None:
         return None
     if event_name == "posttooluse":
-        return _nudge_output(session_id, usage.tokens, thresholds)
+        return _nudge_output(payload, session_id, usage.tokens, thresholds)
     return _stop_output(payload, session_id, usage.tokens, thresholds)
 
 

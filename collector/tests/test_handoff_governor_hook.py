@@ -198,9 +198,7 @@ def test_cursor_composer_usage_is_read_by_conversation_id(
 
     assert response is not None
     assert "Author the milestone handoff NOW" in response["additional_context"]
-    assert response["hookSpecificOutput"]["additionalContext"] == (
-        response["additional_context"]
-    )
+    assert set(response) == {"additional_context"}
 
 
 @pytest.mark.parametrize("database_contents", [None, b"not-a-sqlite-database"])
@@ -264,6 +262,29 @@ def test_post_tool_nudge_latches_each_threshold_once(
     assert state["notified_thresholds"] == [10, 20]
 
 
+def test_codex_post_tool_nudge_uses_only_strict_codex_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = _write_transcript(
+        tmp_path / "rollout.jsonl",
+        [_codex_token_record(input_tokens=20, context_window=100)],
+    )
+    monkeypatch.setattr(governor, "_governor_directory", lambda: tmp_path / "state")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HYGIENE_TOKENS", "10")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HANDOFF_TOKENS", "20")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_BLOCK_TOKENS", "30")
+
+    response = governor.process_hook_payload(
+        _payload(transcript, event="PostToolUse", turn_id="turn-codex-1"),
+        force_enabled=True,
+    )
+
+    assert response is not None
+    assert set(response) == {"hookSpecificOutput"}
+    assert response["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+
+
 @pytest.mark.parametrize(
     ("tokens", "handoff_real", "stop_hook_active", "expects_block"),
     [
@@ -314,8 +335,33 @@ def test_stop_block_requires_threshold_and_missing_real_handoff(
         assert response["decision"] == "block"
         assert "session_id" in response["reason"]
         assert "cd-prefixed resume command" in response["reason"]
+        assert "followup_message" not in response
     else:
         assert response is None
+
+
+def test_cursor_stop_block_keeps_cursor_followup_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HYGIENE_TOKENS", "10")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_HANDOFF_TOKENS", "10")
+    monkeypatch.setenv("MEMENTO_GOVERNOR_BLOCK_TOKENS", "10")
+
+    response = governor.process_hook_payload(
+        {
+            "hook_event_name": "Stop",
+            "conversation_id": "cursor-session-1",
+            "cwd": str(tmp_path),
+            "context_tokens": 10,
+            "context_window_size": 256_000,
+            "loop_count": 0,
+        },
+        force_enabled=True,
+    )
+
+    assert response is not None
+    assert response["followup_message"] == response["reason"]
 
 
 def test_cursor_stop_loop_count_avoids_repeated_continuation(
@@ -535,7 +581,7 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
         local_app_data
         / "Memento"
         / "hooks"
-        / "0.0.57"
+        / "0.0.58"
         / "memento-hook-runner.exe"
     )
     assert changed is True
@@ -699,7 +745,7 @@ def test_runner_install_lost_windows_rename_race_uses_winner(
     source = tmp_path / "source" / "memento-hook-runner"
     _write_complete_runner(source)
     local_app_data = tmp_path / "local-app-data"
-    destination = local_app_data / "Memento" / "hooks" / "0.0.57"
+    destination = local_app_data / "Memento" / "hooks" / "0.0.58"
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
@@ -728,21 +774,48 @@ def test_runner_install_recognizes_generic_windows_already_exists_error() -> Non
 
 
 def _expired_retirement_time() -> datetime:
-    return (
-        datetime.now(timezone.utc)
-        - pending_hook._hook_runner_retention_age()
-        - timedelta(seconds=1)
-    )
+    return datetime.now(timezone.utc) - timedelta(days=30)
 
 
-def test_runner_retention_age_defaults_to_24_hours_and_is_tunable(
+def test_runner_retention_is_opt_in_and_tunable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", raising=False)
-    assert pending_hook._hook_runner_retention_age() == timedelta(hours=24)
+    assert pending_hook._hook_runner_retention_age() is None
 
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", "0.5")
     assert pending_hook._hook_runner_retention_age() == timedelta(minutes=30)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "invalid"])
+def test_runner_retention_rejects_non_positive_or_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", value)
+
+    assert pending_hook._hook_runner_retention_age() is None
+
+
+def test_runner_sweep_keeps_expired_versions_when_retention_is_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", raising=False)
+    root = tmp_path / "hooks"
+    old = root / "0.0.53"
+    current = root / "0.0.56"
+    _write_complete_runner(old)
+    _write_complete_runner(current)
+    assert pending_hook._write_hook_runner_retirement_marker(
+        old,
+        retired_at=_expired_retirement_time(),
+    )
+    before_sweep = _runner_tree_snapshot(old)
+
+    pending_hook._sweep_retired_hook_runner_versions(root, current, {current})
+
+    assert _runner_tree_snapshot(old) == before_sweep
 
 
 def test_runner_sweep_marks_missing_retirement_marker_without_deleting(
@@ -816,9 +889,11 @@ def test_runner_sweep_never_touches_current_or_registered_versions(
 )
 def test_runner_sweep_preserves_live_governor_straggler_then_reclaims_it(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The executable gate must preserve a live Stop hook's block decision."""
 
+    monkeypatch.setenv("MEMENTO_HOOK_RUNNER_RETENTION_HOURS", "0.001")
     root = tmp_path / "hooks"
     old_live = root / "0.0.53"
     previous = root / "0.0.54"
@@ -874,6 +949,7 @@ def test_runner_sweep_preserves_live_governor_straggler_then_reclaims_it(
         assert process.stdout is not None
         assert process.stderr is not None
         response = json.loads(process.stdout.read())
+        assert set(response) == {"decision", "reason"}
         assert response["decision"] == "block"
         assert process.stderr.read() == ""
 

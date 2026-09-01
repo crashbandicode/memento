@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -59,7 +60,6 @@ _HOOK_TIMEOUT_SECONDS = 10
 _HOOK_RUNNER_NAME = "memento-hook-runner"
 _HOOK_RUNNER_RETIREMENT_MARKER = "retired-at.json"
 _HOOK_RUNNER_RETENTION_HOURS_ENV = "MEMENTO_HOOK_RUNNER_RETENTION_HOURS"
-_HOOK_RUNNER_RETENTION_DEFAULT_HOURS = 24.0
 
 
 def _pending_directory() -> Path:
@@ -1188,17 +1188,20 @@ def _hook_runner_retirement_marker(directory: Path) -> Path:
     return directory / _HOOK_RUNNER_RETIREMENT_MARKER
 
 
-def _hook_runner_retention_age() -> timedelta:
+def _hook_runner_retention_age() -> timedelta | None:
     raw_hours = os.environ.get(_HOOK_RUNNER_RETENTION_HOURS_ENV, "").strip()
     if not raw_hours:
-        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
+        return None
     try:
         hours = float(raw_hours)
     except ValueError:
-        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
-    if hours < 0:
-        return timedelta(hours=_HOOK_RUNNER_RETENTION_DEFAULT_HOURS)
-    return timedelta(hours=hours)
+        return None
+    if not math.isfinite(hours) or hours <= 0:
+        return None
+    try:
+        return timedelta(hours=hours)
+    except OverflowError:
+        return None
 
 
 def _write_hook_runner_retirement_marker(
@@ -1291,6 +1294,8 @@ def _sweep_retired_hook_runner_versions(
         marker = _hook_runner_retirement_marker(directory)
         if not marker.is_file():
             _write_hook_runner_retirement_marker(directory)
+            continue
+        if retention_age is None:
             continue
         retired_for = _hook_runner_retirement_age(marker)
         if retired_for is None or retired_for < retention_age:

@@ -9,11 +9,11 @@ last-resort Stop guard.
 
 ## Hook execution and latency
 
-On Windows collector 0.0.57, managed hook registrations invoke the
+On Windows collector 0.0.58, managed hook registrations invoke the
 dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
 It is a small PyInstaller **onedir** bundle, copied on collector startup from
 the desktop application's packaged resource to a versioned directory such as
-`%LOCALAPPDATA%\Memento\hooks\0.0.57\`. Its `_internal` directory stays beside
+`%LOCALAPPDATA%\Memento\hooks\0.0.58\`. Its `_internal` directory stays beside
 the executable, so a hook process does not unpack a 40 MB onefile bundle into a
 new `_MEI*` temp directory for every Claude event.
 
@@ -25,10 +25,13 @@ managed commands. Only after reconciliation points commands at the new runner
 does retirement maintenance run. It never renames a version directory. Each
 now-unregistered version receives a durable `retired-at.json` marker with an
 ISO timestamp and version; a markerless old directory is marked and retained,
-never deleted in the same pass. Only collector-daemon startup—not the hook
-installer command—may sweep a marker older than 24 hours (tunable with
-`MEMENTO_HOOK_RUNNER_RETENTION_HOURS`). The current/registered version and
-legacy-sidecar fallback state are never marked or swept.
+never deleted in the same pass. Sweeping is disabled unless
+`MEMENTO_HOOK_RUNNER_RETENTION_HOURS` is explicitly set to a finite positive
+value. This opt-in is required because Claude, Cursor, and Codex cache absolute
+hook commands for the life of a session, which may outlive a collector rollout.
+When enabled, only collector-daemon startup—not the hook installer command—may
+sweep a marker older than the configured interval. The current/registered
+version and legacy-sidecar fallback state are never marked or swept.
 
 For an aged, unregistered version, deletion is executable-gated: the first
 filesystem mutation is removal of `memento-hook-runner.exe`. Windows refuses
@@ -72,6 +75,10 @@ migrates the commands to the runner once its source is available.
    adds its managed `PostToolUse` and `Stop` entries only when enabled, and the
    generated command carries `--enabled`; a fleet rollout alone therefore
    cannot activate the governor.
+5. **Hook output is engine-specific.** Claude Code and Codex receive only their
+   strict camelCase/common JSON fields. Cursor receives its native snake_case
+   compatibility fields. Codex rejects unknown Stop and PostToolUse fields, so
+   the runner never sends Cursor-only fields to a Codex payload.
 
 ## Configuration
 
@@ -82,6 +89,7 @@ migrates the commands to the runner once its source is available.
 | `MEMENTO_GOVERNOR_HANDOFF_TOKENS` | `350000` | Second `PostToolUse` instruction to hand off immediately. |
 | `MEMENTO_GOVERNOR_BLOCK_TOKENS` | `400000` | `Stop` block threshold. |
 | `MEMENTO_GOVERNOR_HANDOFF_PATH` | `MEMENTO_HANDOFF.md` | Absolute path or path relative to the hook payload's project `cwd`. |
+| `MEMENTO_HOOK_RUNNER_RETENTION_HOURS` | unset (sweep off) | Enables deletion of retired versioned runner directories after this many hours. Must be finite and greater than zero. |
 
 Thresholds must be positive and ordered hygiene ≤ handoff ≤ block. Invalid
 configuration fails open. The generated command captures the explicit enable
@@ -126,6 +134,5 @@ decision; make threshold/path variables visible to the Claude Code process
 
 ## Verification
 
-- Focused governor/runner registration tests: `28 passed in 2.49s`.
-- Existing Claude pending-hook tests: `39 passed in 4.00s`.
-- Full collector suite: `355 passed, 2 skipped, 169 subtests passed in 36.69s`.
+See the release handoff for the exact collector, frozen-runner, and desktop
+build gates executed for the current version.
