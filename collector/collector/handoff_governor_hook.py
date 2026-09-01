@@ -1,4 +1,4 @@
-"""Fail-open Claude Code hooks that govern long-running session handoffs."""
+"""Fail-open cross-engine hooks that advise on long-running handoffs."""
 
 from __future__ import annotations
 
@@ -14,11 +14,9 @@ from typing import Any
 
 DEFAULT_HYGIENE_TOKENS = 200_000
 DEFAULT_HANDOFF_TOKENS = 350_000
-DEFAULT_BLOCK_TOKENS = 400_000
+DEFAULT_REMINDER_TOKENS = 400_000
 _TRANSCRIPT_TAIL_BYTES = 512 * 1024
-_HANDOFF_DOCUMENT_MAX_BYTES = 512 * 1024
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
-_SECTION_HEADING = re.compile(r"(?m)^#{1,6}[ \t]+.*$")
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
@@ -26,7 +24,7 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 class GovernorThresholds:
     hygiene: int
     handoff: int
-    block: int
+    reminder: int
 
 
 @dataclass(frozen=True)
@@ -40,7 +38,10 @@ class ContextUsage:
 def governor_enabled() -> bool:
     """Return whether the governor was explicitly enabled for this process."""
 
-    return os.environ.get("MEMENTO_GOVERNOR_ENABLED", "").strip().casefold() in _TRUE_VALUES
+    return (
+        os.environ.get("MEMENTO_GOVERNOR_ENABLED", "").strip().casefold()
+        in _TRUE_VALUES
+    )
 
 
 def _configured_positive_int(name: str, default: int) -> int:
@@ -53,17 +54,28 @@ def _configured_positive_int(name: str, default: int) -> int:
     return value
 
 
+def _configured_reminder_tokens(default: int) -> int:
+    """Read the advisory threshold, honoring the former block variable."""
+
+    if os.environ.get("MEMENTO_GOVERNOR_REMINDER_TOKENS", "").strip():
+        return _configured_positive_int(
+            "MEMENTO_GOVERNOR_REMINDER_TOKENS",
+            default,
+        )
+    return _configured_positive_int("MEMENTO_GOVERNOR_BLOCK_TOKENS", default)
+
+
 def _default_thresholds(context_window: int | None) -> GovernorThresholds:
     if context_window is None:
         return GovernorThresholds(
             hygiene=DEFAULT_HYGIENE_TOKENS,
             handoff=DEFAULT_HANDOFF_TOKENS,
-            block=DEFAULT_BLOCK_TOKENS,
+            reminder=DEFAULT_REMINDER_TOKENS,
         )
     return GovernorThresholds(
         hygiene=min(DEFAULT_HYGIENE_TOKENS, int(context_window * 0.75)),
-        handoff=min(DEFAULT_HANDOFF_TOKENS, int(context_window * 0.85)),
-        block=min(DEFAULT_BLOCK_TOKENS, int(context_window * 0.90)),
+        handoff=min(DEFAULT_HANDOFF_TOKENS, int(context_window * 0.90)),
+        reminder=min(DEFAULT_REMINDER_TOKENS, int(context_window * 0.95)),
     )
 
 
@@ -83,14 +95,11 @@ def configured_thresholds(
                 "MEMENTO_GOVERNOR_HANDOFF_TOKENS",
                 defaults.handoff,
             ),
-            block=_configured_positive_int(
-                "MEMENTO_GOVERNOR_BLOCK_TOKENS",
-                defaults.block,
-            ),
+            reminder=_configured_reminder_tokens(defaults.reminder),
         )
     except (TypeError, ValueError):
         return None
-    if not thresholds.hygiene <= thresholds.handoff <= thresholds.block:
+    if not thresholds.hygiene <= thresholds.handoff <= thresholds.reminder:
         return None
     return thresholds
 
@@ -335,7 +344,9 @@ def consume_threshold_latch(session_id: str, threshold: int) -> bool:
 
 
 def _event_name(payload: dict[str, Any]) -> str:
-    return str(payload.get("hook_event_name") or payload.get("hook_event") or "").casefold()
+    return str(
+        payload.get("hook_event_name") or payload.get("hook_event") or ""
+    ).casefold()
 
 
 def _session_id(payload: dict[str, Any]) -> str | None:
@@ -380,8 +391,24 @@ def _nudge_output(
         thresholds.handoff,
     ):
         messages.append(
-            "Author the milestone handoff NOW and spawn the successor "
-            "(spawn-prime-stop-resume), then print the cd-prefixed resume command."
+            "Context handoff advisory: complete the current operator request and "
+            "keep working unless the operator explicitly authorizes a handoff. "
+            "Prepare a durable checkpoint when practical, but do not stop, spawn "
+            "a successor, or treat silence or an instruction to continue as "
+            "handoff approval."
+        )
+    if tokens >= thresholds.reminder and consume_threshold_latch(
+        session_id,
+        thresholds.reminder,
+    ):
+        messages.append(
+            "Operator-controlled handoff reminder: now is a good time to hand "
+            "off. Continue executing the active task while awaiting an explicit "
+            "operator go-ahead. By default, include a brief handoff reminder in "
+            "every final response, even after the operator acknowledges it and "
+            "asks you to continue. An acknowledgment or silence is not consent "
+            "to hand off. If the operator asks to be reminded later, to stop "
+            "reminders, or not to be reminded at all, honor that preference."
         )
     if not messages:
         return None
@@ -396,88 +423,19 @@ def _nudge_output(
     }
 
 
-def _handoff_path(payload: dict[str, Any]) -> Path | None:
-    cwd = payload.get("cwd")
-    if not isinstance(cwd, str) or not cwd.strip():
-        return None
-    project = Path(cwd).expanduser()
-    configured = os.environ.get("MEMENTO_GOVERNOR_HANDOFF_PATH", "").strip()
-    if configured:
-        candidate = Path(configured).expanduser()
-        return candidate if candidate.is_absolute() else project / candidate
-    for directory in (project, *project.parents):
-        candidate = directory / "MEMENTO_HANDOFF.md"
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            return None
-    return project / "MEMENTO_HANDOFF.md"
-
-
-def _document_has_session_section(path: Path, session_id: str) -> bool | None:
-    try:
-        if not path.exists():
-            return False
-        if path.stat().st_size > _HANDOFF_DOCUMENT_MAX_BYTES:
-            return None
-        document = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    headings = list(_SECTION_HEADING.finditer(document))
-    if not headings:
-        return False
-    mention = re.compile(
-        rf"(?<![A-Za-z0-9._-]){re.escape(session_id)}(?![A-Za-z0-9._-])"
-    )
-    for index, heading in enumerate(headings):
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(document)
-        if mention.search(document[heading.start() : end]):
-            return True
-    return False
-
-
-def _stop_output(payload: dict[str, Any], session_id: str, tokens: int, thresholds: GovernorThresholds) -> dict[str, str] | None:
-    loop_count = payload.get("loop_count")
-    already_continued = payload.get("stop_hook_active") is True or (
-        isinstance(loop_count, int)
-        and not isinstance(loop_count, bool)
-        and loop_count > 0
-    )
-    if tokens < thresholds.block or already_continued:
-        return None
-    handoff_path = _handoff_path(payload)
-    if handoff_path is None:
-        return None
-    handoff_is_real = _document_has_session_section(handoff_path, session_id)
-    if handoff_is_real is not False:
-        return None
-    reason = (
-        "Write a handoff section naming this session_id, spawn the successor "
-        "(spawn-prime-stop-resume), and print the cd-prefixed resume command."
-    )
-    response = {
-        "decision": "block",
-        "reason": reason,
-    }
-    if _is_cursor_payload(payload):
-        response["followup_message"] = reason
-    return response
-
-
 def process_hook_payload(
     payload: object,
     *,
     force_enabled: bool = False,
 ) -> dict[str, Any] | None:
-    """Produce a Claude hook response, with every unusable input failing open."""
+    """Produce an advisory hook response, with unusable input failing open."""
 
     if not force_enabled and not governor_enabled():
         return None
     if not isinstance(payload, dict):
         return None
     event_name = _event_name(payload)
-    if event_name not in {"posttooluse", "stop"}:
+    if event_name != "posttooluse":
         return None
     session_id = _session_id(payload)
     if session_id is None:
@@ -488,9 +446,7 @@ def process_hook_payload(
     thresholds = configured_thresholds(usage.context_window)
     if thresholds is None:
         return None
-    if event_name == "posttooluse":
-        return _nudge_output(payload, session_id, usage.tokens, thresholds)
-    return _stop_output(payload, session_id, usage.tokens, thresholds)
+    return _nudge_output(payload, session_id, usage.tokens, thresholds)
 
 
 def _read_stdin_payload() -> object:
@@ -515,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception:  # noqa: BLE001, S110 -- a hook must never block work by crashing
         response = None
-    # Codex Stop hooks parse successful stdout as JSON, including neutral no-ops.
+    # All supported hook hosts accept neutral JSON for a fail-open no-op.
     print(
         json.dumps(
             response if response is not None else {},

@@ -4,8 +4,8 @@ Exercises the frozen hook runner's governor dispatch with synthetic data.
 
 .DESCRIPTION
 Creates temporary JSONL transcripts with deliberately non-real session data,
-then verifies the fail-open below-threshold path and the above-threshold Stop
-decision.  No user transcript or MEMENTO_HANDOFF.md is read.
+then verifies the fail-open below-threshold path and the above-threshold
+operator-controlled advisory. No user transcript is read.
 #>
 [CmdletBinding()]
 param(
@@ -50,9 +50,10 @@ $root = Join-Path (
 ) ("memento-hook-functional-" + [Guid]::NewGuid().ToString("N"))
 [System.IO.Directory]::CreateDirectory($root) | Out-Null
 try {
+    $sessionId = "synthetic-functional-" + [Guid]::NewGuid().ToString("N")
     $belowTranscript = Join-Path $root "below.jsonl"
     $aboveTranscript = Join-Path $root "above.jsonl"
-    $belowRecord = '{"type":"assistant","message":{"usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":9,"input_tokens":0}}}'
+    $belowRecord = '{"type":"assistant","message":{"usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":7,"input_tokens":0}}}'
     $aboveRecord = '{"type":"assistant","message":{"usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":10,"input_tokens":0}}}'
     [System.IO.File]::WriteAllText(
         $belowTranscript,
@@ -63,18 +64,18 @@ try {
         $aboveRecord + [Environment]::NewLine
     )
 
-    $env:MEMENTO_GOVERNOR_HYGIENE_TOKENS = "10"
-    $env:MEMENTO_GOVERNOR_HANDOFF_TOKENS = "10"
-    $env:MEMENTO_GOVERNOR_BLOCK_TOKENS = "10"
+    $env:MEMENTO_GOVERNOR_HYGIENE_TOKENS = "8"
+    $env:MEMENTO_GOVERNOR_HANDOFF_TOKENS = "9"
+    $env:MEMENTO_GOVERNOR_REMINDER_TOKENS = "10"
     $belowPayload = (@{
-        hook_event_name = "Stop"
-        session_id = "synthetic-functional-session-not-real"
+        hook_event_name = "PostToolUse"
+        session_id = $sessionId
         cwd = $root
         transcript_path = $belowTranscript
     } | ConvertTo-Json -Compress)
     $abovePayload = (@{
-        hook_event_name = "Stop"
-        session_id = "synthetic-functional-session-not-real"
+        hook_event_name = "PostToolUse"
+        session_id = $sessionId
         cwd = $root
         transcript_path = $aboveTranscript
     } | ConvertTo-Json -Compress)
@@ -88,13 +89,25 @@ try {
     if (-not $aboveOutput) {
         throw "Above-threshold governor payload produced no output: $($aboveResult | ConvertTo-Json -Compress)"
     }
+    $belowDecision = $belowOutput | ConvertFrom-Json
     $aboveDecision = $aboveOutput | ConvertFrom-Json
 
-    if ($belowOutput) {
+    if (@($belowDecision.PSObject.Properties).Count -ne 0) {
         throw "Below-threshold governor payload unexpectedly produced: $belowOutput"
     }
-    if ($aboveDecision.decision -ne "block") {
-        throw "Above-threshold governor payload did not block: $aboveOutput"
+    if (
+        $null -ne $aboveDecision.PSObject.Properties["decision"] -and
+        $aboveDecision.decision -eq "block"
+    ) {
+        throw "Above-threshold governor payload still blocks: $aboveOutput"
+    }
+    $context = $aboveDecision.hookSpecificOutput.additionalContext
+    if (
+        $context -notlike "*Operator-controlled handoff reminder*" -or
+        $context -notlike "*Continue executing the active task*" -or
+        $context -notlike "*every final response*"
+    ) {
+        throw "Above-threshold governor payload lacks advisory policy: $aboveOutput"
     }
     [pscustomobject]@{
         below_threshold_stdout = $belowOutput

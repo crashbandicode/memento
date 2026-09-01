@@ -50,8 +50,8 @@ _MEMENTO_HOOK_MARKERS = (
 )
 _GOVERNOR_HOOK_SPECS = {
     "PostToolUse": ("*",),
-    "Stop": ("*",),
 }
+_GOVERNOR_HOOK_EVENTS = ("PostToolUse", "Stop")
 _MEMENTO_GOVERNOR_HOOK_MARKERS = (
     "collector.handoff_governor_hook",
     " claude-governor-hook",
@@ -1599,8 +1599,14 @@ def install_claude_pending_hooks(
                 governor_command,
                 managed_hook=_is_memento_governor_hook,
             )
+        for event_name in set(_GOVERNOR_HOOK_EVENTS) - set(_GOVERNOR_HOOK_SPECS):
+            _remove_event_hooks(
+                hooks,
+                event_name,
+                managed_hook=_is_memento_governor_hook,
+            )
     else:
-        for event_name in _GOVERNOR_HOOK_SPECS:
+        for event_name in _GOVERNOR_HOOK_EVENTS:
             _remove_event_hooks(
                 hooks,
                 event_name,
@@ -1692,8 +1698,14 @@ def install_codex_governor_hooks(
                 governor_command,
                 managed_hook=_is_memento_governor_hook,
             )
+        for event_name in set(_GOVERNOR_HOOK_EVENTS) - set(_GOVERNOR_HOOK_SPECS):
+            _remove_event_hooks(
+                hooks,
+                event_name,
+                managed_hook=_is_memento_governor_hook,
+            )
     else:
-        for event_name in _GOVERNOR_HOOK_SPECS:
+        for event_name in _GOVERNOR_HOOK_EVENTS:
             _remove_event_hooks(
                 hooks,
                 event_name,
@@ -1701,6 +1713,115 @@ def install_codex_governor_hooks(
             )
     changed = before_hooks != json.dumps(
         hooks,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    if not changed:
+        if hook_runner is not None:
+            _maintain_hook_runner_versions(
+                hook_runner,
+                sweep_retired=sweep_retired,
+            )
+        return hooks_path, False
+
+    previous_mode = None
+    if hooks_path.exists():
+        previous_mode = stat.S_IMODE(hooks_path.stat().st_mode)
+    temporary = hooks_path.with_name(
+        f".{hooks_path.name}.{os.getpid()}.memento.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if previous_mode is not None:
+            temporary.chmod(previous_mode)
+        os.replace(temporary, hooks_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if hook_runner is not None:
+        _maintain_hook_runner_versions(
+            hook_runner,
+            sweep_retired=sweep_retired,
+        )
+    return hooks_path, True
+
+
+def _cursor_hooks_path() -> Path:
+    configured = os.environ.get("MEMENTO_CURSOR_HOOKS_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cursor" / "hooks.json"
+
+
+def _is_memento_cursor_governor_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = str(hook.get("command") or "")
+    return any(marker in command for marker in _MEMENTO_GOVERNOR_HOOK_MARKERS)
+
+
+def _remove_cursor_governor_hooks(hooks: dict[str, Any], event_name: str) -> None:
+    entries = hooks.get(event_name)
+    if entries is None:
+        return
+    if not isinstance(entries, list):
+        raise TypeError(f"Cursor hooks {event_name} must be an array")
+    retained = [
+        entry for entry in entries if not _is_memento_cursor_governor_hook(entry)
+    ]
+    if retained:
+        hooks[event_name] = retained
+    else:
+        hooks.pop(event_name, None)
+
+
+def install_cursor_governor_hooks(
+    *,
+    sweep_retired: bool = False,
+) -> tuple[Path, bool]:
+    """Install the native Cursor advisory without relying on Claude import."""
+
+    hooks_path = _cursor_hooks_path()
+    if not hooks_path.parent.is_dir():
+        return hooks_path, False
+    settings = _read_mapping(hooks_path) if hooks_path.exists() else {}
+    if hooks_path.exists() and not settings:
+        try:
+            decoded = json.loads(hooks_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot merge invalid JSON in {hooks_path}") from exc
+        if not isinstance(decoded, dict):
+            raise TypeError(f"Cannot merge non-object settings in {hooks_path}")
+        settings = decoded
+    version = settings.setdefault("version", 1)
+    if version != 1:
+        raise ValueError(f"Unsupported Cursor hooks version in {hooks_path}: {version}")
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise TypeError("Cursor hooks must be an object")
+
+    before = json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str)
+    hook_runner = _install_hook_runner() if governor_enabled() else None
+    _remove_cursor_governor_hooks(hooks, "postToolUse")
+    _remove_cursor_governor_hooks(hooks, "stop")
+    if governor_enabled():
+        entries = hooks.setdefault("postToolUse", [])
+        if not isinstance(entries, list):
+            raise TypeError("Cursor hooks postToolUse must be an array")
+        entries.append(
+            {
+                "command": _governor_hook_command(
+                    hook_runner,
+                    codex_windows=os.name == "nt",
+                )
+            }
+        )
+
+    changed = before != json.dumps(
+        settings,
         ensure_ascii=False,
         sort_keys=True,
         default=str,

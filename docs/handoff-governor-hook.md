@@ -1,19 +1,19 @@
-# Claude Code handoff governor hook
+# Cross-engine handoff advisory hook
 
 ## Purpose
 
-Long autonomous Claude Code orchestrator sessions need a durable handoff before
-their prompt prefix consumes the context window. The governor is a managed,
-inert-by-default pair of Claude Code hooks that provides a staged nudge and a
-last-resort Stop guard.
+Long autonomous Claude, Codex, and Cursor orchestrator sessions benefit from a
+durable handoff before their prompt prefix consumes the context window. The
+governor is an inert-by-default managed `PostToolUse` advisory. It never blocks
+work or initiates a handoff without the operator's explicit approval.
 
 ## Hook execution and latency
 
-On Windows collector 0.0.59, managed hook registrations invoke the
+On Windows collector 0.0.60, managed hook registrations invoke the
 dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
 It is a small PyInstaller **onedir** bundle, copied on collector startup from
 the desktop application's packaged resource to a versioned directory such as
-`%LOCALAPPDATA%\Memento\hooks\0.0.59\`. Its `_internal` directory stays beside
+`%LOCALAPPDATA%\Memento\hooks\0.0.60\`. Its `_internal` directory stays beside
 the executable, so a hook process does not unpack a 40 MB onefile bundle into a
 new `_MEI*` temp directory for every Claude event.
 
@@ -42,7 +42,7 @@ because the executable is already gone and the retired version can never launch
 again. The daemon/`run` sidecar remains the existing onefile artifact.
 
 Codex's native Windows hook host launches command strings through `cmd.exe`.
-Collector 0.0.59 therefore emits an unquoted leading executable token for a
+Collector 0.0.60 therefore emits an unquoted leading executable token for a
 Codex registration when the resolved runner path contains neither whitespace
 nor command-shell metacharacters. This avoids Codex 0.152's exit-1 failure on
 otherwise valid commands beginning with a quoted executable path. Claude Code
@@ -69,15 +69,17 @@ migrates the commands to the runner once its source is available.
    `message.usage.cache_creation_input_tokens`, and
    `message.usage.input_tokens`. It never uses `cache_read_input_tokens` alone:
    a cold turn can legitimately report zero reads.
-2. **Nudges latch once per session and threshold.** The `PostToolUse` `*` hook
+2. **Stages latch once per session and threshold.** The `PostToolUse` `*` hook
    records delivered thresholds in `~/.memento/governor/<session_id>.json`.
-   This prevents an over-threshold session from receiving the same context on
-   every tool call.
-3. **Stop blocks only when the handoff is not real.** At the block threshold,
-   the `Stop` hook returns `decision: "block"` only if the configured handoff
-   document has no Markdown section mentioning the current `session_id`. It
-   never blocks when stdin has `stop_hook_active: true`, preventing a Stop-hook
-   loop. There is deliberately no `PreToolUse` denial gate.
+   This prevents duplicate developer context on every tool call. At the former
+   cutoff stage, the injected policy tells the agent to add a short handoff
+   recommendation to each final response until the operator approves,
+   snoozes, or disables reminders.
+3. **The operator owns the decision.** There is no managed `Stop` hook and no
+   blocking response. The agent keeps executing the active request. Silence,
+   acknowledgment, or an instruction to continue is not handoff approval; an
+   explicit operator go-ahead in response to the recommendation is required.
+   Requests to remind later or not at all are honored.
 4. **Activation is explicit.** The governor is off by default. The collector
    adds its managed `PostToolUse` and `Stop` entries only when enabled, and the
    generated command carries `--enabled`; a fleet rollout alone therefore
@@ -86,6 +88,11 @@ migrates the commands to the runner once its source is available.
    strict camelCase/common JSON fields. Cursor receives its native snake_case
    compatibility fields. Codex rejects unknown Stop and PostToolUse fields, so
    the runner never sends Cursor-only fields to a Codex payload.
+6. **Cursor is registered natively.** The collector merges one managed
+   `postToolUse` entry into `~/.cursor/hooks.json`, preserving user entries and
+   removing any obsolete managed `stop` entry. This does not depend on Cursor's
+   optional Claude-configuration import; if that import is also active, shared
+   session latches prevent duplicate advisory context.
 
 ## Configuration
 
@@ -94,37 +101,29 @@ migrates the commands to the runner once its source is available.
 | `MEMENTO_GOVERNOR_ENABLED` | off | Enables managed governor-hook registration when the collector reconciles Claude settings. Truthy values: `1`, `true`, `yes`, `on`. |
 | `MEMENTO_GOVERNOR_HYGIENE_TOKENS` | `200000` | First `PostToolUse` context-hygiene nudge. |
 | `MEMENTO_GOVERNOR_HANDOFF_TOKENS` | `350000` | Second `PostToolUse` instruction to hand off immediately. |
-| `MEMENTO_GOVERNOR_BLOCK_TOKENS` | `400000` | `Stop` block threshold. |
-| `MEMENTO_GOVERNOR_HANDOFF_PATH` | `MEMENTO_HANDOFF.md` | Absolute path or path relative to the hook payload's project `cwd`. |
+| `MEMENTO_GOVERNOR_REMINDER_TOKENS` | `400000` | Activates the recurring, operator-controlled recommendation policy. |
+| `MEMENTO_GOVERNOR_BLOCK_TOKENS` | compatibility alias | Former cutoff variable; treated as the reminder threshold when the new variable is unset. It never blocks. |
 | `MEMENTO_HOOK_RUNNER_RETENTION_HOURS` | unset (sweep off) | Enables deletion of retired versioned runner directories after this many hours. Must be finite and greater than zero. |
 
-Thresholds must be positive and ordered hygiene ≤ handoff ≤ block. Invalid
-configuration fails open. The generated command captures the explicit enable
-decision; make threshold/path variables visible to the Claude Code process
-(restart it after changing persistent environment variables).
+Thresholds must be positive and ordered hygiene ≤ handoff ≤ reminder. Invalid
+configuration fails open. When the engine reports its context-window size and
+the corresponding variable is not explicitly configured, the effective
+hygiene/handoff/reminder defaults are capped at 75%/90%/95% of that window.
+The handoff nudge tells the agent to continue the operator's current request;
+the former cutoff becomes recurring advice rather than a veto. The generated
+command captures the explicit enable decision; make threshold variables
+visible to the agent process (restart it after changing persistent environment
+variables).
 
 ## Activation procedure
 
 1. Set `MEMENTO_GOVERNOR_ENABLED=1` in the environment used to start the
    collector and restart the collector so its ordinary managed-hook reconcile
-   writes the two governor entries into `~/.claude/settings.json`.
+   writes the advisory into `~/.claude/settings.json`, `~/.codex/hooks.json`,
+   and `~/.cursor/hooks.json`.
 2. Optionally set the threshold and handoff-path variables above for the
    Claude Code process, then restart Claude Code.
-3. Confirm the project handoff document has a Markdown **section heading**
-   that names the active session id, for example
-   `## Current session 9d9aca8e-427c-480a-a648-f9ab2e13a29e`. The production
-   `memento-run-4` validation on 2026-08-29 found that a body-text mention did
-   not satisfy Stop verification; use the heading form rather than relying on
-   a prose mention. The Stop guard accepts neither mere file existence nor a
-   section for another session.
-
-   The current source matcher identifies headings and searches the text through
-   the next heading, so it also recognizes an exact, delimiter-bounded id in a
-   heading's body. That is broader than the production observation above; no
-   governor logic changed in 0.0.55, and heading placement is the durable
-   operational contract until that environment discrepancy is independently
-   resolved.
-4. To deactivate, remove or set `MEMENTO_GOVERNOR_ENABLED` false and restart
+3. To deactivate, remove or set `MEMENTO_GOVERNOR_ENABLED` false and restart
    the collector. Its next reconcile removes only its own governor entries;
    existing Memento pending-question hooks and user hooks remain intact.
 
@@ -136,8 +135,8 @@ decision; make threshold/path variables visible to the Claude Code process
 - No server/API behavior, queue behavior, or transcript contents are changed.
 - No whole-transcript read occurs: unreadable, malformed, missing-usage, or
   missing-transcript input exits successfully with no hook output.
-- No `PreToolUse` enforcement is installed. Emergency work can continue until
-  the guarded Stop point.
+- No `PreToolUse` or `Stop` enforcement is installed. Context pressure cannot
+  stop a response or force a successor without operator authorization.
 
 ## Verification
 

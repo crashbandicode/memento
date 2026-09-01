@@ -19,6 +19,7 @@ from .canvas_sync import sync_pending_canvases
 from .claude_pending_hook import (
     install_claude_pending_hooks,
     install_codex_governor_hooks,
+    install_cursor_governor_hooks,
 )
 from .claude_pending_questions import (
     ClaudePendingPoller,
@@ -788,6 +789,14 @@ def main() -> None:
             logger.info("Installed Codex governor hooks in %s", codex_hooks)
     except (OSError, TypeError, ValueError) as exc:
         logger.warning("Could not install Codex governor hooks: %s", exc)
+    try:
+        cursor_hooks, cursor_hooks_changed = install_cursor_governor_hooks(
+            sweep_retired=True
+        )
+        if cursor_hooks_changed:
+            logger.info("Installed Cursor governor hooks in %s", cursor_hooks)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Could not install Cursor governor hooks: %s", exc)
 
     # Initialize tools
     claude_tool = ClaudeCodeTool()
