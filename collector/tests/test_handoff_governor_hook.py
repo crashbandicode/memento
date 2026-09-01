@@ -467,6 +467,37 @@ def test_registration_adds_governor_only_when_enabled(
     assert "Stop" not in settings["hooks"]
 
 
+@pytest.mark.parametrize(
+    ("executable", "codex_windows", "expected"),
+    [
+        (
+            r"C:\Users\intpa\AppData\Local\Memento\hooks\0.0.59\memento-hook-runner.exe",
+            True,
+            r"C:\Users\intpa\AppData\Local\Memento\hooks\0.0.59\memento-hook-runner.exe",
+        ),
+        (
+            r"C:\Users\Example User\memento-hook-runner.exe",
+            True,
+            r'"C:\Users\Example User\memento-hook-runner.exe"',
+        ),
+        (
+            r"C:\Users\intpa\memento-hook-runner.exe",
+            False,
+            r'"C:\Users\intpa\memento-hook-runner.exe"',
+        ),
+    ],
+)
+def test_hook_executable_token_avoids_unnecessary_codex_windows_quotes(
+    executable: str,
+    codex_windows: bool,
+    expected: str,
+) -> None:
+    assert pending_hook._hook_executable_token(
+        executable,
+        codex_windows=codex_windows,
+    ) == expected
+
+
 def test_codex_registration_preserves_user_hooks_and_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -513,6 +544,14 @@ def test_codex_registration_preserves_user_hooks_and_is_idempotent(
     ]
     assert len(post_commands) == 1
     assert str(runner.resolve()) in post_commands[0]
+    if os.name == "nt":
+        assert post_commands[0].startswith(str(runner.resolve()))
+        managed_commands = [
+            command
+            for command in stop_commands
+            if "claude-governor-hook --enabled" in command
+        ]
+        assert managed_commands[0].startswith(str(runner.resolve()))
 
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
     _removed_path, removed = pending_hook.install_codex_governor_hooks()
@@ -581,7 +620,7 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
         local_app_data
         / "Memento"
         / "hooks"
-        / "0.0.58"
+        / "0.0.59"
         / "memento-hook-runner.exe"
     )
     assert changed is True
@@ -745,7 +784,7 @@ def test_runner_install_lost_windows_rename_race_uses_winner(
     source = tmp_path / "source" / "memento-hook-runner"
     _write_complete_runner(source)
     local_app_data = tmp_path / "local-app-data"
-    destination = local_app_data / "Memento" / "hooks" / "0.0.58"
+    destination = local_app_data / "Memento" / "hooks" / "0.0.59"
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)

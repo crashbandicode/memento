@@ -9,11 +9,11 @@ last-resort Stop guard.
 
 ## Hook execution and latency
 
-On Windows collector 0.0.58, managed hook registrations invoke the
+On Windows collector 0.0.59, managed hook registrations invoke the
 dedicated `memento-hook-runner.exe`, not the large onefile collector sidecar.
 It is a small PyInstaller **onedir** bundle, copied on collector startup from
 the desktop application's packaged resource to a versioned directory such as
-`%LOCALAPPDATA%\Memento\hooks\0.0.58\`. Its `_internal` directory stays beside
+`%LOCALAPPDATA%\Memento\hooks\0.0.59\`. Its `_internal` directory stays beside
 the executable, so a hook process does not unpack a 40 MB onefile bundle into a
 new `_MEI*` temp directory for every Claude event.
 
@@ -40,6 +40,13 @@ unchanged for a later daemon start. Only after that executable removal succeeds
 may the remaining directory be removed; a residual cleanup failure is harmless
 because the executable is already gone and the retired version can never launch
 again. The daemon/`run` sidecar remains the existing onefile artifact.
+
+Codex's native Windows hook host launches command strings through `cmd.exe`.
+Collector 0.0.59 therefore emits an unquoted leading executable token for a
+Codex registration when the resolved runner path contains neither whitespace
+nor command-shell metacharacters. This avoids Codex 0.152's exit-1 failure on
+otherwise valid commands beginning with a quoted executable path. Claude Code
+registrations retain their existing quoting, and unsafe paths remain quoted.
 
 On Windows, the packaged source is discovered first at Tauri's resource layout
 next to the frozen sidecar:

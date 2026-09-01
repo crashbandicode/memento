@@ -60,6 +60,7 @@ _HOOK_TIMEOUT_SECONDS = 10
 _HOOK_RUNNER_NAME = "memento-hook-runner"
 _HOOK_RUNNER_RETIREMENT_MARKER = "retired-at.json"
 _HOOK_RUNNER_RETENTION_HOURS_ENV = "MEMENTO_HOOK_RUNNER_RETENTION_HOURS"
+_WINDOWS_COMMAND_METACHARACTERS = frozenset('"&|<>^()%!')
 
 
 def _pending_directory() -> Path:
@@ -1416,14 +1417,43 @@ def _hook_command(hook_runner: Path | None = None) -> str:
     return f'"{executable}" -m collector.claude_pending_hook'
 
 
-def _governor_hook_command(hook_runner: Path | None = None) -> str:
+def _hook_executable_token(executable: str, *, codex_windows: bool) -> str:
+    """Format one executable token for the hook host's command shell.
+
+    Codex 0.152 invokes Windows command hooks through ``cmd.exe`` and exits 1
+    when a command string begins with a quoted executable token, even when the
+    executable path itself contains no whitespace. Prefer the safe unquoted
+    form for that exact host; retain quoting for Claude and for paths that need
+    shell protection.
+    """
+
+    if codex_windows and not any(
+        character.isspace() or character in _WINDOWS_COMMAND_METACHARACTERS
+        for character in executable
+    ):
+        return executable
+    escaped = executable.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _governor_hook_command(
+    hook_runner: Path | None = None,
+    *,
+    codex_windows: bool = False,
+) -> str:
     if hook_runner is not None:
-        executable = str(hook_runner.resolve()).replace('"', '\\"')
-        return f'"{executable}" claude-governor-hook --enabled'
-    executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
+        executable = _hook_executable_token(
+            str(hook_runner.resolve()),
+            codex_windows=codex_windows,
+        )
+        return f"{executable} claude-governor-hook --enabled"
+    executable = _hook_executable_token(
+        str(Path(sys.executable).resolve()),
+        codex_windows=codex_windows,
+    )
     if getattr(sys, "frozen", False):
-        return f'"{executable}" claude-governor-hook --enabled'
-    return f'"{executable}" -m collector.handoff_governor_hook --enabled'
+        return f"{executable} claude-governor-hook --enabled"
+    return f"{executable} -m collector.handoff_governor_hook --enabled"
 
 
 def _is_memento_hook(hook: object) -> bool:
@@ -1650,7 +1680,10 @@ def install_codex_governor_hooks(
     )
     hook_runner = _install_hook_runner() if governor_enabled() else None
     if governor_enabled():
-        governor_command = _governor_hook_command(hook_runner)
+        governor_command = _governor_hook_command(
+            hook_runner,
+            codex_windows=os.name == "nt",
+        )
         for event_name, matchers in _GOVERNOR_HOOK_SPECS.items():
             _merge_event_hooks(
                 hooks,
