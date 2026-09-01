@@ -267,6 +267,7 @@ test.describe("smart conversation links", () => {
       hasTouch: true,
       userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
     });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     const page = await context.newPage();
     const base = smartLinkScenarios[0];
     const longLine = "$ExportedNamespace = 'hwinf-cisd-lsf-data-api-fastapi-production-with-a-deliberately-long-mobile-value'";
@@ -320,21 +321,84 @@ test.describe("smart conversation links", () => {
     await expect(pre.locator("code")).toContainText(longLine);
     await expect(page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).resolves.toBe(true);
 
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
+      const clipboard = navigator.clipboard;
+      await clipboard.writeText("SAFE_CLIPBOARD_SENTINEL");
+      const readText = clipboard.readText.bind(clipboard);
       Object.defineProperty(navigator, "clipboard", {
         configurable: true,
-        value: { writeText: async () => undefined },
+        value: {
+          readText,
+          writeText: async () => {
+            throw new DOMException("Mobile clipboard permission denied", "NotAllowedError");
+          },
+        },
       });
     });
     await copy.tap();
-    await expect(copy).toHaveAttribute("data-copy-status", "copied");
+    await expect(copy).toHaveAttribute("data-copy-status", "selected");
+    await expect(codeBlock.getByTestId("code-block-copy-notice")).toContainText("selected");
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(longLine);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("SAFE_CLIPBOARD_SENTINEL");
     await expect.poll(() => copy.evaluate(
       (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
     )).toBeGreaterThanOrEqual(0.95);
-    await expect(copy).toHaveAttribute("data-copy-status", "idle", { timeout: 3_000 });
+    await expect(copy).toHaveAttribute("data-copy-status", "idle", { timeout: 6_000 });
     await expect.poll(() => copy.evaluate(
       (element) => Number.parseFloat(window.getComputedStyle(element).opacity),
     )).toBeLessThanOrEqual(0.55);
+    await context.close();
+  });
+
+  test("clipboard security interception selects mobile code without bypassing the block", async ({ browser }) => {
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 Chrome/138 Mobile Safari/537.36",
+    });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const page = await context.newPage();
+    const base = smartLinkScenarios[0];
+    const resumeCommand = "Set-Location -LiteralPath 'C:\\work'; codex resume '01a0579d-54fc-75d3-8cfe-cc91efdd3e64'";
+    const scenario = {
+      ...base,
+      docId: `${base.docId}-clipboard-intercepted`,
+      meta: { ...base.meta, id: `${base.meta.id}-clipboard-intercepted` },
+      messages: base.messages.map((message) => message.id === 2
+        ? {
+            ...message,
+            content: message.content
+              .replace("```python", "```powershell")
+              .replace("run_refresh_active_via_bjobs()", resumeCommand),
+          }
+        : message),
+    };
+
+    await openConversation(page, scenario);
+    await page.getByTestId("message-expand-toggle").click();
+    const codeBlock = page.getByTestId("markdown-code-block");
+    const copy = codeBlock.getByTestId("code-block-copy");
+
+    await page.evaluate(async () => {
+      const clipboard = navigator.clipboard;
+      await clipboard.writeText("SAFE_CLIPBOARD_SENTINEL");
+      const readText = clipboard.readText.bind(clipboard);
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          readText,
+          // uBlock Origin's prevent-clipboard-write scriptlet returns without
+          // invoking the native method when it blocks a ClickFix-like command.
+          writeText: () => undefined,
+        },
+      });
+    });
+
+    await copy.tap();
+    await expect(copy).toHaveAttribute("data-copy-status", "selected");
+    await expect(codeBlock.getByTestId("code-block-copy-notice")).toContainText("selected");
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(resumeCommand);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("SAFE_CLIPBOARD_SENTINEL");
     await context.close();
   });
 

@@ -456,6 +456,8 @@ const enUS: Translations = {
   common: {
     copy: "Copy",
     copied: "Copied",
+    copyFailed: "Copy failed",
+    copySelected: "Copy was blocked. Text selected — use your browser's Copy action.",
     reveal: "Show",
     hide: "Hide",
     cancel: "Cancel",

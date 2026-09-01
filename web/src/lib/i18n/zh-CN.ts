@@ -464,6 +464,8 @@ const zhCN = {
   common: {
     copy: "复制",
     copied: "已复制",
+    copyFailed: "复制失败",
+    copySelected: "复制被拦截。文本已选中，请使用浏览器的复制操作。",
     reveal: "显示",
     hide: "隐藏",
     cancel: "取消",

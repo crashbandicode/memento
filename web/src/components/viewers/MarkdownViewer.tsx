@@ -43,9 +43,28 @@ function mermaidSource(children: ReactNode): string | null {
   return nodeText(child.props.children).replace(/\n$/, "");
 }
 
-function CodeCopyButton({ source }: { source: string }) {
+type CodeCopyStatus = "idle" | "copied" | "selected" | "error";
+
+function selectNodeText(node: HTMLElement | null): boolean {
+  if (!node) return false;
+  const selection = window.getSelection();
+  if (!selection) return false;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return selection.toString().length > 0;
+}
+
+function CodeCopyButton({
+  source,
+  onSelect,
+}: {
+  source: string;
+  onSelect: () => boolean;
+}) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState<CodeCopyStatus>("idle");
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => () => {
@@ -53,41 +72,65 @@ function CodeCopyButton({ source }: { source: string }) {
   }, []);
 
   const handleCopy = async () => {
+    if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
     try {
       await copyText(source);
-      setCopied(true);
-      if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
+      setStatus("copied");
       feedbackTimer.current = setTimeout(() => {
         feedbackTimer.current = null;
-        setCopied(false);
+        setStatus("idle");
       }, 1600);
     } catch {
-      // Do not claim success when the Clipboard API and its fallback both fail.
-      if (feedbackTimer.current !== null) clearTimeout(feedbackTimer.current);
-      feedbackTimer.current = null;
-      setCopied(false);
+      const selected = onSelect();
+      setStatus(selected ? "selected" : "error");
+      feedbackTimer.current = setTimeout(() => {
+        feedbackTimer.current = null;
+        setStatus("idle");
+      }, selected ? 5000 : 2400);
     }
   };
 
-  const label = copied ? t.common.copied : t.common.copy;
+  const label = status === "copied"
+    ? t.common.copied
+    : status === "selected"
+      ? t.common.copySelected
+      : status === "error"
+        ? t.common.copyFailed
+        : t.common.copy;
 
   return (
-    <button
-      type="button"
-      className={styles.copyButton}
-      data-testid="code-block-copy"
-      data-copy-status={copied ? "copied" : "idle"}
-      aria-label={label}
-      title={label}
-      onClick={() => { void handleCopy(); }}
-    >
-      <Icon name={copied ? "check" : "copy"} size={15} aria-hidden="true" />
-      <span className={styles.copyLabel} aria-live="polite" aria-atomic="true">{label}</span>
-    </button>
+    <>
+      <button
+        type="button"
+        className={styles.copyButton}
+        data-testid="code-block-copy"
+        data-copy-status={status}
+        aria-label={label}
+        title={label}
+        onClick={() => { void handleCopy(); }}
+      >
+        <Icon
+          name={status === "copied" ? "check" : status === "selected" ? "code" : status === "error" ? "close" : "copy"}
+          size={15}
+          aria-hidden="true"
+        />
+        <span className={styles.copyLabel} aria-live="polite" aria-atomic="true">{label}</span>
+      </button>
+      {(status === "selected" || status === "error") && (
+        <span
+          className={styles.copyNotice}
+          data-testid="code-block-copy-notice"
+          role="status"
+        >
+          {label}
+        </span>
+      )}
+    </>
   );
 }
 
 function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
+  const preRef = useRef<HTMLPreElement>(null);
   const source = mermaidSource(children);
   if (source !== null) return <MermaidDiagram source={source} />;
 
@@ -98,8 +141,8 @@ function CodeBlock({ children, ...props }: ComponentPropsWithoutRef<"pre">) {
 
   return (
     <div className={styles.codeBlock} data-testid="markdown-code-block">
-      <pre {...props}>{children}</pre>
-      <CodeCopyButton source={copySource} />
+      <pre ref={preRef} {...props}>{children}</pre>
+      <CodeCopyButton source={copySource} onSelect={() => selectNodeText(preRef.current)} />
     </div>
   );
 }
