@@ -43,7 +43,9 @@ class _Db:
 
 
 @pytest.mark.asyncio
-async def test_direct_cycle_counts_unattributed_event_without_message_activity() -> None:
+async def test_direct_cycle_counts_unattributed_event_without_message_activity() -> (
+    None
+):
     document_id = uuid.uuid4()
     db = _Db(
         [
@@ -97,3 +99,54 @@ async def test_direct_details_prefers_native_last_activity_metadata() -> None:
     )
 
     assert payload["last_activity_at"] == native_last
+
+
+@pytest.mark.asyncio
+async def test_direct_cycle_threads_include_hierarchy_metadata() -> None:
+    document_id = uuid.uuid4()
+    activity = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
+    db = _Db(
+        [
+            [SimpleNamespace(id=document_id, tool_id="codex")],
+            [
+                SimpleNamespace(
+                    document_id=document_id,
+                    attribution_status="attributed",
+                )
+            ],
+            [],
+            [],
+            [
+                SimpleNamespace(
+                    id=document_id,
+                    tool_id="codex",
+                    title="Review current draft",
+                    relative_path="sessions/native-child.jsonl",
+                    metadata={
+                        "session_id": "native-child",
+                        "root_session_id": "native-root",
+                        "parent_thread_id": "native-root",
+                        "thread_source": "subagent",
+                    },
+                    activity_at=activity,
+                    delivery_activity_at=activity,
+                )
+            ],
+            [],
+        ]
+    )
+
+    payload = await aggregate_usage_cycle(
+        db,
+        since=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        until=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        tool="all",
+        include_threads=True,
+    )
+
+    thread = payload["threads"][0]
+    assert thread["is_subagent"] is True
+    assert thread["thread_source"] == "subagent"
+    assert thread["parent_thread_id"] == "native-root"
+    assert thread["orchestration"] is None
+    assert thread["orchestration_parent_document_id"] is None

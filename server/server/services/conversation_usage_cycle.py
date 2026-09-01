@@ -16,7 +16,10 @@ from ..db.models import (
     Document,
     DocumentDeliveryState,
 )
-from .conversation_hierarchy import conversation_display_title
+from .conversation_hierarchy import (
+    conversation_display_title,
+    is_conversation_subagent,
+)
 from .conversation_identity import conversation_native_id
 from .conversation_usage import (
     LAST_ACTIVITY_AT_METADATA_KEY,
@@ -64,6 +67,19 @@ def _usage_from_row(row) -> dict[str, object]:
     return normalize_token_usage(
         {key: int(getattr(row, key, 0) or 0) for key in _USAGE_COLUMNS}
     )
+
+
+def _metadata_text(
+    metadata: dict[str, object],
+    key: str,
+    *,
+    max_length: int = 512,
+) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:max_length] or None
 
 
 async def conversation_usage_models(
@@ -156,9 +172,7 @@ async def aggregate_usage_cycle(
     ).all()
     event_document_ids = {row.document_id for row in event_rows}
     attributed_docs = {
-        row.document_id
-        for row in event_rows
-        if row.attribution_status == "attributed"
+        row.document_id for row in event_rows if row.attribution_status == "attributed"
     }
     missing_model_docs = {
         row.document_id
@@ -171,9 +185,7 @@ async def aggregate_usage_cycle(
         if row.attribution_status == "counter_reset"
     }
 
-    missing_timestamp_query = select(
-        ConversationUsageEvent.document_id
-    ).where(
+    missing_timestamp_query = select(ConversationUsageEvent.document_id).where(
         ConversationUsageEvent.occurred_at.is_(None),
         ConversationUsageEvent.attribution_status == "missing_timestamp",
     )
@@ -334,9 +346,7 @@ async def aggregate_usage_cycle(
     threads = []
     for row in document_rows:
         metadata = row.metadata or {}
-        persisted_last_activity = str(
-            metadata.get(LAST_ACTIVITY_AT_METADATA_KEY) or ""
-        )
+        persisted_last_activity = str(metadata.get(LAST_ACTIVITY_AT_METADATA_KEY) or "")
         fallback_last_candidates = (row.delivery_activity_at, row.activity_at)
         fallback_last_activity = max(
             (value for value in fallback_last_candidates if value is not None),
@@ -367,9 +377,31 @@ async def aggregate_usage_cycle(
                     metadata,
                     row.title,
                 ),
+                "orchestration": _metadata_text(
+                    metadata,
+                    "orchestration",
+                    max_length=64,
+                ),
+                "orchestration_parent_document_id": _metadata_text(
+                    metadata,
+                    "orchestration_parent_document_id",
+                ),
+                "is_subagent": is_conversation_subagent(
+                    row.tool_id,
+                    row.relative_path,
+                    metadata,
+                ),
+                "thread_source": _metadata_text(
+                    metadata,
+                    "thread_source",
+                    max_length=64,
+                ),
+                "parent_thread_id": _metadata_text(
+                    metadata,
+                    "parent_thread_id",
+                ),
                 "started_at": (
-                    str(metadata.get(STARTED_AT_METADATA_KEY) or "")
-                    or None
+                    str(metadata.get(STARTED_AT_METADATA_KEY) or "") or None
                 ),
                 "last_activity_at": (
                     persisted_last_activity

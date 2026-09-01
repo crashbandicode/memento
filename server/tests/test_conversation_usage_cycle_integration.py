@@ -89,6 +89,15 @@ async def test_real_postgres_cycle_groups_models_and_returns_threads(
             ]
         )
         for index, tool_id in enumerate(("codex", "claude_code", "cursor")):
+            session_metadata = {"session_id": str(uuid4())}
+            if tool_id == "codex":
+                session_metadata.update(
+                    {
+                        "root_session_id": "native-root",
+                        "parent_thread_id": "native-root",
+                        "thread_source": "subagent",
+                    }
+                )
             document = Document(
                 id=uuid4(),
                 tool_id=tool_id,
@@ -99,7 +108,7 @@ async def test_real_postgres_cycle_groups_models_and_returns_threads(
                 title=f"{tool_id} usage",
                 content_hash=str(uuid4()).replace("-", ""),
                 file_size_bytes=1,
-                metadata_={"session_id": str(uuid4())},
+                metadata_=session_metadata,
                 activity_at=started,
             )
             session.add(document)
@@ -188,6 +197,10 @@ async def test_real_postgres_cycle_groups_models_and_returns_threads(
         row["last_activity_at"] == last_activity.isoformat()
         for row in payload["threads"]
     )
+    codex_thread = next(row for row in payload["threads"] if row["tool"] == "codex")
+    assert codex_thread["is_subagent"] is True
+    assert codex_thread["thread_source"] == "subagent"
+    assert codex_thread["parent_thread_id"] == "native-root"
 
 
 @requires_postgres

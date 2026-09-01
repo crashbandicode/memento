@@ -45,9 +45,12 @@ treated as no fallback. Remote mode does not need these variables.
 raw native token counts for a half-open ISO-8601 time range. Results are grouped
 by model and reasoning effort and keep Claude cache reads and writes separate.
 Set `include_threads=true` to include document/native IDs, titles, activity
-bounds, per-thread model selections, and their token totals. Cursor usage stays
-explicitly unattributed because Cursor does not currently expose exact native
-token accounting.
+bounds, per-thread model selections, token totals, and authoritative hierarchy
+classification (`is_subagent`, `thread_source`, `parent_thread_id`,
+`orchestration`, and `orchestration_parent_document_id`). Consumers should use
+those fields instead of inferring agent/delegate identity from a title. Cursor
+usage stays explicitly unattributed because Cursor does not currently expose
+exact native token accounting.
 
 `memory_conversation_info(document_id)` returns the same lifetime token/model
 metadata for one thread. These tools deliberately do not calculate prices or

@@ -81,8 +81,8 @@ def normalize_usage(value: object) -> dict[str, int]:
     if not usage.get("input_tokens") and not usage.get("output_tokens"):
         return {}
     if not usage.get("total_tokens"):
-        usage["total_tokens"] = (
-            usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get(
+            "output_tokens", 0
         )
     for public_name, stored_name in (
         ("input_uncached", "uncached_input_tokens"),
@@ -98,10 +98,7 @@ def _add_usage(current: object, addition: object) -> dict[str, int]:
     left = normalize_usage(current)
     right = normalize_usage(addition)
     return normalize_usage(
-        {
-            key: left.get(key, 0) + right.get(key, 0)
-            for key in _COUNT_FIELDS
-        }
+        {key: left.get(key, 0) + right.get(key, 0) for key in _COUNT_FIELDS}
     )
 
 
@@ -130,6 +127,50 @@ def _native_id(metadata: object) -> str | None:
     return str(value) if value else None
 
 
+def _metadata_text(
+    metadata: dict[str, object],
+    key: str,
+    *,
+    max_length: int = 512,
+) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:max_length] or None
+
+
+def _metadata_flag_is_true(value: object) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _is_conversation_subagent(
+    tool_id: str | None,
+    relative_path: str | None,
+    metadata: dict[str, object],
+) -> bool:
+    if tool_id not in {"codex", "claude_code", "cursor"}:
+        return False
+    if metadata.get("orchestration_parent_document_id"):
+        return True
+    if _metadata_text(
+        metadata, "orchestration", max_length=64
+    ) == "claw" and _metadata_flag_is_true(metadata.get("is_subagent")):
+        return True
+    if (
+        tool_id == "codex"
+        and str(metadata.get("thread_source") or "").strip().casefold() == "subagent"
+        and bool(metadata.get("root_session_id"))
+    ):
+        return True
+    path = str(relative_path or "").replace("\\", "/")
+    return tool_id in {"claude_code", "cursor"} and "/subagents/" in path
+
+
 async def direct_conversation_details(
     db,
     document_id: uuid.UUID,
@@ -143,16 +184,13 @@ async def direct_conversation_details(
             select(
                 DocumentDeliveryState.activity_at,
                 DocumentDeliveryState.delivery_metadata,
-            ).where(
-                DocumentDeliveryState.document_id == document_id
-            )
+            ).where(DocumentDeliveryState.document_id == document_id)
         )
     ).one_or_none()
     delivery_last = delivery_row.activity_at if delivery_row is not None else None
     effective_metadata = (
         delivery_row.delivery_metadata
-        if delivery_row is not None
-        and isinstance(delivery_row.delivery_metadata, dict)
+        if delivery_row is not None and isinstance(delivery_row.delivery_metadata, dict)
         else metadata
     )
     model_rows = (
@@ -192,7 +230,8 @@ async def direct_conversation_details(
             str((effective_metadata or {}).get(_STARTED_AT_METADATA_KEY) or "")
             if isinstance(effective_metadata, dict)
             else None
-        ) or None,
+        )
+        or None,
         "last_activity_at": (
             str((effective_metadata or {}).get(_LAST_ACTIVITY_AT_METADATA_KEY) or "")
             if isinstance(effective_metadata, dict)
@@ -256,10 +295,14 @@ async def aggregate_usage_cycle(
         row.document_id for row in event_rows if row.attribution_status == "attributed"
     }
     missing_model_docs = {
-        row.document_id for row in event_rows if row.attribution_status == "missing_model"
+        row.document_id
+        for row in event_rows
+        if row.attribution_status == "missing_model"
     }
     counter_reset_docs = {
-        row.document_id for row in event_rows if row.attribution_status == "counter_reset"
+        row.document_id
+        for row in event_rows
+        if row.attribution_status == "counter_reset"
     }
     missing_timestamp_query = select(ConversationUsageEvent.document_id).where(
         ConversationUsageEvent.occurred_at.is_(None),
@@ -446,12 +489,31 @@ async def aggregate_usage_cycle(
                 "native_id": _native_id(metadata),
                 "tool": "claude" if row.tool_id == "claude_code" else row.tool_id,
                 "title": row.title or row.relative_path,
+                "orchestration": _metadata_text(
+                    metadata,
+                    "orchestration",
+                    max_length=64,
+                ),
+                "orchestration_parent_document_id": _metadata_text(
+                    metadata,
+                    "orchestration_parent_document_id",
+                ),
+                "is_subagent": _is_conversation_subagent(
+                    row.tool_id,
+                    row.relative_path,
+                    metadata,
+                ),
+                "thread_source": _metadata_text(
+                    metadata,
+                    "thread_source",
+                    max_length=64,
+                ),
+                "parent_thread_id": _metadata_text(
+                    metadata,
+                    "parent_thread_id",
+                ),
                 "started_at": (
-                    str(
-                        metadata.get(_STARTED_AT_METADATA_KEY)
-                        or ""
-                    )
-                    or None
+                    str(metadata.get(_STARTED_AT_METADATA_KEY) or "") or None
                 ),
                 "last_activity_at": (
                     persisted_last_activity
