@@ -80,32 +80,107 @@ const claudeProjection = {
   },
 };
 
+const handoffThreads = [
+  {
+    source: "claude",
+    title: "Claude release orchestrator",
+    nativeId: "claude-health-1",
+    documentId: "11111111-1111-4111-8111-111111111111",
+    ratio: 260,
+    hopLine: 200,
+    hardLine: 400,
+    status: "warn",
+    idleMinutes: 2,
+    active: true,
+    oneOff: false,
+    actionable: true,
+  },
+  {
+    source: "cursor",
+    title: "Cursor implementation thread",
+    nativeId: "cursor-health-1",
+    documentId: "22222222-2222-4222-8222-222222222222",
+    ratio: 430,
+    hopLine: 200,
+    hardLine: 400,
+    status: "crit",
+    idleMinutes: 5,
+    active: true,
+    oneOff: false,
+    actionable: true,
+  },
+  {
+    source: "codex",
+    title: "Codex primary orchestrator",
+    nativeId: "codex-health-1",
+    documentId: "33333333-3333-4333-8333-333333333333",
+    ratio: 610,
+    hopLine: 325,
+    hardLine: 575,
+    status: "crit",
+    idleMinutes: 1,
+    active: true,
+    oneOff: false,
+    actionable: true,
+  },
+  {
+    source: "codex",
+    title: "Review current draft",
+    nativeId: "codex-health-subagent",
+    documentId: "44444444-4444-4444-8444-444444444444",
+    ratio: 720,
+    hopLine: 325,
+    hardLine: 575,
+    status: "crit",
+    idleMinutes: 3,
+    active: true,
+    oneOff: true,
+    kind: "one-off",
+    actionable: false,
+  },
+];
+
 const hygiene = {
   source: "all",
   available: true,
-  status: "crit",
+  status: "warn",
   hopLine: 200,
   hardLine: 400,
+  hopLines: {
+    claude: { hop: 200, hard: 400 },
+    cursor: { hop: 200, hard: 400 },
+    codex: { hop: 325, hard: 575 },
+  },
   metric: "cache-read / generated",
+  hopThreads: { count: 4, actionableCount: 3, items: handoffThreads },
   parts: [
     {
       source: "claude",
       available: true,
       status: "ok",
+      hopLine: 200,
+      hardLine: 400,
       shown: { dayKey: "2026-08-21", partial: true, cacheRead: 45_468_162, generated: 488_407, ratio: 93, status: "ok" },
+      hopThreads: { count: 1, actionableCount: 1, items: handoffThreads.filter((thread) => thread.source === "claude") },
     },
     {
       source: "cursor",
       available: true,
       status: "warn",
+      hopLine: 200,
+      hardLine: 400,
       shown: { dayKey: "2026-08-21", partial: true, cacheRead: 16_042_610, generated: 73_476, ratio: 218, status: "warn" },
+      hopThreads: { count: 1, actionableCount: 1, items: handoffThreads.filter((thread) => thread.source === "cursor") },
     },
     {
       source: "codex",
       available: true,
-      status: "crit",
+      status: "warn",
+      hopLine: 325,
+      hardLine: 575,
       usingYesterday: true,
-      shown: { dayKey: "2026-08-20", partial: false, cacheRead: 69_156_608, generated: 163_210, ratio: 424, status: "crit" },
+      shown: { dayKey: "2026-08-20", partial: false, cacheRead: 69_156_608, generated: 163_210, ratio: 424, status: "warn" },
+      hopThreads: { count: 2, actionableCount: 1, items: handoffThreads.filter((thread) => thread.source === "codex") },
     },
   ],
 };
@@ -540,19 +615,38 @@ test("handoff hygiene follows the selected spend source", async ({ page }) => {
 
   const panel = page.getByRole("region", { name: "Handoff hygiene" });
   await expect(panel).toBeVisible();
-  await expect(panel.getByText("cache-read / generated · hop at 200:1")).toBeVisible();
+  await expect(panel.getByText("cache-read / generated · hop at 200:1 · Codex 325:1")).toBeVisible();
   await expect(panel.locator(".spend-hygiene-card")).toHaveCount(3);
   await expect(panel.getByText("93:1", { exact: true })).toBeVisible();
   await expect(panel.getByText("218:1", { exact: true })).toBeVisible();
   await expect(panel.getByText("424:1", { exact: true })).toBeVisible();
-  await expect(panel.locator('.spend-hygiene-card[data-status="crit"]')).toContainText("Codex");
+  await expect(panel.getByLabel(/Codex cache-read to generated ratio/)).toHaveAttribute("data-status", "warn");
   await expect(panel.getByText("yesterday", { exact: true })).toBeVisible();
+
+  const recommendationGroup = panel.locator(".spend-handoff-group");
+  await expect(recommendationGroup).toContainText("3 active threads ready to hand off");
+  await expect(recommendationGroup.getByRole("table")).not.toBeVisible();
+  await recommendationGroup.getByText("3 active threads ready to hand off").click();
+  await expect(recommendationGroup.getByRole("table")).toBeVisible();
+  await expect(recommendationGroup.getByText("260:1", { exact: true })).toBeVisible();
+  await expect(recommendationGroup.getByText("430:1", { exact: true })).toBeVisible();
+  await expect(recommendationGroup.getByText("610:1", { exact: true })).toBeVisible();
+  await expect(recommendationGroup.getByText("720:1", { exact: true })).toBeVisible();
+  await expect(recommendationGroup.getByRole("link", { name: "Codex primary orchestrator" })).toHaveAttribute(
+    "href",
+    "/conversations/33333333-3333-4333-8333-333333333333",
+  );
+  await expect(recommendationGroup.getByText("Review current draft").locator("xpath=ancestor::tr")).toHaveClass(/spend-handoff-informational/);
 
   await page.getByRole("tab", { name: "Claude", exact: true }).click();
   await expect(panel.locator(".spend-hygiene-card")).toHaveCount(1);
   await expect(panel).toContainText("Claude");
   await expect(panel).toContainText("93:1");
   await expect(panel).not.toContainText("Cursor");
+
+  await page.getByRole("tab", { name: "Codex", exact: true }).click();
+  await expect(panel.getByText("cache-read / generated · hop 325:1 · critical 575:1")).toBeVisible();
+  await expect(panel.getByLabel(/Codex cache-read to generated ratio/)).toHaveAttribute("data-status", "warn");
 });
 
 test("projection rays and hygiene stay responsive across chart widths", async ({ page }) => {
@@ -560,6 +654,8 @@ test("projection rays and hygiene stay responsive across chart widths", async ({
   await page.goto("/app");
   await expect(page.getByRole("region", { name: "AI spend" })).toBeVisible();
   const panel = page.getByRole("region", { name: "Handoff hygiene" });
+  const recommendationGroup = panel.locator(".spend-handoff-group");
+  await recommendationGroup.locator("summary").click();
 
   for (const width of [390, 540, 760, 900]) {
     await page.setViewportSize({ width, height: 900 });
@@ -576,6 +672,18 @@ test("projection rays and hygiene stay responsive across chart widths", async ({
           const rect = card.getBoundingClientRect();
           return { left: rect.left, right: rect.right, width: rect.width };
         }),
+        recommendation: (() => {
+          const group = element.querySelector(".spend-handoff-group");
+          const wrap = element.querySelector(".spend-handoff-table-wrap");
+          if (!group || !wrap) return null;
+          const rect = group.getBoundingClientRect();
+          return {
+            left: rect.left,
+            right: rect.right,
+            scrollWidth: wrap.scrollWidth,
+            clientWidth: wrap.clientWidth,
+          };
+        })(),
         documentOverflow: document.documentElement.scrollWidth > window.innerWidth,
       };
     });
@@ -587,6 +695,10 @@ test("projection rays and hygiene stay responsive across chart widths", async ({
       expect(card.left).toBeGreaterThanOrEqual(layout.left);
       expect(card.right).toBeLessThanOrEqual(layout.right);
     }
+    expect(layout.recommendation).not.toBeNull();
+    expect(layout.recommendation.left).toBeGreaterThanOrEqual(layout.left);
+    expect(layout.recommendation.right).toBeLessThanOrEqual(layout.right);
+    expect(layout.recommendation.scrollWidth).toBeGreaterThanOrEqual(layout.recommendation.clientWidth);
   }
 });
 

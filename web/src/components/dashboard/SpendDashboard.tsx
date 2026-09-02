@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent } from "react";
+import Link from "next/link";
 import { Icon } from "@/components/aurora/Icon";
 import { Chip, Glass, SectionLabel } from "@/components/aurora/primitives";
 import { authFetch, getApiBase } from "@/lib/api-client";
@@ -139,14 +140,43 @@ interface HygienePart {
   source?: string;
   available?: boolean;
   status?: string;
+  hopLine?: number;
+  hardLine?: number;
   usingYesterday?: boolean;
   shown?: HygieneSample | null;
+  hopThreads?: HandoffThreadCollection;
+}
+
+interface HandoffThreadHealth {
+  source?: string;
+  title?: string;
+  nativeId?: string | null;
+  documentId?: string | null;
+  ratio?: number | null;
+  cacheRead?: number;
+  generated?: number;
+  hopLine?: number;
+  hardLine?: number;
+  status?: string;
+  idleMinutes?: number | null;
+  active?: boolean;
+  oneOff?: boolean;
+  kind?: string;
+  actionable?: boolean;
+}
+
+interface HandoffThreadCollection {
+  count?: number;
+  actionableCount?: number;
+  items?: HandoffThreadHealth[];
 }
 
 interface HygieneView extends HygienePart {
   metric?: string;
   hopLine?: number;
   hardLine?: number;
+  hopLines?: Partial<Record<Exclude<SpendSource, "all">, { hop?: number; hard?: number }>>;
+  hopThreads?: HandoffThreadCollection;
   parts?: HygienePart[];
   claude?: HygienePart;
   cursor?: HygienePart;
@@ -754,6 +784,128 @@ function ProviderRows({ parts, projections }: { parts: SpendPart[]; projections?
   );
 }
 
+const DEFAULT_HYGIENE_LINES: Record<Exclude<SpendSource, "all">, { hop: number; hard: number }> = {
+  claude: { hop: 200, hard: 400 },
+  cursor: { hop: 200, hard: 400 },
+  codex: { hop: 325, hard: 575 },
+};
+
+function hygieneLinesForSource(
+  hygiene: HygieneView,
+  source: Exclude<SpendSource, "all">,
+  part?: HygienePart,
+) {
+  const configured = hygiene.hopLines?.[source];
+  const fallback = DEFAULT_HYGIENE_LINES[source];
+  return {
+    hop: finite(part?.hopLine ?? configured?.hop ?? fallback.hop),
+    hard: finite(part?.hardLine ?? configured?.hard ?? fallback.hard),
+  };
+}
+
+function handoffThreadsForSource(
+  hygiene: HygieneView,
+  source: SpendSource,
+  parts: HygienePart[],
+) {
+  const candidates = source === "all"
+    ? hygiene.hopThreads?.items || parts.flatMap((part) => part.hopThreads?.items || [])
+    : parts.find((part) => part.source?.toLowerCase() === source)?.hopThreads?.items || [];
+  const unique = new Map<string, HandoffThreadHealth>();
+  for (const thread of candidates) {
+    const threadSource = String(thread.source || "").toLowerCase();
+    if (source !== "all" && threadSource && threadSource !== source) continue;
+    const key = thread.documentId || `${threadSource}:${thread.nativeId || thread.title || unique.size}`;
+    unique.set(key, thread);
+  }
+  return [...unique.values()].sort((left, right) => {
+    const leftActionable = left.actionable ?? (!!left.active && !left.oneOff);
+    const rightActionable = right.actionable ?? (!!right.active && !right.oneOff);
+    return Number(rightActionable) - Number(leftActionable)
+      || Number(!!right.active) - Number(!!left.active)
+      || finite(right.ratio) - finite(left.ratio);
+  });
+}
+
+function idleLabel(minutes?: number | null) {
+  if (minutes == null || !Number.isFinite(minutes)) return "idle";
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${Math.round(minutes)}m idle`;
+  if (minutes < 1_440) return `${Math.floor(minutes / 60)}h idle`;
+  return `${Math.floor(minutes / 1_440)}d idle`;
+}
+
+function HandoffThreadGroup({
+  hygiene,
+  source,
+  parts,
+}: {
+  hygiene: HygieneView;
+  source: SpendSource;
+  parts: HygienePart[];
+}) {
+  const threads = handoffThreadsForSource(hygiene, source, parts);
+  if (!threads.length) return null;
+  const actionable = threads.filter((thread) => thread.actionable ?? (!!thread.active && !thread.oneOff));
+  const informationalCount = threads.length - actionable.length;
+  const criticalCount = actionable.filter((thread) => {
+    const itemSource = (thread.source === "codex" || thread.source === "cursor" ? thread.source : "claude") as Exclude<SpendSource, "all">;
+    const hardLine = finite(thread.hardLine) || hygieneLinesForSource(hygiene, itemSource).hard;
+    return String(thread.status || "").toLowerCase() === "crit" || finite(thread.ratio) >= hardLine;
+  }).length;
+  const summary = actionable.length
+    ? `${actionable.length} active thread${actionable.length === 1 ? "" : "s"} ready to hand off`
+    : "No active threads need a handoff";
+  return (
+    <details className="spend-handoff-group">
+      <summary>
+        <span>
+          <Icon name="activity" size={14} />
+          <strong data-status={criticalCount ? "crit" : actionable.length ? "warn" : "idle"}>{summary}</strong>
+          {informationalCount > 0 && <small>· {informationalCount} idle/delegated</small>}
+        </span>
+        <Icon className="spend-handoff-chevron" name="chevron_down" size={14} />
+      </summary>
+      <div className="spend-handoff-table-wrap">
+        <table className="spend-handoff-table">
+          <thead>
+            <tr>
+              {source === "all" && <th>Source</th>}
+              <th>Thread</th>
+              <th>Health</th>
+              <th>Activity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {threads.map((thread, index) => {
+              const itemSource = (thread.source === "codex" || thread.source === "cursor" ? thread.source : "claude") as Exclude<SpendSource, "all">;
+              const lines = hygieneLinesForSource(hygiene, itemSource);
+              const ratio = typeof thread.ratio === "number" && Number.isFinite(thread.ratio) ? thread.ratio : null;
+              const status = String(thread.status || (ratio != null && ratio >= (finite(thread.hardLine) || lines.hard) ? "crit" : "warn")).toLowerCase();
+              const isActionable = thread.actionable ?? (!!thread.active && !thread.oneOff);
+              const title = thread.title || thread.nativeId || thread.documentId || "Untitled thread";
+              const activity = isActionable ? "active" : thread.oneOff ? "delegated" : idleLabel(thread.idleMinutes);
+              const content = <span title={title}>{title}</span>;
+              return (
+                <tr className={isActionable ? "" : "spend-handoff-informational"} key={thread.documentId || `${itemSource}-${thread.nativeId || title}-${index}`}>
+                  {source === "all" && <td className="spend-handoff-source">{itemSource === "claude" ? "Claude" : itemSource === "cursor" ? "Cursor" : "Codex"}</td>}
+                  <td className="spend-handoff-title">
+                    {thread.documentId
+                      ? <Link href={`/conversations/${encodeURIComponent(thread.documentId)}`} prefetch={false}>{content}</Link>
+                      : content}
+                  </td>
+                  <td><strong className="spend-handoff-ratio" data-status={status}>{ratio == null ? "—" : `${ratio}:1`}</strong></td>
+                  <td className={isActionable ? "spend-handoff-active" : "spend-handoff-idle"}>{activity}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
 function HygienePanel({ hygiene, source }: { hygiene?: HygieneView; source: SpendSource }) {
   if (!hygiene?.available) return null;
   const fallbackParts: HygienePart[] = [];
@@ -769,12 +921,19 @@ function HygienePanel({ hygiene, source }: { hygiene?: HygieneView; source: Spen
   if (!visibleParts.length) return null;
 
   const metric = hygiene.metric || "cache-read / generated";
-  const hopLine = finite(hygiene.hopLine);
+  const selectedPart = source === "all" ? undefined : visibleParts[0];
+  const selectedLines = source === "all"
+    ? hygieneLinesForSource(hygiene, "claude")
+    : hygieneLinesForSource(hygiene, source, selectedPart);
+  const codexLines = hygieneLinesForSource(hygiene, "codex");
+  const thresholdLabel = source === "all"
+    ? `${metric} · hop at ${selectedLines.hop}:1${codexLines.hop !== selectedLines.hop ? ` · Codex ${codexLines.hop}:1` : ""}`
+    : `${metric} · hop ${selectedLines.hop}:1 · critical ${selectedLines.hard}:1`;
   return (
     <section className="spend-hygiene" role="region" aria-labelledby="spend-hygiene-title">
       <div className="spend-hygiene-heading">
         <strong id="spend-hygiene-title">Handoff hygiene</strong>
-        <span>{metric}{hopLine > 0 ? ` · hop at ${hopLine}:1` : ""}</span>
+        <span>{thresholdLabel}</span>
       </div>
       <div className={`spend-hygiene-grid ${visibleParts.length === 1 ? "spend-hygiene-grid-single" : ""}`}>
         {visibleParts.map((part) => {
@@ -799,6 +958,7 @@ function HygienePanel({ hygiene, source }: { hygiene?: HygieneView; source: Spen
           );
         })}
       </div>
+      <HandoffThreadGroup hygiene={hygiene} source={source} parts={allParts} />
     </section>
   );
 }
@@ -955,6 +1115,30 @@ export default function SpendDashboard() {
         @media(max-width:390px){.spend-overview{grid-template-columns:auto 1fr;grid-template-areas:"ring used" "ring days";gap:5px 10px}.spend-ring{grid-area:ring}.spend-used{grid-area:used}.spend-days{grid-area:days;text-align:left}.spend-ranges{grid-template-columns:repeat(3,minmax(0,1fr))}.spend-ranges button:last-child{grid-column:2}.spend-projection-rows>.spend-projection-row>small{white-space:normal}.spend-account>:last-child{display:none}}
       `}</style>
       <style jsx global>{`
+        .spend-handoff-group{margin-top:10px;overflow:hidden;border:1px solid var(--aurora-border);border-radius:10px;background:color-mix(in srgb,var(--aurora-chip) 25%,transparent)}
+        .spend-handoff-group>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:40px;padding:8px 10px;color:var(--aurora-fg3);cursor:pointer;list-style:none;user-select:none}
+        .spend-handoff-group>summary::-webkit-details-marker{display:none}
+        .spend-handoff-group>summary>span{display:flex;align-items:center;gap:7px;min-width:0}
+        .spend-handoff-group>summary strong{color:var(--aurora-fg2);font-size:11px}
+        .spend-handoff-group>summary strong[data-status="warn"]{color:${PROJECTION_COLORS.realistic}}
+        .spend-handoff-group>summary strong[data-status="crit"]{color:${PROJECTION_COLORS.worst}}
+        .spend-handoff-group>summary small{color:var(--aurora-fg4);font-size:9px;white-space:nowrap}
+        .spend-handoff-chevron{flex:none;color:var(--aurora-fg4);transition:transform .15s ease}
+        .spend-handoff-group[open] .spend-handoff-chevron{transform:rotate(180deg)}
+        .spend-handoff-table-wrap{overflow-x:auto;padding:0 8px 8px}
+        .spend-handoff-table{width:100%;border-collapse:collapse;font-size:10px}
+        .spend-handoff-table th,.spend-handoff-table td{padding:6px 7px;border-top:1px solid var(--aurora-border);text-align:left;vertical-align:middle}
+        .spend-handoff-table th{border-top:0;color:var(--aurora-fg4);font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+        .spend-handoff-title{min-width:150px;max-width:280px}
+        .spend-handoff-title>a,.spend-handoff-title>span{display:block;overflow:hidden;color:var(--aurora-fg2);font-weight:650;text-decoration:none;text-overflow:ellipsis;white-space:nowrap}
+        .spend-handoff-title>a:hover{text-decoration:underline}
+        .spend-handoff-source{color:var(--aurora-fg4);white-space:nowrap}
+        .spend-handoff-ratio{color:${PROJECTION_COLORS.realistic};font-variant-numeric:tabular-nums;white-space:nowrap}
+        .spend-handoff-ratio[data-status="crit"],.spend-handoff-ratio[data-status="hard"]{color:${PROJECTION_COLORS.worst}}
+        .spend-handoff-active{color:${PROJECTION_COLORS.average};font-weight:700;white-space:nowrap}
+        .spend-handoff-idle{color:var(--aurora-fg4);white-space:nowrap}
+        .spend-handoff-informational{opacity:.55}
+        @media(max-width:520px){.spend-handoff-group>summary small{display:none}.spend-handoff-title{min-width:130px}.spend-handoff-table th,.spend-handoff-table td{padding:6px 5px}}
         .spend-tooltip{top:42%;min-width:138px;max-width:calc(100% - 16px);width:max-content;gap:5px;padding:9px 10px;white-space:normal}
         .spend-tooltip.spend-tooltip-wide{min-width:180px}
         .spend-tooltip.spend-tooltip-token{min-width:200px}
