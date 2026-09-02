@@ -793,6 +793,7 @@ test("long Claude projection tooltip stacks cleanly on mobile", async ({ browser
   await worst.scrollIntoViewIfNeeded();
   await worst.hover();
   await expect(tooltip).toContainText("$16,184.74 now + $1,529.49/day × 10.0 days left = $17,673");
+  await expect(tooltip).toBeVisible();
   const layout = await tooltip.evaluate((element) => {
     const bounds = element.getBoundingClientRect();
     return {
