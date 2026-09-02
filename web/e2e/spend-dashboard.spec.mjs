@@ -170,7 +170,7 @@ const hygiene = {
       hopLine: 200,
       hardLine: 400,
       shown: { dayKey: "2026-08-21", partial: true, cacheRead: 16_042_610, generated: 73_476, ratio: 218, status: "warn" },
-      hopThreads: { count: 1, actionableCount: 1, items: handoffThreads.filter((thread) => thread.source === "cursor") },
+      hopThreads: { count: 1, actionableCount: 1, attributionAvailable: true, items: handoffThreads.filter((thread) => thread.source === "cursor") },
     },
     {
       source: "codex",
@@ -647,6 +647,37 @@ test("handoff hygiene follows the selected spend source", async ({ page }) => {
   await page.getByRole("tab", { name: "Codex", exact: true }).click();
   await expect(panel.getByText("cache-read / generated · hop 325:1 · critical 575:1")).toBeVisible();
   await expect(panel.getByLabel(/Codex cache-read to generated ratio/)).toHaveAttribute("data-status", "warn");
+});
+
+test("cursor source ratio does not present missing thread attribution as an empty bill of health", async ({ page }) => {
+  const unavailableSnapshot = structuredClone(snapshot);
+  const cursorPart = unavailableSnapshot.hygiene.parts.find((part) => part.source === "cursor");
+  cursorPart.hopThreads = { count: 0, actionableCount: 0, items: [] };
+  const attributableThreads = unavailableSnapshot.hygiene.hopThreads.items.filter((thread) => thread.source !== "cursor");
+  unavailableSnapshot.hygiene.hopThreads = {
+    count: attributableThreads.length,
+    actionableCount: attributableThreads.filter((thread) => thread.actionable).length,
+    items: attributableThreads,
+  };
+
+  await installRoutes(page, unavailableSnapshot);
+  await page.goto("/app");
+  const panel = page.getByRole("region", { name: "Handoff hygiene" });
+  const recommendationGroup = panel.locator(".spend-handoff-group");
+
+  await expect(panel.getByLabel(/Cursor cache-read to generated ratio 218 to 1/)).toBeVisible();
+  await expect(recommendationGroup).toContainText("2 active threads ready to hand off");
+  await expect(recommendationGroup).toContainText("Cursor attribution unavailable");
+  await recommendationGroup.locator("summary").click();
+  await expect(recommendationGroup.getByRole("note")).toContainText(
+    "The source ratio is still valid; this snapshot does not yet include Cursor event-to-thread attribution.",
+  );
+
+  await page.getByRole("tab", { name: "Cursor", exact: true }).click();
+  await expect(panel.getByText("218:1", { exact: true })).toBeVisible();
+  await expect(recommendationGroup).toContainText("Cursor per-thread attribution unavailable");
+  await expect(recommendationGroup.getByRole("table")).toHaveCount(0);
+  await expect(recommendationGroup).not.toContainText("No active threads need a handoff");
 });
 
 test("projection rays and hygiene stay responsive across chart widths", async ({ page }) => {

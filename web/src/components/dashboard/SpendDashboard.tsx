@@ -169,6 +169,8 @@ interface HandoffThreadCollection {
   count?: number;
   actionableCount?: number;
   items?: HandoffThreadHealth[];
+  attributionAvailable?: boolean;
+  attributionNote?: string;
 }
 
 interface HygieneView extends HygienePart {
@@ -835,6 +837,19 @@ function idleLabel(minutes?: number | null) {
   return `${Math.floor(minutes / 1_440)}d idle`;
 }
 
+function cursorThreadAttributionUnavailable(
+  hygiene: HygieneView,
+  source: SpendSource,
+  parts: HygienePart[],
+) {
+  if (source !== "all" && source !== "cursor") return false;
+  const cursorPart = parts.find((part) => part.source?.toLowerCase() === "cursor");
+  if (!cursorPart || cursorPart.available === false || !cursorPart.shown) return false;
+  const explicit = cursorPart.hopThreads?.attributionAvailable;
+  if (explicit != null) return !explicit;
+  return handoffThreadsForSource(hygiene, "cursor", parts).length === 0;
+}
+
 function HandoffThreadGroup({
   hygiene,
   source,
@@ -845,7 +860,8 @@ function HandoffThreadGroup({
   parts: HygienePart[];
 }) {
   const threads = handoffThreadsForSource(hygiene, source, parts);
-  if (!threads.length) return null;
+  const cursorAttributionUnavailable = cursorThreadAttributionUnavailable(hygiene, source, parts);
+  if (!threads.length && !cursorAttributionUnavailable) return null;
   const actionable = threads.filter((thread) => thread.actionable ?? (!!thread.active && !thread.oneOff));
   const informationalCount = threads.length - actionable.length;
   const criticalCount = actionable.filter((thread) => {
@@ -853,9 +869,13 @@ function HandoffThreadGroup({
     const hardLine = finite(thread.hardLine) || hygieneLinesForSource(hygiene, itemSource).hard;
     return String(thread.status || "").toLowerCase() === "crit" || finite(thread.ratio) >= hardLine;
   }).length;
-  const summary = actionable.length
-    ? `${actionable.length} active thread${actionable.length === 1 ? "" : "s"} ready to hand off`
-    : "No active threads need a handoff";
+  const summary = cursorAttributionUnavailable && source === "cursor"
+    ? "Cursor per-thread attribution unavailable"
+    : actionable.length
+      ? `${actionable.length} active thread${actionable.length === 1 ? "" : "s"} ready to hand off`
+      : cursorAttributionUnavailable
+        ? "Per-thread handoff health is partially unavailable"
+        : "No active threads need a handoff";
   return (
     <details className="spend-handoff-group">
       <summary>
@@ -863,45 +883,56 @@ function HandoffThreadGroup({
           <Icon name="activity" size={14} />
           <strong data-status={criticalCount ? "crit" : actionable.length ? "warn" : "idle"}>{summary}</strong>
           {informationalCount > 0 && <small>· {informationalCount} idle/delegated</small>}
+          {cursorAttributionUnavailable && source === "all" && (
+            <small className="spend-handoff-attribution-summary">· Cursor attribution unavailable</small>
+          )}
         </span>
         <Icon className="spend-handoff-chevron" name="chevron_down" size={14} />
       </summary>
-      <div className="spend-handoff-table-wrap">
-        <table className="spend-handoff-table">
-          <thead>
-            <tr>
-              {source === "all" && <th>Source</th>}
-              <th>Thread</th>
-              <th>Health</th>
-              <th>Activity</th>
-            </tr>
-          </thead>
-          <tbody>
-            {threads.map((thread, index) => {
-              const itemSource = (thread.source === "codex" || thread.source === "cursor" ? thread.source : "claude") as Exclude<SpendSource, "all">;
-              const lines = hygieneLinesForSource(hygiene, itemSource);
-              const ratio = typeof thread.ratio === "number" && Number.isFinite(thread.ratio) ? thread.ratio : null;
-              const status = String(thread.status || (ratio != null && ratio >= (finite(thread.hardLine) || lines.hard) ? "crit" : "warn")).toLowerCase();
-              const isActionable = thread.actionable ?? (!!thread.active && !thread.oneOff);
-              const title = thread.title || thread.nativeId || thread.documentId || "Untitled thread";
-              const activity = isActionable ? "active" : thread.oneOff ? "delegated" : idleLabel(thread.idleMinutes);
-              const content = <span title={title}>{title}</span>;
-              return (
-                <tr className={isActionable ? "" : "spend-handoff-informational"} key={thread.documentId || `${itemSource}-${thread.nativeId || title}-${index}`}>
-                  {source === "all" && <td className="spend-handoff-source">{itemSource === "claude" ? "Claude" : itemSource === "cursor" ? "Cursor" : "Codex"}</td>}
-                  <td className="spend-handoff-title">
-                    {thread.documentId
-                      ? <Link href={`/conversations/${encodeURIComponent(thread.documentId)}`} prefetch={false}>{content}</Link>
-                      : content}
-                  </td>
-                  <td><strong className="spend-handoff-ratio" data-status={status}>{ratio == null ? "—" : `${ratio}:1`}</strong></td>
-                  <td className={isActionable ? "spend-handoff-active" : "spend-handoff-idle"}>{activity}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {threads.length > 0 && (
+        <div className="spend-handoff-table-wrap">
+          <table className="spend-handoff-table">
+            <thead>
+              <tr>
+                {source === "all" && <th>Source</th>}
+                <th>Thread</th>
+                <th>Health</th>
+                <th>Activity</th>
+              </tr>
+            </thead>
+            <tbody>
+              {threads.map((thread, index) => {
+                const itemSource = (thread.source === "codex" || thread.source === "cursor" ? thread.source : "claude") as Exclude<SpendSource, "all">;
+                const lines = hygieneLinesForSource(hygiene, itemSource);
+                const ratio = typeof thread.ratio === "number" && Number.isFinite(thread.ratio) ? thread.ratio : null;
+                const status = String(thread.status || (ratio != null && ratio >= (finite(thread.hardLine) || lines.hard) ? "crit" : "warn")).toLowerCase();
+                const isActionable = thread.actionable ?? (!!thread.active && !thread.oneOff);
+                const title = thread.title || thread.nativeId || thread.documentId || "Untitled thread";
+                const activity = isActionable ? "active" : thread.oneOff ? "delegated" : idleLabel(thread.idleMinutes);
+                const content = <span title={title}>{title}</span>;
+                return (
+                  <tr className={isActionable ? "" : "spend-handoff-informational"} key={thread.documentId || `${itemSource}-${thread.nativeId || title}-${index}`}>
+                    {source === "all" && <td className="spend-handoff-source">{itemSource === "claude" ? "Claude" : itemSource === "cursor" ? "Cursor" : "Codex"}</td>}
+                    <td className="spend-handoff-title">
+                      {thread.documentId
+                        ? <Link href={`/conversations/${encodeURIComponent(thread.documentId)}`} prefetch={false}>{content}</Link>
+                        : content}
+                    </td>
+                    <td><strong className="spend-handoff-ratio" data-status={status}>{ratio == null ? "—" : `${ratio}:1`}</strong></td>
+                    <td className={isActionable ? "spend-handoff-active" : "spend-handoff-idle"}>{activity}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {cursorAttributionUnavailable && (
+        <p className="spend-handoff-attribution-note" role="note">
+          <strong>Cursor per-thread attribution is unavailable.</strong>{" "}
+          The source ratio is still valid; this snapshot does not yet include Cursor event-to-thread attribution.
+        </p>
+      )}
     </details>
   );
 }
@@ -1138,7 +1169,9 @@ export default function SpendDashboard() {
         .spend-handoff-active{color:${PROJECTION_COLORS.average};font-weight:700;white-space:nowrap}
         .spend-handoff-idle{color:var(--aurora-fg4);white-space:nowrap}
         .spend-handoff-informational{opacity:.55}
-        @media(max-width:520px){.spend-handoff-group>summary small{display:none}.spend-handoff-title{min-width:130px}.spend-handoff-table th,.spend-handoff-table td{padding:6px 5px}}
+        .spend-handoff-attribution-note{margin:0;padding:8px 10px;border-top:1px solid var(--aurora-border);color:var(--aurora-fg4);font-size:10px;line-height:1.45}
+        .spend-handoff-attribution-note strong{color:var(--aurora-fg2)}
+        @media(max-width:520px){.spend-handoff-group>summary small{display:none}.spend-handoff-group>summary small.spend-handoff-attribution-summary{display:inline;white-space:normal}.spend-handoff-title{min-width:130px}.spend-handoff-table th,.spend-handoff-table td{padding:6px 5px}}
         .spend-tooltip{top:42%;min-width:138px;max-width:calc(100% - 16px);width:max-content;gap:5px;padding:9px 10px;white-space:normal}
         .spend-tooltip.spend-tooltip-wide{min-width:180px}
         .spend-tooltip.spend-tooltip-token{min-width:200px}
