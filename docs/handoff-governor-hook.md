@@ -88,11 +88,12 @@ migrates the commands to the runner once its source is available.
    strict camelCase/common JSON fields. Cursor receives its native snake_case
    compatibility fields. Codex rejects unknown Stop and PostToolUse fields, so
    the runner never sends Cursor-only fields to a Codex payload.
-6. **Cursor is registered natively.** The collector merges one managed
-   `postToolUse` entry into `~/.cursor/hooks.json`, preserving user entries and
-   removing any obsolete managed `stop` entry. This does not depend on Cursor's
-   optional Claude-configuration import; if that import is also active, shared
-   session latches prevent duplicate advisory context.
+6. **Cursor runs exactly one governor.** Current Cursor builds import the global
+   Claude hook configuration. When that managed Claude governor is present, the
+   collector removes its native `~/.cursor/hooks.json` copy so one tool
+   completion cannot launch the frozen runner twice. A Cursor-only installation
+   without the managed Claude hook retains the native `postToolUse` fallback.
+   User entries are preserved and obsolete managed `stop` entries are removed.
 
 ## Configuration
 
@@ -119,8 +120,9 @@ variables).
 
 1. Set `MEMENTO_GOVERNOR_ENABLED=1` in the environment used to start the
    collector and restart the collector so its ordinary managed-hook reconcile
-   writes the advisory into `~/.claude/settings.json`, `~/.codex/hooks.json`,
-   and `~/.cursor/hooks.json`.
+   writes the advisory into `~/.claude/settings.json` and
+   `~/.codex/hooks.json`. Cursor imports the managed Claude entry;
+   `~/.cursor/hooks.json` is used only when that entry is unavailable.
 2. Optionally set the threshold and handoff-path variables above for the
    Claude Code process, then restart Claude Code.
 3. To deactivate, remove or set `MEMENTO_GOVERNOR_ENABLED` false and restart

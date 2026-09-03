@@ -604,6 +604,9 @@ def test_cursor_native_registration_preserves_user_hooks_and_removes_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    (claude_home / "settings.json").write_text("{}\n", encoding="utf-8")
     cursor_home = tmp_path / ".cursor"
     cursor_home.mkdir()
     hooks_path = cursor_home / "hooks.json"
@@ -628,6 +631,7 @@ def test_cursor_native_registration_preserves_user_hooks_and_removes_stop(
     )
     runner = tmp_path / "memento-hook-runner.exe"
     runner.write_bytes(b"runner")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
     monkeypatch.setenv("MEMENTO_CURSOR_HOOKS_PATH", str(hooks_path))
     monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
     monkeypatch.setattr(pending_hook, "_install_hook_runner", lambda: runner)
@@ -657,6 +661,86 @@ def test_cursor_native_registration_preserves_user_hooks_and_removes_stop(
     settings = json.loads(hooks_path.read_text(encoding="utf-8"))
 
     assert removed is True
+    assert settings == {
+        "version": 1,
+        "hooks": {
+            "postToolUse": [{"command": "user-post-hook", "matcher": "Read"}],
+            "stop": [{"command": "user-stop-hook"}],
+        },
+    }
+
+
+def test_cursor_uses_imported_claude_governor_without_native_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claude_home = tmp_path / ".claude"
+    claude_home.mkdir()
+    claude_command = (
+        r'"C:\managed\memento-hook-runner.exe" '
+        "claude-governor-hook --enabled"
+    )
+    (claude_home / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": claude_command,
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cursor_home = tmp_path / ".cursor"
+    cursor_home.mkdir()
+    hooks_path = cursor_home / "hooks.json"
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "hooks": {
+                    "postToolUse": [
+                        {"command": "user-post-hook", "matcher": "Read"},
+                        {
+                            "command": (
+                                r"C:\old\memento-hook-runner.exe "
+                                "claude-governor-hook --enabled"
+                            )
+                        },
+                    ],
+                    "stop": [{"command": "user-stop-hook"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = tmp_path / "memento-hook-runner.exe"
+    runner.write_bytes(b"runner")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("MEMENTO_CURSOR_HOOKS_PATH", str(hooks_path))
+    monkeypatch.setenv("MEMENTO_GOVERNOR_ENABLED", "1")
+    monkeypatch.setattr(pending_hook, "_install_hook_runner", lambda: runner)
+    monkeypatch.setattr(
+        pending_hook, "_maintain_hook_runner_versions", lambda *args, **kwargs: None
+    )
+
+    installed_path, changed = pending_hook.install_cursor_governor_hooks()
+    _installed_path, changed_again = pending_hook.install_cursor_governor_hooks()
+    settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+    assert installed_path == hooks_path
+    assert changed is True
+    assert changed_again is False
     assert settings == {
         "version": 1,
         "hooks": {

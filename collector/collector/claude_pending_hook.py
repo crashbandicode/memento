@@ -1470,6 +1470,24 @@ def _is_memento_governor_hook(hook: object) -> bool:
     return any(marker in command for marker in _MEMENTO_GOVERNOR_HOOK_MARKERS)
 
 
+def _claude_governor_hook_is_registered() -> bool:
+    """Return whether Cursor can import the managed global Claude governor."""
+
+    settings = _read_mapping(_settings_path())
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    entries = hooks.get("PostToolUse")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        _is_memento_governor_hook(hook)
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+    )
+
+
 def _merge_event_hooks(
     hooks: dict[str, Any],
     event_name: str,
@@ -1782,7 +1800,7 @@ def install_cursor_governor_hooks(
     *,
     sweep_retired: bool = False,
 ) -> tuple[Path, bool]:
-    """Install the native Cursor advisory without relying on Claude import."""
+    """Reconcile one Cursor advisory, preferring Cursor's Claude-hook import."""
 
     hooks_path = _cursor_hooks_path()
     if not hooks_path.parent.is_dir():
@@ -1807,7 +1825,7 @@ def install_cursor_governor_hooks(
     hook_runner = _install_hook_runner() if governor_enabled() else None
     _remove_cursor_governor_hooks(hooks, "postToolUse")
     _remove_cursor_governor_hooks(hooks, "stop")
-    if governor_enabled():
+    if governor_enabled() and not _claude_governor_hook_is_registered():
         entries = hooks.setdefault("postToolUse", [])
         if not isinstance(entries, list):
             raise TypeError("Cursor hooks postToolUse must be an array")
