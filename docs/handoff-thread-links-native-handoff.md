@@ -80,3 +80,49 @@ workflow has not run since 2026-08-08. This server-only change therefore deploys
 to the live Compose `api` service. Web, workers, ingestion, projection, storage,
 database, Redis, collectors, and AI/MCP processes are excluded because none
 consume the changed code path.
+
+## Pre-recreate release checkpoint — 2026-09-04
+
+- Source commit `ff10533e4904a7fa20d0d9832eb497f8c7ac9fbe` is pushed
+  exactly to `fork/feat/thread-handoff-health`; `origin` is untouched.
+- The clean source commit built successfully as idle image
+  `memento-api:latest`, image ID
+  `sha256:130927f8ebb4f1aac8428081d465e1171b2711939f9f80966dcff6ecc8d7ead5`.
+- The running API is still container `18ca50fcf7b2`, image
+  `sha256:3c4f9362b116435dfdfa3b20bb4c621935c9809b57ed775763765790e436d62f`,
+  started `2026-09-02T15:21:05.179Z`, restart count 0.
+- Immediate rollback tag
+  `memento-api:rollback-pre-native-handoff-ff10533e` resolves exactly to that
+  running pre-release image.
+- The complete pre-recreate excluded-service inventory is captured in this
+  session. All ten excluded Memento web/worker/ingest/projection/data services
+  were running with restart count 0. Next mutation is exactly:
+  `docker compose up -d --no-deps --no-build --force-recreate api`.
+
+## Deployment and acceptance — 2026-09-04
+
+- The first recreation command was run without the production env file because
+  this worktree has no `.env`. Production validation correctly rejected the
+  insecure Compose defaults; the API returned 502 and its restart policy made
+  eight failed startup attempts. The public web application remained HTTP 200.
+  No request reached application startup, no data migration ran, and no other
+  service changed.
+- Root cause was deployment-path configuration, not application code. The
+  existing production env was found at the canonical WSL source worktree and
+  passed directly to Compose without printing or persisting any value. The API
+  was recreated again with that env and recovered normally.
+- Accepted API container is `34680a200225`, running image
+  `sha256:130927f8ebb4f1aac8428081d465e1171b2711939f9f80966dcff6ecc8d7ead5`,
+  started `2026-09-04T20:16:20.490Z`, restart count 0. Logs show application
+  startup complete and live ingest requests returning 200.
+- Host and deployed `/app/server/api/conversations.py` hashes match exactly:
+  `D558322F189B61001D325AEEF51B6850C811BA8E7CF00627F12D23FE60D6599E`.
+- Public `/app` returns HTTP 200. Authenticated read-only acceptance against the
+  reported Codex thread `01a06c8c-5020-7090-a891-81c734f8216e` returns HTTP 200
+  and its predecessor `01a05cf3-4217-7260-8352-9cb4207976c4`. The live page
+  visibly renders `Continued from Remove tiers 1 and 2` with that exact parent
+  link. The owner token stayed in browser memory and was never printed or
+  persisted.
+- Final isolation audit matched every excluded web/worker/ingest/projection/
+  embedding/MinIO/PostgreSQL/Redis container ID, image, start time, running
+  state, and restart count 0 exactly to preflight.
