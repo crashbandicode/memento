@@ -2214,13 +2214,22 @@ class ConversationsNormalizedApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message_count"], 4306)
         self.assertEqual(payload["subagent_count"], 0)
-        self.assertEqual(len(db.statements), 6)
+        self.assertEqual(len(db.statements), 7)
+        handoff_probes = []
         for statement in db.statements:
             sql = str(statement.compile(dialect=postgresql.dialect())).upper()
             self.assertNotIn("COUNT(", sql)
-            if "CANVAS_ARTIFACT_REFERENCES" not in sql:
-                self.assertNotIn("CONVERSATION_MESSAGES", sql)
+            if (
+                "CONVERSATION_MESSAGES" in sql
+                and "CANVAS_ARTIFACT_REFERENCES" not in sql
+            ):
+                handoff_probes.append(sql)
             self.assertNotIn("JSONB_EXTRACT_PATH_TEXT", sql)
+        self.assertEqual(len(handoff_probes), 1)
+        self.assertIn("TO_TSVECTOR", handoff_probes[0])
+        self.assertIn("PLAINTO_TSQUERY", handoff_probes[0])
+        self.assertIn("CONVERSATION_MESSAGES.LINE_NUMBER <=", handoff_probes[0])
+        self.assertIn(" LIMIT ", handoff_probes[0])
         hierarchy_sql = str(
             db.statements[2].compile(dialect=postgresql.dialect())
         ).upper()

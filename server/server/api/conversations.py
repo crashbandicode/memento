@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, load_only
 
@@ -144,8 +144,9 @@ _CLAUDE_SESSION_PATH_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl\Z"
 )
-# Claude JSONL files begin with a small fixed set of non-user records before
-# the first prompt. Keep the reverse FTS probe bounded to that opening window.
+# Native conversation transcripts begin with a small fixed set of non-user
+# records before the first prompt. Keep the reverse FTS probe bounded to that
+# opening window.
 _HANDOFF_EARLY_USER_LINE_LIMIT = 3
 
 _SHELL_TOOL_NAMES = {
@@ -779,8 +780,19 @@ def _tangent_marker_session_id(content: object) -> str | None:
     return conversation_briefing_session_id(content)
 
 
+def _persisted_handoff_session_id(document: Document) -> str | None:
+    """Return a validated durable handoff parent ID when ingest stored one."""
+    metadata = document.metadata_ if isinstance(document.metadata_, dict) else {}
+    if metadata.get("briefing_kind") != "handoff":
+        return None
+    try:
+        return str(uuid.UUID(str(metadata.get("briefing_session_id") or "")))
+    except (ValueError, AttributeError):
+        return None
+
+
 def _claude_session_id_from_relative_path(relative_path: object) -> str | None:
-    """Return the Claude Code session UUID encoded by a transcript filename."""
+    """Recover a Claude session UUID when legacy metadata is incomplete."""
     if not isinstance(relative_path, str):
         return None
     match = _CLAUDE_SESSION_PATH_RE.search(relative_path)
@@ -829,24 +841,31 @@ async def _handoff_predecessor_reference(
     document: Document,
     machine_ids: set[uuid.UUID] | None,
 ) -> dict | None:
-    """Resolve a Claude handoff marker in this thread's first user prompt."""
-    first_user_content = (
-        await db.execute(
-            select(ConversationMessage.content)
-            .where(
-                ConversationMessage.document_id == document.id,
-                ConversationMessage.role == "user",
-            )
-            .order_by(
-                ConversationMessage.line_number.asc(),
-                ConversationMessage.id.asc(),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    predecessor_session_id = _handoff_marker_session_id(first_user_content)
+    """Resolve a handoff parent by its tool-native conversation UUID."""
+    predecessor_session_id = _persisted_handoff_session_id(document)
     if predecessor_session_id is None:
-        return None
+        # Codex and Cursor ingestion persist briefing metadata. Avoid an
+        # extra normalized-message read on every ordinary native detail view;
+        # only legacy Claude rows need the pre-metadata fallback.
+        if document.tool_id != "claude_code":
+            return None
+        first_user_content = (
+            await db.execute(
+                select(ConversationMessage.content)
+                .where(
+                    ConversationMessage.document_id == document.id,
+                    ConversationMessage.role == "user",
+                )
+                .order_by(
+                    ConversationMessage.line_number.asc(),
+                    ConversationMessage.id.asc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        predecessor_session_id = _handoff_marker_session_id(first_user_content)
+        if predecessor_session_id is None:
+            return None
 
     normalized_path = func.lower(func.replace(Document.relative_path, "\\", "/"))
     predecessor_path = f"{predecessor_session_id}.jsonl"
@@ -860,24 +879,51 @@ async def _handoff_predecessor_reference(
                 Document.title,
                 Document.relative_path,
                 Document.metadata_,
+                Document.source_modified_at,
+                Document.activity_at,
+                Document.synced_at,
+                Document.file_size_bytes,
             )
         )
         .where(
-            Document.tool_id == "claude_code",
+            Document.id != document.id,
+            Document.tool_id.in_(FOLDABLE_CONVERSATION_TOOLS),
             Document.category == "conversation",
             or_(
-                normalized_path == predecessor_path,
-                normalized_path.like(f"%/{predecessor_path}"),
+                Document.metadata_["session_id"].astext == predecessor_session_id,
+                and_(
+                    Document.tool_id == "claude_code",
+                    or_(
+                        normalized_path == predecessor_path,
+                        normalized_path.like(f"%/{predecessor_path}"),
+                    ),
+                ),
             ),
         )
-        .order_by(Document.id)
-        .limit(1)
     )
     if machine_ids is not None:
         statement = statement.where(Document.machine_id.in_(machine_ids))
-    predecessor = (await db.execute(statement)).scalars().first()
-    if predecessor is None:
+    candidates = list((await db.execute(statement)).scalars().all())
+    candidates_by_tool: dict[str, list[Document]] = {}
+    for candidate in candidates:
+        candidates_by_tool.setdefault(candidate.tool_id, []).append(candidate)
+    canonical = [
+        selected
+        for tool_id, tool_candidates in candidates_by_tool.items()
+        if (
+            selected := select_canonical_conversation_document(
+                tool_candidates,
+                tool_id=tool_id,
+                session_id=predecessor_session_id,
+            )
+        )
+        is not None
+    ]
+    # A UUID-only marker cannot disambiguate a collision across engine families.
+    # Fail closed rather than linking to an arbitrary transcript.
+    if len(canonical) != 1:
         return None
+    predecessor = canonical[0]
     predecessor_title = previous_handoff_chain_name(
         (document.metadata_ or {}).get("handoff_chain_name")
     )
@@ -893,7 +939,15 @@ async def _handoff_successor_reference(
     machine_ids: set[uuid.UUID] | None,
 ) -> dict | None:
     """Find a linked successor with one bounded indexed full-text probe."""
-    session_id = _claude_session_id_from_relative_path(document.relative_path)
+    session_id = conversation_native_id(
+        document.tool_id,
+        "conversation",
+        document.metadata_,
+    )
+    if session_id is None and document.tool_id == "claude_code":
+        session_id = _claude_session_id_from_relative_path(
+            document.relative_path
+        )
     if session_id is None:
         return None
 
@@ -916,7 +970,7 @@ async def _handoff_successor_reference(
         )
         .where(
             Document.id != document.id,
-            Document.tool_id == "claude_code",
+            Document.tool_id.in_(FOLDABLE_CONVERSATION_TOOLS),
             Document.category == "conversation",
             ConversationMessage.role == "user",
             ConversationMessage.line_number <= _HANDOFF_EARLY_USER_LINE_LIMIT,
@@ -951,7 +1005,7 @@ async def _handoff_thread_links(
     machine_ids: set[uuid.UUID] | None,
 ) -> dict:
     """Return detail-only handoff links without changing stored conversation data."""
-    if document.tool_id != "claude_code":
+    if document.tool_id not in FOLDABLE_CONVERSATION_TOOLS:
         return {}
 
     predecessor = await _handoff_predecessor_reference(db, document, machine_ids)

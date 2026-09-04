@@ -38,46 +38,73 @@ async def _seed_thread(
     title: str,
     first_user_content: str,
     machine_id: UUID,
+    tool_id: str = "claude_code",
+    leading_system: bool = False,
 ) -> Document:
+    relative_path = {
+        "claude_code": f"projects/memento/{session_id}.jsonl",
+        "codex": f"sessions/2026/09/04/rollout-{session_id}.jsonl",
+        "cursor": f"projects/memento/agent-transcripts/{session_id}.jsonl",
+    }[tool_id]
+    metadata = {"session_id": str(session_id)}
+    if tool_id == "codex":
+        metadata["thread_id"] = str(session_id)
     document = Document(
         id=uuid4(),
-        tool_id="claude_code",
+        tool_id=tool_id,
         machine_id=machine_id,
-        relative_path=f"projects/memento/{session_id}.jsonl",
+        relative_path=relative_path,
         category="conversation",
         content_type="jsonl",
         title=title,
         content_hash=uuid4().hex,
         file_size_bytes=1,
-        metadata_={"session_id": str(session_id)},
+        metadata_=metadata,
     )
     session.add(document)
     await session.flush()
-    session.add_all(
-        [
+    messages = []
+    if leading_system:
+        messages.append(
             ConversationMessage(
                 document_id=document.id,
                 line_number=1,
+                role="system",
+                content="Session context.",
+                metadata_={},
+            )
+        )
+    messages.extend(
+        [
+            ConversationMessage(
+                document_id=document.id,
+                line_number=2 if leading_system else 1,
                 role="user",
                 content=first_user_content,
                 metadata_={},
             ),
             ConversationMessage(
                 document_id=document.id,
-                line_number=2,
+                line_number=3 if leading_system else 2,
                 role="assistant",
                 content="Acknowledged.",
                 metadata_={},
             ),
         ]
     )
+    session.add_all(messages)
     await session.flush()
     return document
 
 
 async def _seed_owner(session):
-    if await session.get(Tool, "claude_code") is None:
-        session.add(Tool(id="claude_code", display_name="Claude Code"))
+    for tool_id, display_name in (
+        ("claude_code", "Claude Code"),
+        ("codex", "Codex"),
+        ("cursor", "Cursor"),
+    ):
+        if await session.get(Tool, tool_id) is None:
+            session.add(Tool(id=tool_id, display_name=display_name))
     user = User(
         id=uuid4(),
         email=f"{uuid4()}@example.test",
@@ -179,6 +206,129 @@ async def test_detail_api_links_successor_to_predecessor(session_factory) -> Non
         "canonical_url": f"/conversations/claude/{predecessor_session_id}",
     }
     assert "handoff_successor" not in payload
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_detail_api_links_codex_handoff_in_both_directions(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session)
+        predecessor_session_id = uuid4()
+        predecessor = await _seed_thread(
+            session,
+            session_id=predecessor_session_id,
+            title="Codex predecessor",
+            first_user_content="Start the Codex work.",
+            machine_id=machine.id,
+            tool_id="codex",
+            leading_system=True,
+        )
+        successor_session_id = uuid4()
+        successor = await _seed_thread(
+            session,
+            session_id=successor_session_id,
+            title="Codex successor",
+            first_user_content=(
+                f"MEMENTO-HANDOFF-FROM: {predecessor_session_id}\n"
+                "Continue the Codex work."
+            ),
+            machine_id=machine.id,
+            tool_id="codex",
+            leading_system=True,
+        )
+        successor.metadata_ = {
+            **successor.metadata_,
+            "briefing_kind": "handoff",
+            "briefing_session_id": str(predecessor_session_id),
+        }
+        await session.commit()
+
+        predecessor_payload = await get_conversation(
+            predecessor.id,
+            db=session,
+            _user=user,
+        )
+        successor_payload = await get_conversation(
+            successor.id,
+            db=session,
+            _user=user,
+        )
+
+    assert predecessor_payload["handoff_successor"] == {
+        "document_id": str(successor.id),
+        "tool_id": "codex",
+        "title": "Codex successor",
+        "canonical_url": f"/conversations/codex/{successor_session_id}",
+    }
+    assert successor_payload["handoff_predecessor"] == {
+        "document_id": str(predecessor.id),
+        "tool_id": "codex",
+        "title": "Codex predecessor",
+        "canonical_url": f"/conversations/codex/{predecessor_session_id}",
+    }
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_detail_api_links_cross_engine_handoff_in_both_directions(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        user, machine = await _seed_owner(session)
+        predecessor_session_id = uuid4()
+        predecessor = await _seed_thread(
+            session,
+            session_id=predecessor_session_id,
+            title="Cursor architecture thread",
+            first_user_content="Design the change.",
+            machine_id=machine.id,
+            tool_id="cursor",
+        )
+        successor_session_id = uuid4()
+        successor = await _seed_thread(
+            session,
+            session_id=successor_session_id,
+            title="Codex implementation thread",
+            first_user_content=(
+                f"MEMENTO-HANDOFF-FROM: {predecessor_session_id}\n"
+                "Implement the handed-off design."
+            ),
+            machine_id=machine.id,
+            tool_id="codex",
+            leading_system=True,
+        )
+        successor.metadata_ = {
+            **successor.metadata_,
+            "briefing_kind": "handoff",
+            "briefing_session_id": str(predecessor_session_id),
+        }
+        await session.commit()
+
+        predecessor_payload = await get_conversation(
+            predecessor.id,
+            db=session,
+            _user=user,
+        )
+        successor_payload = await get_conversation(
+            successor.id,
+            db=session,
+            _user=user,
+        )
+
+    assert predecessor_payload["handoff_successor"] == {
+        "document_id": str(successor.id),
+        "tool_id": "codex",
+        "title": "Codex implementation thread",
+        "canonical_url": f"/conversations/codex/{successor_session_id}",
+    }
+    assert successor_payload["handoff_predecessor"] == {
+        "document_id": str(predecessor.id),
+        "tool_id": "cursor",
+        "title": "Cursor architecture thread",
+        "canonical_url": f"/conversations/cursor/{predecessor_session_id}",
+    }
 
 
 @requires_postgres
