@@ -1732,3 +1732,25 @@ def test_installer_preserves_settings_and_is_idempotent(tmp_path: Path) -> None:
                 for hook in entry.get("hooks", [])
             )
         } >= {"AskUserQuestion", "Bash", "PowerShell", "Shell"}
+
+
+def test_hook_commands_preserve_virtualenv_interpreter_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    virtualenv_python = os.path.join(
+        os.sep,
+        "home",
+        "tester",
+        "collector-venv",
+        "bin",
+        "python",
+    )
+    monkeypatch.setattr(hook_module.sys, "executable", virtualenv_python)
+
+    pending_command = hook_module._hook_command()
+    governor_command = hook_module._governor_hook_command()
+
+    assert virtualenv_python in pending_command
+    assert virtualenv_python in governor_command
+    assert "collector.claude_pending_hook" in pending_command
+    assert "collector.handoff_governor_hook" in governor_command

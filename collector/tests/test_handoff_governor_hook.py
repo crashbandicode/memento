@@ -811,7 +811,8 @@ def test_frozen_tauri_reconciler_migrates_old_hooks_to_versioned_runner(
     _settings_path, changed = pending_hook.install_claude_pending_hooks()
 
     installed_runner = (
-        local_app_data / "Memento" / "hooks" / "0.0.60" / "memento-hook-runner.exe"
+        pending_hook._hook_runner_install_directory()
+        / "memento-hook-runner.exe"
     )
     assert changed is True
     assert installed_runner.read_bytes() == b"runner"
@@ -984,10 +985,10 @@ def test_runner_install_lost_windows_rename_race_uses_winner(
     source = tmp_path / "source" / "memento-hook-runner"
     _write_complete_runner(source)
     local_app_data = tmp_path / "local-app-data"
-    destination = local_app_data / "Memento" / "hooks" / "0.0.60"
     monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
     monkeypatch.setenv("MEMENTO_HOOK_RUNNER_SOURCE", str(source))
     monkeypatch.setattr(pending_hook.sys, "frozen", True, raising=False)
+    destination = pending_hook._hook_runner_install_directory()
 
     def lose_race(staging: Path, target: Path) -> None:
         shutil.copytree(staging, target)

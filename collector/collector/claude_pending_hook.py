@@ -1411,7 +1411,10 @@ def _hook_command(hook_runner: Path | None = None) -> str:
     if hook_runner is not None:
         executable = str(hook_runner.resolve()).replace('"', '\\"')
         return f'"{executable}" claude-hook'
-    executable = str(Path(sys.executable).resolve()).replace('"', '\\"')
+    # Keep the virtualenv entry point intact. Resolving it follows the usual
+    # ``venv/bin/python -> /usr/bin/python`` symlink on Linux, which leaves
+    # lifecycle hooks outside the environment that owns ``collector``.
+    executable = os.path.abspath(sys.executable).replace('"', '\\"')
     if getattr(sys, "frozen", False):
         return f'"{executable}" claude-hook'
     return f'"{executable}" -m collector.claude_pending_hook'
@@ -1448,7 +1451,7 @@ def _governor_hook_command(
         )
         return f"{executable} claude-governor-hook --enabled"
     executable = _hook_executable_token(
-        str(Path(sys.executable).resolve()),
+        os.path.abspath(sys.executable),
         codex_windows=codex_windows,
     )
     if getattr(sys, "frozen", False):
