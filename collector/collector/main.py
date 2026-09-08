@@ -34,6 +34,7 @@ from .cursor_state_export import (
 )
 from .orchestration_sync import OrchestrationSync
 from .queue import SyncQueue
+from .session_runtime import SessionRuntimePoller
 from .sync_client import SyncClient
 from .tools.antigravity import AntigravityTool
 from .tools.claude_code import ClaudeCodeTool
@@ -544,6 +545,7 @@ _ag_export_lock = threading.Lock()
 _claude_pending_poll_lock = threading.Lock()
 _codex_metadata_poll_lock = threading.Lock()
 _cursor_state_poll_lock = threading.Lock()
+_session_runtime_poll_lock = threading.Lock()
 
 
 def _poll_claude_pending_questions(
@@ -621,6 +623,32 @@ def _poll_codex_thread_titles(
         logger.exception("Codex thread title poll failed")
     finally:
         _codex_metadata_poll_lock.release()
+
+
+def _poll_session_runtimes(
+    poller: SessionRuntimePoller,
+    queue: SyncQueue,
+    logger: logging.Logger,
+) -> None:
+    """Queue hook-observed session lifecycle and privilege state."""
+
+    if not _session_runtime_poll_lock.acquire(blocking=False):
+        return
+    try:
+        grouped = poller.poll()
+        queued = 0
+        for tool_name, records in grouped.items():
+            queued += queue.enqueue_metadata_changes(
+                namespace="conversation_runtimes",
+                tool_name=tool_name,
+                records=records,
+            )
+        if queued:
+            logger.info("Queued %d agent runtime update(s)", queued)
+    except Exception:
+        logger.exception("Agent runtime poll failed")
+    finally:
+        _session_runtime_poll_lock.release()
 
 
 def _poll_cursor_state(
@@ -804,6 +832,7 @@ def main() -> None:
     cursor_tool = CursorTool()
     cursor_exporter = CursorStateExporter(cursor_tool)
     claude_pending_poller = ClaudePendingPoller()
+    session_runtime_poller = SessionRuntimePoller()
     canvas_schedule = _CanvasPollSchedule()
     tools = [
         claude_tool, OpenClawTool(), codex_tool,
@@ -859,6 +888,8 @@ def main() -> None:
             codex_tool.invalidate_thread_title_poll()
         with _claude_pending_poll_lock:
             claude_pending_poller.invalidate()
+        with _session_runtime_poll_lock:
+            session_runtime_poller.invalidate()
 
     control_spool = ControlEventSpool()
     control_uploader = ControlEventUploader(config, control_spool)
@@ -935,6 +966,12 @@ def main() -> None:
             args=(claude_tool, queue, logger, claude_pending_poller),
             daemon=True,
         ).start()
+
+    threading.Thread(
+        target=_poll_session_runtimes,
+        args=(session_runtime_poller, queue, logger),
+        daemon=True,
+    ).start()
 
     if cursor_tool in available and cursor_tool.state_database_path.is_file():
         threading.Thread(
@@ -1058,6 +1095,16 @@ def main() -> None:
                     threading.Thread(
                         target=_poll_cursor_state,
                         args=(cursor_exporter, queue, logger),
+                        daemon=True,
+                    ).start()
+
+                if (
+                    not _session_runtime_poll_lock.locked()
+                    and session_runtime_poller.needs_poll()
+                ):
+                    threading.Thread(
+                        target=_poll_session_runtimes,
+                        args=(session_runtime_poller, queue, logger),
                         daemon=True,
                     ).start()
 

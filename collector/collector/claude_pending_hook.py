@@ -56,6 +56,7 @@ _MEMENTO_GOVERNOR_HOOK_MARKERS = (
     "collector.handoff_governor_hook",
     " claude-governor-hook",
 )
+_MEMENTO_RUNTIME_HOOK_MARKERS = (" session-runtime-hook",)
 _HOOK_TIMEOUT_SECONDS = 10
 _HOOK_RUNNER_NAME = "memento-hook-runner"
 _HOOK_RUNNER_RETIREMENT_MARKER = "retired-at.json"
@@ -380,7 +381,8 @@ def _session_file_lock(
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError("Claude side-file lock timed out")
                     time.sleep(0.01)
-            unlock = lambda: msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            def unlock() -> None:
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
 
@@ -392,7 +394,8 @@ def _session_file_lock(
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError("Claude side-file lock timed out")
                     time.sleep(0.01)
-            unlock = lambda: fcntl.flock(descriptor, fcntl.LOCK_UN)
+            def unlock() -> None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         try:
             yield
         finally:
@@ -1459,6 +1462,26 @@ def _governor_hook_command(
     return f"{executable} -m collector.handoff_governor_hook --enabled"
 
 
+def _runtime_hook_command(
+    hook_runner: Path | None = None,
+    *,
+    codex_windows: bool = False,
+) -> str:
+    if hook_runner is not None:
+        executable = _hook_executable_token(
+            str(hook_runner.resolve()),
+            codex_windows=codex_windows,
+        )
+        return f"{executable} session-runtime-hook"
+    executable = _hook_executable_token(
+        os.path.abspath(sys.executable),
+        codex_windows=codex_windows,
+    )
+    if getattr(sys, "frozen", False):
+        return f"{executable} session-runtime-hook"
+    return f"{executable} -m collector.session_runtime"
+
+
 def _is_memento_hook(hook: object) -> bool:
     if not isinstance(hook, dict) or hook.get("type") != "command":
         return False
@@ -1471,6 +1494,13 @@ def _is_memento_governor_hook(hook: object) -> bool:
         return False
     command = str(hook.get("command") or "")
     return any(marker in command for marker in _MEMENTO_GOVERNOR_HOOK_MARKERS)
+
+
+def _is_memento_runtime_hook(hook: object) -> bool:
+    if not isinstance(hook, dict) or hook.get("type") != "command":
+        return False
+    command = str(hook.get("command") or "")
+    return any(marker in command for marker in _MEMENTO_RUNTIME_HOOK_MARKERS)
 
 
 def _claude_governor_hook_is_registered() -> bool:
@@ -1705,7 +1735,19 @@ def install_codex_governor_hooks(
         sort_keys=True,
         default=str,
     )
-    hook_runner = _install_hook_runner() if governor_enabled() else None
+    hook_runner = _install_hook_runner()
+    runtime_command = _runtime_hook_command(
+        hook_runner,
+        codex_windows=os.name == "nt",
+    )
+    for event_name in ("SessionStart", "SessionEnd"):
+        _merge_event_hooks(
+            hooks,
+            event_name,
+            ("*",),
+            runtime_command,
+            managed_hook=_is_memento_runtime_hook,
+        )
     if governor_enabled():
         governor_command = _governor_hook_command(
             hook_runner,
@@ -1784,6 +1826,13 @@ def _is_memento_cursor_governor_hook(hook: object) -> bool:
     return any(marker in command for marker in _MEMENTO_GOVERNOR_HOOK_MARKERS)
 
 
+def _is_memento_cursor_runtime_hook(hook: object) -> bool:
+    if not isinstance(hook, dict):
+        return False
+    command = str(hook.get("command") or "")
+    return any(marker in command for marker in _MEMENTO_RUNTIME_HOOK_MARKERS)
+
+
 def _remove_cursor_governor_hooks(hooks: dict[str, Any], event_name: str) -> None:
     entries = hooks.get(event_name)
     if entries is None:
@@ -1825,9 +1874,24 @@ def install_cursor_governor_hooks(
         raise TypeError("Cursor hooks must be an object")
 
     before = json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str)
-    hook_runner = _install_hook_runner() if governor_enabled() else None
+    hook_runner = _install_hook_runner()
     _remove_cursor_governor_hooks(hooks, "postToolUse")
     _remove_cursor_governor_hooks(hooks, "stop")
+    runtime_command = _runtime_hook_command(
+        hook_runner,
+        codex_windows=os.name == "nt",
+    )
+    for event_name in ("sessionStart", "sessionEnd"):
+        entries = hooks.get(event_name)
+        if entries is not None and not isinstance(entries, list):
+            raise TypeError(f"Cursor hooks {event_name} must be an array")
+        retained = [
+            entry
+            for entry in (entries or [])
+            if not _is_memento_cursor_runtime_hook(entry)
+        ]
+        retained.append({"command": runtime_command})
+        hooks[event_name] = retained
     if governor_enabled() and not _claude_governor_hook_is_registered():
         entries = hooks.setdefault("postToolUse", [])
         if not isinstance(entries, list):
@@ -1885,6 +1949,9 @@ def _hook_main() -> int:
             payload = _read_stdin_payload()
         except (OSError, UnicodeError, TypeError, ValueError):
             payload = {}
+        from .session_runtime import record_hook_observation
+
+        record_hook_observation(payload)
         process_payload(payload)
     except Exception:  # noqa: BLE001, S110 -- hooks must never block Claude
         pass

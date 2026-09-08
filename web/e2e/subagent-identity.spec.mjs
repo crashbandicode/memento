@@ -63,3 +63,46 @@ for (const viewport of [
     expect(pageErrors).toEqual([]);
   });
 }
+
+test("root assistant identity shows a forward-observed Administrator chip", async ({ page }) => {
+  const scenario = {
+    ...dreamlandParallelSubagents,
+    docId: "conv-administrator-runtime",
+    meta: {
+      ...dreamlandParallelSubagents.meta,
+      id: "conv-administrator-runtime",
+      runtime_state: "running",
+      runtime_privilege: "administrator",
+    },
+  };
+
+  await openConversation(page, scenario);
+
+  const assistant = page.locator('[data-message-category="assistant"]').first();
+  await expect(assistant.locator('[data-assistant-privilege="administrator"]')).toBeVisible();
+  await expect(assistant.getByText("Administrator", { exact: true })).toBeVisible();
+
+  await openConversation(page, {
+    ...scenario,
+    docId: "conv-root-runtime",
+    meta: {
+      ...scenario.meta,
+      id: "conv-root-runtime",
+      runtime_privilege: "root",
+    },
+  });
+  const rootAssistant = page.locator('[data-message-category="assistant"]').first();
+  await expect(rootAssistant.locator('[data-assistant-privilege="root"]')).toBeVisible();
+  await expect(rootAssistant.getByText("Root", { exact: true })).toBeVisible();
+
+  await openConversation(page, {
+    ...scenario,
+    docId: "conv-ended-administrator-runtime",
+    meta: {
+      ...scenario.meta,
+      id: "conv-ended-administrator-runtime",
+      runtime_state: "ended",
+    },
+  });
+  await expect(page.locator('[data-assistant-privilege]')).toHaveCount(0);
+});

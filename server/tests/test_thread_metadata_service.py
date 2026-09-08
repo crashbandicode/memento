@@ -1513,6 +1513,42 @@ class ThreadMetadataApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deferred_payload["relative_path"], relative_path)
         self.assertEqual(deferred_payload["session_id"], str(session_id))
 
+    async def test_runtime_endpoint_uses_explicit_codex_session_id(self) -> None:
+        user_id = uuid.uuid4()
+        machine = SimpleNamespace(id=uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        request = IngestMetadataRequest(
+            metadata_type="conversation_runtime",
+            tool="codex",
+            session_id=session_id,
+            runtime_state="running",
+            runtime_privilege="administrator",
+            timestamp="2026-09-08T13:00:00Z",
+        )
+
+        with (
+            patch(
+                "server.api.ingest.ensure_device",
+                new=AsyncMock(return_value=machine),
+            ),
+            patch(
+                "server.api.ingest.apply_conversation_runtime_update",
+                new=AsyncMock(return_value=ThreadTitleUpdateResult(1, 1, 0)),
+            ) as apply_runtime,
+        ):
+            response = await ingest_metadata_endpoint(
+                request,
+                _collector_user=SimpleNamespace(id=user_id),
+                _throttle=None,
+                db=_Session(),
+                x_device_id="device",
+                x_device_name="Device",
+                x_device_platform="Windows",
+            )
+
+        self.assertEqual(response.status, "ok")
+        self.assertEqual(apply_runtime.await_args.kwargs["session_id"], session_id)
+
     async def test_interaction_endpoint_forwards_source_backed_response(self) -> None:
         user_id = uuid.uuid4()
         machine = SimpleNamespace(id=uuid.uuid4())

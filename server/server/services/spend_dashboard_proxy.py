@@ -85,6 +85,44 @@ class SpendDashboardProxy:
         self._last_error = None
         self._refresh_task = None
 
+    def get_cached_snapshot(self) -> dict[str, Any]:
+        """Return usable cached telemetry without starting or awaiting I/O."""
+        if not settings.spend_dashboard_url.strip():
+            return {
+                "available": False,
+                "stale": False,
+                "source": "spend-dashboard-mcp",
+                "reason": "not_configured",
+                "snapshot": None,
+            }
+
+        entry = self._entry
+        if entry is None:
+            return {
+                "available": False,
+                "stale": False,
+                "source": "spend-dashboard-mcp",
+                "reason": "cache_empty",
+                "snapshot": None,
+            }
+
+        ttl = max(0, settings.spend_dashboard_cache_ttl_seconds)
+        max_stale = max(ttl, settings.spend_dashboard_max_stale_seconds)
+        age = self._age(entry)
+        if age > max_stale:
+            return {
+                "available": False,
+                "stale": False,
+                "source": "spend-dashboard-mcp",
+                "reason": "cache_expired",
+                "snapshot": None,
+            }
+        return self._response(
+            entry,
+            stale=age > ttl,
+            error=self._last_error,
+        )
+
     @staticmethod
     def _age(entry: _CacheEntry) -> float:
         return max(0.0, time.monotonic() - entry.cached_monotonic)

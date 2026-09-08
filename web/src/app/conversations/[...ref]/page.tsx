@@ -234,11 +234,12 @@ export default function ConversationPage() {
                 <Chip tone="accent">{t.conversation.planMode}</Chip>
               )}
               <span>{currentMeta.message_count} {t.conversation.messages}</span>
-              {(currentMeta.model || currentMeta.reasoning_effort || currentMeta.service_tier) && (
+              {(currentMeta.model || currentMeta.reasoning_effort || currentMeta.service_tier || currentMeta.runtime_state === "running") && (
                 <AssistantIdentityBadge
                   model={currentMeta.model}
                   reasoningEffort={currentMeta.reasoning_effort}
                   serviceTier={currentMeta.service_tier}
+                  privilege={currentMeta.runtime_state === "running" ? currentMeta.runtime_privilege : null}
                 />
               )}
               <TokenUsageBadge usage={currentMeta.token_usage} />
@@ -377,6 +378,7 @@ export default function ConversationPage() {
         activeTaskState={currentMeta?.active_task_state}
         artifacts={plans}
         handoffSuccessor={currentMeta?.handoff_successor}
+        runtimePrivilege={currentMeta?.runtime_state === "running" ? currentMeta.runtime_privilege : null}
         onBackgroundRunningCountChange={setBackgroundRunningCount}
       />
       {showExport && (

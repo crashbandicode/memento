@@ -16,7 +16,14 @@ from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..db.models import ConversationMessage, Document, Machine, PinnedMessage, User
+from ..db.models import (
+    ConversationMessage,
+    Document,
+    Machine,
+    PinnedMessage,
+    PinnedThread,
+    User,
+)
 from ..db.session import get_db
 from ..middleware.auth import get_current_user
 from ..services.user_filter import user_machine_ids
@@ -128,6 +135,17 @@ async def _authorized_message(
     return message
 
 
+async def _authorized_conversation(
+    db: AsyncSession,
+    user: User,
+    document_id: uuid.UUID,
+) -> Document:
+    document = await _authorized_document(db, user, document_id)
+    if document.category != "conversation":
+        raise HTTPException(status_code=404)
+    return document
+
+
 def _preview_for_message(message: ConversationMessage) -> dict:
     return _preview_payload(
         message_id=message.id,
@@ -137,6 +155,53 @@ def _preview_for_message(message: ConversationMessage) -> dict:
         content=(message.content or "")[:_PREVIEW_CHARS],
         timestamp=message.timestamp,
     )
+
+
+@router.post("/api/conversations/{document_id}/pin")
+async def pin_thread(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Idempotently pin one authorized conversation for the current user."""
+    await _authorized_conversation(db, user, document_id)
+    await db.execute(
+        insert(PinnedThread)
+        .values(user_id=user.id, document_id=document_id)
+        .on_conflict_do_nothing(index_elements=["user_id", "document_id"])
+    )
+    pin = (
+        await db.execute(
+            select(PinnedThread).where(
+                PinnedThread.user_id == user.id,
+                PinnedThread.document_id == document_id,
+            )
+        )
+    ).scalar_one()
+    await db.commit()
+    return {
+        "document_id": str(document_id),
+        "pinned": True,
+        "created_at": pin.created_at.isoformat() if pin.created_at else None,
+    }
+
+
+@router.delete("/api/conversations/{document_id}/pin")
+async def unpin_thread(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Idempotently remove the current user's conversation-level pin."""
+    await _authorized_conversation(db, user, document_id)
+    await db.execute(
+        delete(PinnedThread).where(
+            PinnedThread.user_id == user.id,
+            PinnedThread.document_id == document_id,
+        )
+    )
+    await db.commit()
+    return {"document_id": str(document_id), "pinned": False}
 
 
 @router.post("/api/conversations/{document_id}/messages/{message_id}/pin")

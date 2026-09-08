@@ -1,5 +1,5 @@
 import type { IconType } from "react-icons";
-import { FiMap, FiZap } from "react-icons/fi";
+import { FiMap, FiShield, FiZap } from "react-icons/fi";
 import {
   SiAnthropic,
   SiGooglegemini,
@@ -14,6 +14,7 @@ interface AssistantIdentityBadgeProps {
   reasoningEffort?: string | null;
   serviceTier?: string | null;
   agentMode?: string | null;
+  privilege?: "standard" | "administrator" | "root" | "unknown" | null;
   thinkingLabel?: string;
   planLabel?: string;
 }
@@ -103,6 +104,7 @@ export default function AssistantIdentityBadge({
   reasoningEffort,
   serviceTier,
   agentMode,
+  privilege,
   thinkingLabel = "Thinking",
   planLabel = "Plan mode",
 }: AssistantIdentityBadgeProps) {
@@ -110,26 +112,34 @@ export default function AssistantIdentityBadge({
   const rawEffort = cleanIdentityValue(reasoningEffort);
   const rawServiceTier = cleanIdentityValue(serviceTier);
   const rawAgentMode = cleanIdentityValue(agentMode);
+  const rawPrivilege = cleanIdentityValue(privilege).toLowerCase();
   const modelLabel = formatAssistantModelLabel(rawModel);
   const provider = assistantModelProvider(rawModel);
   const effortLabel = formatReasoningEffortLabel(rawEffort);
   const fastMode = isFastServiceTier(rawServiceTier);
   const planMode = rawAgentMode.toLowerCase() === "plan";
+  const privilegeLabel = rawPrivilege === "administrator"
+    ? "Administrator"
+    : rawPrivilege === "root"
+      ? "Root"
+      : "";
   const localizedThinkingLabel = cleanIdentityValue(thinkingLabel) || "Thinking";
   const localizedPlanLabel = cleanIdentityValue(planLabel) || "Plan mode";
-  if (!modelLabel && !effortLabel && !fastMode && !planMode) return null;
+  if (!modelLabel && !effortLabel && !fastMode && !planMode && !privilegeLabel) return null;
 
   const accessibleParts = [
     modelLabel ? `Model ${modelLabel}` : "",
     effortLabel ? `${localizedThinkingLabel} level ${effortLabel}` : "",
     planMode ? localizedPlanLabel : "",
     fastMode ? "Fast mode" : "",
+    privilegeLabel ? `Running as ${privilegeLabel}` : "",
   ].filter(Boolean);
   const exactParts = [
     rawModel ? `Model: ${rawModel}` : "",
     rawEffort ? `${localizedThinkingLabel}: ${rawEffort}` : "",
     rawServiceTier ? `Service tier: ${rawServiceTier}` : "",
     rawAgentMode ? `Agent mode: ${rawAgentMode}` : "",
+    privilegeLabel ? `Privilege: ${rawPrivilege}` : "",
   ].filter(Boolean);
 
   return (
@@ -140,6 +150,7 @@ export default function AssistantIdentityBadge({
       data-assistant-reasoning={rawEffort || undefined}
       data-assistant-service-tier={rawServiceTier || undefined}
       data-assistant-agent-mode={rawAgentMode || undefined}
+      data-assistant-privilege={privilegeLabel ? rawPrivilege : undefined}
       data-assistant-provider={provider.id}
       title={exactParts.join(" · ")}
     >
@@ -179,6 +190,15 @@ export default function AssistantIdentityBadge({
           <span className={styles.serviceTier}>
             <FiZap aria-hidden="true" />
             <span>Fast</span>
+          </span>
+        </>
+      )}
+      {privilegeLabel && (
+        <>
+          {(modelLabel || effortLabel || planMode || fastMode) && <span className={styles.divider} aria-hidden="true" />}
+          <span className={styles.privilege}>
+            <FiShield aria-hidden="true" />
+            <span>{privilegeLabel}</span>
           </span>
         </>
       )}

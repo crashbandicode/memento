@@ -14,6 +14,7 @@ import { Glass, Chip, TopBar, SectionLabel, StatCard } from "@/components/aurora
 import LowActivitySection from "@/components/conversations/LowActivitySection";
 import SubagentBadge from "@/components/conversations/SubagentBadge";
 import SpendDashboard from "@/components/dashboard/SpendDashboard";
+import OpenThreadsPanel, { type OpenThreadGroup } from "@/components/dashboard/OpenThreadsPanel";
 import { clawDelegateGroupCount, partitionDashboardRecent } from "@/lib/dashboard-recent";
 
 interface DashboardData {
@@ -43,6 +44,9 @@ interface DashboardData {
     claw_delegate?: boolean;
   }[];
   claw_delegate_count?: number;
+  open_thread_groups?: OpenThreadGroup[];
+  open_threads_truncated?: boolean;
+  open_thread_active_minutes?: number;
   daily: { date: string; count: number }[];
   tool_daily: Record<string, { date: string; count: number }[]>;
   devices: {
@@ -194,11 +198,10 @@ export default function Dashboard() {
   if (loading) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>{t.loading}</div>;
   if (!data) return <div style={{ color: "var(--aurora-fg4)", textAlign: "center", marginTop: 80 }}>Failed to load dashboard</div>;
 
-  const { stats, tools, daily, devices } = data;
+  const { stats, tools, devices } = data;
   const recent_conversations = [
     ...new Map(data.recent_conversations.map((item) => [item.id, item])).values(),
   ];
-  const maxDaily = Math.max(...daily.map((d) => d.count), 1);
   const {
     attention: attentionConversations,
     active: activeRecentConversations,
@@ -288,30 +291,11 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
         {/* Left col */}
         <div className="lg:col-span-2 space-y-6">
-          {/* 7-day activity bars */}
-          <Glass padding={22} radius={22}>
-            <SectionLabel style={{ margin: "0 0 16px" }}>{t.dashboard.weeklyActivity}</SectionLabel>
-            <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 88 }}>
-              {daily.map((d) => {
-                const h = Math.max((d.count / maxDaily) * 100, 4);
-                return (
-                  <div key={d.date} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-                    <span style={{ fontSize: 10, color: "var(--aurora-fg4)" }}>{d.count}</span>
-                    <div
-                      style={{
-                        width: "100%",
-                        height: `${h}%`,
-                        borderRadius: "6px 6px 2px 2px",
-                        background: "linear-gradient(180deg, #A78BFA, #7C3AED)",
-                        boxShadow: "0 4px 12px -4px rgba(124,58,237,0.45)",
-                      }}
-                    />
-                    <span style={{ fontSize: 10, color: "var(--aurora-fg4)" }}>{d.date.slice(5)}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </Glass>
+          <OpenThreadsPanel
+            groups={data.open_thread_groups ?? []}
+            truncated={data.open_threads_truncated}
+            activeMinutes={data.open_thread_active_minutes}
+          />
 
           {/* Tools grid */}
           <div>

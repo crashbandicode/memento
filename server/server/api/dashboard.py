@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -24,9 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.models import (
     ConversationMessage,
+    ConversationRuntime,
     DashboardDocumentProjection,
     Document,
     Machine,
+    PinnedThread,
     Project,
     Tool,
     User,
@@ -42,9 +46,15 @@ from ..services.conversation_hierarchy import (
     build_subagent_summaries,
     build_conversation_companion_filter,
     conversation_display_title,
+    current_thread_id,
     fold_conversation_subagents,
     group_conversation_root_thread_ids,
     handoff_chain_title_overrides,
+    resolve_conversation_briefing,
+)
+from ..services.conversation_identity import (
+    conversation_resume_id,
+    native_conversation_url,
 )
 from ..services.dashboard_projection import (
     ARCHIVED_METADATA_KEY,
@@ -59,7 +69,7 @@ from ..services.dashboard_conversation_message_rollup import (
     dashboard_conversation_message_rollup_is_populated,
     dashboard_message_activity_from_rollup,
 )
-from ..services.device_grouping import resolve_device_scope_ids
+from ..services.device_grouping import resolve_device_scope_ids, split_device_name
 from ..services.document_delivery import (
     delivery_activity_expression,
     delivery_file_size_expression,
@@ -75,6 +85,7 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 DASHBOARD_CONVERSATION_CANDIDATE_LIMIT = 600
 RECENT_PRIMARY_LIMIT = 20
 RECENT_CLAW_SAMPLE_LIMIT = 20
+OPEN_THREAD_ACTIVE_MINUTES = 20
 
 
 @router.get("/spend")
@@ -255,6 +266,240 @@ def _row_metadata(row) -> dict:
         if row.tool_id == "codex":
             metadata["thread_source"] = "subagent"
     return metadata
+
+
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _absolute_project_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 4096
+        or re.search(r"[\x00-\x1f\x7f-\x9f]", candidate)
+    ):
+        return None
+    if (
+        candidate.startswith("/")
+        or candidate.startswith("\\\\")
+        or _WINDOWS_ABSOLUTE_PATH_RE.match(candidate)
+    ):
+        return candidate
+    return None
+
+
+def _row_location(row) -> dict[str, str] | None:
+    raw_host = str(getattr(row, "machine_name", "") or "").strip()
+    host, runtime_platform = split_device_name(raw_host)
+    if not host or re.search(r"[\x00-\x1f\x7f-\x9f]", host):
+        return None
+    metadata = _row_metadata(row)
+    path = next(
+        (
+            candidate
+            for candidate in (
+                _absolute_project_path(metadata.get("project_path")),
+                _absolute_project_path(metadata.get("cwd")),
+                _absolute_project_path(getattr(row, "project_source_path", None)),
+            )
+            if candidate
+        ),
+        None,
+    )
+    if path is None:
+        return None
+    return {
+        "host": host[:255],
+        "path": path,
+        "platform": runtime_platform,
+    }
+
+
+def _conversation_resume_command(
+    tool_id: str,
+    resume_id: str | None,
+    location: dict[str, str] | None,
+) -> str | None:
+    """Build one copy-ready native resume command from verified identifiers."""
+    if not resume_id:
+        return None
+    quoted_resume_id = f"'{resume_id}'"
+    invocations = {
+        "claude_code": f"claude --resume {quoted_resume_id}",
+        "codex": f"codex resume {quoted_resume_id}",
+        "cursor": f"cursor-agent --resume={quoted_resume_id}",
+    }
+    invocation = invocations.get(tool_id)
+    if invocation is None:
+        return None
+    path = str((location or {}).get("path") or "").strip()
+    if not path:
+        return invocation
+    platform = str((location or {}).get("platform") or "").casefold()
+    if platform == "windows":
+        return (
+            f"Set-Location -LiteralPath '{path.replace(chr(39), chr(39) * 2)}' && "
+            f"{invocation}"
+        )
+    escaped = path.replace("'", "'\"'\"'")
+    return f"cd -- '{escaped}' && {invocation}"
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _thread_health_by_document(response: object) -> dict[str, dict]:
+    """Index only observed per-thread health rows; absence stays unknown."""
+    if not isinstance(response, dict) or response.get("available") is not True:
+        return {}
+    snapshot = response.get("snapshot")
+    hygiene = snapshot.get("hygiene") if isinstance(snapshot, dict) else None
+    hop_threads = hygiene.get("hopThreads") if isinstance(hygiene, dict) else None
+    items = hop_threads.get("items") if isinstance(hop_threads, dict) else None
+    if not isinstance(items, list):
+        return {}
+    result: dict[str, dict] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        document_id = str(
+            item.get("documentId") or item.get("document_id") or ""
+        ).strip()
+        source = str(item.get("source") or "").strip()
+        status = str(item.get("status") or "").strip()
+        ratio = _finite_number(item.get("ratio"))
+        hop_line = _finite_number(
+            item.get("hopLine") if "hopLine" in item else item.get("hop_line")
+        )
+        hard_line = _finite_number(
+            item.get("hardLine") if "hardLine" in item else item.get("hard_line")
+        )
+        if (
+            not document_id
+            or not source
+            or not status
+            or ratio is None
+            or hop_line is None
+            or hard_line is None
+        ):
+            continue
+        result[document_id] = {
+            "available": True,
+            "stale": bool(response.get("stale")),
+            "source": source,
+            "ratio": ratio,
+            "status": status,
+            "hop_line": hop_line,
+            "hard_line": hard_line,
+        }
+    return result
+
+
+def _handoff_predecessor_document_ids(rows) -> set:
+    """Return predecessors closed by one unambiguous explicit handoff marker."""
+    rows = list(rows)
+    rows_by_thread: dict[tuple[object, str], list] = {}
+    for row in rows:
+        if thread_id := current_thread_id(_row_metadata(row)):
+            key = (getattr(row, "machine_id", None), thread_id)
+            rows_by_thread.setdefault(key, []).append(row)
+    predecessors = set()
+    for row in rows:
+        kind, predecessor_thread_id = resolve_conversation_briefing(
+            metadata=_row_metadata(row),
+        )
+        if kind != "handoff" or predecessor_thread_id is None:
+            continue
+        predecessor_key = (
+            getattr(row, "machine_id", None),
+            predecessor_thread_id,
+        )
+        matches = [
+            candidate
+            for candidate in rows_by_thread.get(predecessor_key, [])
+            if candidate.id != row.id
+        ]
+        # A UUID collision or duplicate source copy cannot be disambiguated
+        # from this bounded projection. Keep both instead of hiding the wrong
+        # conversation.
+        if len(matches) == 1:
+            predecessors.add(matches[0].id)
+    return predecessors
+
+
+def _select_open_thread_rows(
+    rows,
+    *,
+    visible_document_ids: set,
+    pinned_root_ids: set,
+    handoff_predecessor_ids: set,
+    logical_activity_by_document: dict,
+    running_document_ids: set | None = None,
+    now: datetime,
+    active_minutes: int = OPEN_THREAD_ACTIVE_MINUTES,
+):
+    """Select recently active roots plus explicit pins without inferring closure."""
+    cutoff = now - timedelta(minutes=active_minutes)
+    running_document_ids = running_document_ids or set()
+    selected = []
+    for row in rows:
+        if row.id not in visible_document_ids or row.is_subagent:
+            continue
+        if row.id in pinned_root_ids:
+            selected.append(row)
+            continue
+        activity_at = (
+            logical_activity_by_document.get(row.id)
+            or row.activity_at
+            or row.source_modified_at
+            or row.synced_at
+        )
+        if (
+            not row.is_archived
+            and row.id not in handoff_predecessor_ids
+            and (
+                row.id in running_document_ids
+                or (activity_at is not None and activity_at >= cutoff)
+            )
+        ):
+            selected.append(row)
+    return selected
+
+
+def _fold_open_thread_hierarchy_by_machine(rows, conversation_refs):
+    """Fold native hierarchy without deduplicating copies across machines."""
+
+    refs_by_document = {
+        ref.document_id: ref for ref in conversation_refs
+    }
+    visible_document_ids = set()
+    canonical_document_ids = {}
+    logical_activity_by_document = {}
+    rows_by_machine = {}
+    for row in rows:
+        rows_by_machine.setdefault(row.machine_id, []).append(row)
+    for machine_rows in rows_by_machine.values():
+        machine_refs = [refs_by_document[row.id] for row in machine_rows]
+        hierarchy = fold_conversation_subagents(machine_refs)
+        visible_document_ids.update(hierarchy.visible_document_ids)
+        canonical_document_ids.update(hierarchy.canonical_document_ids)
+        logical_activity_by_document.update(
+            build_logical_activity_map(hierarchy, machine_refs)
+        )
+    return (
+        visible_document_ids,
+        canonical_document_ids,
+        logical_activity_by_document,
+    )
 
 
 def _is_unlinked_claw_row(row) -> bool:
@@ -461,6 +706,11 @@ async def get_dashboard(
         source.c.project_id,
         source.c.file_size_bytes,
         Project.title.label("project_title"),
+        Project.source_path.label("project_source_path"),
+        select(Machine.name)
+        .where(Machine.id == source.c.machine_id)
+        .scalar_subquery()
+        .label("machine_name"),
         source.c.relative_path,
         source.c.hierarchy_metadata,
         source.c.source_modified_at,
@@ -543,6 +793,82 @@ async def get_dashboard(
         rows_by_id[row.id] = row
     for row in claw_sample_rows:
         rows_by_id[row.id] = row
+    # The Recent section remains bounded, but Open Threads must not inherit
+    # that presentation budget. Fetch every source-active conversation in the
+    # open window, including Claw rows, before hierarchy folding.
+    open_activity_cutoff = now - timedelta(minutes=OPEN_THREAD_ACTIVE_MINUTES)
+    active_convos_q = (
+        select(*conversation_columns)
+        .outerjoin(Project, source.c.project_id == Project.id)
+        .where(
+            _unarchived_conversation_filter(source),
+            activity_expr >= open_activity_cutoff,
+        )
+    )
+    for row in (await db.execute(scoped(active_convos_q))).all():
+        rows_by_id[row.id] = row
+    pinned_thread_rows = list(
+        (
+            await db.execute(
+                select(PinnedThread.document_id, PinnedThread.created_at).where(
+                    PinnedThread.user_id == _user.id
+                )
+            )
+        ).all()
+    )
+    pinned_document_ids = {row.document_id for row in pinned_thread_rows}
+    if pinned_document_ids:
+        pinned_convos_q = (
+            select(*conversation_columns)
+            .outerjoin(Project, source.c.project_id == Project.id)
+            .where(
+                source.c.category == "conversation",
+                source.c.id.in_(pinned_document_ids),
+            )
+        )
+        for row in (await db.execute(scoped(pinned_convos_q))).all():
+            rows_by_id[row.id] = row
+
+    machine_scope = _effective_machine_scope(mids, selected_machine_ids)
+    running_runtimes_q = select(ConversationRuntime).where(
+        ConversationRuntime.state == "running"
+    )
+    if machine_scope is not None:
+        running_runtimes_q = running_runtimes_q.where(
+            ConversationRuntime.machine_id.in_(machine_scope)
+        )
+    running_runtimes = list(
+        (await db.execute(running_runtimes_q)).scalars().all()
+    )
+    runtime_by_key = {
+        (runtime.machine_id, runtime.tool_id, runtime.session_id): runtime
+        for runtime in running_runtimes
+    }
+    runtime_by_document = {}
+    running_document_ids = set()
+    runtime_filters = [
+        and_(
+            source.c.machine_id == machine_id,
+            source.c.tool_id == tool_id,
+            source.c.session_id == session_id,
+        )
+        for machine_id, tool_id, session_id in runtime_by_key
+    ]
+    if runtime_filters:
+        runtime_convos_q = (
+            select(*conversation_columns)
+            .outerjoin(Project, source.c.project_id == Project.id)
+            .where(source.c.category == "conversation", or_(*runtime_filters))
+        )
+        for row in (await db.execute(scoped(runtime_convos_q))).all():
+            runtime = runtime_by_key.get(
+                (row.machine_id, row.tool_id, row.session_id)
+            )
+            if runtime is None:
+                continue
+            rows_by_id[row.id] = row
+            running_document_ids.add(row.id)
+            runtime_by_document[row.id] = runtime
     candidate_rows = list(rows_by_id.values())
 
     def conversation_ref(row) -> ConversationRef:
@@ -647,6 +973,14 @@ async def get_dashboard(
         conversation_hierarchy,
         conversation_refs,
     )
+    # Open-thread cards represent physical collector copies. Fold children
+    # independently inside each machine so a newer copy on one host cannot
+    # hide the same native root on another host.
+    (
+        open_visible_document_ids,
+        open_canonical_document_ids,
+        open_logical_activity_by_document,
+    ) = _fold_open_thread_hierarchy_by_machine(all_convo_rows, conversation_refs)
     pending_question_counts: dict = {}
     for row in all_convo_rows:
         count = max(0, int(row.pending_question_count or 0))
@@ -675,6 +1009,22 @@ async def get_dashboard(
             or row.synced_at,
             str(row.id),
         )
+
+    pinned_root_ids = {
+        open_canonical_document_ids.get(document_id, document_id)
+        for document_id in pinned_document_ids
+        if document_id in all_convo_rows_by_id
+    }
+    handoff_predecessor_ids = _handoff_predecessor_document_ids(all_convo_rows)
+    open_thread_rows = _select_open_thread_rows(
+        all_convo_rows,
+        visible_document_ids=open_visible_document_ids,
+        pinned_root_ids=pinned_root_ids,
+        handoff_predecessor_ids=handoff_predecessor_ids,
+        logical_activity_by_document=open_logical_activity_by_document,
+        running_document_ids=running_document_ids,
+        now=now,
+    )
 
     attention_rows = [
         row
@@ -845,6 +1195,113 @@ async def get_dashboard(
         "total_files": device_counts.get(machine.id, 0),
     } for machine in machine_rows]
 
+    # Never make the primary dashboard wait for external telemetry. The
+    # dedicated /api/dashboard/spend route owns cache population; until then,
+    # per-thread health is truthfully unknown.
+    health_by_document = _thread_health_by_document(
+        spend_dashboard_proxy.get_cached_snapshot()
+    ) if open_thread_rows else {}
+    open_rows_by_machine: dict[str, list] = {}
+    for row in open_thread_rows:
+        open_rows_by_machine.setdefault(str(row.machine_id or "unknown"), []).append(row)
+
+    open_thread_groups = []
+    open_threads_truncated = False
+    open_thread_cutoff = now - timedelta(minutes=OPEN_THREAD_ACTIVE_MINUTES)
+
+    def open_activity_key(row):
+        return (
+            open_logical_activity_by_document.get(row.id)
+            or row.activity_at
+            or row.source_modified_at
+            or row.synced_at,
+            str(row.id),
+        )
+
+    for machine_id, rows in open_rows_by_machine.items():
+        pinned_rows = sorted(
+            (row for row in rows if row.id in pinned_root_ids),
+            key=open_activity_key,
+            reverse=True,
+        )
+        unpinned_rows = sorted(
+            (row for row in rows if row.id not in pinned_root_ids),
+            key=open_activity_key,
+            reverse=True,
+        )
+        ordered_rows = pinned_rows + unpinned_rows
+        group_truncated = False
+        raw_machine_name = str(ordered_rows[0].machine_name or "").strip()
+        machine_host, machine_platform = split_device_name(raw_machine_name)
+        threads = []
+        for row in ordered_rows:
+            metadata = _row_metadata(row)
+            location = _row_location(row)
+            resume_id = conversation_resume_id(
+                row.tool_id,
+                "conversation",
+                metadata,
+            )
+            activity_at = open_activity_key(row)[0]
+            observed_runtime = runtime_by_document.get(row.id)
+            threads.append({
+                "document_id": str(row.id),
+                "tool_id": row.tool_id,
+                "title": conversation_titles.get(row.id) or row.title,
+                "canonical_url": (
+                    native_conversation_url(
+                        row.tool_id,
+                        "conversation",
+                        metadata,
+                    )
+                    or f"/conversations/{row.id}"
+                ),
+                "resume_id": resume_id,
+                "resume_command": _conversation_resume_command(
+                    row.tool_id,
+                    resume_id,
+                    location,
+                ),
+                "location": location,
+                "project_title": row.project_title,
+                "activity_at": activity_at.isoformat() if activity_at else None,
+                "is_open": (
+                    row.id in running_document_ids
+                    or (
+                        not row.is_archived
+                        and row.id not in handoff_predecessor_ids
+                        and activity_at is not None
+                        and activity_at >= open_thread_cutoff
+                    )
+                ),
+                "runtime_state": (
+                    observed_runtime.state if observed_runtime is not None else None
+                ),
+                "runtime_privilege": (
+                    observed_runtime.privilege
+                    if observed_runtime is not None
+                    else None
+                ),
+                "pinned": row.id in pinned_root_ids,
+                "health": health_by_document.get(str(row.id)),
+            })
+        open_thread_groups.append({
+            "machine": {
+                "id": machine_id,
+                "name": raw_machine_name or machine_host,
+                "host": machine_host,
+                "platform": machine_platform,
+            },
+            "total_threads": len(rows),
+            "truncated": group_truncated,
+            "threads": threads,
+        })
+    open_thread_groups.sort(key=lambda group: (
+        group["machine"]["host"].casefold(),
+        group["machine"]["platform"].casefold(),
+        group["machine"]["id"],
+    ))
+
     today_total_q = scoped(
         select(func.count()).select_from(source).where(
             source.c.synced_at >= today_start
@@ -874,6 +1331,9 @@ async def get_dashboard(
         "tools": tools,
         "recent_conversations": recent_conversations,
         "claw_delegate_count": claw_delegate_count,
+        "open_thread_groups": open_thread_groups,
+        "open_thread_active_minutes": OPEN_THREAD_ACTIVE_MINUTES,
+        "open_threads_truncated": open_threads_truncated,
         "daily": daily,
         "tool_daily": tool_daily,
         "devices": devices,

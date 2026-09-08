@@ -447,6 +447,60 @@ class PinnedMessage(Base):
     )
 
 
+class PinnedThread(Base):
+    """A user's explicit dashboard pin for one conversation document."""
+
+    __tablename__ = "pinned_threads"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_pinned_threads_user_created", "user_id", created_at.desc()),
+    )
+
+
+class ConversationRuntime(Base):
+    """Forward-only hook observation for one native agent session."""
+
+    __tablename__ = "conversation_runtimes"
+
+    machine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("machines.id", ondelete="CASCADE"), primary_key=True
+    )
+    tool_id: Mapped[str] = mapped_column(
+        ForeignKey("tools.id", ondelete="CASCADE"), primary_key=True
+    )
+    session_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    privilege: Mapped[str] = mapped_column(String(20), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('running', 'ended')",
+            name="ck_conversation_runtimes_state",
+        ),
+        CheckConstraint(
+            "privilege IN ('standard', 'administrator', 'root', 'unknown')",
+            name="ck_conversation_runtimes_privilege",
+        ),
+        Index("idx_conversation_runtimes_state", "machine_id", "state"),
+    )
+
+
 class ConversationUsageEvent(Base):
     """One exact native usage observation attributed to a model selection."""
 

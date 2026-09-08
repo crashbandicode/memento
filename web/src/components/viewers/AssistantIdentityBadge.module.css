@@ -140,6 +140,19 @@
   font-weight: 750;
 }
 
+.privilege {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #b45309;
+  font-weight: 750;
+}
+
+.privilege svg {
+  width: 10px;
+  height: 10px;
+}
+
 .agentMode svg {
   width: 10px;
   height: 10px;

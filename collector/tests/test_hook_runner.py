@@ -34,6 +34,18 @@ def test_dispatches_governor_hook_with_remaining_arguments(
     assert observed == [["--enabled"]]
 
 
+def test_dispatches_session_runtime_hook_with_remaining_arguments(
+    monkeypatch,
+) -> None:
+    observed: list[list[str]] = []
+    runtime = types.ModuleType("collector.session_runtime")
+    runtime.main = lambda arguments: observed.append(arguments) or 29
+    monkeypatch.setitem(sys.modules, "collector.session_runtime", runtime)
+
+    assert hook_runner.main(["session-runtime-hook"]) == 29
+    assert observed == [[]]
+
+
 def test_rejects_unknown_or_missing_hook_command() -> None:
     assert hook_runner.main([]) == 2
     assert hook_runner.main(["not-a-hook"]) == 2

@@ -289,6 +289,43 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_pinned_messages_user_document "
         "ON pinned_messages (user_id, document_id)"
     ))
+    # Thread pins are a distinct personal dashboard preference. Do not overload
+    # pinned_messages: message bookmarks have a stable-message anchor and a
+    # different lifecycle from a whole-conversation pin.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS pinned_threads ("
+        "user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE, "
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "PRIMARY KEY (user_id, document_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_pinned_threads_user_created "
+        "ON pinned_threads (user_id, created_at DESC)"
+    ))
+    # Runtime state is deliberately forward-only. Agent lifecycle hooks observe
+    # the owning process token and publish the newest state for each native
+    # session; old conversations are not guessed or backfilled.
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS conversation_runtimes ("
+        "machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE, "
+        "tool_id VARCHAR(50) NOT NULL REFERENCES tools(id) ON DELETE CASCADE, "
+        "session_id VARCHAR(512) NOT NULL, "
+        "state VARCHAR(20) NOT NULL CHECK (state IN ('running', 'ended')), "
+        "privilege VARCHAR(20) NOT NULL CHECK (privilege IN "
+        "('standard', 'administrator', 'root', 'unknown')), "
+        "started_at TIMESTAMPTZ, "
+        "observed_at TIMESTAMPTZ NOT NULL, "
+        "ended_at TIMESTAMPTZ, "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+        "PRIMARY KEY (machine_id, tool_id, session_id)"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_runtimes_state "
+        "ON conversation_runtimes (machine_id, state)"
+    ))
     # Claude transcripts are parent-linked trees. Keep their raw UUID lineage
     # normalized instead of putting an unbounded branch path in documents
     # metadata; this is additive and populated lazily by authoritative ingest.

@@ -588,9 +588,29 @@ def test_codex_registration_preserves_user_hooks_and_is_idempotent(
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
     _removed_path, removed = pending_hook.install_codex_governor_hooks()
     settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+    runtime_command = pending_hook._runtime_hook_command(
+        runner,
+        codex_windows=os.name == "nt",
+    )
 
     assert removed is True
     assert settings["hooks"] == {
+        "SessionEnd": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {"type": "command", "command": runtime_command, "timeout": 10}
+                ],
+            }
+        ],
+        "SessionStart": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {"type": "command", "command": runtime_command, "timeout": 10}
+                ],
+            }
+        ],
         "Stop": [
             {
                 "matcher": "*",
@@ -659,12 +679,18 @@ def test_cursor_native_registration_preserves_user_hooks_and_removes_stop(
     monkeypatch.delenv("MEMENTO_GOVERNOR_ENABLED")
     _removed_path, removed = pending_hook.install_cursor_governor_hooks()
     settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+    runtime_command = pending_hook._runtime_hook_command(
+        runner,
+        codex_windows=os.name == "nt",
+    )
 
     assert removed is True
     assert settings == {
         "version": 1,
         "hooks": {
             "postToolUse": [{"command": "user-post-hook", "matcher": "Read"}],
+            "sessionEnd": [{"command": runtime_command}],
+            "sessionStart": [{"command": runtime_command}],
             "stop": [{"command": "user-stop-hook"}],
         },
     }
@@ -737,6 +763,10 @@ def test_cursor_uses_imported_claude_governor_without_native_duplicate(
     installed_path, changed = pending_hook.install_cursor_governor_hooks()
     _installed_path, changed_again = pending_hook.install_cursor_governor_hooks()
     settings = json.loads(hooks_path.read_text(encoding="utf-8"))
+    runtime_command = pending_hook._runtime_hook_command(
+        runner,
+        codex_windows=os.name == "nt",
+    )
 
     assert installed_path == hooks_path
     assert changed is True
@@ -745,6 +775,8 @@ def test_cursor_uses_imported_claude_governor_without_native_duplicate(
         "version": 1,
         "hooks": {
             "postToolUse": [{"command": "user-post-hook", "matcher": "Read"}],
+            "sessionEnd": [{"command": runtime_command}],
+            "sessionStart": [{"command": runtime_command}],
             "stop": [{"command": "user-stop-hook"}],
         },
     }

@@ -466,6 +466,7 @@ export default function ConversationViewer({
   activeTaskState,
   artifacts,
   handoffSuccessor,
+  runtimePrivilege,
   onBackgroundRunningCountChange,
 }: {
   documentId: string;
@@ -479,6 +480,7 @@ export default function ConversationViewer({
   activeTaskState?: ConversationTaskState | null;
   artifacts?: Artifact[];
   handoffSuccessor?: ConversationHandoffLink | null;
+  runtimePrivilege?: "standard" | "administrator" | "root" | "unknown" | null;
   onBackgroundRunningCountChange?: (count: number) => void;
 }) {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
@@ -1532,6 +1534,7 @@ export default function ConversationViewer({
             msg={msg}
             toolId={toolId}
             userRoleOrigin={userRoleOrigin}
+            runtimePrivilege={runtimePrivilege}
             locale={locale}
             t={t}
             isPinned={pinnedMessageIds.has(msg.id)}
@@ -5682,6 +5685,7 @@ export const ChatBubble = memo(function ChatBubble({
   msg,
   toolId = "",
   userRoleOrigin,
+  runtimePrivilege,
   locale,
   t,
   isPinned = false,
@@ -5699,6 +5703,7 @@ export const ChatBubble = memo(function ChatBubble({
   msg: ConversationMessage;
   toolId?: string;
   userRoleOrigin?: "parent_agent" | null;
+  runtimePrivilege?: "standard" | "administrator" | "root" | "unknown" | null;
   locale: string;
   t: ReturnType<typeof useI18n>["t"];
   isPinned?: boolean;
@@ -6025,6 +6030,7 @@ export const ChatBubble = memo(function ChatBubble({
                   reasoningEffort={msg.reasoning_effort}
                   serviceTier={msg.service_tier}
                   agentMode={msg.agent_mode}
+                  privilege={runtimePrivilege}
                   thinkingLabel={t.conversation.thinking}
                   planLabel={t.conversation.planMode}
                 />

@@ -16,7 +16,7 @@ type IconName =
   | "activity" | "zap" | "grid" | "inbox" | "command"
   | "git_branch"
   | "arrow_up" | "arrow_down" | "refresh" | "check" | "close"
-  | "menu" | "trash" | "link" | "copy" | "external_link" | "eye";
+  | "menu" | "trash" | "link" | "copy" | "external_link" | "eye" | "pin";
 
 const PATHS: Record<IconName, React.ReactElement> = {
   home: <><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-7h4v7h4a1 1 0 0 0 1-1V10"/></>,
@@ -76,6 +76,7 @@ const PATHS: Record<IconName, React.ReactElement> = {
   copy: <><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>,
   external_link: <><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14L21 3"/></>,
   eye: <><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></>,
+  pin: <><path d="M12 17v5"/><path d="M5 17h14"/><path d="M7 17l1-7-3-3V5h14v2l-3 3 1 7z"/></>,
 };
 
 interface IconProps extends Omit<SVGProps<SVGSVGElement>, "name"> {

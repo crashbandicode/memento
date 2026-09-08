@@ -73,6 +73,23 @@ def _settings(monkeypatch) -> None:
     monkeypatch.setattr(settings, "spend_dashboard_max_stale_seconds", 3600)
 
 
+def test_cached_snapshot_never_starts_an_upstream_fetch(monkeypatch) -> None:
+    async def unexpected(_url: str, _headers: dict) -> _Response:
+        raise AssertionError("cached-only lookup called upstream")
+
+    calls = _install_client(monkeypatch, unexpected)
+    proxy = SpendDashboardProxy()
+
+    assert proxy.get_cached_snapshot() == {
+        "available": False,
+        "stale": False,
+        "source": "spend-dashboard-mcp",
+        "reason": "cache_empty",
+        "snapshot": None,
+    }
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_disabled_integration_never_calls_upstream(monkeypatch) -> None:
     monkeypatch.setattr(settings, "spend_dashboard_url", "")

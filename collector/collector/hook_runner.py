@@ -26,6 +26,10 @@ def main(argv: list[str] | None = None) -> int:
         from .handoff_governor_hook import main as governor_main
 
         return governor_main(command_arguments)
+    if command == "session-runtime-hook":
+        from .session_runtime import main as runtime_main
+
+        return runtime_main(command_arguments)
     return 2
 
 

@@ -81,6 +81,7 @@ from ..services.conversation_read_model import (
     conversation_prompt_rows_statement,
 )
 from ..services.conversation_usage import token_usage_from_metadata
+from ..services.conversation_runtime import conversation_runtime_for_document
 from ..services.conversation_usage_cycle import (
     aggregate_usage_cycle,
     conversation_usage_models,
@@ -1709,6 +1710,7 @@ async def get_conversation(
     if token_usage:
         runtime["token_usage"] = token_usage
     usage_models = await conversation_usage_models(db, doc.id)
+    observed_runtime = await conversation_runtime_for_document(db, doc)
     thread_links = await _conversation_thread_links(db, doc, mids)
     display_title = conversation_display_title(
         doc.tool_id,
@@ -1765,6 +1767,17 @@ async def get_conversation(
         "model_family": runtime.get("model_family"),
         "reasoning_effort": runtime.get("reasoning_effort"),
         "service_tier": runtime.get("service_tier"),
+        "runtime_state": (
+            observed_runtime.state if observed_runtime is not None else None
+        ),
+        "runtime_privilege": (
+            observed_runtime.privilege if observed_runtime is not None else None
+        ),
+        "runtime_observed_at": (
+            observed_runtime.observed_at.isoformat()
+            if observed_runtime is not None
+            else None
+        ),
         "token_usage": runtime.get("token_usage") or None,
         "models": usage_models,
         "started_at": runtime.get("started_at") or None,

@@ -350,6 +350,9 @@ export interface ConversationMeta {
   model_family?: string | null;
   reasoning_effort?: string | null;
   service_tier?: string | null;
+  runtime_state?: "running" | "ended" | null;
+  runtime_privilege?: "standard" | "administrator" | "root" | "unknown" | null;
+  runtime_observed_at?: string | null;
   token_usage?: ConversationTokenUsage | null;
   handoff_predecessor?: ConversationHandoffLink | null;
   handoff_successor?: ConversationHandoffLink | null;
@@ -860,13 +863,13 @@ async function markdownExportDownload(
 ): Promise<MarkdownExportDownload> {
   const response = await authFetch(`${getApiBase()}${path}`, init);
   if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
+    const text = await response.text();
+    let detail = text || `HTTP ${response.status}`;
     try {
-      const body = await response.json() as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body = JSON.parse(text) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
     } catch {
-      const text = await response.text();
-      if (text) detail = text;
+      // Non-JSON responses retain their original server-provided text.
     }
     throw new Error(detail);
   }

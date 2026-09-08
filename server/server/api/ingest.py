@@ -60,6 +60,7 @@ from ..services.large_content_store import (
     store_large_content,
 )
 from ..services.orchestration_events import ingest_orchestration_events
+from ..services.conversation_runtime import apply_conversation_runtime_update
 from ..services.thread_metadata_service import (
     apply_codex_thread_title_update,
     apply_conversation_activity_update,
@@ -146,6 +147,7 @@ class IngestMetadataRequest(BaseModel):
         "codex_thread_title",
         "conversation_activity",
         "conversation_interaction",
+        "conversation_runtime",
     ]
     tool: Literal["codex", "claude_code", "cursor"]
     thread_id: UUID | None = None
@@ -175,6 +177,13 @@ class IngestMetadataRequest(BaseModel):
     activity_tool: str = Field(default="", max_length=256)
     is_background: bool = False
     command: object = ""
+    runtime_state: Literal["running", "ended"] | None = None
+    runtime_privilege: Literal[
+        "standard",
+        "administrator",
+        "root",
+        "unknown",
+    ] | None = None
     timestamp: str = Field(default="", max_length=128)
 
 
@@ -573,8 +582,29 @@ async def ingest_metadata_endpoint(
             tool_id=req.tool,
             relative_path=relative_path,
             session_id=routing_session_id,
+    )
+    if req.metadata_type == "conversation_runtime":
+        runtime_session_id = str(req.session_id or "").strip()
+        if (
+            not runtime_session_id
+            or req.runtime_state is None
+            or req.runtime_privilege is None
+            or not req.timestamp
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid conversation runtime update",
+            )
+        result = await apply_conversation_runtime_update(
+            db,
+            machine_id=machine.id,
+            tool_id=req.tool,
+            session_id=runtime_session_id,
+            runtime_state=req.runtime_state,
+            runtime_privilege=req.runtime_privilege,
+            timestamp=req.timestamp,
         )
-    if req.metadata_type == "codex_thread_title":
+    elif req.metadata_type == "codex_thread_title":
         if (
             req.tool != "codex"
             or req.thread_id is None

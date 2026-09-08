@@ -17,7 +17,9 @@ from server.api.pins import (
     get_conversation_pins,
     get_pins,
     pin_message,
+    pin_thread,
     unpin_message,
+    unpin_thread,
 )
 from server.db.models import (
     Base,
@@ -25,6 +27,7 @@ from server.db.models import (
     Document,
     Machine,
     PinnedMessage,
+    PinnedThread,
     Tool,
     User,
 )
@@ -193,6 +196,44 @@ async def test_pin_repin_unpin_and_lists_are_idempotent(session_factory) -> None
         assert await unpin_message(document.id, message.id, db=session, user=user) == {"ok": True}
         assert await unpin_message(document.id, message.id, db=session, user=user) == {"ok": True}
         assert (await get_conversation_pins(document.id, db=session, user=user))["pins"] == []
+
+
+@requires_postgres
+@pytest.mark.asyncio
+async def test_thread_pin_is_personal_authorized_and_idempotent(session_factory) -> None:
+    async with session_factory() as session:
+        user, _other_user, document, other_document, _message, _other_message = (
+            await _seed_documents(session)
+        )
+
+        first = await pin_thread(document.id, db=session, user=user)
+        repeated = await pin_thread(document.id, db=session, user=user)
+
+        assert first == repeated
+        assert first["document_id"] == str(document.id)
+        assert first["pinned"] is True
+        stored = (
+            await session.execute(
+                select(PinnedThread).where(
+                    PinnedThread.user_id == user.id,
+                    PinnedThread.document_id == document.id,
+                )
+            )
+        ).scalars().all()
+        assert len(stored) == 1
+
+        with pytest.raises(HTTPException) as denied:
+            await pin_thread(other_document.id, db=session, user=user)
+        assert denied.value.status_code == 404
+
+        assert await unpin_thread(document.id, db=session, user=user) == {
+            "document_id": str(document.id),
+            "pinned": False,
+        }
+        assert await unpin_thread(document.id, db=session, user=user) == {
+            "document_id": str(document.id),
+            "pinned": False,
+        }
 
 
 @requires_postgres
