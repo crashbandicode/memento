@@ -5054,6 +5054,16 @@ def _iter_cursor_conversation_messages(
     seen_source_ids: set[str] = set()
     seen_directives: set[str] = set()
     subagent_models: dict[str, str] = {}
+    # Sparse Cursor "agent-transcripts" (source=NULL CLI/headless threads)
+    # stamp only the user envelope; the assistant/tool rows of that turn arrive
+    # with no recoverable per-message time. Carry the current turn's timestamp
+    # forward so the whole thread renders with turn-resolution times. Only rows
+    # that are otherwise timeless are filled, so cursor_state_v1 threads (which
+    # stamp every bubble) keep their exact native times unchanged.
+    carried_turn_timestamp = ""
+    carried_turn_at = _message_timestamp(identity.started_at)
+    if carried_turn_at is not None:
+        carried_turn_timestamp = identity.started_at
     pending_question: tuple[int, dict[str, object]] | None = None
     for interaction in reversed(initial_question_interactions or []):
         if isinstance(interaction, dict) and interaction.get("source") == "cursor":
@@ -5129,6 +5139,19 @@ def _iter_cursor_conversation_messages(
                 if message.source_id in seen_source_ids:
                     continue
                 seen_source_ids.add(message.source_id)
+            message_at = _message_timestamp(message.timestamp)
+            if message_at is not None:
+                # Authoritative time on this row (the user envelope, or a
+                # cursor_state_v1 per-bubble time). Advance the turn clock but
+                # never rewrite the row itself.
+                if carried_turn_at is None or message_at >= carried_turn_at:
+                    carried_turn_at = message_at
+                    carried_turn_timestamp = message.timestamp
+            elif carried_turn_timestamp:
+                # Timeless sparse-transcript row: inherit the current turn's
+                # timestamp. carried_turn_at only moves forward, so assigned
+                # times are monotonic and never precede a real one.
+                message.timestamp = carried_turn_timestamp
             task_tracker.apply(message)
             yield message
 

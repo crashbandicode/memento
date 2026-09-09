@@ -736,6 +736,111 @@ class ConversationParserTests(unittest.TestCase):
         self.assertIn("Investigating tool paths", messages[1].thinking)
         self.assertEqual(messages[2].tool_name, "Ripgrep")
 
+    def test_sparse_cursor_agent_transcript_propagates_turn_timestamp(self) -> None:
+        # Cursor CLI/headless "agent-transcripts" ingest from a sparse
+        # transcript (source=NULL): only the user envelope carries a time, and
+        # the assistant/tool rows of that turn arrive with no recoverable
+        # per-message time.  The parser propagates each user turn's timestamp
+        # forward so the whole thread renders with turn-resolution times, and
+        # never lets an assigned time move backward.
+        raw = "\n".join([
+            json.dumps({
+                "role": "user",
+                "message": {"content": (
+                    "<timestamp>Wednesday, Jun 24, 2026, 9:08 AM "
+                    "(UTC-4)</timestamp>\n<user_query>First question</user_query>"
+                )},
+            }),
+            json.dumps({
+                "role": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "Looking into it."},
+                    {
+                        "type": "tool_use",
+                        "id": "call-first",
+                        "name": "Read",
+                        "input": {"path": "a.py"},
+                    },
+                ]},
+            }),
+            json.dumps({
+                "role": "user",
+                "message": {"content": (
+                    "<timestamp>Wednesday, Jun 24, 2026, 9:10 AM "
+                    "(UTC-4)</timestamp>\n<user_query>Second question</user_query>"
+                )},
+            }),
+            json.dumps({
+                "role": "assistant",
+                "message": {"content": "All done."},
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(
+            [message.role for message in messages],
+            ["user", "assistant", "tool", "user", "assistant"],
+        )
+        # Turn 1's envelope time flows onto its timeless assistant + tool rows;
+        # turn 2's later time flows onto its trailing assistant row.
+        self.assertEqual(
+            [message.timestamp for message in messages],
+            [
+                "2026-06-24T09:08:00-04:00",
+                "2026-06-24T09:08:00-04:00",
+                "2026-06-24T09:08:00-04:00",
+                "2026-06-24T09:10:00-04:00",
+                "2026-06-24T09:10:00-04:00",
+            ],
+        )
+        stamps = [message.timestamp for message in messages]
+        self.assertEqual(stamps, sorted(stamps))
+
+    def test_cursor_state_v1_times_survive_turn_propagation_unchanged(self) -> None:
+        # A cursor_state_v1 thread stamps every bubble with an authoritative
+        # per-message time.  Turn propagation must never override those, so the
+        # rendered timestamps stay byte-for-byte identical to the native times.
+        raw = "\n".join([
+            json.dumps({
+                "type": "user",
+                "role": "user",
+                "id": "state-user",
+                "timestamp": "2026-07-30T02:34:33.625Z",
+                "message": {"content": "Investigate"},
+            }),
+            json.dumps({
+                "type": "cursor_state_thinking",
+                "role": "assistant",
+                "id": "state-thinking:thinking",
+                "timestamp": "2026-07-30T02:34:42.569Z",
+                "message": {"content": [{
+                    "type": "thinking",
+                    "thinking": "Planning the search.",
+                }]},
+            }),
+            json.dumps({
+                "type": "cursor_state_tool",
+                "role": "tool",
+                "id": "state-tool:tool",
+                "timestamp": "2026-07-30T02:34:43.500Z",
+                "tool_name": "Ripgrep",
+                "tool_input": '{"pattern":"handoff"}',
+                "content": '{"matches":2}',
+            }),
+        ])
+
+        messages = parse_conversation(raw, "cursor")
+
+        self.assertEqual(
+            [message.timestamp for message in messages],
+            [
+                "2026-07-30T02:34:33.625Z",
+                "2026-07-30T02:34:42.569Z",
+                "2026-07-30T02:34:43.500Z",
+            ],
+        )
+
     def test_cursor_terminal_file_read_is_normalized_as_terminal(self) -> None:
         terminal_path = (
             r"C:\Users\intpa\.cursor\projects\c-Users-intpa-demo"
