@@ -32,7 +32,11 @@ from ..services.canvas_artifacts import (
     canvas_message_can_have_reference,
     detect_message_canvases,
 )
-from ..services.conversation_activity import conversation_activity_is_fresh
+from ..services.conversation_activity import (
+    background_activity_retired_by_session_end,
+    conversation_activity_is_fresh,
+    conversation_runtime_ended_at_map,
+)
 from ..services.conversation_hierarchy import (
     FOLDABLE_CONVERSATION_TOOLS,
     TANGENT_MARKER_PREFIX,
@@ -2054,6 +2058,18 @@ async def _projected_pending_interactions(
             )
         ),
     )
+    session_ended_at = await conversation_runtime_ended_at_map(
+        db,
+        (
+            (
+                source_document.id,
+                source_document.machine_id,
+                source_document.tool_id,
+                source_document.metadata_,
+            )
+            for source_document, _state in rows
+        ),
+    )
 
     interactions: list[dict] = []
     inline_by_id: dict[str, dict] = {}
@@ -2103,6 +2119,10 @@ async def _projected_pending_interactions(
                 or not conversation_activity_is_fresh(
                     raw_activity,
                     now=activity_now,
+                )
+                or background_activity_retired_by_session_end(
+                    raw_activity,
+                    session_ended_at.get(source_document.id),
                 )
             ):
                 continue
@@ -2259,7 +2279,12 @@ async def _projected_pending_interactions(
                     "started_at": raw_activity.get("started_at") or None,
                     "updated_at": raw_activity.get("updated_at") or None,
                 }
-                if conversation_activity_is_fresh(activity, now=activity_now):
+                if conversation_activity_is_fresh(
+                    activity, now=activity_now
+                ) and not background_activity_retired_by_session_end(
+                    activity,
+                    session_ended_at.get(source_document.id),
+                ):
                     activities_by_id[(str(source_document.id), canonical_id)] = (
                         activity
                     )
@@ -2552,6 +2577,13 @@ async def get_pending_conversation_interactions(
     live_pending: list[dict] = []
     live_activities_by_key: dict[tuple[uuid.UUID, str], dict] = {}
     activity_now = datetime.now(timezone.utc)
+    session_ended_at = await conversation_runtime_ended_at_map(
+        db,
+        (
+            (source_document_id, doc.machine_id, doc.tool_id, metadata)
+            for source_document_id, metadata in source_metadata.items()
+        ),
+    )
     for message in reversed(recent_tool_rows):
         message_metadata = (
             message.metadata_ if isinstance(message.metadata_, dict) else {}
@@ -2599,7 +2631,12 @@ async def get_pending_conversation_interactions(
             "started_at": timestamp,
             "updated_at": timestamp,
         }
-        if conversation_activity_is_fresh(activity, now=activity_now):
+        if conversation_activity_is_fresh(
+            activity, now=activity_now
+        ) and not background_activity_retired_by_session_end(
+            activity,
+            session_ended_at.get(message.document_id),
+        ):
             live_activities_by_key[activity_key] = activity
     inline_interactions_by_id: dict[str, dict] = {}
     seen_question_fingerprints = {
@@ -2791,7 +2828,7 @@ async def get_pending_conversation_interactions(
                 )
             except (TypeError, ValueError):
                 anchor_line_number = 0
-            live_activities_by_key[(source_document_id, canonical_id)] = {
+            activity = {
                 "document_id": str(source_document_id),
                 "source_title": source_documents.get(source_document_id),
                 "message_id": 0,
@@ -2805,6 +2842,12 @@ async def get_pending_conversation_interactions(
                 "started_at": raw_activity.get("started_at") or None,
                 "updated_at": raw_activity.get("updated_at") or None,
             }
+            if background_activity_retired_by_session_end(
+                activity,
+                session_ended_at.get(source_document_id),
+            ):
+                continue
+            live_activities_by_key[(source_document_id, canonical_id)] = activity
     live_pending.sort(key=lambda item: str(item.get("timestamp") or ""))
     live_pending = live_pending[-64:]
     inline_interactions = list(inline_interactions_by_id.values())

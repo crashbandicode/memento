@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 
-from ..db.models import ConversationMessage
+from ..db.models import ConversationMessage, ConversationRuntime
+from .conversation_identity import conversation_native_id
 from .document_delivery import (
     advance_document_activity,
     document_delivery_state,
@@ -100,6 +101,98 @@ def conversation_activity_is_fresh(
         else TERMINAL_ACTIVITY_MAX_AGE
     )
     return observed_at - event_at <= max_age
+
+
+def background_activity_retired_by_session_end(
+    activity: Mapping[str, object],
+    session_ended_at: object,
+) -> bool:
+    """Return whether an ended owning session retires a background card.
+
+    A launched-and-forgotten Claude ``run_in_background`` shell never emits a
+    completion event, so its projected activity stays ``running`` until the
+    freshness TTL (:data:`RUNNING_ACTIVITY_MAX_AGE`). When the owning session
+    ends -- a deterministic lifecycle signal the collector already reports via
+    the session-runtime path -- that background shell can no longer surface a
+    completion in this session, so the card is retired at read time instead of
+    lingering for a day.
+
+    Only still-``running`` background activities are affected. Non-background
+    activities, already-terminal activities, activities whose session is still
+    open (``session_ended_at`` unset), and any activity that clearly began
+    after the recorded session end are always kept. This is applied at read
+    time -- like :func:`conversation_activity_is_fresh` -- so a full projection
+    rebuild never resurrects a card and the stored transcript is never mutated.
+    """
+    ended_at = parse_conversation_activity_timestamp(session_ended_at)
+    if ended_at is None:
+        return False
+    if activity.get("is_background") is not True:
+        return False
+    status = str(activity.get("status") or "").strip().casefold()
+    if status != "running":
+        return False
+    started_at = parse_conversation_activity_timestamp(
+        activity.get("started_at")
+        or activity.get("updated_at")
+        or activity.get("timestamp")
+    )
+    if started_at is None:
+        return True
+    return started_at <= ended_at + ACTIVITY_FUTURE_CLOCK_SKEW
+
+
+async def conversation_runtime_ended_at_map(
+    db: "AsyncSession",
+    identities: Iterable[tuple[object, object, str, object]],
+) -> dict[object, datetime]:
+    """Map each document id to its owning session's end time when ended.
+
+    ``identities`` yields ``(document_id, machine_id, tool_id, metadata)`` for
+    the documents on one conversation surface. Only sessions currently in the
+    terminal ``ended`` state contribute an entry, so a session that reopened
+    (state ``running``) is intentionally absent and keeps surfacing its live
+    background cards. The lookup is one bounded query over the caller's already
+    page-bounded document set.
+    """
+    keyed: dict[tuple[object, str, str], list[object]] = {}
+    for document_id, machine_id, tool_id, metadata in identities:
+        if document_id is None or machine_id is None:
+            continue
+        session_id = conversation_native_id(tool_id, "conversation", metadata)
+        if not session_id:
+            continue
+        keyed.setdefault(
+            (machine_id, tool_id, session_id), []
+        ).append(document_id)
+    if not keyed:
+        return {}
+    rows = (
+        await db.execute(
+            select(ConversationRuntime).where(
+                or_(
+                    *(
+                        and_(
+                            ConversationRuntime.machine_id == machine_id,
+                            ConversationRuntime.tool_id == tool_id,
+                            ConversationRuntime.session_id == session_id,
+                        )
+                        for machine_id, tool_id, session_id in keyed
+                    )
+                )
+            )
+        )
+    ).scalars().all()
+    ended: dict[object, datetime] = {}
+    for runtime in rows:
+        if runtime.state != "ended" or runtime.ended_at is None:
+            continue
+        for document_id in keyed.get(
+            (runtime.machine_id, runtime.tool_id, runtime.session_id),
+            (),
+        ):
+            ended[document_id] = runtime.ended_at
+    return ended
 
 
 def effective_conversation_activity(
