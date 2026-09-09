@@ -1195,12 +1195,20 @@ async def get_dashboard(
         "total_files": device_counts.get(machine.id, 0),
     } for machine in machine_rows]
 
-    # Never make the primary dashboard wait for external telemetry. The
-    # dedicated /api/dashboard/spend route owns cache population; until then,
-    # per-thread health is truthfully unknown.
-    health_by_document = _thread_health_by_document(
-        spend_dashboard_proxy.get_cached_snapshot()
-    ) if open_thread_rows else {}
+    # Never make the primary dashboard wait for external telemetry. Trigger a
+    # non-blocking background warm so this ~13 s open-threads poll keeps the
+    # in-memory snapshot cache fresh instead of relying on a Spend-panel mount;
+    # this removes the post-restart cold window where every thread reads
+    # "health not reported". The read below stays cache-only and never awaits
+    # spend-provider I/O, so per-thread health is truthfully unknown only until
+    # the first background warm lands.
+    if open_thread_rows:
+        spend_dashboard_proxy.prime_cache()
+        health_by_document = _thread_health_by_document(
+            spend_dashboard_proxy.get_cached_snapshot()
+        )
+    else:
+        health_by_document = {}
     open_rows_by_machine: dict[str, list] = {}
     for row in open_thread_rows:
         open_rows_by_machine.setdefault(str(row.machine_id or "unknown"), []).append(row)

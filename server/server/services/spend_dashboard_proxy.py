@@ -123,6 +123,44 @@ class SpendDashboardProxy:
             error=self._last_error,
         )
 
+    def prime_cache(self) -> None:
+        """Warm the in-memory cache in the background without blocking.
+
+        A companion to ``get_cached_snapshot``: it never awaits upstream I/O,
+        so a cache-only read path (e.g. the open-threads handler, polled every
+        ~13 s while a dashboard is open) can call it on every request. When the
+        cache is missing or past its freshness TTL it schedules at most one
+        shared background refresh, which removes the post-restart cold window
+        and keeps an actively-viewed dashboard warm without adding a poller.
+        Any refresh failure is caught and logged by ``_fetch_and_store``; it
+        never surfaces to the caller.
+        """
+        if not settings.spend_dashboard_url.strip():
+            return
+        entry = self._entry
+        ttl = max(0, settings.spend_dashboard_cache_ttl_seconds)
+        if entry is not None and self._age(entry) <= ttl:
+            return  # Fresh cache: no refresh needed.
+        self._schedule_background_refresh()
+
+    def _schedule_background_refresh(self) -> None:
+        """Start one shared refresh task, fire-and-forget, if none is running.
+
+        Runs synchronously to completion on the event-loop thread, so the
+        single-flight check-and-set is atomic with respect to ``_begin_refresh``
+        and ``_fetch_and_store``; rapid triggers therefore share one in-flight
+        refresh instead of stacking duplicates. If there is no running loop the
+        call is a no-op so it can never block or raise on a caller.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = self._refresh_task
+        if task is not None and not task.done():
+            return
+        self._refresh_task = loop.create_task(self._fetch_and_store())
+
     @staticmethod
     def _age(entry: _CacheEntry) -> float:
         return max(0.0, time.monotonic() - entry.cached_monotonic)

@@ -213,3 +213,186 @@ async def test_invalid_first_snapshot_fails_closed(monkeypatch) -> None:
         "reason": "snapshot_missing_required_sections",
         "snapshot": None,
     }
+
+
+def _snapshot_with_hop(document_id: str = "near-hop-document") -> dict:
+    payload = _snapshot()
+    payload["hygiene"] = {
+        "hopThreads": {
+            "items": [
+                {
+                    "documentId": document_id,
+                    "source": "codex",
+                    "ratio": 180.0,
+                    "status": "near",
+                    "hopLine": 200,
+                    "hardLine": 400,
+                }
+            ]
+        }
+    }
+    return payload
+
+
+def test_prime_cache_is_a_noop_when_integration_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "spend_dashboard_url", "")
+
+    async def unexpected(_url: str, _headers: dict) -> _Response:
+        raise AssertionError("disabled integration triggered a warm")
+
+    calls = _install_client(monkeypatch, unexpected)
+    proxy = SpendDashboardProxy()
+
+    proxy.prime_cache()
+
+    assert calls == []
+    assert proxy.get_cached_snapshot()["reason"] == "not_configured"
+
+
+@pytest.mark.asyncio
+async def test_prime_cache_warms_empty_cache_without_blocking(monkeypatch) -> None:
+    fetch_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def respond(_url: str, _headers: dict) -> _Response:
+        fetch_started.set()
+        await release_refresh.wait()
+        return _Response(_snapshot(used="$7.50"))
+
+    calls = _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    # The cache-only read path triggers a background warm and returns at once.
+    proxy.prime_cache()
+    assert proxy.get_cached_snapshot()["reason"] == "cache_empty"
+
+    # The refresh is in flight but has NOT populated the cache yet: the request
+    # path did not await the upstream fetch.
+    await asyncio.wait_for(fetch_started.wait(), timeout=1)
+    assert proxy.get_cached_snapshot()["reason"] == "cache_empty"
+
+    release_refresh.set()
+    await asyncio.wait_for(proxy._refresh_task, timeout=1)
+
+    warmed = proxy.get_cached_snapshot()
+    assert warmed["available"] is True
+    assert warmed["stale"] is False
+    assert warmed["snapshot"]["spend"]["all"]["used"] == "$7.50"
+    assert len([call for call in calls if "url" in call]) == 1
+
+
+@pytest.mark.asyncio
+async def test_prime_cache_rapid_triggers_share_one_refresh(monkeypatch) -> None:
+    fetch_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def respond(_url: str, _headers: dict) -> _Response:
+        fetch_started.set()
+        await release_refresh.wait()
+        return _Response(_snapshot())
+
+    calls = _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    # Rapid open-threads polls (~every 13 s) hitting an empty/stale cache must
+    # not stack duplicate in-flight refreshes.
+    proxy.prime_cache()
+    proxy.prime_cache()
+    proxy.prime_cache()
+    await asyncio.wait_for(fetch_started.wait(), timeout=1)
+    proxy.prime_cache()  # still in flight
+
+    assert len([call for call in calls if "url" in call]) == 1
+
+    release_refresh.set()
+    await asyncio.wait_for(proxy._refresh_task, timeout=1)
+    assert proxy.get_cached_snapshot()["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_prime_cache_skips_refresh_when_cache_is_fresh(monkeypatch) -> None:
+    async def respond(_url: str, _headers: dict) -> _Response:
+        return _Response(_snapshot())
+
+    calls = _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    await proxy.get_snapshot()  # one warm fetch
+    url_calls = len([call for call in calls if "url" in call])
+    assert url_calls == 1
+
+    proxy.prime_cache()  # fresh cache → no new fetch scheduled
+    await asyncio.sleep(0.01)
+
+    assert proxy._refresh_task is None
+    assert len([call for call in calls if "url" in call]) == url_calls
+
+
+@pytest.mark.asyncio
+async def test_prime_cache_refreshes_expired_cache(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "spend_dashboard_cache_ttl_seconds", 0)
+    response_number = 0
+
+    async def respond(_url: str, _headers: dict) -> _Response:
+        nonlocal response_number
+        response_number += 1
+        return _Response(_snapshot(used=f"${response_number}.00"))
+
+    calls = _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    await proxy.get_snapshot()  # first warm (ttl=0 → immediately stale)
+    assert len([call for call in calls if "url" in call]) == 1
+
+    proxy.prime_cache()  # stale/expired → background refresh
+    await asyncio.wait_for(proxy._refresh_task, timeout=1)
+
+    assert len([call for call in calls if "url" in call]) == 2
+    assert proxy.get_cached_snapshot()["snapshot"]["spend"]["all"]["used"] == "$2.00"
+
+
+@pytest.mark.asyncio
+async def test_prime_cache_swallows_upstream_errors(monkeypatch) -> None:
+    async def respond(_url: str, _headers: dict) -> _Response:
+        return _Response({}, status_code=503)
+
+    _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    proxy.prime_cache()
+    task = proxy._refresh_task
+    assert task is not None
+    # A failed background warm resolves without raising to the caller.
+    await asyncio.wait_for(task, timeout=1)
+
+    result = proxy.get_cached_snapshot()
+    assert result["available"] is False
+    assert result["reason"] == "cache_empty"
+
+
+@pytest.mark.asyncio
+async def test_primed_warm_yields_health_for_near_hop_document(monkeypatch) -> None:
+    dashboard = pytest.importorskip("server.api.dashboard")
+    thread_health_by_document = dashboard._thread_health_by_document
+
+    async def respond(_url: str, _headers: dict) -> _Response:
+        return _Response(_snapshot_with_hop("near-hop-document"))
+
+    _install_client(monkeypatch, respond)
+    proxy = SpendDashboardProxy()
+
+    proxy.prime_cache()
+    task = proxy._refresh_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=1)
+
+    health = thread_health_by_document(proxy.get_cached_snapshot())
+    assert health["near-hop-document"] == {
+        "available": True,
+        "stale": False,
+        "source": "codex",
+        "ratio": 180.0,
+        "status": "near",
+        "hop_line": 200.0,
+        "hard_line": 400.0,
+    }
