@@ -163,6 +163,8 @@ class IngestSpoolTests(unittest.TestCase):
             root=self.root,
         )
         self.assertEqual(committed.status, "committed")
+        self.assertEqual(committed.tool_id, "codex")
+        self.assertEqual(committed.relative_path, "sessions/thread.jsonl")
 
     def test_realtime_delta_rejects_same_revision_with_different_payload(self) -> None:
         first = b'{"type":"event_msg","n":1}\n'

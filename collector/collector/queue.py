@@ -423,6 +423,8 @@ class SyncQueue:
                 synced_hash TEXT,
                 synced_offset INTEGER NOT NULL DEFAULT 0,
                 synced_at REAL,
+                synced_full_offset INTEGER,
+                bounded_full_prefix INTEGER NOT NULL DEFAULT 0,
                 source_size INTEGER,
                 source_mtime_ns INTEGER,
                 identity_version TEXT,
@@ -483,6 +485,8 @@ class SyncQueue:
             "synced_hash": "TEXT",
             "synced_offset": "INTEGER NOT NULL DEFAULT 0",
             "synced_at": "REAL",
+            "synced_full_offset": "INTEGER",
+            "bounded_full_prefix": "INTEGER NOT NULL DEFAULT 0",
             "source_size": "INTEGER",
             "source_mtime_ns": "INTEGER",
             "identity_version": "TEXT",
@@ -1551,6 +1555,28 @@ class SyncQueue:
                 return None, 0
             return str(synced[0]), int(synced[1] or 0)
 
+    def get_full_snapshot_state(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> tuple[int | None, bool]:
+        """Return the last committed complete snapshot offset and prefix flag.
+
+        ``synced_offset`` can reach EOF through conversation DELTA windows
+        while the server still holds only the bounded FULL prefix.  Skip
+        and repair decisions must consult this snapshot cursor instead.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT synced_full_offset, bounded_full_prefix
+                   FROM file_state WHERE tool_name=? AND relative_path=?""",
+                (tool_name, relative_path),
+            ).fetchone()
+        if row is None:
+            return None, False
+        full_offset = None if row[0] is None else max(0, int(row[0]))
+        return full_offset, bool(row[1])
+
     def get_capture_delta_base(
         self,
         tool_name: str,
@@ -2355,8 +2381,19 @@ class SyncQueue:
             stream.close()
 
     @_rollback_on_error
-    def mark_synced(self, item: QueueItem) -> bool:
-        """Acknowledge only the exact live lease and advance synced state."""
+    def mark_synced(
+        self,
+        item: QueueItem,
+        *,
+        committed_hash: str | None = None,
+        committed_offset: int | None = None,
+    ) -> bool:
+        """Acknowledge only the exact live lease and advance synced state.
+
+        When the server echoes a committed cursor, that cursor is the durable
+        source of truth.  Local queue offsets can overshoot a prefix that the
+        server actually stored.
+        """
         if not item.lease_token and not item.receipt_id:
             return False
         payload_paths: list[str] = []
@@ -2366,7 +2403,7 @@ class SyncQueue:
             if item.lease_token:
                 row = self._conn.execute(
                     """SELECT tool_name, relative_path, content_hash, offset,
-                              payload_path, metadata
+                              payload_path, metadata, is_partial
                        FROM queue WHERE id=? AND status='uploading' AND lease_token=?""",
                     (item.id, item.lease_token),
                 ).fetchone()
@@ -2375,7 +2412,7 @@ class SyncQueue:
             else:
                 row = self._conn.execute(
                     """SELECT tool_name, relative_path, content_hash, offset,
-                              payload_path, metadata
+                              payload_path, metadata, is_partial
                        FROM queue WHERE id=? AND status='accepted' AND receipt_id=?""",
                     (item.id, item.receipt_id),
                 ).fetchone()
@@ -2431,36 +2468,63 @@ class SyncQueue:
                 if not item.lease_token
                 else ""
             )
+            try:
+                item_metadata = json.loads(str(row[5]))
+            except (TypeError, json.JSONDecodeError):
+                item_metadata = {}
+            if not isinstance(item_metadata, dict):
+                item_metadata = {}
+            synced_hash = (
+                committed_hash
+                if isinstance(committed_hash, str) and committed_hash
+                else row[2]
+            )
+            synced_offset = (
+                max(0, int(committed_offset))
+                if committed_offset is not None
+                else int(row[3])
+            )
+            is_complete_snapshot = not bool(row[6])
+            bounded_full_prefix = bool(
+                is_complete_snapshot
+                and item_metadata.get("_bounded_full_prefix")
+            )
+            full_snapshot_assignments = ""
+            full_snapshot_values: tuple = ()
+            if is_complete_snapshot:
+                full_snapshot_assignments = """,
+                        synced_full_offset=excluded.synced_full_offset,
+                        bounded_full_prefix=excluded.bounded_full_prefix"""
+                full_snapshot_values = (synced_offset, int(bounded_full_prefix))
             self._conn.execute(
                 """INSERT INTO file_state (
                        tool_name, relative_path, last_hash, last_offset,
                        last_synced_at, observed_hash, observed_offset, observed_at,
-                       synced_hash, synced_offset, synced_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       synced_hash, synced_offset, synced_at,
+                       synced_full_offset, bounded_full_prefix
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(tool_name, relative_path) DO UPDATE SET
                         last_synced_at=excluded.last_synced_at,
                         synced_hash=excluded.synced_hash,
                         synced_offset=excluded.synced_offset,
                         synced_at=excluded.synced_at"""
+                + full_snapshot_assignments
                 + monotonic_receipt_predicate,
                 (
                     row[0],
                     row[1],
-                    row[2],
-                    int(row[3]),
+                    synced_hash,
+                    synced_offset,
                     now,
-                    row[2],
-                    int(row[3]),
+                    synced_hash,
+                    synced_offset,
                     now,
-                    row[2],
-                    int(row[3]),
+                    synced_hash,
+                    synced_offset,
                     now,
+                    *(full_snapshot_values if is_complete_snapshot else (None, 0)),
                 ),
             )
-            try:
-                item_metadata = json.loads(str(row[5]))
-            except (TypeError, json.JSONDecodeError):
-                item_metadata = {}
             state_namespace = item_metadata.get("_queue_state_namespace")
             state_key = item_metadata.get("_queue_state_key")
             state_value = item_metadata.get("_queue_state_value")
@@ -2503,7 +2567,11 @@ class SyncQueue:
         """Persist a typed failure without retrying terminal dispositions."""
 
         if outcome.state is UploadOutcomeState.SUCCESS:
-            return self.mark_synced(item)
+            return self.mark_synced(
+                item,
+                committed_hash=outcome.committed_hash,
+                committed_offset=outcome.committed_offset,
+            )
         if not item.lease_token:
             return False
         payload_path: str | None = None

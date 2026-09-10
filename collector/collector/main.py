@@ -880,6 +880,7 @@ def main() -> None:
         delta_catchup_callback=watcher.request_delta_catchup,
         upload_synced_callback=canvas_schedule.notify_upload,
     )
+    watcher.committed_source_lookup = sync_client.fetch_committed_source
     orchestration_sync = OrchestrationSync(config)
 
     def _invalidate_source_pollers() -> None:

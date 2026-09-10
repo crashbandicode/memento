@@ -169,6 +169,21 @@ class _RaisingHttpClient:
         raise self.exception
 
 
+class _JsonPostHttpClient:
+    def __init__(self, outcomes: list[_Response | Exception]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[str] = []
+
+    def post(self, path: str, **_kwargs) -> _Response:
+        self.calls.append(path)
+        if not self.outcomes:
+            raise AssertionError(f"unexpected HTTP call {path}")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 class _CommitHttpClient:
     def __init__(self, statuses: list[dict]) -> None:
         self.statuses = list(statuses)
@@ -205,7 +220,7 @@ class _ConcurrentQueue:
         self.claim_calls += 1
         return [self.items.pop(0)] if self.items else []
 
-    def mark_synced(self, item: QueueItem) -> bool:
+    def mark_synced(self, item: QueueItem, **_kwargs) -> bool:
         self.synced.append(item.id)
         return True
 
@@ -243,8 +258,8 @@ class _SignaledQueue(_ConcurrentQueue):
             self._token += 1
             self._condition.notify_all()
 
-    def mark_synced(self, item: QueueItem) -> bool:
-        result = super().mark_synced(item)
+    def mark_synced(self, item: QueueItem, **kwargs) -> bool:
+        result = super().mark_synced(item, **kwargs)
         with self._condition:
             self._token += 1
             self._condition.notify_all()
@@ -268,9 +283,9 @@ class _AcceptedReceiptQueue(_SignaledQueue):
     def is_accepted_receipt(self, item: QueueItem) -> bool:
         return self.accepted and item.id == self.item.id
 
-    def mark_synced(self, item: QueueItem) -> bool:
+    def mark_synced(self, item: QueueItem, **kwargs) -> bool:
         self.accepted = False
-        return super().mark_synced(item)
+        return super().mark_synced(item, **kwargs)
 
 
 class SyncClientStreamingTests(unittest.TestCase):
@@ -319,6 +334,7 @@ class SyncClientStreamingTests(unittest.TestCase):
         client._client = http_client
         client._full_resync_callback = None
         client._delta_catchup_callback = None
+        client._http_lock = threading.Lock()
         return client
 
     def test_all_upload_routes_use_source_mtime_and_legacy_fallback(self) -> None:
@@ -1010,6 +1026,150 @@ class SyncClientStreamingTests(unittest.TestCase):
         self.assertEqual(outcome.state, UploadOutcomeState.TRANSIENT_RETRY)
         self.assertEqual(outcome.diagnostic_code, "network_error")
         self.assertIsNone(outcome.http_status)
+
+    def test_h2_keyerror_is_a_transient_network_retry(self) -> None:
+        client = self._client(
+            _FakeQueue(1),
+            _RaisingHttpClient(KeyError("stream_id")),
+        )
+
+        outcome = client._upload(self._item(1))
+
+        self.assertEqual(outcome.state, UploadOutcomeState.TRANSIENT_RETRY)
+        self.assertEqual(outcome.diagnostic_code, "network_error")
+        self.assertIn("KeyError", outcome.diagnostic)
+
+    def test_committed_upload_echoes_cursor_into_success(self) -> None:
+        client = self._client(
+            _FakeQueue(1),
+            _JsonPostHttpClient(
+                [
+                    _Response(
+                        200,
+                        {
+                            "status": "committed",
+                            "document_id": "doc-1",
+                            "committed_hash": "echo-hash",
+                            "committed_offset": 12345,
+                            "stored_source_size": 12345,
+                        },
+                    )
+                ]
+            ),
+        )
+
+        outcome = client._upload(self._item(1))
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.committed_hash, "echo-hash")
+        self.assertEqual(outcome.committed_offset, 12345)
+        self.assertEqual(outcome.stored_source_size, 12345)
+
+    def test_receipt_keyerror_retries_then_commits_with_echo(self) -> None:
+        item = self._item(100)
+        item.receipt_id = "a" * 64
+        client = self._client(
+            _FakeQueue(100),
+            _JsonPostHttpClient(
+                [
+                    KeyError("stream_id"),
+                    _Response(
+                        200,
+                        {
+                            "status": "committed",
+                            "receipt_id": "a" * 64,
+                            "committed_hash": "echo-hash",
+                            "committed_offset": 4096,
+                            "stored_source_size": 1024,
+                        },
+                    ),
+                ]
+            ),
+        )
+        client._sleep_interruptibly = lambda _seconds: None
+
+        outcome = client._wait_for_admission_commit(item)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.committed_hash, "echo-hash")
+        self.assertEqual(outcome.committed_offset, 4096)
+        self.assertEqual(outcome.stored_source_size, 1024)
+
+    def test_http_lock_serializes_upload_and_receipt_posts(self) -> None:
+        in_flight = 0
+        peak = 0
+        guard = threading.Lock()
+
+        class SlowHttpClient:
+            def post(self, _path: str, **_kwargs) -> _Response:
+                nonlocal in_flight, peak
+                with guard:
+                    in_flight += 1
+                    peak = max(peak, in_flight)
+                time.sleep(0.05)
+                with guard:
+                    in_flight -= 1
+                return _Response(200, {"status": "committed"})
+
+        client = self._client(_FakeQueue(1), SlowHttpClient())
+        item = self._item(100)
+        item.receipt_id = "a" * 64
+        errors: list[BaseException] = []
+
+        def upload() -> None:
+            try:
+                client._upload(self._item(1))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def poll() -> None:
+            try:
+                client._wait_for_admission_commit(item)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=upload),
+            threading.Thread(target=poll),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(peak, 1)
+
+    def test_fetch_committed_source_parses_echo(self) -> None:
+        client = self._client(
+            _FakeQueue(1),
+            _JsonPostHttpClient(
+                [
+                    _Response(
+                        200,
+                        {
+                            "committed_hash": "d2:abc",
+                            "committed_offset": 16_777_216,
+                            "stored_source_size": 16_777_216,
+                        },
+                    )
+                ]
+            ),
+        )
+
+        proof = client.fetch_committed_source(
+            "claude_code",
+            "projects/thread.jsonl",
+        )
+
+        self.assertEqual(
+            proof,
+            {
+                "committed_hash": "d2:abc",
+                "committed_offset": 16_777_216,
+                "stored_source_size": 16_777_216,
+            },
+        )
 
     def test_structured_409_spool_terminal_remains_quarantined(self) -> None:
         outcome = _classify_http_response(

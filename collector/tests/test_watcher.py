@@ -117,7 +117,7 @@ def test_relative_resync_resolves_only_files_below_the_tool_root(
     watcher = object.__new__(FileWatcher)
     watcher._tools = [tool]
     requested: list[str] = []
-    watcher.request_full_resync = requested.append
+    watcher.request_complete_snapshot = requested.append
 
     assert watcher.request_relative_resync("codex", "sessions/thread.jsonl") is True
     assert requested == [str(transcript.resolve())]
@@ -2130,3 +2130,346 @@ def test_mutation_during_read_defers_without_advancing_source_revision(
     assert len(queue.enqueued) == 1
     assert json.loads(queue.enqueued[0]["content"])["message"]["content"] == "new"
     assert queue.enqueued[0]["source_modified_at"] == replacement_mtime
+
+
+def _bounded_jsonl_record() -> str:
+    return (
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"text": "x" * 1000},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def test_complete_snapshot_reads_the_entire_file(tmp_path: Path) -> None:
+    path = tmp_path / "complete-snapshot.jsonl"
+    record = _bounded_jsonl_record()
+    path.write_text(record * 40, encoding="utf-8")
+    file_size = path.stat().st_size
+    max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path="sessions/complete-snapshot.jsonl",
+    )
+
+    class RecordingQueue:
+        def __init__(self) -> None:
+            self.enqueued: list[dict] = []
+
+        def get_file_state(self, _tool_name: str, _relative_path: str):
+            return None, 0
+
+        def enqueue(self, **kwargs) -> int:
+            self.enqueued.append(kwargs)
+            return 1
+
+    queue = RecordingQueue()
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=max_delta_bytes)
+
+    watcher._process_file_changed(
+        path,
+        complete_snapshot=True,
+        emit_live_signals=False,
+    )
+
+    snapshot = queue.enqueued[0]
+    assert snapshot["is_partial"] is False
+    assert snapshot["offset"] == file_size
+    assert snapshot["base_hash"] is None
+    assert snapshot["base_offset"] == 0
+    assert len(snapshot["content"].splitlines()) == 40
+    assert snapshot["metadata"].get("_bounded_full_prefix") is not True
+    assert len(snapshot["metadata"].get("_queue_force_reprocess_nonce") or "") == 32
+
+
+def test_bounded_delta_catchup_queues_an_unwindowed_complete_snapshot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "truncated-session.jsonl"
+    record = _bounded_jsonl_record()
+    path.write_text(record * 40, encoding="utf-8")
+    file_size = path.stat().st_size
+    max_delta_bytes = len(record.encode("utf-8")) * 8 - 10
+    relative_path = "sessions/truncated-session.jsonl"
+
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path=relative_path,
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db", spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=max_delta_bytes)
+
+    def claim() -> object:
+        batch = queue.claim_batch(max_bytes=1024 * 1024)
+        assert batch
+        return batch[0]
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        prefix = claim()
+        assert prefix.is_partial is False
+        assert prefix.offset < file_size
+        assert prefix.metadata.get("_bounded_full_prefix") is True
+        assert queue.mark_synced(prefix)
+        assert queue.get_full_snapshot_state("codex", relative_path) == (
+            prefix.offset,
+            True,
+        )
+
+        while True:
+            watcher._process_file_changed(path, emit_live_signals=False)
+            item = claim()
+            assert item.is_partial is True
+            assert queue.mark_synced(item)
+            if item.offset >= file_size:
+                break
+
+        watcher._process_file_changed(path, emit_live_signals=False)
+        snapshot = claim()
+        assert snapshot.is_partial is False
+        assert snapshot.offset == file_size
+        assert snapshot.base_hash is None
+        assert snapshot.metadata.get("_bounded_full_prefix") is not True
+        assert len(snapshot.metadata.get("_queue_force_reprocess_nonce") or "") == 32
+        assert len(queue.read_payload_text(snapshot).splitlines()) == 40
+    finally:
+        queue.close()
+
+
+def test_complete_delta_snapshot_skips_when_last_full_covered_the_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "small-session.jsonl"
+    path.write_text(
+        '{"type":"event_msg","payload":{"text":"hello"}}\n',
+        encoding="utf-8",
+    )
+    relative_path = "sessions/small-session.jsonl"
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path=relative_path,
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        item = queue.claim_batch()[0]
+        assert item.is_partial is False
+        assert item.offset == path.stat().st_size
+        assert item.metadata.get("_bounded_full_prefix") is not True
+        assert queue.mark_synced(item)
+        assert queue.get_full_snapshot_state("codex", relative_path) == (
+            path.stat().st_size,
+            False,
+        )
+
+        monkeypatch.setattr(
+            JsonlParser,
+            "parse_to_writer",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("fully covered delta source was reparsed")
+            ),
+        )
+        watcher._process_file_changed(path, emit_live_signals=False)
+        assert queue.pending_count() == 0
+    finally:
+        queue.close()
+
+
+def test_remote_stored_prefix_queues_complete_snapshot_at_eof(tmp_path: Path) -> None:
+    path = tmp_path / "remote-truncated.jsonl"
+    line = (
+        json.dumps(
+            {"type": "event_msg", "payload": {"text": "x" * 200}},
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    repeats = (80 * 1024 // len(line.encode("utf-8"))) + 1
+    path.write_text(line * repeats, encoding="utf-8")
+    file_size = path.stat().st_size
+    relative_path = "sessions/remote-truncated.jsonl"
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path=relative_path,
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db", spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert original.is_partial is False
+        assert original.offset == file_size
+        assert queue.mark_synced(original)
+
+        watcher._config = SimpleNamespace(max_delta_upload_bytes=32 * 1024)
+        lookup_calls: list[tuple[str, str]] = []
+
+        def lookup(tool_name: str, relative: str) -> dict:
+            lookup_calls.append((tool_name, relative))
+            return {
+                "committed_hash": original.content_hash,
+                "committed_offset": file_size,
+                "stored_source_size": 1024,
+            }
+
+        watcher.committed_source_lookup = lookup
+        watcher._process_file_changed(path, emit_live_signals=False)
+        snapshot = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert lookup_calls == [("codex", relative_path)]
+        assert snapshot.is_partial is False
+        assert snapshot.offset == file_size
+        assert snapshot.metadata.get("_bounded_full_prefix") is not True
+        assert len(snapshot.metadata.get("_queue_force_reprocess_nonce") or "") == 32
+    finally:
+        queue.close()
+
+
+def test_small_eof_delta_does_not_query_remote_stored_size(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "small-session.jsonl"
+    path.write_text(
+        '{"type":"event_msg","payload":{"text":"hello"}}\n',
+        encoding="utf-8",
+    )
+    relative_path = "sessions/small-session.jsonl"
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path=relative_path,
+    )
+    queue = SyncQueue(tmp_path / "queue" / "sync.db")
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+    lookup_calls: list[tuple[str, str]] = []
+    watcher.committed_source_lookup = lambda tool, rel: (
+        lookup_calls.append((tool, rel)) or {"stored_source_size": 1}
+    )
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        item = queue.claim_batch()[0]
+        assert queue.mark_synced(item)
+        monkeypatch.setattr(
+            JsonlParser,
+            "parse_to_writer",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("small covered delta source was reparsed")
+            ),
+        )
+        watcher._process_file_changed(path, emit_live_signals=False)
+        assert lookup_calls == []
+        assert queue.pending_count() == 0
+    finally:
+        queue.close()
+
+
+def test_upgraded_eof_state_without_snapshot_cursor_queues_complete_snapshot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-large.jsonl"
+    line = (
+        json.dumps(
+            {"type": "event_msg", "payload": {"text": "x" * 200}},
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    repeats = (80 * 1024 // len(line.encode("utf-8"))) + 1
+    path.write_text(line * repeats, encoding="utf-8")
+    file_size = path.stat().st_size
+    relative_path = "sessions/legacy-large.jsonl"
+    classification = FileClassification(
+        tool_name="codex",
+        category=Category.CONVERSATION,
+        content_type=ContentType.JSONL,
+        sync_strategy=SyncStrategy.DELTA,
+        relative_path=relative_path,
+    )
+    database = tmp_path / "queue" / "sync.db"
+    queue = SyncQueue(database, spool_threshold=64 * 1024)
+    watcher = object.__new__(FileWatcher)
+    watcher._tool_map = {
+        str(tmp_path): SimpleNamespace(classify_file=lambda _path: classification)
+    }
+    watcher._queue = queue
+    watcher._parsers = [JsonlParser()]
+    watcher._config = SimpleNamespace(max_delta_upload_bytes=16 * 1024 * 1024)
+
+    try:
+        watcher._process_file_changed(path, emit_live_signals=False)
+        original = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert original.offset == file_size
+        assert queue.mark_synced(original)
+        with queue._lock:
+            queue._conn.execute(
+                """UPDATE file_state
+                   SET synced_full_offset=NULL, bounded_full_prefix=0
+                   WHERE tool_name=? AND relative_path=?""",
+                ("codex", relative_path),
+            )
+            queue._conn.commit()
+        assert queue.get_full_snapshot_state("codex", relative_path) == (None, False)
+
+        watcher._config = SimpleNamespace(max_delta_upload_bytes=32 * 1024)
+        watcher._process_file_changed(path, emit_live_signals=False)
+        snapshot = queue.claim_batch(max_bytes=1024 * 1024)[0]
+        assert snapshot.is_partial is False
+        assert snapshot.offset == file_size
+        assert snapshot.metadata.get("_bounded_full_prefix") is not True
+        assert len(snapshot.metadata.get("_queue_force_reprocess_nonce") or "") == 32
+    finally:
+        queue.close()

@@ -182,6 +182,7 @@ class SyncClient:
         )
         from .tls import SSL_CONTEXT
 
+        self._http_lock = threading.Lock()
         self._client = httpx.Client(
             base_url=config.server.url,
             http2=True,
@@ -224,6 +225,20 @@ class SyncClient:
         self._receipt_pool.shutdown(wait=True, cancel_futures=True)
         self._client.close()
         logger.info("Sync client stopped")
+
+    def _request(self, method: str, url: str, **kwargs):
+        """Issue one HTTP call on the shared client.
+
+        httpx HTTP/2 connection state is not safe to mutate from the upload
+        pool and the receipt pool at once; a concurrent h2/hpack KeyError is
+        a transient transport failure, not a source disposition.
+        """
+        http_lock = getattr(self, "_http_lock", None)
+        if http_lock is None:
+            http_lock = threading.Lock()
+            self._http_lock = http_lock
+        with http_lock:
+            return getattr(self._client, method)(url, **kwargs)
 
     def pause(self, timeout: float = 75) -> bool:
         """Stop claiming work and wait for the active upload batch to drain."""
@@ -413,7 +428,11 @@ class SyncClient:
                             )
                         ] = item
                 elif outcome.state is UploadOutcomeState.SUCCESS:
-                    if self._queue.mark_synced(item):
+                    if self._queue.mark_synced(
+                        item,
+                        committed_hash=outcome.committed_hash,
+                        committed_offset=outcome.committed_offset,
+                    ):
                         synced = True
                         upload_synced_callback = getattr(
                             self,
@@ -522,7 +541,11 @@ class SyncClient:
                     "receipt poll returned false"
                 )
                 if outcome.state is UploadOutcomeState.SUCCESS:
-                    if self._queue.mark_synced(item):
+                    if self._queue.mark_synced(
+                        item,
+                        committed_hash=outcome.committed_hash,
+                        committed_offset=outcome.committed_offset,
+                    ):
                         synced = True
                         callback = getattr(self, "_upload_synced_callback", None)
                         if callable(callback):
@@ -727,7 +750,7 @@ class SyncClient:
                 expected_hash=conflict.expected_hash,
                 expected_offset=conflict.expected_offset,
             )
-        except httpx.TransportError as exc:
+        except (httpx.TransportError, KeyError) as exc:
             logger.warning("Server unreachable, will retry later")
             return UploadOutcome.transient(
                 f"{type(exc).__name__}: {exc}",
@@ -771,7 +794,7 @@ class SyncClient:
             for key, value in item.metadata.items()
             if not key.startswith("_queue_")
         }
-        resp = self._client.post("/api/ingest/metadata", json=payload)
+        resp = self._request("post", "/api/ingest/metadata", json=payload)
         return _classify_http_response(
             resp,
             endpoint="/api/ingest/metadata",
@@ -781,12 +804,12 @@ class SyncClient:
         )
 
     def _upload_json(self, payload: dict) -> UploadOutcome:
-        resp = self._client.post("/api/ingest/file", json=payload)
+        resp = self._request("post", "/api/ingest/file", json=payload)
         self._raise_delta_conflict(resp, payload)
         admission = self._accepted_admission_outcome(resp, "/api/ingest/file")
         if admission is not None:
             return admission
-        return _classify_http_response(
+        return self._committed_or_classified_response(
             resp,
             endpoint="/api/ingest/file",
         )
@@ -796,7 +819,8 @@ class SyncClient:
         payload: dict,
         content_stream: BinaryIO,
     ) -> UploadOutcome:
-        resp = self._client.post(
+        resp = self._request(
+            "post",
             "/api/ingest/file/upload",
             data={"metadata": json.dumps(payload)},
             files={"content": ("content.txt", content_stream, "text/plain")},
@@ -808,7 +832,7 @@ class SyncClient:
         )
         if admission is not None:
             return admission
-        return _classify_http_response(
+        return self._committed_or_classified_response(
             resp,
             endpoint="/api/ingest/file/upload",
         )
@@ -832,6 +856,83 @@ class SyncClient:
             )
         return UploadOutcome.accepted(receipt_id, "server durably accepted delta")
 
+    @staticmethod
+    def _committed_cursor_from_payload(
+        payload: dict,
+    ) -> tuple[str | None, int | None, int | None]:
+        raw_hash = payload.get("committed_hash")
+        committed_hash = raw_hash if isinstance(raw_hash, str) and raw_hash else None
+        committed_offset = None
+        raw_offset = payload.get("committed_offset")
+        if raw_offset is not None:
+            try:
+                committed_offset = max(0, int(raw_offset))
+            except (TypeError, ValueError):
+                committed_offset = None
+        stored_source_size = None
+        raw_size = payload.get("stored_source_size")
+        if raw_size is not None:
+            try:
+                stored_source_size = max(0, int(raw_size))
+            except (TypeError, ValueError):
+                stored_source_size = None
+        return committed_hash, committed_offset, stored_source_size
+
+    def _committed_or_classified_response(
+        self,
+        response,
+        *,
+        endpoint: str,
+    ) -> UploadOutcome:
+        if 200 <= int(response.status_code) < 300:
+            try:
+                payload = response.json()
+            except (AttributeError, TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("status") == "committed":
+                committed_hash, committed_offset, stored_source_size = (
+                    self._committed_cursor_from_payload(payload)
+                )
+                return UploadOutcome.success(
+                    f"{endpoint} committed",
+                    committed_hash=committed_hash,
+                    committed_offset=committed_offset,
+                    stored_source_size=stored_source_size,
+                )
+        return _classify_http_response(response, endpoint=endpoint)
+
+    def fetch_committed_source(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> dict | None:
+        """Return the server's committed blob cursor for one source path."""
+        try:
+            response = self._request(
+                "post",
+                "/api/ingest/file/committed-base",
+                json={"tool": tool_name, "relative_path": relative_path},
+                timeout=10.0,
+            )
+        except (httpx.TransportError, KeyError):
+            return None
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            return None
+        try:
+            payload = response.json()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        committed_hash, committed_offset, stored_source_size = (
+            self._committed_cursor_from_payload(payload)
+        )
+        return {
+            "committed_hash": committed_hash,
+            "committed_offset": committed_offset,
+            "stored_source_size": stored_source_size,
+        }
+
     def _wait_for_admission_commit(self, item: QueueItem) -> UploadOutcome:
         """Poll an ACCEPTED receipt without treating it as a committed base."""
         if not item.receipt_id:
@@ -842,11 +943,12 @@ class SyncClient:
         deadline = time.monotonic() + ADMISSION_COMMIT_TIMEOUT_SECONDS
         while self._running and not self._pause_requested.is_set():
             try:
-                response = self._client.post(
+                response = self._request(
+                    "post",
                     "/api/ingest/file/receipt/status",
                     json={"receipt_id": item.receipt_id},
                 )
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, KeyError) as exc:
                 logger.debug("Commit receipt unavailable for %s: %s", item.relative_path, exc)
             else:
                 if response.status_code == 200:
@@ -865,7 +967,15 @@ class SyncClient:
                             diagnostic_code="commit_identity_mismatch",
                         )
                     if status == "committed":
-                        return UploadOutcome.success("admitted delta committed")
+                        committed_hash, committed_offset, stored_source_size = (
+                            self._committed_cursor_from_payload(payload)
+                        )
+                        return UploadOutcome.success(
+                            "admitted delta committed",
+                            committed_hash=committed_hash,
+                            committed_offset=committed_offset,
+                            stored_source_size=stored_source_size,
+                        )
                     if status in {"failed", "blocked", "missing"}:
                         error_type = str(payload.get("error_type") or "unknown")
                         return UploadOutcome.source_repair(
@@ -968,7 +1078,8 @@ class SyncClient:
 
                     retry_outcome: UploadOutcome | None = None
                     try:
-                        resp = self._client.post(
+                        resp = self._request(
+                            "post",
                             "/api/ingest/file/chunk",
                             data={"metadata": encoded_meta},
                             files={
@@ -979,7 +1090,7 @@ class SyncClient:
                                 ),
                             },
                         )
-                    except httpx.TransportError as exc:
+                    except (httpx.TransportError, KeyError) as exc:
                         retry_outcome = UploadOutcome.transient(
                             f"{type(exc).__name__}: {exc}",
                             diagnostic_code="network_error",
@@ -1097,11 +1208,12 @@ class SyncClient:
                     diagnostic_code="lease_lost",
                 )
             try:
-                response = self._client.post(
+                response = self._request(
+                    "post",
                     "/api/ingest/file/chunk/status",
                     json={"upload_id": upload_id, "hash": payload["hash"]},
                 )
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, KeyError) as exc:
                 logger.warning(
                     "Commit status unavailable for %s: %s",
                     payload["relative_path"],
@@ -1241,7 +1353,7 @@ class SyncClient:
     @property
     def is_connected(self) -> bool:
         try:
-            resp = self._client.get("/api/ingest/status", timeout=5)
+            resp = self._request("get", "/api/ingest/status", timeout=5)
             return resp.status_code == 200
         except Exception:
             return False

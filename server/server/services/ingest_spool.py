@@ -104,6 +104,9 @@ class ChunkCommitStatus:
     job_id: str
     status: str
     error_type: str | None = None
+    document_id: str | None = None
+    tool_id: str | None = None
+    relative_path: str | None = None
 
 
 def _job_id(meta: dict[str, Any], user_id: str, device_id: str) -> str:
@@ -325,7 +328,16 @@ def receipt_commit_status(
             or completion.get("device_id") not in (None, device_id)
         ):
             return ChunkCommitStatus(job_id=receipt_id, status="missing")
-        return ChunkCommitStatus(job_id=receipt_id, status="committed")
+        document_id = completion.get("document_id")
+        tool_id = completion.get("tool")
+        relative_path = completion.get("relative_path")
+        return ChunkCommitStatus(
+            job_id=receipt_id,
+            status="committed",
+            document_id=document_id if isinstance(document_id, str) else None,
+            tool_id=tool_id if isinstance(tool_id, str) else None,
+            relative_path=relative_path if isinstance(relative_path, str) else None,
+        )
 
     job_dir = _job_dir(receipt_id, root)
     if not job_dir.is_dir():
@@ -1672,6 +1684,8 @@ def mark_job_complete(
             # even after the job directory has been removed.
             "user_id": manifest.get("user_id") if isinstance(manifest, dict) else None,
             "device_id": manifest.get("device_id") if isinstance(manifest, dict) else None,
+            "tool": meta.get("tool"),
+            "relative_path": meta.get("relative_path"),
             "admission_identity": meta.get("admission_identity"),
             "payload_sha256": meta.get("payload_sha256"),
         },

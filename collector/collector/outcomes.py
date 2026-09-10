@@ -39,6 +39,9 @@ class UploadOutcome:
     expected_hash: str | None = None
     expected_offset: int = 0
     receipt_id: str | None = None
+    committed_hash: str | None = None
+    committed_offset: int | None = None
+    stored_source_size: int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -50,8 +53,21 @@ class UploadOutcome:
         return self.succeeded
 
     @classmethod
-    def success(cls, diagnostic: str = "") -> "UploadOutcome":
-        return cls(UploadOutcomeState.SUCCESS, diagnostic=diagnostic)
+    def success(
+        cls,
+        diagnostic: str = "",
+        *,
+        committed_hash: str | None = None,
+        committed_offset: int | None = None,
+        stored_source_size: int | None = None,
+    ) -> "UploadOutcome":
+        return cls(
+            UploadOutcomeState.SUCCESS,
+            diagnostic=diagnostic,
+            committed_hash=committed_hash,
+            committed_offset=committed_offset,
+            stored_source_size=stored_source_size,
+        )
 
     @classmethod
     def accepted(cls, receipt_id: str, diagnostic: str = "") -> "UploadOutcome":

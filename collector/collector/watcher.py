@@ -270,6 +270,7 @@ class FileWatcher:
         self._catching_up_paths: set[str] = set()
         self._handlers: list[_DebouncedHandler] = []
         self._tool_map: dict[str, BaseTool] = {}  # root_path_str -> tool
+        self.committed_source_lookup = None
 
         # Build parser registry
         self._parsers: list[BaseParser] = [
@@ -452,6 +453,121 @@ class FileWatcher:
             daemon=True,
         ).start()
 
+    def _delta_window_bytes(self) -> int:
+        config = getattr(self, "_config", None)
+        return int(
+            getattr(config, "max_delta_upload_bytes", 16 * 1024 * 1024)
+            or 16 * 1024 * 1024
+        )
+
+    def _may_have_bounded_full_prefix(self, *, file_size: int) -> bool:
+        """Remote blob checks are only needed for sources that can be windowed."""
+        return file_size > self._delta_window_bytes()
+
+    def _delta_source_is_fully_committed(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        file_size: int,
+    ) -> bool:
+        """Return whether a DELTA source has a complete server-side snapshot.
+
+        Reaching EOF through bounded windows is not enough: conversation
+        DELTAs keep the last FULL blob, so a 16 MiB prefix can look locally
+        complete while the server still stores only that prefix.
+        """
+        _, committed_offset = self._queue.get_delta_base(tool_name, relative_path)
+        if committed_offset != file_size:
+            return False
+        full_offset = None
+        snapshot_lookup = getattr(self._queue, "get_full_snapshot_state", None)
+        if callable(snapshot_lookup):
+            full_offset, bounded_prefix = snapshot_lookup(tool_name, relative_path)
+            if bounded_prefix:
+                return False
+            if full_offset is not None and full_offset < file_size:
+                return False
+        if self._may_have_bounded_full_prefix(file_size=file_size) and (
+            full_offset is None or full_offset < file_size
+        ):
+            return False
+        if not self._may_have_bounded_full_prefix(file_size=file_size):
+            return full_offset is None or full_offset == file_size
+        remote = self._remote_source_proof(tool_name, relative_path)
+        if remote is None:
+            return full_offset == file_size
+        stored_size = remote.get("stored_source_size")
+        if isinstance(stored_size, int) and stored_size >= 0:
+            slack = max(64 * 1024, file_size // 100)
+            if stored_size + slack < file_size:
+                return False
+        return True
+
+    def _delta_needs_complete_snapshot(
+        self,
+        tool_name: str,
+        relative_path: str,
+        *,
+        file_size: int,
+    ) -> bool:
+        """Return whether EOF catch-up must replace a bounded FULL prefix."""
+        _, committed_offset = self._queue.get_delta_base(tool_name, relative_path)
+        at_eof = committed_offset == file_size or committed_offset >= file_size
+        snapshot_lookup = getattr(self._queue, "get_full_snapshot_state", None)
+        bounded_prefix = False
+        full_offset = None
+        if callable(snapshot_lookup):
+            full_offset, bounded_prefix = snapshot_lookup(tool_name, relative_path)
+        if bounded_prefix and (at_eof or (full_offset is not None and full_offset < file_size)):
+            return True
+        if full_offset is not None and full_offset < file_size and at_eof:
+            return True
+        if (
+            self._may_have_bounded_full_prefix(file_size=file_size)
+            and at_eof
+            and (full_offset is None or full_offset < file_size)
+        ):
+            return True
+        if not self._may_have_bounded_full_prefix(file_size=file_size):
+            return False
+        remote = self._remote_source_proof(tool_name, relative_path)
+        if remote is None:
+            return False
+        stored_size = remote.get("stored_source_size")
+        if not isinstance(stored_size, int) or stored_size < 0:
+            return False
+        slack = max(64 * 1024, file_size // 100)
+        return stored_size + slack < file_size
+
+    def _remote_source_proof(
+        self,
+        tool_name: str,
+        relative_path: str,
+    ) -> dict | None:
+        cache = getattr(self, "_remote_source_proof_cache", None)
+        key = (tool_name, relative_path)
+        if isinstance(cache, dict) and key in cache:
+            return cache[key]
+        lookup = getattr(self, "committed_source_lookup", None)
+        if not callable(lookup):
+            proof = None
+        else:
+            try:
+                result = lookup(tool_name, relative_path)
+            except Exception:
+                logger.debug(
+                    "Committed source lookup failed for %s/%s",
+                    tool_name,
+                    relative_path,
+                    exc_info=True,
+                )
+                result = None
+            proof = result if isinstance(result, dict) else None
+        if isinstance(cache, dict):
+            cache[key] = proof
+        return proof
+
     def request_relative_resync(self, tool_name: str, relative_path: str) -> bool:
         """Safely resolve and queue one server-selected conversation snapshot."""
         tool = next((item for item in self._tools if item.name == tool_name), None)
@@ -470,8 +586,17 @@ class FileWatcher:
             or not source_path.is_file()
         ):
             return False
-        self.request_full_resync(str(source_path))
+        self.request_complete_snapshot(str(source_path))
         return True
+
+    def request_complete_snapshot(self, source_path: str) -> None:
+        """Queue one unwindowed FULL snapshot of the current source file."""
+        path = Path(source_path)
+        self._on_file_changed(
+            path,
+            complete_snapshot=True,
+            emit_live_signals=False,
+        )
 
     def _get_parser(self, content_type: ContentType) -> BaseParser | None:
         ext_map = {
@@ -541,6 +666,7 @@ class FileWatcher:
         path: Path,
         force_full: bool = False,
         emit_live_signals: bool = True,
+        complete_snapshot: bool = False,
     ) -> None:
         """Serialize parsing and make shutdown a hard callback boundary."""
         if self._stop_event.is_set():
@@ -552,6 +678,7 @@ class FileWatcher:
                 path,
                 force_full=force_full,
                 emit_live_signals=emit_live_signals,
+                complete_snapshot=complete_snapshot,
             )
 
     def _process_file_changed(
@@ -559,6 +686,7 @@ class FileWatcher:
         path: Path,
         force_full: bool = False,
         emit_live_signals: bool = True,
+        complete_snapshot: bool = False,
     ) -> None:
         tool = self._find_tool(path)
         if tool is None:
@@ -567,6 +695,9 @@ class FileWatcher:
         classification = tool.classify_file(path)
         if classification is None:
             return
+        if complete_snapshot:
+            force_full = True
+        self._remote_source_proof_cache = {}
 
         # Special handling for encrypted Antigravity .pb files
         if classification.metadata.get("__antigravity_pb__"):
@@ -688,11 +819,21 @@ class FileWatcher:
                 # the stat would strand that source across every restart.
                 source_is_committed = True
                 if classification.sync_strategy == SyncStrategy.DELTA:
-                    _, committed_offset = self._queue.get_delta_base(
+                    source_is_committed = self._delta_source_is_fully_committed(
                         classification.tool_name,
                         classification.relative_path,
+                        file_size=file_size,
                     )
-                    source_is_committed = committed_offset == file_size
+                    if (
+                        not source_is_committed
+                        and self._delta_needs_complete_snapshot(
+                            classification.tool_name,
+                            classification.relative_path,
+                            file_size=file_size,
+                        )
+                    ):
+                        complete_snapshot = True
+                        force_full = True
                 if source_is_committed:
                     return
 
@@ -813,7 +954,12 @@ class FileWatcher:
                             read_offset = 0
                             base_hash = None
                             base_offset = 0
-            if file_size - read_offset > max_delta_bytes:
+            if complete_snapshot:
+                read_offset = 0
+                base_hash = None
+                base_offset = 0
+                read_end_offset = file_size
+            elif file_size - read_offset > max_delta_bytes:
                 read_end_offset = read_offset + max_delta_bytes
                 logger.info(
                     "Delta backlog exceeds %d bytes; queueing bounded %s for %s",
@@ -919,6 +1065,20 @@ class FileWatcher:
         if not payload_has_content:
             if prepared_payload is not None:
                 self._queue.discard_prepared_payload(prepared_payload)
+            if (
+                not complete_snapshot
+                and classification.sync_strategy == SyncStrategy.DELTA
+                and self._delta_needs_complete_snapshot(
+                    classification.tool_name,
+                    classification.relative_path,
+                    file_size=file_size,
+                )
+            ):
+                self._process_file_changed(
+                    path,
+                    complete_snapshot=True,
+                    emit_live_signals=False,
+                )
             return
 
         if prepared_payload is None:
@@ -1071,6 +1231,13 @@ class FileWatcher:
             # completed server receipt without leaking queue-only state into
             # the document metadata.
             queue_metadata["_queue_force_reprocess_nonce"] = uuid.uuid4().hex
+        if (
+            classification.sync_strategy == SyncStrategy.DELTA
+            and not is_partial
+            and new_offset < file_size
+            and not complete_snapshot
+        ):
+            queue_metadata["_bounded_full_prefix"] = True
 
         self._queue.enqueue(
             tool_name=classification.tool_name,

@@ -1484,6 +1484,91 @@ class SyncQueueTests(unittest.TestCase):
         finally:
             rebuilt.close()
 
+    def test_mark_synced_records_bounded_prefix_and_prefers_server_echo(self) -> None:
+        path = "sessions/thread.jsonl"
+        self.queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content="prefix\n",
+            content_hash="prefix-hash",
+            file_size=7,
+            sync_strategy="delta",
+            is_partial=False,
+            offset=16_000,
+            metadata={"_bounded_full_prefix": True},
+        )
+        prefix = self.queue.claim_batch()[0]
+        self.assertTrue(
+            self.queue.mark_synced(
+                prefix,
+                committed_hash="echo-prefix",
+                committed_offset=16_000,
+            )
+        )
+        self.assertEqual(
+            self.queue.get_delta_base("codex", path),
+            ("echo-prefix", 16_000),
+        )
+        self.assertEqual(
+            self.queue.get_full_snapshot_state("codex", path),
+            (16_000, True),
+        )
+
+        self._enqueue(
+            path,
+            "tail\n",
+            "tail-hash",
+            "delta",
+            True,
+            50_000,
+            base_hash="echo-prefix",
+            base_offset=16_000,
+        )
+        tail = self.queue.claim_batch()[0]
+        self.assertTrue(
+            self.queue.mark_upload_outcome(
+                tail,
+                UploadOutcome.success(
+                    committed_hash="echo-tail",
+                    committed_offset=50_000,
+                ),
+            )
+        )
+        self.assertEqual(
+            self.queue.get_delta_base("codex", path),
+            ("echo-tail", 50_000),
+        )
+        self.assertEqual(
+            self.queue.get_full_snapshot_state("codex", path),
+            (16_000, True),
+        )
+
+        self.queue.enqueue(
+            tool_name="codex",
+            category="conversation",
+            content_type="jsonl",
+            relative_path=path,
+            content="full\n",
+            content_hash="full-hash",
+            file_size=5,
+            sync_strategy="delta",
+            is_partial=False,
+            offset=50_000,
+            metadata={},
+        )
+        snapshot = self.queue.claim_batch()[0]
+        self.assertTrue(self.queue.mark_synced(snapshot))
+        self.assertEqual(
+            self.queue.get_full_snapshot_state("codex", path),
+            (50_000, False),
+        )
+        self.assertEqual(
+            self.queue.get_delta_base("codex", path),
+            ("full-hash", 50_000),
+        )
+
 
 class SyncQueueMigrationTests(unittest.TestCase):
     def test_v1_migration_preserves_deltas_and_deduplicates_pending_full(self) -> None:

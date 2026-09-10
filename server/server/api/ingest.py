@@ -28,6 +28,7 @@ from ..services.device_service import ensure_device
 from ..services.document_delivery import (
     delivery_metadata_expression,
     delivery_revision_expression,
+    document_metadata,
     outerjoin_document_delivery,
 )
 from ..services.conversation_metadata_inbox import (
@@ -37,6 +38,7 @@ from ..services.conversation_metadata_inbox import (
 )
 from ..services.ingest_service import (
     STORED_SOURCE_REVISION_KEY,
+    STORED_SOURCE_SIZE_KEY,
     DeltaBaseMismatch,
     _get_ingest_semaphore,
     committed_delta_base_for_source,
@@ -119,6 +121,9 @@ class IngestResponse(BaseModel):
     document_id: str
     message: str = ""
     receipt_id: str | None = None
+    committed_hash: str | None = None
+    committed_offset: int | None = None
+    stored_source_size: int | None = None
 
 
 class IngestChunkStatusRequest(BaseModel):
@@ -140,6 +145,22 @@ class IngestReceiptStatusResponse(BaseModel):
     receipt_id: str
     status: Literal["accepted", "committed", "failed", "blocked", "receiving", "missing"]
     error_type: str | None = None
+    committed_hash: str | None = None
+    committed_offset: int | None = None
+    stored_source_size: int | None = None
+
+
+class IngestCommittedBaseRequest(BaseModel):
+    tool: str = Field(min_length=1, max_length=64)
+    relative_path: str = Field(min_length=1, max_length=2000)
+
+
+class IngestCommittedBaseResponse(BaseModel):
+    tool: str
+    relative_path: str
+    committed_hash: str | None = None
+    committed_offset: int = 0
+    stored_source_size: int | None = None
 
 
 class IngestMetadataRequest(BaseModel):
@@ -344,6 +365,58 @@ def _delta_mismatch_response(exc: DeltaBaseMismatch) -> HTTPException:
             "expected_hash": exc.expected_hash,
             "expected_offset": exc.expected_offset,
         },
+    )
+
+
+def _stored_source_size_from_document(document: Document | None) -> int | None:
+    if document is None:
+        return None
+    raw = document_metadata(document).get(STORED_SOURCE_SIZE_KEY)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if raw < 0:
+        return None
+    return int(raw)
+
+
+async def _committed_source_proof(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    device_id: str,
+    device_name: str = "unknown",
+    device_platform: str = "unknown",
+    tool_id: str,
+    relative_path: str,
+) -> tuple[str | None, int, int | None]:
+    """Return the durable delta cursor and stored blob size for one source."""
+    machine = await ensure_device(
+        db,
+        device_id,
+        device_name,
+        device_platform,
+        user_id=user_id,
+    )
+    committed_hash, committed_offset = await committed_delta_base_for_source(
+        db,
+        tool_id=tool_id,
+        relative_path=relative_path,
+        machine_id=str(machine.id),
+        user_id=user_id,
+    )
+    document = (
+        await db.execute(
+            select(Document).where(
+                Document.tool_id == tool_id,
+                Document.relative_path == relative_path,
+                Document.machine_id == machine.id,
+            )
+        )
+    ).scalar_one_or_none()
+    return (
+        committed_hash,
+        committed_offset,
+        _stored_source_size_from_document(document),
     )
 
 
@@ -1302,7 +1375,10 @@ async def ingest_file_receipt_status(
     req: IngestReceiptStatusRequest,
     _collector_user: User = Depends(verify_collector_token),
     _throttle: None = Depends(throttle_ingest),
+    db: AsyncSession = Depends(get_db),
     x_device_id: str = Header("unknown"),
+    x_device_name: str = Header("unknown"),
+    x_device_platform: str = Header("unknown"),
 ) -> IngestReceiptStatusResponse:
     """Report ACCEPTED separately from the terminal database receipt."""
     try:
@@ -1314,10 +1390,63 @@ async def ingest_file_receipt_status(
         )
     except ChunkValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    committed_hash = None
+    committed_offset = None
+    stored_source_size = None
+    if (
+        result.status == "committed"
+        and isinstance(result.tool_id, str)
+        and result.tool_id
+        and isinstance(result.relative_path, str)
+        and result.relative_path
+    ):
+        committed_hash, committed_offset, stored_source_size = (
+            await _committed_source_proof(
+                db,
+                user_id=str(_collector_user.id),
+                device_id=x_device_id,
+                device_name=x_device_name,
+                device_platform=x_device_platform,
+                tool_id=result.tool_id,
+                relative_path=result.relative_path,
+            )
+        )
     return IngestReceiptStatusResponse(
         receipt_id=result.job_id,
         status=result.status,
         error_type=result.error_type,
+        committed_hash=committed_hash,
+        committed_offset=committed_offset,
+        stored_source_size=stored_source_size,
+    )
+
+
+@router.post("/file/committed-base", response_model=IngestCommittedBaseResponse)
+async def ingest_file_committed_base(
+    req: IngestCommittedBaseRequest,
+    _collector_user: User = Depends(verify_collector_token),
+    _throttle: None = Depends(throttle_ingest),
+    db: AsyncSession = Depends(get_db),
+    x_device_id: str = Header("unknown"),
+    x_device_name: str = Header("unknown"),
+    x_device_platform: str = Header("unknown"),
+) -> IngestCommittedBaseResponse:
+    """Return the durable source cursor a collector must reconcile against."""
+    committed_hash, committed_offset, stored_source_size = await _committed_source_proof(
+        db,
+        user_id=str(_collector_user.id),
+        device_id=x_device_id,
+        device_name=x_device_name,
+        device_platform=x_device_platform,
+        tool_id=req.tool,
+        relative_path=req.relative_path,
+    )
+    return IngestCommittedBaseResponse(
+        tool=req.tool,
+        relative_path=req.relative_path,
+        committed_hash=committed_hash,
+        committed_offset=committed_offset,
+        stored_source_size=stored_source_size,
     )
 
 

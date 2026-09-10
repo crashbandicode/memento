@@ -191,6 +191,80 @@ class ChunkIngestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "accepted")
 
+    def test_receipt_status_committed_includes_source_echo(self) -> None:
+        result = SimpleNamespace(
+            job_id="a" * 64,
+            status="committed",
+            error_type=None,
+            tool_id="claude_code",
+            relative_path="projects/thread.jsonl",
+        )
+        with (
+            patch.object(ingest_api, "receipt_commit_status", return_value=result),
+            patch.object(
+                ingest_api,
+                "_committed_source_proof",
+                new_callable=AsyncMock,
+                return_value=("d2:abc", 16_777_216, 16_777_216),
+            ) as proof,
+        ):
+            response = self.client.post(
+                "/api/ingest/file/receipt/status",
+                json={"receipt_id": "a" * 64},
+                headers={
+                    "x-device-id": "device-1",
+                    "x-device-name": "Yoga",
+                    "x-device-platform": "Windows",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "receipt_id": "a" * 64,
+                "status": "committed",
+                "error_type": None,
+                "committed_hash": "d2:abc",
+                "committed_offset": 16_777_216,
+                "stored_source_size": 16_777_216,
+            },
+        )
+        proof.assert_awaited_once()
+
+    def test_committed_base_returns_durable_cursor(self) -> None:
+        with patch.object(
+            ingest_api,
+            "_committed_source_proof",
+            new_callable=AsyncMock,
+            return_value=("d2:abc", 4096, 1024),
+        ) as proof:
+            response = self.client.post(
+                "/api/ingest/file/committed-base",
+                json={
+                    "tool": "claude_code",
+                    "relative_path": "projects/thread.jsonl",
+                },
+                headers={
+                    "x-device-id": "device-1",
+                    "x-device-name": "Yoga",
+                    "x-device-platform": "Windows",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "tool": "claude_code",
+                "relative_path": "projects/thread.jsonl",
+                "committed_hash": "d2:abc",
+                "committed_offset": 4096,
+                "stored_source_size": 1024,
+            },
+        )
+        proof.assert_awaited_once()
+
     def test_invalid_metadata_returns_400_without_enqueuing(self) -> None:
         response = self.client.post(
             "/api/ingest/file/chunk",
